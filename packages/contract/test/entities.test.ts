@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Board, Card, Reference } from '../src';
+import { Board, Card, Reference, Tenant } from '../src';
 
 describe('entity schemas', () => {
   it('parses a board with a pipeline and applies stage defaults', () => {
@@ -57,5 +57,53 @@ describe('entity schemas', () => {
     });
     expect(ok.success).toBe(true);
     expect(Reference.safeParse({ id: 'ref_abc123' }).success).toBe(false);
+  });
+});
+
+/**
+ * The tenant is kaambaan's LOCAL isolation boundary. `externalId` + `externalSource` optionally
+ * record that the same real organisation is also known elsewhere; the pair is all-or-nothing,
+ * mirroring the database CHECK (apps/api/migrations/0002_tenant_external_mapping.sql).
+ */
+describe('tenant external mapping', () => {
+  const base = {
+    id: 'tnt_abc123',
+    slug: 'acme',
+    name: 'Acme',
+    createdAt: '2026-06-20T10:00:00.000Z',
+  };
+
+  it('a standalone tenant carries no external mapping', () => {
+    const t = Tenant.parse(base);
+    expect(t.externalId).toBeUndefined();
+    expect(t.externalSource).toBeUndefined();
+  });
+
+  it('accepts an explicit absence on both halves', () => {
+    expect(Tenant.safeParse({ ...base, externalId: null, externalSource: null }).success).toBe(true);
+  });
+
+  it('accepts both halves together', () => {
+    const t = Tenant.parse({
+      ...base,
+      externalId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+      externalSource: 'agentpod',
+    });
+    expect(t.externalSource).toBe('agentpod');
+  });
+
+  it('rejects an external id with no source naming whose id it is', () => {
+    expect(Tenant.safeParse({ ...base, externalId: 'org_1' }).success).toBe(false);
+    expect(Tenant.safeParse({ ...base, externalId: 'org_1', externalSource: null }).success).toBe(false);
+  });
+
+  it('rejects a source with no external id', () => {
+    expect(Tenant.safeParse({ ...base, externalSource: 'agentpod' }).success).toBe(false);
+    expect(Tenant.safeParse({ ...base, externalSource: 'agentpod', externalId: null }).success).toBe(false);
+  });
+
+  it('rejects an empty string as a stand-in for either half', () => {
+    expect(Tenant.safeParse({ ...base, externalId: '', externalSource: 'agentpod' }).success).toBe(false);
+    expect(Tenant.safeParse({ ...base, externalId: 'org_1', externalSource: '' }).success).toBe(false);
   });
 });

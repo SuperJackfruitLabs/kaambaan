@@ -9,6 +9,16 @@ const idSchema = (prefix: string) =>
     .string()
     .regex(new RegExp(`^${prefix}_[A-Za-z0-9]{6,}$`), `expected a "${prefix}_…" id`);
 
+/**
+ * `tnt` stays `tnt`. The tenant is now explicitly kaambaan's *local* isolation boundary rather
+ * than an org (docs/01), which raises the question of renaming the prefix — and the answer is no.
+ * `tnt` is registered to kaambaan as `declared-and-minted` in the shared fixture corpus
+ * (AgentPod `fixtures/ecosystem-identity/id_grammar.json`), with accept/reject cases another
+ * repo's suite asserts against; renaming would be a coordinated two-repo change that buys no
+ * correctness. Collision safety comes from the registry, not from the spelling: AgentPod's own
+ * local boundary must claim a *different* prefix, exactly as `run_`/`attempt_` was settled — the
+ * side with no rows moves, and here that is AgentPod's, which does not exist yet.
+ */
 export const TenantId = idSchema('tnt');
 export const UserId = idSchema('usr');
 // `mbr`, not `mem`: this is what the API mints (`newId('mbr')`) and what exists in D1 today.
