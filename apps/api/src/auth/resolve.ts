@@ -1,8 +1,9 @@
 /**
  * Edge auth resolution (docs/02). Real auth first: a signed session cookie identifies a human; a
- * `kbn_` bearer token identifies an agent (looked up in the catalog). When `DEV_AUTH === "true"`
- * (local + tests) the legacy dev headers (`X-Tenant-Id` / `X-Agent-Id` / `X-User-Id`) are accepted
- * as a fallback — that path is OFF in production, so the deployed app requires real credentials.
+ * `kbn_` bearer token identifies an agent (looked up in the catalog). The legacy dev headers
+ * (`X-Tenant-Id` / `X-Agent-Id` / `X-User-Id`) are accepted as a fallback only when `DEV_AUTH` is
+ * explicitly `"true"` — it is opt-in (set by `pnpm dev` and the test runner, never in
+ * wrangler.jsonc), so any deploy requires real credentials by default.
  */
 import type { Env } from '../env';
 import { readSessionToken, verifySession } from './session';

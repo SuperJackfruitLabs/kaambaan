@@ -127,6 +127,19 @@ doesn't speak MCP. Tokens are per-agent bearers (tenant + capability scoped).
 
 All mutating endpoints accept an `Idempotency-Key` header (see [08](./08-reliability-and-durable-execution.md)).
 
+### Auth (as shipped)
+
+An agent presents its token as `Authorization: Bearer kbn_…` (minted by "Connect an agent";
+stored only as a SHA-256 hash in `agent_tokens`). The token carries the tenant, the agent identity
+and the agent's registered capabilities, so the client never asserts them. `@kaambaan/agent-sdk`
+speaks this by default — see [its README](../packages/agent-sdk/README.md). The dev-mode
+`X-Tenant-Id` / `X-Agent-Id` headers only work against a server run with `DEV_AUTH=true`
+([12](./12-deploy.md)).
+
+Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims` and
+`POST /v1/boards/:id/runs/:runId/:action`. Board/card administration is a human surface behind a
+session cookie.
+
 ## 4. Outbound webhooks (push dispatch)
 
 Pull is the default ([04 §3](./04-agent-contract.md)); push is an **accelerator** that just tells

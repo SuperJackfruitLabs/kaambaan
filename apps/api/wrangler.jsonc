@@ -7,9 +7,10 @@
   "observability": {
     "enabled": true
   },
-  // Dev-mode auth: accept X-Tenant-Id / X-Agent-Id headers (local dev + tests). Production turns this
-  // off (`wrangler deploy --var DEV_AUTH:false`) so the deployed app requires real auth.
-  "vars": { "DEV_AUTH": "true" },
+  // NOTE: DEV_AUTH is deliberately NOT set here. Dev-mode auth (accepting X-Tenant-Id / X-Agent-Id
+  // headers as a credential) is opt-IN: `pnpm dev` passes `--var DEV_AUTH:true` and the test runner
+  // sets it in vitest.config.ts. Setting it here would make every `wrangler deploy` that forgot to
+  // override it ship an app where any X-Tenant-Id header is a full credential for that tenant.
   "d1_databases": [
     {
       "binding": "DB",

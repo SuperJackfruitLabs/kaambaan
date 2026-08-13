@@ -11,7 +11,8 @@ const idSchema = (prefix: string) =>
 
 export const TenantId = idSchema('tnt');
 export const UserId = idSchema('usr');
-export const MembershipId = idSchema('mem');
+// `mbr`, not `mem`: this is what the API mints (`newId('mbr')`) and what exists in D1 today.
+export const MembershipId = idSchema('mbr');
 export const BoardId = idSchema('brd');
 export const AgentId = idSchema('agt');
 export const TokenId = idSchema('tok');
@@ -26,7 +27,7 @@ export const ContextId = idSchema('ctx');
 export const ID_PREFIXES = {
   tenant: 'tnt',
   user: 'usr',
-  membership: 'mem',
+  membership: 'mbr',
   board: 'brd',
   agent: 'agt',
   token: 'tok',

@@ -8,7 +8,8 @@ the web SPA (static assets, same-origin). Same-origin means the session cookie a
 
 Merging to `main` auto-deploys. The `deploy` job in `.github/workflows/ci.yml` runs after the `test`
 and `e2e` jobs pass on a push to `main`: it migrates the remote D1 and runs `wrangler deploy
---var DEV_AUTH:false`. It needs one repo secret:
+--var DEV_AUTH:false` (belt-and-braces — dev auth is off by default, see below). It needs one repo
+secret:
 
 - **`CLOUDFLARE_API_TOKEN`** — a Cloudflare API token with **Workers Scripts: Edit** and **D1: Edit**,
   scoped to your account (a single-account token lets wrangler infer the account). Add it under
@@ -54,9 +55,16 @@ kaambaan.dev automatically. The manual steps below are only for first-time setup
    pnpm --filter @kaambaan/api deploy
    ```
 
-`deploy` runs `wrangler deploy --var DEV_AUTH:false`, so the deployed app accepts **only** real auth
-(GitHub session cookies + `kbn_` agent tokens). The dev-mode `X-Tenant-Id` / `X-Agent-Id` headers are
-rejected in production.
+### Dev auth is opt-in
+
+Dev-mode auth (accepting `X-Tenant-Id` / `X-Agent-Id` headers, `?tenant=`, and the
+`<tenant>:<agent>:<caps>` MCP bearer as credentials) is **only** on when `DEV_AUTH=true` is passed
+explicitly. It is deliberately **not** in `wrangler.jsonc`, so *any* deploy — including a bare
+`wrangler deploy` — accepts **only** real auth (GitHub session cookies + `kbn_` agent tokens). The
+`deploy` script still passes `--var DEV_AUTH:false` as belt-and-braces.
+
+Opting in is per-command: `pnpm --filter @kaambaan/api dev` runs `wrangler dev --var DEV_AUTH:true`,
+and the API test runner sets the binding in `apps/api/vitest.config.ts`.
 
 ## After deploy
 
@@ -67,5 +75,5 @@ rejected in production.
 ## Local development is unchanged
 
 `pnpm --filter @kaambaan/api dev:setup` (migrate + seed the local D1) then run the web (`:5173`,
-Vite) and API (`:8787`, wrangler) separately; Vite proxies `/v1`, `/auth`, `/mcp` to the Worker. Local
-runs with `DEV_AUTH=true`, so the `tnt_dev` workspace works without signing in.
+Vite) and API (`:8787`, wrangler) separately; Vite proxies `/v1`, `/auth`, `/mcp` to the Worker. The
+`dev` script passes `--var DEV_AUTH:true`, so the `tnt_dev` workspace works without signing in.
