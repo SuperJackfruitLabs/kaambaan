@@ -74,6 +74,11 @@ carries `tenantId`, and the data-access layer refuses any query without a resolv
 scope. **⚠️ OPEN**: whether to also adopt per-tenant DBs or row-level enforcement only —
 default is row-level with a mandatory tenant guard in the data layer.
 
+`tenants` additionally carries an optional `external_id` + `external_source` pair — where the
+same real organisation is known outside kaambaan — under an all-or-nothing CHECK
+(`tenants_external_pair`, migration 0002). It is a *record*, never an input to isolation: no
+query, DO name, or authorization check reads it.
+
 ### R2 — artifacts
 Large agent outputs (files, diffs, generated docs, build logs) referenced by A2A `Artifact`s
 via `FileWithUri`. Tasks/cards store the R2 keys; blobs never bloat the DO.
@@ -92,6 +97,12 @@ Human session tokens, short-lived caches (e.g. resolved tenant routing), feature
 
 - **Boundary = Tenant.** A Board belongs to exactly one tenant. A Board DO id is derived from
   `(tenantId, boardId)` so a DO can never serve two tenants.
+- **The boundary is local, not an authority.** kaambaan enforces isolation; it does not decide
+  who anyone is. Principal, Team, Role and authority belong to the Organization plane, which
+  does not exist yet — so kaambaan models none of them and instead records an *optional*
+  mapping (`external_source` + `external_id`) to the same organisation elsewhere. kaambaan runs
+  standalone with no mapping at all, and the mapping never widens a scope: isolation is always
+  computed from `tenantId`.
 - **Humans**: session → membership lookup → role check. No membership ⇒ no access, full stop.
 - **Agents**: a per-tenant **app-actor** registration with bearer tokens scoped to that tenant
   (optionally to specific boards/capabilities). An agent token is meaningless outside its

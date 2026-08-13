@@ -8,11 +8,34 @@ export interface UserRecord {
   email: string;
   name: string | null;
 }
+/**
+ * A tenant is kaambaan's LOCAL isolation boundary, not an authority on who anyone is. The
+ * external pair optionally records that the same real organisation is also known elsewhere:
+ * `externalSource` names the system, `externalId` is its (opaque) id. Both or neither — see
+ * `setTenantExternalMapping` and migrations/0002_tenant_external_mapping.sql.
+ */
 export interface TenantRecord {
   id: string;
   slug: string;
   name: string;
+  externalId: string | null;
+  externalSource: string | null;
 }
+
+/** Where a tenant is also known, outside kaambaan. */
+export interface TenantExternalMapping {
+  externalId: string;
+  externalSource: string;
+}
+
+/** A half-recorded external mapping — an id whose id space nobody can name, or the reverse. */
+export class ExternalMappingError extends Error {
+  constructor(message = 'externalId and externalSource must be set together, or not at all') {
+    super(message);
+    this.name = 'ExternalMappingError';
+  }
+}
+
 export interface AgentRecord {
   id: string;
   tenantId: string;
@@ -43,7 +66,15 @@ export async function ensurePersonalWorkspace(db: D1Database, userId: string, di
   const existing = await primaryTenant(db, userId);
   if (existing) return existing;
   const id = newId('tnt');
-  const tenant: TenantRecord = { id, slug: `${slugify(displayName)}-${id.slice(-6)}`, name: `${displayName}'s workspace` };
+  // No external mapping: a personal workspace answers to nothing outside kaambaan, and that is a
+  // complete tenant. A mapping is recorded later, by whoever links this boundary to an org.
+  const tenant: TenantRecord = {
+    id,
+    slug: `${slugify(displayName)}-${id.slice(-6)}`,
+    name: `${displayName}'s workspace`,
+    externalId: null,
+    externalSource: null,
+  };
   await db.prepare(`INSERT INTO tenants (id, slug, name) VALUES (?, ?, ?)`).bind(tenant.id, tenant.slug, tenant.name).run();
   await db.prepare(`INSERT INTO memberships (id, tenant_id, user_id, role) VALUES (?, ?, ?, 'owner')`).bind(newId('mbr'), id, userId).run();
   return tenant;
@@ -51,9 +82,44 @@ export async function ensurePersonalWorkspace(db: D1Database, userId: string, di
 
 export async function primaryTenant(db: D1Database, userId: string): Promise<TenantRecord | null> {
   return db
-    .prepare(`SELECT t.id, t.slug, t.name FROM tenants t JOIN memberships m ON m.tenant_id = t.id WHERE m.user_id = ? ORDER BY m.created_at ASC LIMIT 1`)
+    .prepare(
+      `SELECT t.id, t.slug, t.name, t.external_id AS externalId, t.external_source AS externalSource
+       FROM tenants t JOIN memberships m ON m.tenant_id = t.id WHERE m.user_id = ? ORDER BY m.created_at ASC LIMIT 1`,
+    )
     .bind(userId)
     .first<TenantRecord>();
+}
+
+/**
+ * Record (or clear, with `null`) where this tenant is also known outside kaambaan.
+ *
+ * The pair is all-or-nothing and the database enforces it (`tenants_external_pair`); this guard
+ * exists so the failure names the mistake instead of surfacing as a SQLITE_CONSTRAINT. Recording
+ * an id without the system it came from is worse than recording nothing: an unattributed id
+ * cannot be joined against anything, and a wrong join is harder to notice than a missing one.
+ *
+ * Nothing calls this yet — the shape is reserved ahead of its first writer, which is the only
+ * moment it is free to get right. It changes no existing behaviour: a tenant with no mapping is
+ * exactly the tenant kaambaan has today.
+ */
+export async function setTenantExternalMapping(
+  db: D1Database,
+  tenantId: string,
+  mapping: TenantExternalMapping | null,
+): Promise<void> {
+  if (mapping !== null) {
+    const { externalId, externalSource } = mapping;
+    if (typeof externalId !== 'string' || externalId.trim() === '') {
+      throw new ExternalMappingError('an external mapping needs an externalId');
+    }
+    if (typeof externalSource !== 'string' || externalSource.trim() === '') {
+      throw new ExternalMappingError('an external mapping needs an externalSource naming whose id it is');
+    }
+  }
+  await db
+    .prepare(`UPDATE tenants SET external_id = ?, external_source = ?, updated_at = datetime('now') WHERE id = ?`)
+    .bind(mapping?.externalId ?? null, mapping?.externalSource ?? null, tenantId)
+    .run();
 }
 
 export async function createAgent(db: D1Database, tenantId: string, input: { name: string; capabilities?: string[] }): Promise<AgentRecord> {

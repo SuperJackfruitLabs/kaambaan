@@ -30,10 +30,29 @@ Card ──< Task (one per stage / rework, A2A-immutable) ──< Run (one per a
 
 ## Entities
 
-### Tenant *(a.k.a. Workspace / Org)*
-The **hard isolation boundary**. All data, auth, and agent registrations are scoped to exactly
-one tenant. Fields: `id`, `slug`, `name`, `createdAt`, settings, billing. There is no cross-
-tenant read path; isolation is enforced at the edge, not by a query filter.
+### Tenant *(a.k.a. Workspace)*
+kaambaan's **local hard isolation boundary** — and only that. All data, auth, and agent
+registrations are scoped to exactly one tenant. Fields: `id`, `slug`, `name`, `createdAt`,
+`externalId`, `externalSource`, settings, billing. There is no cross-tenant read path;
+isolation is enforced at the edge, not by a query filter.
+
+**It is deliberately not an Org.** Principal, Team, Role and authority belong to the
+Organization plane, which does not exist yet; a product that grows its own org model has to
+migrate it later. So kaambaan owns the boundary and nothing about who anyone *is*.
+
+**The external mapping.** `externalSource` names the system a tenant is also known to
+(`agentpod` today, `org-plane` later) and `externalId` is that system's id, kept opaque
+because it is not kaambaan's id space. **Both or neither**, enforced by a database CHECK
+(`tenants_external_pair`) — an id recorded without the system it came from cannot be joined
+against anything, and a wrong join is harder to notice than a missing one. AgentPod carries
+the same pair with the same CHECK on its own rows.
+
+Absent is the normal, complete state: a **standalone kaambaan** — a plain kanban board for
+someone's agents, with no organisation layer anywhere — never sets either column. When the
+Organization plane mints canonical ids, both products map to them: a data move, not a schema
+change. The mapping is deliberately **not unique** — kaambaan is one-tenant-per-user, so two
+people in one real organisation legitimately map two local boundaries onto one external id.
+A shared mapping never becomes a shared keyspace; isolation stays local, on `tenantId`.
 
 ### User & Membership
 A human principal and their role within a tenant. `Membership(userId, tenantId, role)` where
@@ -132,7 +151,8 @@ Events drive the WebSocket broadcast to UI clients and the webhook dispatch to s
 
 | Term | One-line meaning |
 |------|------------------|
-| **Tenant / Workspace** | Hard isolation boundary; everything is scoped to one |
+| **Tenant / Workspace** | kaambaan's *local* hard isolation boundary; everything is scoped to one. Not an authority — the Organization plane owns Principal/Team/Role |
+| **External mapping** | Optional `externalSource` + `externalId` on a tenant: the same real organisation, as known to another system. Both or neither |
 | **Board** | A pipeline + its cards; one Durable Object |
 | **Pipeline / Stage** | The ordered columns a card flows through |
 | **Card** | The durable unit of work; has a human owner |
