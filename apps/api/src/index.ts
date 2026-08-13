@@ -40,6 +40,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
     case 'CARD_NOT_FOUND':
+    case 'RUN_NOT_FOUND':
     case 'NOT_INITIALIZED':
     case 'GATE_NOT_FOUND':
       return 404;
@@ -47,6 +48,9 @@ function statusForCode(code: BoardErrorCode): number {
     case 'GATE_NOT_PENDING':
       return 409;
     case 'SEPARATION_OF_DUTIES':
+    // The caller authenticated, but this run is another agent's: a permanent refusal of an
+    // understood request, and deliberately NOT the 409 that means "your lease lapsed, re-claim".
+    case 'NOT_RUN_OWNER':
       return 403;
     case 'INVALID_SIGNATURE':
       return 401;
@@ -367,6 +371,16 @@ export default {
           profileKey: payload.profileKey,
         });
         return Response.json(claimResult);
+      }
+
+      // GET /v1/boards/:id/runs/:runId — the agent read surface (docs/04 §3 `getCard`): the card
+      // this run holds, its stage, the upstream handoff and the card's references. Scoped to the
+      // agent that claimed the run — a shared board is not readable through an agent token.
+      const runReadMatch = rest.match(/^runs\/([^/]+)$/);
+      if (runReadMatch && request.method === 'GET') {
+        const result = await stub.getRunContext({ runId: runReadMatch[1]!, agentId: agent!.agentId });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
       }
 
       // POST /v1/boards/:id/runs/:runId/:action — agent run verbs (docs/04 §3)

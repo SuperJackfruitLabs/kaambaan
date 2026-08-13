@@ -135,6 +135,31 @@ export interface ActivityView {
   signal: string | null;
 }
 
+/**
+ * The context of one run, as the agent that owns it may read it (docs/04 §3 `getCard`).
+ *
+ * This is the *whole* agent read surface: the card this run was claimed for, that card's stage, the
+ * upstream handoff and the card's references — enough to do the work, and nothing about the rest of
+ * the (tenant-shared) board.
+ */
+export interface RunContext {
+  run: {
+    runId: string;
+    cardId: string;
+    stageKey: string;
+    leaseEpoch: number;
+    status: string;
+    outcome: string | null;
+    startedAt: string;
+    endedAt: string | null;
+  };
+  card: CardView;
+  /** The card's *current* stage — null if the board's stage list no longer contains it. */
+  stage: StageDef | null;
+  handoff: JsonValue | null;
+  references: ReferenceView[];
+}
+
 /** One run of a card, surfaced for the attempts comparison view (docs/07 §5). */
 export interface AttemptView {
   runId: string;
@@ -275,6 +300,8 @@ export type BoardErrorCode =
   | 'UNKNOWN_STAGE'
   | 'WIP_LIMIT'
   | 'CARD_NOT_FOUND'
+  | 'RUN_NOT_FOUND'
+  | 'NOT_RUN_OWNER'
   | 'STALE_LEASE'
   | 'GATE_NOT_FOUND'
   | 'GATE_NOT_PENDING'
@@ -318,6 +345,7 @@ export interface BoardStub {
   setBudget(input: { boardUsdCap?: number | null; cardUsdCap?: number | null }): Promise<Result<{ ok: true }>>;
   getUsage(opts?: { window?: string }): Promise<UsageSummary>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
+  getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
   getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }>;
   estimateCardCost(cardId: string): Promise<Result<EstimateView>>;
@@ -1188,6 +1216,47 @@ export class BoardDO extends DurableObject<Env> {
     );
   }
 
+  /**
+   * The agent read surface (docs/04 §3 `getCard`): everything the agent that owns `runId` needs to
+   * work its card, and nothing else. Authorized by the same predicate as the run verbs — a run
+   * belongs to the agent that claimed it — so there is one ownership rule, not two.
+   *
+   * Unlike the verbs this does not require a live lease: a finished run stays readable so an agent
+   * can verify the outcome it produced (and a reclaimed one can see that it lost the card).
+   */
+  async getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>> {
+    const row = this.getRunRow(input.runId);
+    if (!row) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${input.runId}` };
+    const denied = this.denyForeignRun<RunContext>(row, input.agentId);
+    if (denied) return denied;
+
+    const cardId = row.card_id as string;
+    const card = this.getCard(cardId);
+    if (!card) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    return {
+      ok: true,
+      value: {
+        run: {
+          runId: row.id as string,
+          cardId,
+          stageKey: row.stage_key as string,
+          leaseEpoch: Number(row.lease_epoch),
+          status: row.status as string,
+          outcome: (row.outcome as string | null) ?? null,
+          startedAt: row.started_at as string,
+          endedAt: (row.ended_at as string | null) ?? null,
+        },
+        card,
+        stage: this.stages().find((s) => s.key === card.currentStageKey) ?? null,
+        handoff: this.parseHandoff(this.getCardHandoffJson(cardId)),
+        references: this.sql
+          .exec(`SELECT * FROM card_references WHERE card_id = ? ORDER BY created_at ASC`, cardId)
+          .toArray()
+          .map((r) => this.rowToReference(r)),
+      },
+    };
+  }
+
   /** The attempts (runs) for a card, newest-stage-first, with each run's cost and model (docs/07 §5). */
   async getAttempts(cardId: string): Promise<AttemptView[]> {
     return this.sql
@@ -1652,12 +1721,30 @@ export class BoardDO extends DurableObject<Env> {
     return false;
   }
 
+  private getRunRow(runId: string): Row | null {
+    return this.sql.exec(`SELECT * FROM runs WHERE id = ?`, runId).toArray()[0] ?? null;
+  }
+
   private getActiveRunRow(runId: string, leaseEpoch: number): Row | null {
-    const row = this.sql.exec(`SELECT * FROM runs WHERE id = ?`, runId).toArray()[0];
+    const row = this.getRunRow(runId);
     if (!row) return null;
     if ((row.status as string) !== 'working') return null;
     if (Number(row.lease_epoch) !== leaseEpoch) return null;
     return row;
+  }
+
+  /**
+   * Identity guard (docs/04 §1): a run is driven and read by the agent that claimed it. Returns an
+   * error to hand back, or null when the caller is entitled to the run.
+   *
+   * `agentId` is the *authenticated* principal, which is always present for a `kbn_` token; it is
+   * null only under `DEV_AUTH` when the caller sent no `X-Agent-Id`, where there is no identity to
+   * compare and the lease alone authorizes (dev headers are not a credential in a deploy).
+   */
+  private denyForeignRun<T>(run: Row, agentId: string | null | undefined): Result<T> | null {
+    if (agentId === null || agentId === undefined) return null;
+    if ((run.agent_id as string) === agentId) return null;
+    return { ok: false, code: 'NOT_RUN_OWNER', message: 'this run belongs to another agent' };
   }
 
   private staleLease<T>(): Result<T> {

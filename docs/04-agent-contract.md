@@ -41,7 +41,7 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 |------|-----------|---------|-----------------|
 | `discover` | agent → Kaambaan | Fetch AgentCard / available boards & stages it may work | capabilities + board list |
 | `claim` | agent → Kaambaan | Atomically pull the next *ready* card in a stage it owns | Task (`working`) + context bundle, or *empty* |
-| `getCard` | agent → Kaambaan | Read a card's spec, references, current task, handoff metadata | card snapshot (read-only) |
+| `getCard` | agent → Kaambaan | Read the card **it holds** — spec, references, stage, handoff metadata | run context (read-only) |
 | `heartbeat` | agent → Kaambaan | Keep the run alive | ack; resets stale/reclaim timers |
 | `activity` | agent → Kaambaan | Emit typed progress (`thought/action/response/elicitation/error`) | appended (immutable); state derived |
 | `requestInput` | agent → Kaambaan | Ask the human a question / present choices (elicitation + signal) | Task → `input-required` |
@@ -126,7 +126,7 @@ The same verb on two surfaces — full detail in `05-integration-surfaces` (plan
 | Verb | MCP tool (`tools/call`) | REST endpoint |
 |------|--------------------------|---------------|
 | `claim` | `kaambaan_claim_card` *(not read-only, not idempotent)* | `POST /v1/boards/:id/claims` |
-| `getCard` | `kaambaan_get_card` *(`readOnlyHint: true`)* | `GET /v1/cards/:id` |
+| `getCard` | `kaambaan_get_card` *(`readOnlyHint: true`)* | `GET /v1/boards/:id/runs/:runId` *(run-scoped — [05 §3](./05-integration-surfaces.md))* |
 | `heartbeat` | `kaambaan_heartbeat` | `POST /v1/runs/:id/heartbeat` |
 | `activity` | `kaambaan_post_activity` | `POST /v1/runs/:id/activities` |
 | `requestInput` | `kaambaan_request_input` | `POST /v1/runs/:id/activities` (elicitation) |
