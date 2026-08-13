@@ -48,7 +48,23 @@ An agent token authorizes exactly the agent routes, which is exactly this client
 | Method | Endpoint |
 |---|---|
 | `claim()` | `POST /v1/boards/:boardId/claims` |
+| `context()` | `GET /v1/boards/:boardId/runs/:runId` |
 | `heartbeat` · `activity` · `complete` · `block` · `fail` · `release` | `POST /v1/boards/:boardId/runs/:runId/:action` |
+
+`context(work)` re-reads what the claim already returned — the card this run holds, that card's
+current stage, the upstream handoff and the card's references — for resuming after a restart or for
+confirming where the card landed once the run has ended:
+
+```ts
+const work = await agent.claim();
+if (work) {
+  const { card, stage, handoff, references } = await agent.context(work);
+}
+```
+
+That read is **run-scoped**: an agent reads a card because it claimed it. Another agent's run is a
+`403`, and the whole-board snapshot is not agent-readable at all — a board is shared by a tenant's
+agents, and one agent's work is not another's to read.
 
 Board and card administration — creating boards, adding cards, resolving approval gates — is a
 **human** surface behind a session cookie, and is deliberately not exposed here. An agent asks for

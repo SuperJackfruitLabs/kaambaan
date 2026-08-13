@@ -20,8 +20,12 @@ export interface UserPrincipal {
 
 export interface AgentPrincipal {
   tenantId: string;
-  /** The claiming agent. Null is allowed for run verbs (authorized by the lease, not identity); the
-   * claim route requires it. */
+  /**
+   * The authenticated agent. A `kbn_` token always resolves one: it is compared against
+   * `run.agent_id` on every run verb and on the run read, so an agent only drives and reads its own
+   * runs. Null only in `DEV_AUTH` mode when no `X-Agent-Id` was sent — there is no identity to
+   * compare and the lease alone authorizes; the claim route refuses it outright.
+   */
   agentId: string | null;
   /** From the token's agent (catalog); null in dev where capabilities come from the request body. */
   capabilities: string[] | null;
@@ -63,8 +67,9 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
     return found ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities } : null;
   }
   if (devAuth(env)) {
-    // Dev: the tenant (X-Tenant-Id) locates the board DO; X-Agent-Id identifies the claiming agent
-    // (only the claim route needs it — run verbs are authorized by the run's lease).
+    // Dev: the tenant (X-Tenant-Id) locates the board DO; X-Agent-Id identifies the agent. Sending
+    // it makes local runs behave exactly like a deployed one (identity-checked run verbs); omitting
+    // it falls back to lease-only authorization, which is a dev convenience and nothing more.
     const tenantId = request.headers.get('X-Tenant-Id');
     if (tenantId && tenantId.trim() !== '') {
       const agentId = request.headers.get('X-Agent-Id');

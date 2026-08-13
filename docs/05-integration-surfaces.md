@@ -117,7 +117,7 @@ doesn't speak MCP. Tokens are per-agent bearers (tenant + capability scoped).
 | Verb | Endpoint |
 |------|----------|
 | claim | `POST /v1/boards/:boardId/claims` |
-| getCard | `GET /v1/cards/:cardId` |
+| getCard | `GET /v1/boards/:boardId/runs/:runId` *(as shipped — see "The agent read surface")* |
 | heartbeat | `POST /v1/runs/:runId/heartbeat` |
 | activity / requestInput | `POST /v1/runs/:runId/activities` |
 | addReference | `PUT /v1/cards/:cardId/references` *(idempotent on url)* |
@@ -136,9 +136,46 @@ speaks this by default — see [its README](../packages/agent-sdk/README.md). Th
 `X-Tenant-Id` / `X-Agent-Id` headers only work against a server run with `DEV_AUTH=true`
 ([12](./12-deploy.md)).
 
-Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims` and
-`POST /v1/boards/:id/runs/:runId/:action`. Board/card administration is a human surface behind a
-session cookie.
+Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims`,
+`GET /v1/boards/:id/runs/:runId` and `POST /v1/boards/:id/runs/:runId/:action`. Board/card
+administration is a human surface behind a session cookie, and a session cookie is *not* a
+credential on the agent routes (a human moves work by moving a card or resolving a gate, never by
+driving someone's run).
+
+Within the tenant, a token reaches **its own runs**: the authenticated agent is compared against
+`run.agentId` on every run verb and on the run read ([04 §1](./04-agent-contract.md)), so
+`{runId, leaseEpoch}` is not a bearer capability — `403 NOT_RUN_OWNER` on another agent's run,
+distinct from the `409 STALE_LEASE` that means "your lease lapsed, re-claim". Both wires enforce it:
+the MCP tools pass the token's agent into the same Board DO methods.
+
+### The agent read surface
+
+`GET /v1/boards/:boardId/runs/:runId` is the whole of what an agent may read:
+
+```jsonc
+{
+  "run":  { "runId", "cardId", "stageKey", "leaseEpoch", "status", "outcome", "startedAt", "endedAt" },
+  "card": { …the claimed card… },
+  "stage": { …the card's current stage… },
+  "handoff": { …the upstream stage's handoff… },
+  "references": [ …the card's external links… ]
+}
+```
+
+It is **run-scoped, not board-scoped**, and authorized by the same predicate as the run verbs — *a
+run belongs to the agent that claimed it* — so there is one ownership rule, not two:
+
+- an agent reads a card **because it claimed it**, never by naming one (403 `NOT_RUN_OWNER` on
+  another agent's run, 404 on an unknown one);
+- no lease is required, so a finished run stays readable and an agent can confirm where its card
+  landed (a reclaimed agent sees it lost the card);
+- the whole-board snapshot (`GET /v1/boards/:id`) — every card, every gate, board-wide cost and the
+  GitHub config — stays **human-only**, as does listing boards or cards. A board is shared by a
+  tenant's agents; one agent's spec, handoff and output are not another's to read, and an agent
+  cannot enumerate the board it works on.
+
+Agents find work through `claim` (capability-routed) rather than by browsing, so a read surface
+wider than "the run I hold" would buy nothing and leak across every agent in the tenant.
 
 ## 4. Outbound webhooks (push dispatch)
 

@@ -132,7 +132,8 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       inputSchema: { boardId: z.string(), runId: z.string(), leaseEpoch: z.number().int().min(0) },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    async ({ boardId, runId, leaseEpoch }) => fromResult(await deps.boardStub(boardId).heartbeat({ runId, leaseEpoch })),
+    async ({ boardId, runId, leaseEpoch }) =>
+      fromResult(await deps.boardStub(boardId).heartbeat({ runId, leaseEpoch, agentId: auth.agentId })),
   );
 
   server.registerTool(
@@ -166,6 +167,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
         await deps.boardStub(boardId).postActivity({
           runId,
           leaseEpoch,
+          agentId: auth.agentId,
           type: type as AgentActivityType,
           ephemeral,
           body,
@@ -186,7 +188,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ boardId, runId, leaseEpoch, output }) =>
-      fromResult(await deps.boardStub(boardId).submitForReview({ runId, leaseEpoch, output: output as JsonValue })),
+      fromResult(await deps.boardStub(boardId).submitForReview({ runId, leaseEpoch, agentId: auth.agentId, output: output as JsonValue })),
   );
 
   server.registerTool(
@@ -197,7 +199,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ boardId, runId, leaseEpoch, handoff }) =>
-      fromResult(await deps.boardStub(boardId).complete({ runId, leaseEpoch, handoff: handoff as JsonValue })),
+      fromResult(await deps.boardStub(boardId).complete({ runId, leaseEpoch, agentId: auth.agentId, handoff: handoff as JsonValue })),
   );
 
   server.registerTool(
@@ -208,7 +210,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async ({ boardId, runId, leaseEpoch, reason }) =>
-      fromResult(await deps.boardStub(boardId).block({ runId, leaseEpoch, reason })),
+      fromResult(await deps.boardStub(boardId).block({ runId, leaseEpoch, agentId: auth.agentId, reason })),
   );
 
   server.registerTool(
@@ -219,7 +221,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async ({ boardId, runId, leaseEpoch, reason }) =>
-      fromResult(await deps.boardStub(boardId).release({ runId, leaseEpoch, reason })),
+      fromResult(await deps.boardStub(boardId).release({ runId, leaseEpoch, agentId: auth.agentId, reason })),
   );
 
   server.registerTool(
@@ -230,6 +232,6 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },
     async ({ boardId, runId, leaseEpoch, reason }) =>
-      fromResult(await deps.boardStub(boardId).fail({ runId, leaseEpoch, reason })),
+      fromResult(await deps.boardStub(boardId).fail({ runId, leaseEpoch, agentId: auth.agentId, reason })),
   );
 }

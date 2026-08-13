@@ -66,6 +66,27 @@ export interface ClaimedWork {
   handoff: unknown;
 }
 
+/**
+ * What an agent may read: the context of a run it owns (docs/04 §3 `getCard`). Deliberately not a
+ * board view — the whole-board snapshot is a human surface.
+ */
+export interface RunContext {
+  run: {
+    runId: string;
+    cardId: string;
+    stageKey: string;
+    leaseEpoch: number;
+    status: string;
+    outcome: string | null;
+    startedAt: string;
+    endedAt: string | null;
+  };
+  card: { id: string; title: string; spec: unknown; currentStageKey: string; state: string };
+  stage: { key: string; name: string } | null;
+  handoff: unknown;
+  references: Array<{ id: string; url: string; title: string | null; provider: string; sourceType: string }>;
+}
+
 export interface AgentActivity {
   type: 'thought' | 'action' | 'response' | 'elicitation' | 'error';
   body?: string;
@@ -96,7 +117,7 @@ export class KaambaanApiError extends Error {
 }
 
 /** Best-effort human-readable reason from an error response (`{ error }` or `{ error: { message } }`). */
-async function errorMessage(res: HttpResponse, path: string): Promise<string> {
+async function errorMessage(res: HttpResponse, path: string, method = 'POST'): Promise<string> {
   let detail = '';
   try {
     const body = (await res.json()) as { error?: string | { message?: string } };
@@ -104,7 +125,7 @@ async function errorMessage(res: HttpResponse, path: string): Promise<string> {
   } catch {
     // non-JSON body — the status is enough
   }
-  return `POST ${path} failed with ${res.status}${detail ? `: ${detail}` : ''}`;
+  return `${method} ${path} failed with ${res.status}${detail ? `: ${detail}` : ''}`;
 }
 
 /** A small client for the Kaambaan agent contract. One instance works one board as one agent. */
@@ -165,6 +186,21 @@ export class KaambaanAgent {
       stage: body.stage,
       handoff: body.handoff ?? null,
     };
+  }
+
+  /**
+   * Re-read the context of a run this agent owns — the card it holds, that card's current stage,
+   * the upstream handoff and the card's references. The claim already returns this; use it to
+   * resume after a restart, or to observe where the card landed once the run has ended.
+   *
+   * Throws {@link KaambaanApiError} on 403 (the run is another agent's) or 404 (no such run).
+   */
+  async context(work: ClaimedWork | string): Promise<RunContext> {
+    const runId = typeof work === 'string' ? work : work.runId;
+    const path = `/v1/boards/${this.config.boardId}/runs/${runId}`;
+    const res = await this.config.fetch(`${this.config.baseUrl}${path}`, { method: 'GET', headers: this.headers() });
+    if (!res.ok) throw new KaambaanApiError(res.status, path, await errorMessage(res, path, 'GET'));
+    return (await res.json()) as RunContext;
   }
 
   private run(work: ClaimedWork, action: string, extra: Record<string, unknown> = {}): Promise<HttpResponse> {

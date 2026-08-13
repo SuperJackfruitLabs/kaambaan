@@ -16,6 +16,17 @@ A2A at its core, with Linear's activity/signal model for transparency and human-
 - An agent is only ever a card's **delegate** (executor), never its **owner** (the accountable
   human). When an agent claims a card it becomes `card.delegateAgentId`; the human
   `ownerUserId` is untouched. *(Linear delegate model — Principle 3.)*
+- **A run belongs to the agent that claimed it.** Every run verb (`heartbeat`, `activity`,
+  `complete`, `submitForReview`, `block`, `fail`, `release`) and the run read compare the
+  authenticated agent against `run.agentId` and refuse a mismatch with **403** — *in addition to*
+  the lease check, never instead of it. The lease answers "is this write current?"; identity
+  answers "is it yours?". Without both, any token in the tenant could drive any run, and the run's
+  cost would still meter against the original agent — so "which agent did this" would not be a
+  fact the platform can assert.
+- **Reclaim is unaffected**: a lapsed run is *ended* and the card re-queued, so the agent that
+  re-claims gets a **new run** (new id, new lease epoch) that is its own. The original agent is
+  refused by the lease (`409 STALE_LEASE` — "re-claim"), which is what it should act on, not by
+  identity.
 - An agent advertises what it can do via an **A2A AgentCard** (skills, input/output modes,
   `capabilities.streaming`, `capabilities.pushNotifications`). Kaambaan stores this as the
   agent's capability registry and uses its `capabilities` tags for routing.
@@ -41,7 +52,7 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 |------|-----------|---------|-----------------|
 | `discover` | agent → Kaambaan | Fetch AgentCard / available boards & stages it may work | capabilities + board list |
 | `claim` | agent → Kaambaan | Atomically pull the next *ready* card in a stage it owns | Task (`working`) + context bundle, or *empty* |
-| `getCard` | agent → Kaambaan | Read a card's spec, references, current task, handoff metadata | card snapshot (read-only) |
+| `getCard` | agent → Kaambaan | Read the card **it holds** — spec, references, stage, handoff metadata | run context (read-only) |
 | `heartbeat` | agent → Kaambaan | Keep the run alive | ack; resets stale/reclaim timers |
 | `activity` | agent → Kaambaan | Emit typed progress (`thought/action/response/elicitation/error`) | appended (immutable); state derived |
 | `requestInput` | agent → Kaambaan | Ask the human a question / present choices (elicitation + signal) | Task → `input-required` |
@@ -126,7 +137,7 @@ The same verb on two surfaces — full detail in `05-integration-surfaces` (plan
 | Verb | MCP tool (`tools/call`) | REST endpoint |
 |------|--------------------------|---------------|
 | `claim` | `kaambaan_claim_card` *(not read-only, not idempotent)* | `POST /v1/boards/:id/claims` |
-| `getCard` | `kaambaan_get_card` *(`readOnlyHint: true`)* | `GET /v1/cards/:id` |
+| `getCard` | `kaambaan_get_card` *(`readOnlyHint: true`)* | `GET /v1/boards/:id/runs/:runId` *(run-scoped — [05 §3](./05-integration-surfaces.md))* |
 | `heartbeat` | `kaambaan_heartbeat` | `POST /v1/runs/:id/heartbeat` |
 | `activity` | `kaambaan_post_activity` | `POST /v1/runs/:id/activities` |
 | `requestInput` | `kaambaan_request_input` | `POST /v1/runs/:id/activities` (elicitation) |
