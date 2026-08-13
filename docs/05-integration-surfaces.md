@@ -138,7 +138,15 @@ speaks this by default — see [its README](../packages/agent-sdk/README.md). Th
 
 Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims`,
 `GET /v1/boards/:id/runs/:runId` and `POST /v1/boards/:id/runs/:runId/:action`. Board/card
-administration is a human surface behind a session cookie.
+administration is a human surface behind a session cookie, and a session cookie is *not* a
+credential on the agent routes (a human moves work by moving a card or resolving a gate, never by
+driving someone's run).
+
+Within the tenant, a token reaches **its own runs**: the authenticated agent is compared against
+`run.agentId` on every run verb and on the run read ([04 §1](./04-agent-contract.md)), so
+`{runId, leaseEpoch}` is not a bearer capability — `403 NOT_RUN_OWNER` on another agent's run,
+distinct from the `409 STALE_LEASE` that means "your lease lapsed, re-claim". Both wires enforce it:
+the MCP tools pass the token's agent into the same Board DO methods.
 
 ### The agent read surface
 

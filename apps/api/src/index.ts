@@ -407,14 +407,17 @@ export default {
             ? Response.json({ [key]: r.value })
             : Response.json({ error: r }, { status: statusForCode(r.code) });
 
+        // The lease says the run is current; `agentId` says it is *yours*. It is the principal the
+        // token resolved to, never a client-asserted value (docs/04 §1).
+        const lease = { runId, leaseEpoch: p.leaseEpoch, agentId: agent!.agentId };
+
         switch (action) {
           case 'heartbeat':
-            return respond(await stub.heartbeat({ runId, leaseEpoch: p.leaseEpoch }), 'run');
+            return respond(await stub.heartbeat(lease), 'run');
           case 'activities':
             return respond(
               await stub.postActivity({
-                runId,
-                leaseEpoch: p.leaseEpoch,
+                ...lease,
                 type: p.type ?? 'thought',
                 ephemeral: p.ephemeral,
                 body: p.body,
@@ -427,15 +430,15 @@ export default {
               'activity',
             );
           case 'complete':
-            return respond(await stub.complete({ runId, leaseEpoch: p.leaseEpoch, handoff: p.handoff }), 'card');
+            return respond(await stub.complete({ ...lease, handoff: p.handoff }), 'card');
           case 'block':
-            return respond(await stub.block({ runId, leaseEpoch: p.leaseEpoch, reason: p.reason ?? '' }), 'card');
+            return respond(await stub.block({ ...lease, reason: p.reason ?? '' }), 'card');
           case 'fail':
-            return respond(await stub.fail({ runId, leaseEpoch: p.leaseEpoch, reason: p.reason ?? '' }), 'card');
+            return respond(await stub.fail({ ...lease, reason: p.reason ?? '' }), 'card');
           case 'release':
-            return respond(await stub.release({ runId, leaseEpoch: p.leaseEpoch }), 'card');
+            return respond(await stub.release(lease), 'card');
           case 'submit':
-            return respond(await stub.submitForReview({ runId, leaseEpoch: p.leaseEpoch, output: p.output }), 'card');
+            return respond(await stub.submitForReview({ ...lease, output: p.output }), 'card');
           default:
             return Response.json({ error: `unknown run action: ${action}` }, { status: 404 });
         }
