@@ -69,3 +69,40 @@ agents, and one agent's work is not another's to read.
 Board and card administration — creating boards, adding cards, resolving approval gates — is a
 **human** surface behind a session cookie, and is deliberately not exposed here. An agent asks for
 human input from inside a run instead (an `elicitation` activity), which is how gates work.
+
+## Asking a human, and getting an answer
+
+When the work needs a decision the agent may not take alone — a permission prompt, a choice between
+paths — `ask()` puts the question on the card and parks it in `input-required`. **The run keeps its
+lease**: the agent is waiting, not finished, and it resumes as itself rather than re-claiming.
+
+```ts
+const asked = await agent.ask(work, 'May I run the test suite?', {
+  options: [
+    { name: 'run_them', title: 'Run the tests' },
+    { name: 'skip', title: 'Skip them' },
+  ],
+});
+
+// Wait for a human, staying alive while you do.
+for (;;) {
+  await agent.heartbeat(work);
+  const q = (await agent.elicitations(work)).find((e) => e.id === asked.id);
+  if (q?.status === 'answered') break;      // q.answer = { option, text, answeredBy, answeredAt }
+  if (q?.status !== 'pending') return;      // cancelled — the card moved on without you
+  await new Promise((r) => setTimeout(r, 5_000));
+}
+```
+
+Notes that matter in practice:
+
+- **Options ride in `parameter`** — `ask()` puts them there for you. They are what the human clicks,
+  and an answer comes back as the option's `name`.
+- **Keep heartbeating.** A pending question does not pause the heartbeat timeout; an agent that goes
+  quiet while waiting has its run reclaimed like any other, and its question `cancelled`.
+- **The answer arrives on the run you already hold** (`GET /v1/boards/:id/runs/:runId`), so no human
+  credential and no extra authorization are involved. Polling is the mechanism today; a push
+  refinement would not change the shape of what you read.
+- **You cannot answer your own question.** The answer route is a human surface, and the board
+  refuses an answer from the agent that asked. Omit `options` for an open question — the human's
+  free text comes back as `answer.text`.
