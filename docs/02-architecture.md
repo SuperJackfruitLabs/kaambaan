@@ -1,6 +1,15 @@
 # 02 — Architecture
 
-Kaambaan runs on **Cloudflare**. The shape of the platform maps unusually well onto the
+Kaambaan runs on **Cloudflare**.
+
+> **⚠️ What is actually bound today.** `apps/api/wrangler.jsonc` binds exactly three things: **D1**
+> (`DB`), the **Board Durable Object** namespace (`BOARD_DO`), and the static **ASSETS** for the SPA.
+> **R2, KV, Queues and Workflows are not bound and not used** — the diagram and the component
+> sections below describe the intended topology, and the paragraphs marked ⚠️ say what stands in for
+> each today. Treat this document as design intent with the gaps called out, not as a deployment
+> description.
+
+The shape of the platform maps unusually well onto the
 problem: Durable Objects give us a single-threaded, strongly-consistent live authority per
 board (atomic claims for free), D1 gives us a queryable multi-tenant catalog, Workflows/Queues
 give us durable webhook delivery and timeouts, and Workers give us a global edge for auth and
@@ -35,12 +44,16 @@ routing.
 
 ### Edge Worker — the front door
 A single Worker that:
-- **Serves the React app** (static assets) and the API.
+- **Serves the SvelteKit SPA** (static assets from `apps/web/build`) and the API, same-origin.
 - **Terminates auth**: resolves a request to `{principal, tenant}` *before* anything else.
-  Humans → session cookie (KV-backed). Agents → bearer token (MCP `Authorization` header or
-  REST). MCP auth follows OAuth 2.1 with Kaambaan as the **Resource Server** (see
-  Integration Surfaces, planned).
-- **Authorizes**: checks the principal's membership/role or the agent's tenant + scopes.
+  Humans → a signed session cookie (**stateless HMAC, not KV-backed** — there is no session
+  store). Agents → a `kbn_` bearer token, the **same credential on REST and on `/mcp`**. `/mcp`
+  is an OAuth Resource Server *shell* only — no authorization server, no PKCE, no audience
+  validation ([05 §2](./05-integration-surfaces.md)).
+- **Authorizes**: pins the tenant, which is always derived from the credential and never from a
+  client-supplied value, and compares the authenticated agent against `run.agentId` on run verbs.
+  **⚠️ Membership `role` and token `scopes` are stored but never checked** — that authorization
+  layer is design intent, not a control that exists.
 - **Routes** to the correct **Board Durable Object** (by `boardId → DO id`) and to the MCP
   endpoint. The DO trusts the Worker's authorization decision — it never re-authenticates.
 
@@ -79,19 +92,24 @@ same real organisation is known outside kaambaan — under an all-or-nothing CHE
 (`tenants_external_pair`, migration 0002). It is a *record*, never an input to isolation: no
 query, DO name, or authorization check reads it.
 
-### R2 — artifacts
-Large agent outputs (files, diffs, generated docs, build logs) referenced by A2A `Artifact`s
-via `FileWithUri`. Tasks/cards store the R2 keys; blobs never bloat the DO.
+### R2 — artifacts — **⚠️ not bound**
+*Intended*: large agent outputs (files, diffs, generated docs, build logs) referenced by A2A
+`Artifact`s via `FileWithUri`. *Today*: there is no R2 binding and no artifact model. A card's
+outputs are whatever JSON the agent puts in its `complete` handoff, stored in the DO.
 
-### KV — sessions & hot config
-Human session tokens, short-lived caches (e.g. resolved tenant routing), feature flags.
+### KV — sessions & hot config — **⚠️ not bound**
+*Intended*: session tokens and hot caches. *Today*: there is no KV binding. The session is a
+**stateless** base64url payload + HMAC signature in a cookie — nothing is stored server-side, which
+is also why there is no way to revoke one before it expires.
 
-### Queues / Workflows — durable async
-- **Webhook delivery** with retries + backoff and HMAC signing (push side of the contract).
-- **Scheduled/recurring cards** (cron-style task creation).
-- **Timeouts**: ack/stale/heartbeat deadlines, circuit-breaker bookkeeping (see
-  [Card Lifecycle](./03-card-lifecycle.md)). The DO sets alarms; Workflows handle multi-step
-  retrying delivery.
+### Queues / Workflows — durable async — **⚠️ not bound**
+*Intended*: retrying webhook delivery, scheduled/recurring cards, multi-step timeout bookkeeping.
+*Today*: neither is bound. What stands in for each:
+- **Webhook delivery** is a table in the DO drained by an explicit `POST …/push/dispatch`, signed
+  with HMAC, and **at-most-once** — a failed delivery is terminal ([05 §4](./05-integration-surfaces.md)).
+- **Scheduled/recurring cards** do not exist.
+- **Timeouts**: the DO alarm enforces the heartbeat/reclaim deadline and the circuit breaker. The
+  ack SLA, stale window and per-stage max runtime are **not** enforced ([04 §5](./04-agent-contract.md)).
 
 ## Multi-tenancy & isolation
 
@@ -113,13 +131,17 @@ Human session tokens, short-lived caches (e.g. resolved tenant routing), feature
 
 ## Authentication summary
 
-| Principal | Mechanism | Carrier |
+| Principal | Mechanism *(as shipped)* | Carrier |
 |---|---|---|
-| Human | OAuth (GitHub/Google) or email magic-link → session | Cookie (KV-backed) |
-| Agent (MCP) | OAuth 2.1; Kaambaan = Resource Server; audience-validated bearer | `Authorization: Bearer` on `/mcp` |
-| Agent (REST) | Per-agent bearer token, tenant+capability scoped | `Authorization: Bearer` on `/v1/*` |
-| Inbound webhook (GitHub) | HMAC-SHA256 signature verify | `X-Hub-Signature-256` |
-| Outbound webhook (to agents) | Signed delivery (A2A PushNotificationConfig pattern: JWT/HMAC) | `Authorization` / signature header |
+| Human | **GitHub OAuth only** → stateless HMAC-signed session (30d). No Google, no magic-link, no password | Cookie `kaambaan_session` |
+| Agent (REST **and** MCP) | Per-agent `kbn_` token, stored as a SHA-256 hash; carries tenant + agent identity + capabilities | `Authorization: Bearer` on `/v1/boards/*` and `/mcp` |
+| Human or agent, **dev only** | `X-Tenant-Id` / `X-Agent-Id` / `?tenant=`, or an MCP `<tenant>:<agent>:<caps>` bearer — self-asserted, no secret. Requires `DEV_AUTH=true`; a deploy rejects them | Headers / query |
+| Inbound webhook (GitHub) | HMAC-SHA256 signature verify, in the DO | `X-Hub-Signature-256` |
+| Outbound webhook (to agents) | HMAC-SHA256 over the exact body | `X-Kaambaan-Signature: sha256=…` |
+
+**Not implemented**: any authorization server, `/authorize`, `/token`, dynamic client
+registration, PKCE, JWTs, audience (`aud`) claims, token expiry or rotation, role/scope checks,
+rate limiting, and CSRF tokens (`SameSite=Lax` is the only CSRF defense).
 
 ## Key data flows (textual sequence)
 
@@ -150,10 +172,11 @@ kaambaan/
 ├── docs/                      # this spec set (source of truth)
 ├── packages/
 │   └── contract/              # zod schemas + types for the shared contract (A2A-aligned)
+│   └── agent-sdk/             # client for the agent REST surface (private, unpublished)
 ├── apps/
 │   ├── api/                   # Cloudflare Worker: edge, REST, MCP server, Board DO
-│   └── web/                   # React + Vite board UI
-├── test/                      # cross-cutting contract/conformance tests
-└── wrangler.* / package.json
+│   └── web/                   # SvelteKit (Svelte 5) board UI, built to static assets
+└── pnpm-workspace.yaml / package.json
 ```
-**⚠️ OPEN — monorepo tooling** (pnpm workspaces vs bun vs turborepo) — decide at scaffold time.
+Resolved: **pnpm workspaces** (`packageManager: pnpm@11.5.2`, Node ≥ 22). There is no top-level
+`test/` directory — contract/conformance tests live in `apps/api/test` and `packages/contract/test`.

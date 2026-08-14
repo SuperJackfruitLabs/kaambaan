@@ -48,31 +48,71 @@ activities are the immutable record; `usage` feeds per-tenant metering ([07](./0
 Kaambaan exposes a **remote MCP server over Streamable HTTP** at `/mcp`, so any MCP-capable
 harness becomes a board worker.
 
-- **Auth**: OAuth 2.1; Kaambaan is the **Resource Server**. Unauthenticated → `401` +
-  `WWW-Authenticate` → client discovers `/.well-known/oauth-protected-resource` → PKCE flow →
-  audience-validated bearer. **Validate the token audience; never pass tokens upstream.**
-- **Session**: `Mcp-Session-Id` header; validate `Origin` (DNS-rebinding defense).
-- **Tools** map 1:1 to contract verbs, with **honest annotations** so harnesses prompt humans
-  correctly:
+### Auth — what `/mcp` actually is (read this before building against it)
 
-| Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` |
-|------|:-:|:-:|:-:|
-| `kaambaan_claim_card` | ✗ | ✗ | ✗ |
-| `kaambaan_get_card` | ✓ | — | ✓ |
-| `kaambaan_heartbeat` | ✗ | ✗ | ✓ |
-| `kaambaan_post_activity` | ✗ | ✗ | ✗ |
-| `kaambaan_request_input` | ✗ | ✗ | ✗ |
-| `kaambaan_add_reference` | ✗ | ✗ | ✓ |
-| `kaambaan_submit_for_review` | ✗ | ✗ | ✗ |
-| `kaambaan_complete` | ✗ | ✗ | ✗ |
-| `kaambaan_block` / `_release` / `_fail` | ✗ | ✓ | ✗ |
+`/mcp` is an **OAuth 2.0 *Resource Server shell* over a bearer token**. It is not an OAuth 2.1
+deployment, and an integrator who plans for one will build the wrong client.
+
+**What exists.** An unauthenticated request gets `401` with
+`WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource"`, and
+that path serves RFC 9728 protected-resource metadata.
+
+**What does not exist — anywhere in this repo.** There is no authorization server, no `/authorize`,
+no `/token`, no dynamic client registration, no PKCE, no refresh tokens, no scope enforcement, and
+**no audience**: nothing mints, carries, or validates an `aud` claim, and there are no JWTs at all
+(the session cookie is a base64url+HMAC blob, not a JWT). Earlier drafts of this section described
+that flow in the present tense. None of it was ever built.
+
+**The two credentials `/mcp` accepts** (`apps/api/src/mcp/auth.ts`):
+
+1. A **`kbn_` agent token** — the *same* credential as the REST surface, matched by SHA-256 hash
+   against `agent_tokens`. This is the only credential that works against a deployed server.
+2. A **dev bearer** `<tenantId>:<agentId>:<comma-separated-capabilities>` — accepted **only** when
+   the server runs with `DEV_AUTH=true`. It is parsed, not verified: it asserts its own tenant,
+   identity and capabilities with no secret involved. Local and test use only.
+
+> **⚠️ The discovery chain dead-ends.** The metadata advertises `authorization_servers: [<origin>]`,
+> and that origin serves no `/.well-known/oauth-authorization-server` and no `/authorize`. An MCP
+> client that follows the `401` and tries to run the authorization flow **will fail at the next
+> hop**. Configure your client with a `kbn_` token directly instead. A real Authorization Server is
+> a fast-follow (**⚠️ OPEN**); until it lands, only the `401`-and-metadata shape is real.
+
+- **Session**: none — the transport is **stateless** (`sessionIdGenerator: undefined`), so there is
+  no `Mcp-Session-Id` acting as a credential. **⚠️ OPEN**: `Origin`/DNS-rebinding validation is not
+  wired (auth is a bearer, so there is no ambient browser session to hijack).
+- **Tools** carry **honest annotations** so harnesses prompt humans correctly. The eleven tools
+  actually registered (`apps/api/src/mcp/tools.ts`), and how they line up with REST:
+
+| Tool | Arguments beyond `boardId` | REST equivalent |
+|------|---|---|
+| `kaambaan_list_work` | *(none — no `boardId` either)* | **none** — MCP-only; `GET /v1/boards` is human-auth and has no `readyForYou` |
+| `kaambaan_claim_card` | `maxConcurrency?` | `POST /v1/boards/:id/claims` *(REST also takes `profileKey`)* |
+| `kaambaan_get_card` | `cardId` | **none** — there is no `GET …/cards/:cardId` |
+| `kaambaan_add_reference` | `cardId`, `url`, `provider?`, `sourceType?`, … | `PUT …/cards/:cardId/references` *(human-auth — MCP is the only agent path)* |
+| `kaambaan_heartbeat` | `runId`, `leaseEpoch` | `POST …/runs/:runId/heartbeat` |
+| `kaambaan_post_activity` | `runId`, `leaseEpoch`, `type`, `body?`, `parameter?`, `signal?`, `usage?` | `POST …/runs/:runId/activities` |
+| `kaambaan_submit_for_review` | `runId`, `leaseEpoch`, `output?` | `POST …/runs/:runId/`**`submit`** *(the verb is `submit`, not `submit_for_review`)* |
+| `kaambaan_complete` | `runId`, `leaseEpoch`, `handoff?` | `POST …/runs/:runId/complete` |
+| `kaambaan_block` / `_fail` | `runId`, `leaseEpoch`, `reason` *(required, non-empty)* | `POST …/runs/:runId/{block,fail}` *(REST defaults `reason` to `''`)* |
+| `kaambaan_release` | `runId`, `leaseEpoch`, `reason?` | `POST …/runs/:runId/release` *(REST drops `reason`)* |
+
+`{tenant, agentId, capabilities}` always come from the token, never from tool arguments.
+
+> **⚠️ The one asymmetry that matters: MCP cannot read a run.** `GET /v1/boards/:id/runs/:runId` has
+> **no MCP tool**, so an MCP-only agent cannot re-read its run — and therefore **cannot collect an
+> elicitation answer** (§ "The elicitation return path" in [04](./04-agent-contract.md)), which
+> arrives on that read. An agent that needs to ask a human a question must use REST for the
+> collection half. `mcp-parity.test.ts` proves the verbs it covers agree across both wires; it does
+> not establish that the two surfaces are equal in extent.
 
 - **Business failures** return `isError: true` (model-visible, self-correctable), not transport
   errors. Transport errors are reserved for "tool not found"/bad args.
-- **Elicitation**: when the agent's harness supports MCP **elicitation**, a `request_input` /
-  gate can be surfaced as `elicitation/create` with a restricted flat schema and the
-  `accept / decline / cancel` tri-state (see [08 — Reliability](./08-reliability-and-durable-execution.md)).
-- We expose **tools only** (no MCP resources/prompts in v1) — matches what Claude Code / Copilot
+- **⚠️ OPEN — MCP `elicitation/create`**: surfacing a gate as a native MCP elicitation (restricted
+  flat schema, `accept / decline / cancel` tri-state, see
+  [08](./08-reliability-and-durable-execution.md)) is **not built**. Today a question travels as an
+  `elicitation` activity and the answer is collected off the run read — a kaambaan-level mechanism,
+  not an MCP protocol one.
+- We expose **tools only** (no MCP resources/prompts) — matches what Claude Code / Copilot
   agents consume. **⚠️ OPEN**: expose board/card snapshots as MCP *resources* later.
 
 ### Implementation (P4)
@@ -82,23 +122,17 @@ The server is the official `@modelcontextprotocol/sdk` `McpServer` hosted over t
 mode: every request gets a fresh server whose tools are thin RPC calls into the per-(tenant, board)
 Board DO, so the only authority is the DO and there is no MCP-session state to keep in the Worker
 (`apps/api/src/mcp/`). The tool handlers call the **same** `BoardStub` methods as the REST routes, so
-the two surfaces are one contract — proven by `apps/api/test/mcp-parity.test.ts` (MCP ≡ REST).
+where both surfaces expose a verb they cannot drift — `apps/api/test/mcp-parity.test.ts` asserts that
+for the verbs it covers. It does **not** assert that the surfaces are equal in extent, and they are
+not (see the run-read asymmetry above).
 
-- **Implemented tools**: `claim_card`, `get_card`, `heartbeat`, `post_activity`, `submit_for_review`,
-  `complete`, `block`, `release`, `fail`. The agent's `{tenant, agentId, capabilities}` come from the
-  token, never from tool arguments.
-- **Deferred** (noted, not yet wired): `add_reference` (no reference model until **P5**) and
-  `request_input` (MCP elicitation, rides with gate timeout/escalation in the deferred **P3.1**).
-- **Auth (P4)**: the Resource Server validates a **dev bearer** —
-  `Bearer <tenantId>:<agentId>:<comma-separated-capabilities>` — mirroring today's dev-mode
-  `X-Tenant-Id`/`X-Agent-Id` headers, and serves RFC 9728 protected-resource metadata + the `401`
-  challenge. **⚠️ OPEN**: a real Authorization Server (PKCE / dynamic registration via
-  `@cloudflare/workers-oauth-provider`) is a fast-follow; only the token resolver changes.
-- **⚠️ OPEN (P4 deferred)**: `Origin`/DNS-rebinding validation on the transport. Auth is a bearer
-  (no ambient browser session to hijack), so the risk is low; it is wired when the real AS lands
-  (`enableDnsRebindingProtection` + an allowlist derived from the deployed host).
+The tool list and the auth story are above, and are not repeated here. There is no
+`kaambaan_request_input` tool: an agent raises an elicitation by posting an `elicitation` **activity**
+through `kaambaan_post_activity`, which is also how it works over REST.
 
-**Connect Claude Code** to a running board worker (`pnpm --filter @kaambaan/api dev`) — see
+**Connect Claude Code.** Against a **deployed** board, the `Authorization` header is your `kbn_`
+token (`"Bearer kbn_…"`, minted by "Connect an agent"). The example below uses the **dev bearer**,
+which works only against a **local** worker started with `pnpm --filter @kaambaan/api dev` — see
 [`apps/api/examples/claude-code.mcp.json`](../apps/api/examples/claude-code.mcp.json):
 
 ```jsonc
@@ -118,28 +152,61 @@ the two surfaces are one contract — proven by `apps/api/test/mcp-parity.test.t
 The A2A **HTTP+JSON** binding semantics — the same verbs as MCP, for any language/service that
 doesn't speak MCP. Tokens are per-agent bearers (tenant + capability scoped).
 
-| Verb | Endpoint |
-|------|----------|
-| claim | `POST /v1/boards/:boardId/claims` |
-| getCard | `GET /v1/boards/:boardId/runs/:runId` *(as shipped — see "The agent read surface")* |
-| heartbeat | `POST /v1/runs/:runId/heartbeat` |
-| activity / requestInput | `POST /v1/runs/:runId/activities` |
-| addReference | `PUT /v1/cards/:cardId/references` *(idempotent on url)* |
-| submitForReview | `POST /v1/runs/:runId/submit` |
-| complete / block / release / fail | `POST /v1/runs/:runId/{complete,block,release,fail}` |
-| answerElicitation *(human)* | `POST /v1/boards/:boardId/elicitations/:elicitationId/answer` |
-| discover | `GET /.well-known/agent-card.json` · `GET /v1/boards` |
+**Every agent route is board-scoped.** There is no `/v1/runs/…` prefix — a run is always addressed
+under its board. Earlier drafts of this table omitted the `/boards/:boardId` segment on every run
+verb; those paths 404 or 405.
 
-All mutating endpoints accept an `Idempotency-Key` header (see [08](./08-reliability-and-durable-execution.md)).
+| Verb | Endpoint | Auth |
+|------|----------|------|
+| claim | `POST /v1/boards/:boardId/claims` | agent token |
+| getCard | `GET /v1/boards/:boardId/runs/:runId` | agent token |
+| heartbeat | `POST /v1/boards/:boardId/runs/:runId/heartbeat` | agent token |
+| activity *(incl. raising an elicitation)* | `POST /v1/boards/:boardId/runs/:runId/activities` | agent token |
+| submitForReview | `POST /v1/boards/:boardId/runs/:runId/`**`submit`** | agent token |
+| complete / block / fail / release | `POST /v1/boards/:boardId/runs/:runId/{complete,block,fail,release}` | agent token |
+| addReference | `PUT /v1/boards/:boardId/cards/:cardId/references` *(idempotent on `(cardId, url)`)* | **human session** — see below |
+| answerElicitation *(human)* | `POST /v1/boards/:boardId/elicitations/:elicitationId/answer` | human session |
+| resolve a gate *(human)* | `POST /v1/boards/:boardId/gates/:gateId/resolve` | human session |
+
+An unknown `:action` on a run returns `404 {"error":"unknown run action: …"}`; anything else
+unmatched under `/v1/boards` returns `405 {"error":"method not allowed"}`.
+
+- **`addReference` is not on the agent REST surface.** The route is behind a session cookie, so an
+  agent cannot call it over REST at all — `kaambaan_add_reference` over MCP is the only agent path to
+  it. [04 §3](./04-agent-contract.md) lists `addReference` as an agent verb; over REST it is not one.
+- **There is no `discover` verb.** `GET /.well-known/agent-card.json` **does not exist** — nothing
+  serves an AgentCard. `GET /v1/boards` exists but is human-auth, so an agent token cannot list
+  boards over REST either. Agents find work by calling `claim` (capability-routed), or over MCP with
+  `kaambaan_list_work`, which is the only board-discovery surface an agent credential can reach.
+- **⚠️ There is no `Idempotency-Key` handling.** No route reads such a header and nothing de-dupes a
+  replayed verb; the `idempotencyKey` field in the contract schemas is accepted and ignored. Earlier
+  drafts (and [08 §5](./08-reliability-and-durable-execution.md)) describe this as shipped — it is
+  not. What *is* idempotent today is narrower and real: reference upsert on `(cardId, url)`, and
+  GitHub webhook delivery dedup on `X-GitHub-Delivery`. Treat every other verb as at-most-once from
+  the client's side: a retried `complete` after a timeout may act twice.
 
 ### Auth (as shipped)
 
 An agent presents its token as `Authorization: Bearer kbn_…` (minted by "Connect an agent";
 stored only as a SHA-256 hash in `agent_tokens`). The token carries the tenant, the agent identity
-and the agent's registered capabilities, so the client never asserts them. `@kaambaan/agent-sdk`
-speaks this by default — see [its README](../packages/agent-sdk/README.md). The dev-mode
+and the agent's registered capabilities, so the client never asserts them. The dev-mode
 `X-Tenant-Id` / `X-Agent-Id` headers only work against a server run with `DEV_AUTH=true`
 ([12](./12-deploy.md)).
+
+> **`@kaambaan/agent-sdk` is not a dependency you can take.** It is `private: true`, ships raw
+> TypeScript with no build, and is **not published to npm** — nothing outside this repo can install
+> it. [Its README](../packages/agent-sdk/README.md) is worth reading as a worked example of the loop
+> below, but an external integrator implements these HTTP calls directly. The same is true of
+> `@kaambaan/contract`: the zod schemas are the source of truth *inside* this repo, and a copy you
+> vendor will not be kept in step with it.
+
+**Error shapes differ by surface**, which is worth knowing before writing a client:
+
+- REST board routes wrap the whole failed result: `{"error":{"ok":false,"code":"STALE_LEASE","message":"…"}}`
+  — the code is nested at `error.code`.
+- REST auth and routing failures are flat strings: `{"error":"a valid agent token is required"}`.
+- MCP always returns HTTP 200 JSON-RPC; a business failure is `isError: true` with the body
+  `{"error":{"code","message"}}` and no `ok` field.
 
 Answering an elicitation is deliberately **not** an agent route: it is a human decision on a
 tenant-shared board, so it sits behind the session cookie with gate resolution, and the board

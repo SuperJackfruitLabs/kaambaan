@@ -1,6 +1,6 @@
 {
   "//": "Point Claude Code at a running Kaambaan board worker (pnpm --filter @kaambaan/api dev).",
-  "//auth": "Dev bearer = '<tenantId>:<agentId>:<comma-separated-capabilities>' (docs/05 §2).",
+  "//auth": "LOCAL ONLY. Dev bearer '<tenantId>:<agentId>:<caps>' is accepted only when the server runs with DEV_AUTH=true (docs/05 \u00a72).",
   "//usage": "Copy into your project's .mcp.json, then in Claude Code the kaambaan_* tools become available.",
   "mcpServers": {
     "kaambaan": {
@@ -10,5 +10,6 @@
         "Authorization": "Bearer tnt_dev:agt_research:research,publish"
       }
     }
-  }
+  },
+  "//deployed": "Against a deployed board use your agent token instead: \"Authorization\": \"Bearer kbn_...\" (minted by Connect an agent). There is NO OAuth flow to run."
 }
