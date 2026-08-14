@@ -61,6 +61,7 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 | `complete` | agent → Kaambaan | Finish the stage successfully with structured handoff | Task → `completed`; card advances |
 | `block` | agent → Kaambaan | Escalate; cannot proceed without human help | Task → `input-required`/blocked |
 | `release` / `fail` | agent → Kaambaan | Give the claim back / report failure | Task → `submitted` (reclaim) / `failed` |
+| `answerElicitation` | human → Kaambaan | Answer an agent's question (pick an option / free text) | Task → `working`; the asking agent reads the answer off its run |
 
 ### Claim semantics (the critical verb)
 - **Atomic.** The Board DO's single thread guarantees exactly one agent receives a given card.
@@ -103,16 +104,42 @@ Agents communicate progress as a small, typed set (Linear, adopted verbatim). Th
 ### Signals (typed overlay on an activity)
 Open enum; initial set from Linear, extended for gates:
 
-| Signal | Direction | On | Renders as | Metadata |
+| Signal | Direction | On | Renders as | Payload (in `parameter`) |
 |--------|-----------|----|-----------|----------|
 | `stop` | human → agent | `prompt` | "Stop request" delivered to agent; agent must cease and emit `response`/`error` | — |
 | `auth` | agent → human | `elicitation` | "Link account to continue" → `auth-required` | `url, userId, providerName` |
 | `select` | agent → human | `elicitation` | clickable options (e.g. **Approve / Request changes / Reject**) | `options[]` |
 | `approve` / `reject` | human → agent | `prompt` | gate resolution | optional feedback |
 
+A signal's payload travels in the activity's **`parameter`** — `{ "options": [{ "name", "title" }] }`
+for `select`. One carrier, not two: a second field (`signalMetadata`) was read by nothing, so an
+agent that put its options there had them dropped and the human saw a question with no answers.
+
 > The **approval gate** is literally an `elicitation` with a `select` signal whose options are
 > Approve / Request changes / Reject. We did not invent a new gate primitive — gates reuse the
 > activity+signal model.
+
+### The elicitation return path (as shipped)
+
+An `elicitation` is a **question with an answer**, not a status change. Posting one persists it
+(`elc_…`: the question, its options, the run and agent that asked) and parks the card in
+`input-required` — or `auth-required` for an `auth` signal — while the asking run **keeps its
+lease**. Nothing about the run ends; the agent is waiting, not finished.
+
+- **The human answers** at `POST /v1/boards/:boardId/elicitations/:elicitationId/answer` with an
+  option `name`, free `text`, or both. The card moves by the state machine's own transition —
+  `human_reply` out of `input-required`, `account_linked` out of `auth-required` — and the answer is
+  appended to the card's replay as a `prompt` activity, the human-authored type that resumes work.
+- **The agent collects it** by re-reading the run it holds (`GET /v1/boards/:id/runs/:runId`), whose
+  `elicitations` carry each question's `status` and `answer`. Polling is the first mechanism; keep
+  heartbeating while you wait, because a question does not pause the heartbeat timeout.
+- **Who may answer**: a signed-in human, never the agent that asked (`SEPARATION_OF_DUTIES`) — the
+  same rule that stops a gate's producer approving it. An elicitation an agent can answer itself
+  would make the whole mechanism decorative.
+- **Answering twice** is a typed conflict (`ELICITATION_NOT_PENDING`), never a second transition.
+- **A question that outlives its run or its card** (the run ends or is reclaimed, the card is moved,
+  a newer question supersedes it) is `cancelled`: it drops out of the board's "needs you" queue
+  instead of sitting there unanswerable, and the agent polling it learns to stop waiting.
 
 ## 5. SLAs & timeouts (normative)
 

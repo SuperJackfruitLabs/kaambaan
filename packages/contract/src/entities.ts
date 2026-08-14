@@ -10,6 +10,7 @@ import {
   RunId,
   ReferenceId,
   ContextId,
+  ElicitationId,
 } from './ids';
 import {
   Role,
@@ -161,6 +162,49 @@ export const Task = z.object({
   ...timestamps,
 });
 export type Task = z.infer<typeof Task>;
+
+/** A choice offered to a human — on an agent's elicitation, or at an approval gate (docs/08 §6). */
+export const ElicitationOption = z.object({
+  name: z.string().min(1),
+  title: z.string().min(1),
+  /** Text fed back to the agent when this option is picked (HumanLayer `ResponseOption`). */
+  promptFill: z.string().optional(),
+  /** Whether picking this option invites free text alongside it. */
+  interactive: z.boolean().optional(),
+});
+export type ElicitationOption = z.infer<typeof ElicitationOption>;
+
+/**
+ * An agent's open question to a human, persisted so it can be answered (docs/04 §4).
+ *
+ * The agent asks by posting an `elicitation` activity — its `body` is the question and its
+ * `parameter` carries the `options`. The card parks in `input-required` (or `auth-required` for an
+ * `auth` signal) while `status` is `pending`; a human's answer moves it back to `working` and the
+ * asking agent, which still holds its lease, reads `answer` off the run it owns.
+ *
+ * `agentId` is who asked — and therefore who may not answer.
+ */
+export const Elicitation = z.object({
+  id: ElicitationId,
+  cardId: CardId,
+  runId: RunId,
+  stageKey: z.string().min(1),
+  agentId: z.string().min(1),
+  question: z.string().min(1),
+  signal: z.string().nullish(),
+  options: z.array(ElicitationOption).default([]),
+  status: z.enum(['pending', 'answered', 'cancelled']),
+  answer: z
+    .object({
+      option: z.string().nullish(),
+      text: z.string().nullish(),
+      answeredBy: z.string().min(1),
+      answeredAt: z.string(),
+    })
+    .nullish(),
+  createdAt: z.string(),
+});
+export type Elicitation = z.infer<typeof Elicitation>;
 
 /** One execution attempt of a Task by one agent (Linear Session × Hermes task_run). */
 export const Run = z.object({

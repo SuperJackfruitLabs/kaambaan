@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { BoardId, CardId, RunId, TaskId, AgentId } from './ids';
+import { BoardId, CardId, RunId, TaskId, AgentId, ElicitationId } from './ids';
 import { ActivityType, Signal, ReferenceProvider, ReferenceSourceType } from './primitives';
 import { Card, Task, Reference } from './entities';
 
@@ -35,6 +35,10 @@ export const HeartbeatInput = z.object({
 });
 export type HeartbeatInput = z.infer<typeof HeartbeatInput>;
 
+/**
+ * Post one typed activity. A signal's structured payload — an `elicitation`'s `options`, an `auth`
+ * signal's `url` — travels in `parameter`, the one field the board persists and hands back.
+ */
 export const PostActivityInput = z.object({
   runId: RunId,
   leaseEpoch: z.number().int().min(0),
@@ -45,10 +49,23 @@ export const PostActivityInput = z.object({
   parameter: z.unknown().optional(),
   result: z.unknown().optional(),
   signal: Signal.optional(),
-  signalMetadata: z.record(z.string(), z.unknown()).optional(),
   idempotencyKey: z.string().optional(),
 });
 export type PostActivityInput = z.infer<typeof PostActivityInput>;
+
+/**
+ * Answer an agent's `elicitation` — the human half of the return path. Answering transitions the
+ * card `input-required → working` (or `auth-required → working`) so the agent that asked, which is
+ * still holding its lease, can collect the answer from the run it owns and carry on.
+ */
+export const AnswerElicitationInput = z.object({
+  elicitationId: ElicitationId,
+  /** The `name` of one of the options the agent offered; required when it offered any. */
+  option: z.string().optional(),
+  /** Free text — the whole answer when no options were offered, or a note alongside one. */
+  text: z.string().optional(),
+});
+export type AnswerElicitationInput = z.infer<typeof AnswerElicitationInput>;
 
 export const AddReferenceInput = z.object({
   cardId: CardId,

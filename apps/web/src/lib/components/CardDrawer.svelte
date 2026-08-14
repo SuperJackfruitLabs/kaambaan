@@ -8,6 +8,7 @@
     deleteCard,
     addReference,
     resolveGate,
+    answerElicitation,
     type CardActivities,
     type Attempt,
     type Estimate,
@@ -20,6 +21,7 @@
   const cardId = $derived(app.openCardId);
   const card = $derived(cardId ? app.cardById(cardId) : undefined);
   const gate = $derived(cardId ? app.gateForCard(cardId) : undefined);
+  const elicitation = $derived(cardId ? app.elicitationForCard(cardId) : undefined);
   const refs = $derived(cardId ? app.referencesForCard(cardId) : []);
   const boardId = $derived(app.boardId);
   const stageName = $derived(
@@ -42,6 +44,10 @@
   let newRefUrl = $state('');
   let localError = $state<string | null>(null);
 
+  // ---- elicitation (agent question) state ----
+  let answerText = $state('');
+  let answering = $state(false);
+
   // ---- gate state ----
   // which option is interactive (request_changes) — shows comment textarea
   let activeInteractiveOption = $state<string | null>(null);
@@ -51,6 +57,7 @@
   $effect(() => {
     const id = cardId;
     if (id && boardId) {
+      answerText = '';
       gateComment = '';
       activeInteractiveOption = null;
       editing = false;
@@ -155,12 +162,40 @@
     app.closeCard();
   }
 
+  // ---- answering an agent's question (docs/04 §4) ----
+  // The agent is blocked and still holding its lease; the answer is what lets it carry on, so a
+  // failure here has to say so rather than quietly leaving the card parked.
+  async function onAnswer(option?: string): Promise<void> {
+    if (!boardId || !elicitation || answering) return;
+    const text = answerText.trim();
+    if (!option && text === '') {
+      localError = elicitation.options.length > 0 ? 'Pick one of the options.' : 'Type an answer first.';
+      return;
+    }
+    answering = true;
+    try {
+      const res = await answerElicitation(boardId, elicitation.id, { option, text: text || undefined });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        localError = body?.error?.message ?? `Couldn't send that answer (${res.status})`;
+      } else {
+        localError = null;
+        answerText = '';
+      }
+      await app.refresh();
+      if (cardId && boardId) void refreshDrawer(cardId, boardId);
+    } finally {
+      answering = false;
+    }
+  }
+
   // ---- helpers ----
   function activityMarker(type: string): { glyph: string; cssClass: string } {
     if (type === 'action') return { glyph: '▸', cssClass: 'act-action' };
     if (type === 'response') return { glyph: '◆', cssClass: 'act-response' };
     if (type === 'error') return { glyph: '✕', cssClass: 'act-error' };
     if (type === 'elicitation') return { glyph: '⚑', cssClass: 'act-elicitation' };
+    if (type === 'prompt') return { glyph: '✎', cssClass: 'act-response' }; // the human's turn
     return { glyph: '◇', cssClass: 'act-thought' };
   }
 
@@ -338,6 +373,49 @@
           <section class="sec">
             <div class="sec-h eyebrow">description</div>
             <p class="text-foreground/90 text-sm leading-relaxed whitespace-pre-wrap">{String(card.spec.description)}</p>
+          </section>
+        {/if}
+
+        <!-- the agent's open question — the card is parked until someone answers it -->
+        {#if elicitation}
+          <section class="sec">
+            <div class="elicitation border rounded-[10px] p-3.5" style="border-color:rgba(255,107,87,.35);background:rgba(255,107,87,.06)">
+              <div class="mb-2 flex items-center gap-2">
+                <span class="wordmark font-semibold text-sm" style="color:var(--coral)">
+                  ⚑ {elicitation.signal === 'auth' ? 'awaiting your sign-in' : 'awaiting your answer'}
+                </span>
+                <span class="eyebrow ml-auto">{elicitation.agentId} is waiting</span>
+              </div>
+              <p class="mb-3 text-[13px] leading-relaxed whitespace-pre-wrap">{elicitation.question}</p>
+
+              {#if elicitation.options.length > 0}
+                <div class="flex flex-wrap gap-2">
+                  {#each elicitation.options as opt (opt.name)}
+                    <Button size="sm" variant={opt.name === elicitation.options[0]?.name ? 'default' : 'outline'} disabled={answering} onclick={() => onAnswer(opt.name)}>
+                      {opt.title}
+                    </Button>
+                  {/each}
+                </div>
+                <textarea
+                  bind:value={answerText}
+                  rows="2"
+                  placeholder="Add a note for the agent (optional)…"
+                  class="bg-inset border-border mt-2.5 w-full resize-none rounded-[7px] border px-2.5 py-2 text-xs outline-none"
+                  style="border-color:rgba(255,107,87,.4)"
+                ></textarea>
+              {:else}
+                <textarea
+                  bind:value={answerText}
+                  rows="3"
+                  placeholder="Your answer — this goes straight back to the waiting agent…"
+                  class="bg-inset border-border w-full resize-none rounded-[7px] border px-2.5 py-2 text-xs outline-none"
+                  style="border-color:rgba(255,107,87,.4)"
+                ></textarea>
+                <div class="mt-2 flex justify-end">
+                  <Button size="sm" disabled={answering} onclick={() => onAnswer()}>Send answer</Button>
+                </div>
+              {/if}
+            </div>
           </section>
         {/if}
 

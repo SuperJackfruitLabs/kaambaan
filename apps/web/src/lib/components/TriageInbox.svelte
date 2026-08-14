@@ -15,6 +15,7 @@
 
   function reasonBadge(cardId: string, overBudget: boolean, state: string): string {
     if (app.gateForCard(cardId)) return 'awaiting review';
+    if (app.elicitationForCard(cardId)) return 'awaiting your answer';
     if (overBudget) return 'over budget';
     if (state === 'failed') return 'failed';
     return '';

@@ -85,6 +85,36 @@ export interface RunContext {
   stage: { key: string; name: string } | null;
   handoff: unknown;
   references: Array<{ id: string; url: string; title: string | null; provider: string; sourceType: string }>;
+  /** The questions this run asked a human, oldest first, each with its answer once one is given. */
+  elicitations: Elicitation[];
+}
+
+/** A choice offered to a human on an elicitation. `name` is what an answer comes back as. */
+export interface ElicitationOption {
+  name: string;
+  title: string;
+  promptFill?: string;
+  interactive?: boolean;
+}
+
+/**
+ * A question this run asked a human (docs/04 §4). It is `pending` until someone answers; the card
+ * waits in `input-required` and this run keeps its lease throughout, so the agent resumes as itself
+ * rather than re-claiming. `cancelled` means the question outlived its run or its card and will
+ * never be answered — stop waiting.
+ */
+export interface Elicitation {
+  id: string;
+  cardId: string;
+  runId: string;
+  stageKey: string;
+  agentId: string;
+  question: string;
+  signal: string | null;
+  options: ElicitationOption[];
+  status: 'pending' | 'answered' | 'cancelled';
+  answer: { option: string | null; text: string | null; answeredBy: string; answeredAt: string } | null;
+  createdAt: string;
 }
 
 export interface AgentActivity {
@@ -93,6 +123,11 @@ export interface AgentActivity {
   action?: string;
   ephemeral?: boolean;
   signal?: string;
+  /**
+   * The structured payload that goes with the activity — an `action`'s arguments, and an
+   * `elicitation`'s selectable `options`. This is the one carrier the board reads and hands back.
+   */
+  parameter?: unknown;
 }
 
 interface ClaimResponse {
@@ -227,6 +262,54 @@ export class KaambaanAgent {
   }
   release(work: ClaimedWork): Promise<HttpResponse> {
     return this.run(work, 'release');
+  }
+
+  /**
+   * Ask the human a question and stop on it — the move for a decision the agent may not take alone
+   * (a permission prompt, a choice between paths). The card parks in `input-required` (or
+   * `auth-required` with `signal: 'auth'`), **this run keeps its lease**, and the returned
+   * elicitation is what an answer will be attached to.
+   *
+   * `options` are the answers offered; they travel in the activity's `parameter`. Omit them for an
+   * open question. Keep heartbeating while you wait — a question does not pause the heartbeat
+   * timeout, and an agent that goes quiet has its run reclaimed like any other.
+   *
+   * ```ts
+   * const asked = await agent.ask(work, 'May I run the test suite?', {
+   *   options: [{ name: 'run', title: 'Run them' }, { name: 'skip', title: 'Skip them' }],
+   * });
+   * for (;;) {
+   *   await agent.heartbeat(work);
+   *   const [q] = (await agent.elicitations(work)).filter((e) => e.id === asked.id);
+   *   if (q?.status === 'answered') return q.answer;      // resume with the decision
+   *   if (q?.status !== 'pending') return null;           // cancelled — the card moved on
+   *   await sleep(5_000);
+   * }
+   * ```
+   */
+  async ask(
+    work: ClaimedWork,
+    question: string,
+    opts: { options?: ElicitationOption[]; signal?: string } = {},
+  ): Promise<Elicitation> {
+    const path = `/v1/boards/${this.config.boardId}/runs/${work.runId}/activities`;
+    const res = await this.run(work, 'activities', {
+      type: 'elicitation',
+      body: question,
+      signal: opts.signal ?? (opts.options && opts.options.length > 0 ? 'select' : undefined),
+      parameter: opts.options ? { options: opts.options } : undefined,
+    });
+    if (!res.ok) throw new KaambaanApiError(res.status, path, await errorMessage(res, path));
+    // The activity response acknowledges the post; the question itself (with its id) comes back on
+    // the run — the same read the agent polls for the answer, so there is one shape to handle.
+    const asked = (await this.elicitations(work)).at(-1);
+    if (!asked) throw new KaambaanApiError(res.status, path, `${path} accepted the question but the run has none`);
+    return asked;
+  }
+
+  /** The questions this run asked, oldest first — poll this to collect a human's answer. */
+  async elicitations(work: ClaimedWork | string): Promise<Elicitation[]> {
+    return (await this.context(work)).elicitations;
   }
 }
 

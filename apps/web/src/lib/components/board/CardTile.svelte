@@ -14,6 +14,7 @@
 
   // Gate is reactive — reads from app store
   const gate = $derived(app.gateForCard(card.id));
+  const question = $derived(app.elicitationForCard(card.id));
   const refs = $derived(app.referencesForCard(card.id));
   const firstRef = $derived(refs[0] ?? null);
 
@@ -210,6 +211,17 @@
         class="costbar-fill {card.overBudget ? 'costbar-fill-over' : ''}"
         style="width:{card.overBudget ? 100 : costBarPct}%"
       ></span>
+    </div>
+  {/if}
+
+  <!-- an agent is blocked on a question: say so on the tile, and open the drawer to answer it -->
+  {#if question}
+    <div class="mt-2.5">
+      <Button
+        size="sm"
+        variant="outline"
+        onclick={(e: MouseEvent) => { e.stopPropagation(); app.openCard(card.id); }}
+      >⚑ Answer {question.agentId}</Button>
     </div>
   {/if}
 

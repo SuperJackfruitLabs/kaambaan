@@ -23,7 +23,6 @@ const ActivityFields = z.object({
   parameter: z.unknown().optional(),
   result: z.unknown().optional(),
   signal: Signal.optional(),
-  signalMetadata: z.record(z.string(), z.unknown()).optional(),
   usage: Usage.optional(),
   idempotencyKey: z.string().optional(),
 });
@@ -36,6 +35,11 @@ const MESSAGE_REQUIRED: readonly string[] = ['response', 'elicitation', 'error',
  *  - only `thought`/`action` may be ephemeral;
  *  - `action` activities must name an `action`;
  *  - message-bearing activities (`response`/`elicitation`/`error`/`prompt`) must carry a `body`.
+ *
+ * A signal's structured payload rides in **`parameter`** — an `elicitation`'s selectable `options`,
+ * an `auth` signal's `url`/`providerName`. There is exactly one carrier: a second field (the former
+ * `signalMetadata`) was read by nothing, so options put there were silently dropped and the human
+ * was shown a question with no answers to pick.
  */
 export const ActivityEnvelope = ActivityFields.refine(
   (a) => !(a.ephemeral && a.type !== 'thought' && a.type !== 'action'),
