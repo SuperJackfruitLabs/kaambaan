@@ -31,6 +31,8 @@ export const TaskId = idSchema('task');
 export const RunId = idSchema('run');
 export const ReferenceId = idSchema('ref');
 export const GateId = idSchema('gate');
+/** An agent's open question to a human (docs/04 §4) — the thing an answer is addressed to. */
+export const ElicitationId = idSchema('elc');
 export const EventId = idSchema('evt');
 export const ContextId = idSchema('ctx');
 
@@ -46,6 +48,7 @@ export const ID_PREFIXES = {
   run: 'run',
   reference: 'ref',
   gate: 'gate',
+  elicitation: 'elc',
   event: 'evt',
   context: 'ctx',
 } as const;
