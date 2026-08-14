@@ -1,12 +1,23 @@
 /**
- * MCP OAuth 2.1 Resource Server (docs/05 §2). Kaambaan validates audience-scoped bearer tokens and,
- * when none is present, returns 401 + WWW-Authenticate so a client can discover the protected-resource
- * metadata (RFC 9728) and run the authorization flow.
+ * The OAuth *Resource Server shell* in front of /mcp (docs/05 §2). This file is the whole of it, so
+ * read it before believing any prose about OAuth here.
  *
- * P4 uses a dev-mode bearer — "<tenantId>:<agentId>:<comma-separated-capabilities>" — mirroring the
- * dev-mode X-Tenant-Id/X-Agent-Id headers the rest of the API uses today. A real Authorization Server
- * (PKCE / dynamic client registration via @cloudflare/workers-oauth-provider) is a fast-follow; only
- * `resolveBearer` changes when it lands.
+ * What this does: an unauthenticated request gets 401 + WWW-Authenticate pointing at RFC 9728
+ * protected-resource metadata, and a bearer is resolved to a principal.
+ *
+ * What it does NOT do, despite the OAuth vocabulary: there is no authorization server, no
+ * /authorize, no /token, no dynamic client registration, no PKCE, and — in particular — **no
+ * audience validation**. Nothing here parses a JWT or reads an `aud` claim; a previous version of
+ * this comment claimed "validates audience-scoped bearer tokens", which was never true.
+ *
+ * The two credentials actually accepted are a real `kbn_` agent token (SHA-256 hashed and looked up
+ * in the catalog — the same credential the REST surface takes) and, only under DEV_AUTH, a
+ * self-asserted "<tenantId>:<agentId>:<caps>" bearer with no secret in it.
+ *
+ * Note the metadata advertises `authorization_servers: [origin]` and this origin serves no AS
+ * endpoints, so a client that follows the discovery chain dead-ends. A real Authorization Server
+ * (PKCE / dynamic client registration via @cloudflare/workers-oauth-provider) is a fast-follow; when
+ * it lands, `resolveBearer` and that metadata field are what change.
  */
 import type { McpAuth } from './tools';
 import type { Env } from '../env';

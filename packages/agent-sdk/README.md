@@ -4,6 +4,13 @@ A minimal, dependency-free client for the [Kaambaan agent contract](../../docs/0
 Any harness can use it to claim work and drive a run through the loop. The HTTP `fetch` is injected,
 so it runs anywhere — Workers, Node, Bun, a test runtime — without environment-specific types.
 
+> **⚠️ You cannot install this.** The package is `private: true`, has no build step, and ships raw
+> TypeScript — it is **not published to npm**, so nothing outside this repository can depend on it.
+> Inside the repo it resolves as `workspace:*`. If you are integrating from elsewhere, read this
+> README and `src/index.ts` as a worked example, then make the same HTTP calls yourself: the whole
+> surface is nine endpoints, specified in [docs/05 §3](../../docs/05-integration-surfaces.md). The
+> same applies to `@kaambaan/contract` — also private, also unpublished.
+
 ## Authenticate with an agent token
 
 Agents authenticate with a **`kbn_` bearer token**. Mint one in the UI ("Connect an agent"): the

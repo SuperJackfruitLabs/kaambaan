@@ -109,22 +109,22 @@ Because terminal tasks never restart:
 
 Borrowed from Hermes, expressed over the wire (since we don't own the agent process):
 
-- **Acknowledgement SLA** — after a `claim`, the agent must emit its first activity within
-  **~10s** or the run is marked *unresponsive*. (Linear's 10s rule.)
+- **Acknowledgement SLA** — **⚠️ not implemented.** Intended: first activity within ~10s or the run
+  is marked *unresponsive*. Nothing measures ack latency today.
 - **Heartbeats** — a working run must `heartbeat` periodically. Missing heartbeats past the
-  **claim TTL** (default **⚠️ OPEN**, ~15 min) → the run is **reclaimed**: its Task returns to
-  `submitted` (claimable again) and the prior run is recorded as `reclaimed`. A new agent
-  picking it up sees the prior run's context.
-- **Stale (recoverable)** — no activity for a longer window (Linear: 30 min) marks the run
-  *stale*; emitting any activity recovers it. Stale ≠ dead.
-- **Circuit breaker** — after **N** consecutive failed/crashed runs on a task (default 2,
-  Hermes-style), the card auto-parks in a **Blocked/gave-up** state requiring a human to
-  resume. Prevents a broken agent from hot-looping a card.
-- **Timeouts** — an optional per-stage `maxRuntime`; exceeding it transitions the run to
-  `timed_out` and the task toward reclaim or `failed` per policy.
+  **claim TTL** (**15 min**, hardcoded as `HEARTBEAT_TIMEOUT_MS`) → the run is **reclaimed**: the
+  card returns to `submitted` (claimable again) and the prior run is recorded as `reclaimed`, with
+  the lease epoch bumped so a zombie write is refused. A new agent picking it up sees the prior
+  run's context.
+- **Stale (recoverable)** — **⚠️ not implemented** as a distinct state. Any activity refreshes the
+  same heartbeat clock, so a slow-but-alive agent stays alive; there is no separate *stale* window.
+- **Circuit breaker** — after **2** consecutive failed/reclaimed runs (`CIRCUIT_BREAKER_LIMIT`,
+  hardcoded), the card auto-parks in `input-required` requiring a human to resume. Prevents a broken
+  agent from hot-looping a card.
+- **Timeouts** — **⚠️ not implemented.** `StageDef` has no `maxRuntime` field.
 
-All deadlines are tracked by the Board DO via alarms; reclaim/timeout bookkeeping runs in
-Workflows.
+The two enforced deadlines (heartbeat reclaim at 15 min, circuit breaker at 2) are tracked by the
+Board DO via its single alarm. There are **no Workflows** in the deployment ([02](./02-architecture.md)).
 
 ## State-transition table (normative — feeds TDD)
 
@@ -132,10 +132,10 @@ Workflows.
 |------|-------|----|--------------|
 | (none) | card enters stage | `submitted` | Task created, card in Ready |
 | `submitted` | agent `claim` | `working` | Run created, `delegateAgentId` set, ack timer armed |
-| `working` | `activity(response)` / `complete` | `completed` | handoff metadata stored; card advances |
+| `working` | `complete` | `completed` | handoff metadata stored; card advances. **⚠️ `activity(response)` does NOT do this** — it is recorded and the card stays `working` ([04 §4](./04-agent-contract.md)) |
 | `working` | `request_input`/`elicitation` | `input-required` | gate/question rendered |
 | `working` | `auth` signal | `auth-required` | "link account" rendered |
-| `working` | `activity(error)` / `fail` | `failed` | run outcome `crashed`/`failed`; breaker++ |
+| `working` | `fail` | `failed` | run outcome `failed`; breaker++. **⚠️ `activity(error)` does NOT do this** — the card stays `working` |
 | `working` | heartbeat timeout | `submitted` (reclaim) | run `reclaimed`; breaker++ |
 | `working` | operator cancel | `canceled` | run `canceled` |
 | `input-required` (gate) | human **approve** | `completed` → next stage `submitted` | advance |
@@ -145,4 +145,4 @@ Workflows.
 | `auth-required` | account linked | `working` | run resumes |
 | terminal (`completed/rejected/failed/canceled`) | rework | new Task `submitted` | same `contextId` |
 
-> Every row in this table is a test case. See `08-testing-strategy` (planned).
+> Every row in this table is a test case. See [09 — Testing Strategy](./09-testing-strategy.md).

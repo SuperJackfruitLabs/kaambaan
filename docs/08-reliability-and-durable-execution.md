@@ -69,7 +69,7 @@ the DO isn't hammered. On reclaim, the next agent resumes from the **last report
 | Operation | Idempotency key | Enforcement |
 |---|---|---|
 | Agent dispatch / claim | `${runId}-${leaseEpoch}` | DO rejects duplicate/stale-epoch |
-| Verb call (activity, complete, …) | client `Idempotency-Key` header | DO de-dups; replay returns the prior result |
+| Verb call (activity, complete, …) | client `Idempotency-Key` header | **⚠️ NOT IMPLEMENTED** — no route reads the header and nothing de-dupes a replayed verb ([05 §3](./05-integration-surfaces.md)) |
 | Stage transition | `${cardId}-${stageKey}-${transition}` | `UNIQUE` constraint in DO SQLite → re-apply is a no-op |
 | External reference write | `(cardId, url)` | Idempotent upsert ([06](./06-external-references.md)) |
 | Webhook delivery | delivery id | Consumer de-dups |
@@ -107,10 +107,11 @@ Decisions:
    retry) ≠ `cancel` (no opinion → card returns to backlog) ≠ `expired` (timeout policy).
 2. **Structured options** with `promptFill` (the text fed back to the agent on rejection) and
    `interactive` (allow appended free text) — HumanLayer `ResponseOption`.
-3. **Resolve flow**: `POST /v1/gates/:gateId/resolve` (CORS-enabled so Slack/web buttons hit it
-   directly) → DO validates tenant + approver **policy + separation-of-duties** (the attempt's author
-   can't approve it) → transitions the task. Double-resolve is **idempotent** (second resolve on a
-   settled gate no-ops).
+3. **Resolve flow** *(as shipped)*: `POST /v1/boards/:boardId/gates/:gateId/resolve` — **board-scoped**,
+   behind the human session cookie, **not** CORS-enabled. The DO enforces **separation-of-duties**
+   (`403 SEPARATION_OF_DUTIES` — the producer cannot resolve their own gate). A second resolve is a
+   typed conflict, `409 GATE_NOT_PENDING`, **not** an idempotent no-op. **⚠️ Approver policy and
+   quorum are not implemented.**
 4. **Timeout & escalation** are driven by the **DO alarm**, independent of any agent: on `after`,
    widen approvers / notify; on `timeoutMs`, apply `onTimeout`. A slow human never blocks compute; a
    forgotten gate resolves by policy.

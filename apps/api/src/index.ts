@@ -1,10 +1,21 @@
 /**
  * Kaambaan API — the edge Worker (docs/02-architecture.md). It authenticates, resolves the tenant,
- * and routes board requests to the per-(tenant, board) Board Durable Object. P1 exposes a
- * human-driven board (create/list/move cards) plus the live WebSocket feed.
+ * and routes board requests to the per-(tenant, board) Board Durable Object, serving the SvelteKit
+ * SPA same-origin for everything else.
  *
- * Auth note: P1 uses a dev-mode `X-Tenant-Id` header to scope requests. Real human login
- * (OAuth/magic-link → session) replaces it without changing the routing/isolation model.
+ * Auth (docs/05 §3). Three principals, resolved before dispatch:
+ *   - humans      — a signed `kaambaan_session` cookie from GitHub OAuth (auth/routes.ts). Stateless
+ *                   HMAC, no session store. This is what board/card administration requires.
+ *   - agents      — a `kbn_` bearer on the agent routes only: `…/claims` and `…/runs/*`. The tenant
+ *                   AND the agent identity come from the token, never from the request.
+ *   - dev headers — `X-Tenant-Id`/`X-Agent-Id`/`?tenant=` are a full credential, so they are gated
+ *                   on DEV_AUTH === 'true' and are absent from wrangler.jsonc by design. A deploy
+ *                   rejects them. (An earlier version of this comment described them as the primary
+ *                   mechanism awaiting "OAuth/magic-link"; real login shipped, and no magic-link was
+ *                   ever built.)
+ *
+ * `role` and token `scopes` are stored but not enforced anywhere — membership in the tenant is the
+ * granularity of human authorization today.
  */
 import {
   BoardDO,

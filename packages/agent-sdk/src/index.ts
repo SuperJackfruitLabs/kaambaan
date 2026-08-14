@@ -4,6 +4,14 @@
  * only the public REST surface. The HTTP `fetch` is injected so it runs anywhere (Workers, Node,
  * or a test runtime) without pulling in environment-specific types.
  *
+ * ## This package is not installable
+ *
+ * It is `private: true`, has no build, and ships raw TypeScript via `main`/`exports` — so it is NOT
+ * published to npm and **nothing outside this repo can depend on it**. Inside the repo it resolves
+ * as `workspace:*` (apps/api takes it as a devDependency, for tests). An external integrator should
+ * read this file as a worked example and then make the same HTTP calls directly; the surface is
+ * small and fully specified in docs/05 §3.
+ *
  * ## Authentication
  *
  * Agents authenticate with a **`kbn_` bearer token**, minted in the UI ("Connect an agent") and
@@ -21,10 +29,10 @@
  *
  * ## What a token can reach
  *
- * An agent token authorizes exactly the agent routes: `POST /v1/boards/:id/claims` and
- * `POST /v1/boards/:id/runs/:runId/:action` — i.e. every verb on this client. Board/card
- * administration (creating boards, adding cards, resolving gates) is a human surface behind a
- * session cookie and is deliberately not exposed here.
+ * An agent token authorizes exactly the agent routes: `POST /v1/boards/:id/claims`,
+ * `GET /v1/boards/:id/runs/:runId` and `POST /v1/boards/:id/runs/:runId/:action` — i.e. every verb
+ * on this client. Board/card administration (creating boards, adding cards, resolving gates) is a
+ * human surface behind a session cookie and is deliberately not exposed here.
  */
 
 export interface HttpResponse {

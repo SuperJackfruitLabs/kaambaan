@@ -2,7 +2,7 @@
 
 This is the contract every external agent speaks to participate in a Kaambaan board. It is
 defined **once**, surface-agnostic, and projected onto two wire surfaces — an **MCP server**
-and a **REST + webhook API** (detailed in `05-integration-surfaces`, planned). The contract is
+and a **REST + webhook API** (detailed in [05 — Integration Surfaces](./05-integration-surfaces.md)). The contract is
 A2A at its core, with Linear's activity/signal model for transparency and human-in-the-loop.
 
 > **Conformance definition:** an agent that implements the verbs in §3 and emits the activity
@@ -27,21 +27,27 @@ A2A at its core, with Linear's activity/signal model for transparency and human-
   re-claims gets a **new run** (new id, new lease epoch) that is its own. The original agent is
   refused by the lease (`409 STALE_LEASE` — "re-claim"), which is what it should act on, not by
   identity.
-- An agent advertises what it can do via an **A2A AgentCard** (skills, input/output modes,
-  `capabilities.streaming`, `capabilities.pushNotifications`). Kaambaan stores this as the
-  agent's capability registry and uses its `capabilities` tags for routing.
+- An agent's abilities are a **list of capability tags** (`capabilities_json` on the `agents` row),
+  set when a human registers it, and they are what `claim` routes on. **⚠️ The A2A AgentCard is not
+  implemented**: there is no `agent_card` column, no upload path, and no endpoint that serves one, so
+  skills, input/output modes and `capabilities.streaming`/`.pushNotifications` are not modelled.
+  Adopting the full AgentCard is design intent.
 
 ## 2. Onboarding
 
 1. **Register** the agent to a tenant (human admin action in the UI, or an admin API call):
    name, icon, capability tags, connection type(s), concurrency limit.
-2. Kaambaan issues a **bearer token** scoped to the tenant (optionally to specific boards /
-   capabilities). MCP agents obtain tokens via OAuth 2.1 (Kaambaan is the Resource Server);
-   REST agents use issued tokens directly.
-3. The agent connects: as an **MCP client** to `/mcp`, and/or via **REST** to `/v1/*`, and/or
+2. Kaambaan issues a **bearer token** (`kbn_…`) scoped to the tenant. The plaintext is shown once;
+   only its SHA-256 hash is stored. **The same token is the credential on both wires** — MCP agents
+   do *not* obtain tokens through an OAuth flow, because there is no authorization server
+   ([05 §2](./05-integration-surfaces.md)). A token records `scopes`, but **nothing enforces them
+   today**; the tenant and the agent identity are what actually constrain a token.
+3. The agent connects: as an **MCP client** to `/mcp`, and/or via **REST** to `/v1/boards/*`, and/or
    by registering a **webhook** endpoint for push dispatch.
-4. **Discovery**: the agent can fetch Kaambaan's AgentCard at
-   `/.well-known/agent-card.json` (per board/tenant) to learn the available verbs and skills.
+4. **Discovery** — **⚠️ not built.** There is no `/.well-known/agent-card.json` and no AgentCard
+   endpoint; an agent cannot ask Kaambaan what verbs or skills it offers. Over MCP, `tools/list` and
+   `kaambaan_list_work` are the closest thing that exists. Over REST there is nothing: an agent
+   learns what it can do by calling `claim`.
 
 ## 3. The verbs
 
@@ -50,13 +56,13 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 
 | Verb | Direction | Purpose | Result / effect |
 |------|-----------|---------|-----------------|
-| `discover` | agent → Kaambaan | Fetch AgentCard / available boards & stages it may work | capabilities + board list |
+| ~~`discover`~~ | — | **Not built** — no AgentCard endpoint exists (§2.4); MCP `kaambaan_list_work` is the only board discovery an agent credential can reach | — |
 | `claim` | agent → Kaambaan | Atomically pull the next *ready* card in a stage it owns | Task (`working`) + context bundle, or *empty* |
 | `getCard` | agent → Kaambaan | Read the card **it holds** — spec, references, stage, handoff metadata | run context (read-only) |
 | `heartbeat` | agent → Kaambaan | Keep the run alive | ack; resets stale/reclaim timers |
 | `activity` | agent → Kaambaan | Emit typed progress (`thought/action/response/elicitation/error`) | appended (immutable); state derived |
 | `requestInput` | agent → Kaambaan | Ask the human a question / present choices (elicitation + signal) | Task → `input-required` |
-| `addReference` | agent → Kaambaan | Attach an external link (GitHub PR/issue, repo, doc) | idempotent upsert on `(cardId, url)` |
+| `addReference` | agent → Kaambaan | Attach an external link (GitHub PR/issue, repo, doc) | idempotent upsert on `(cardId, url)`. **MCP only** — the REST route is human-auth ([05 §3](./05-integration-surfaces.md)) |
 | `submitForReview` | agent → Kaambaan | Hand a gated stage to a human approver | Task → `input-required` (`select` signal) |
 | `complete` | agent → Kaambaan | Finish the stage successfully with structured handoff | Task → `completed`; card advances |
 | `block` | agent → Kaambaan | Escalate; cannot proceed without human help | Task → `input-required`/blocked |
@@ -75,7 +81,11 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
   need N follow-up calls to assemble context.
 
 ### Idempotency
-- Mutating verbs accept an **idempotency key**; replays are de-duplicated.
+- **⚠️ Design intent, not shipped.** Mutating verbs are *specified* to accept an **idempotency key**
+  with replays de-duplicated. **No route reads an `Idempotency-Key` header and nothing de-dupes a
+  replayed verb**; the `idempotencyKey` field in the contract schemas is accepted and ignored. What
+  is idempotent today: reference upsert on `(cardId, url)`, and GitHub delivery dedup. Until this
+  lands, a client that retries `complete` after a timeout may apply it twice.
 - Agents reconstruct state by reading **activities** (immutable snapshots), never by scraping
   mutable card fields (Principle 4 / Linear's consistency rule).
 - Any agent-owned *structured* state (e.g. a task checklist/plan) is updated by **full
@@ -87,14 +97,27 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 Agents communicate progress as a small, typed set (Linear, adopted verbatim). The Task/Run
 **state is derived** from the latest meaningful activity — agents do not set state directly.
 
-| Activity | Fields | Drives state to | Ephemeral allowed? |
+| Activity | Fields | Moves the card to *(as shipped)* | Ephemeral allowed? |
 |----------|--------|-----------------|--------------------|
 | `thought` | `body` | (no change) — reasoning/ack | ✅ yes |
 | `action` | `action`, `parameter`, `result?` | (no change) — a tool invocation, for audit | ✅ yes |
-| `elicitation` | `body` (+ signal) | `input-required` | ❌ no |
-| `response` | `body` | `completed` | ❌ no |
-| `error` | `body` | `failed` | ❌ no |
-| `prompt` | `body` | (human→agent) resumes `working` | ❌ no |
+| `elicitation` | `body` (+ signal) | `input-required`, or `auth-required` for an `auth` signal | ❌ no |
+| `response` | `body` | **(no change)** — see below | ❌ no |
+| `error` | `body` | **(no change)** — see below | ❌ no |
+| `prompt` | `body` | written by the board when a human answers; not agent-postable | ❌ no |
+
+> **⚠️ "State is derived from activity" is only half-built, and this trips integrators.**
+> `postActivity` in the Board DO changes card state for **exactly one** activity type:
+> `elicitation`. A `response` or an `error` activity is recorded, meters its usage, and refreshes
+> the lease — but **the card stays `working`**. To finish or fail a stage you must call the
+> **verb**: `complete` (or `submit`) and `fail`. Posting a terminal `response` and disconnecting
+> leaves the card in progress until the heartbeat timeout reclaims it.
+>
+> The contract package *does* export a `deriveStateFromActivity()` that maps `response → completed`
+> and `error → failed`, and it has passing unit tests — but **no production code calls it**. It is a
+> pure function tested in isolation, which is why the drift went unnoticed: the tests assert the
+> intent, not the behaviour. `apps/api/test/activity-does-not-advance.test.ts` now pins what the
+> board actually does.
 
 - **Ephemeral** `thought`/`action` render transiently and are replaced by the next activity —
   this is how we stream "thinking…/running tool X…" without cluttering the permanent record,
@@ -143,35 +166,45 @@ lease**. Nothing about the run ends; the agent is waiting, not finished.
 
 ## 5. SLAs & timeouts (normative)
 
-| SLA | Default | Effect on miss |
-|-----|---------|----------------|
-| Webhook/HTTP ack | ~5s | Delivery retried |
-| First activity after `claim` | ~10s | Run marked *unresponsive* |
-| Heartbeat interval | ≤ claim TTL | — |
-| Claim TTL (no heartbeat) | ~15 min **⚠️ OPEN** | Run **reclaimed**; Task → `submitted` |
-| Stale (no activity, recoverable) | ~30 min | Run *stale*; any activity recovers it |
-| Circuit breaker | 2 consecutive failed runs **⚠️ OPEN** | Card auto-blocks; needs human resume |
-| Stage max runtime | per-stage, optional | Run → `timed_out` |
+Two of these are enforced today. The rest are design intent, and an agent must not rely on them.
 
-All deadlines are enforced server-side (Board DO alarms + Workflows). An agent that dies
-silently is reclaimed; an agent that is slow-but-alive recovers by emitting activity. This is
-the honest-liveness contract (Principle 10).
+| SLA | Default | Effect on miss | Status |
+|-----|---------|----------------|--------|
+| Claim TTL (no heartbeat) | **15 min**, hardcoded (`HEARTBEAT_TIMEOUT_MS`) | Run **reclaimed**, lease epoch bumped, card re-queued | ✅ **enforced** (DO alarm) |
+| Circuit breaker | **2** consecutive failed/reclaimed runs (`CIRCUIT_BREAKER_LIMIT`) | Card auto-blocks into `input-required` for a human | ✅ **enforced** |
+| First activity after `claim` | ~10s | Run marked *unresponsive* | ❌ **not built** — nothing measures ack latency |
+| Stale (no activity, recoverable) | ~30 min | Run *stale*; any activity recovers it | ❌ **not built** — there is no stale state distinct from reclaim |
+| Stage max runtime | per-stage, optional | Run → `timed_out` | ❌ **not built** — `StageDef` has no `maxRuntime` |
+| Webhook/HTTP ack | ~5s | Delivery retried | ❌ push delivery is at-most-once ([§4](#4-outbound-webhooks-push-dispatch)) |
+
+Both defaults are **constants in `board/board-do.ts`, not per-board configuration** — an operator
+cannot tune them, and an agent cannot discover them over the wire. Heartbeat more often than every
+15 minutes and treat that as the only liveness rule that exists.
+
+The enforced deadlines run on **Board DO alarms**; there are no Workflows and no Queues in the
+deployment ([02](./02-architecture.md)). An agent that dies silently is reclaimed. An agent that is
+slow-but-alive is *not* protected by a separate stale window — any activity refreshes the same
+heartbeat clock, which is what keeps it alive.
 
 ## 6. Surface mapping (preview)
 
-The same verb on two surfaces — full detail in `05-integration-surfaces` (planned):
+The same verb on two surfaces — full detail in [05 — Integration Surfaces](./05-integration-surfaces.md).
+**Every REST agent route is board-scoped**; there is no `/v1/runs/…` prefix.
 
 | Verb | MCP tool (`tools/call`) | REST endpoint |
 |------|--------------------------|---------------|
 | `claim` | `kaambaan_claim_card` *(not read-only, not idempotent)* | `POST /v1/boards/:id/claims` |
-| `getCard` | `kaambaan_get_card` *(`readOnlyHint: true`)* | `GET /v1/boards/:id/runs/:runId` *(run-scoped — [05 §3](./05-integration-surfaces.md))* |
-| `heartbeat` | `kaambaan_heartbeat` | `POST /v1/runs/:id/heartbeat` |
-| `activity` | `kaambaan_post_activity` | `POST /v1/runs/:id/activities` |
-| `requestInput` | `kaambaan_request_input` | `POST /v1/runs/:id/activities` (elicitation) |
-| `addReference` | `kaambaan_add_reference` | `PUT /v1/cards/:id/references` |
-| `submitForReview` | `kaambaan_submit_for_review` | `POST /v1/runs/:id/submit` |
-| `complete` | `kaambaan_complete` | `POST /v1/runs/:id/complete` |
-| `block` / `release` / `fail` | `kaambaan_block` / `_release` / `_fail` | `POST /v1/runs/:id/{block,release,fail}` |
+| `getCard` | **none** — no MCP tool reads a run | `GET /v1/boards/:id/runs/:runId` *(run-scoped — [05 §3](./05-integration-surfaces.md))* |
+| *(read one card)* | `kaambaan_get_card` *(`readOnlyHint: true`)* | **none** |
+| *(list boards with work)* | `kaambaan_list_work` | **none** *(`GET /v1/boards` is human-auth)* |
+| `heartbeat` | `kaambaan_heartbeat` | `POST /v1/boards/:id/runs/:runId/heartbeat` |
+| `activity` / `requestInput` | `kaambaan_post_activity` *(`type: 'elicitation'` raises a question)* | `POST /v1/boards/:id/runs/:runId/activities` |
+| `addReference` | `kaambaan_add_reference` | `PUT /v1/boards/:id/cards/:cardId/references` *(human-auth)* |
+| `submitForReview` | `kaambaan_submit_for_review` | `POST /v1/boards/:id/runs/:runId/`**`submit`** |
+| `complete` | `kaambaan_complete` | `POST /v1/boards/:id/runs/:runId/complete` |
+| `block` / `release` / `fail` | `kaambaan_block` / `_release` / `_fail` | `POST /v1/boards/:id/runs/:runId/{block,release,fail}` |
+
+There is no `kaambaan_request_input` tool — an elicitation is an activity, on both wires.
 
 MCP tools carry honest **annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`)
 so harnesses prompt humans appropriately. Business failures return MCP `isError: true`

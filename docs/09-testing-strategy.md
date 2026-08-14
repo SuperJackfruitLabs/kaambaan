@@ -4,6 +4,16 @@ Kaambaan is built **docs-first → test-first**. The normative tables in the spe
 documentation flavour — each row is an executable test written **before** its implementation.
 This doc defines the method, the layers, and the suites that must exist.
 
+> **⚠️ This is the method and the target, not a description of current coverage.** Where it says a
+> suite "must exist", some do and some do not. Known gaps as of today: **§5's conformance kit** is a
+> single in-repo test (`apps/api/test/conformance.test.ts`) driving the SDK through the loop, not a
+> standalone runner an external author can point at their own agent, and it does not run the agent
+> over MCP or report a capability matrix; **KV and R2 bindings named in §2 do not exist**; and the
+> **property-based tests** in §6 and the **coverage-by-normative-table** rule in §7 are not
+> implemented. The lesson that produced this warning is in the row below: a claim asserted only in a
+> pure unit test can pass forever while production does something else — `deriveStateFromActivity`
+> did exactly that ([04 §4](./04-agent-contract.md)). **Test the claim where the behaviour lives.**
+
 ## 1. The TDD loop
 
 1. Pick a normative statement (a row in a state-transition / gate / failure table, or a contract

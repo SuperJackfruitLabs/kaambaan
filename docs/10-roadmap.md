@@ -9,7 +9,7 @@ human gate, live on a multi-tenant board.*
 ## P0 — Foundations
 - Monorepo (`apps/api`, `apps/web`, `packages/contract`), `wrangler` config, CI.
 - **D1 catalog** schema: tenants, users, memberships/roles, boards, agents, tokens, webhooks.
-- **Auth**: human login (OAuth/magic-link → session); per-agent bearer tokens; the edge
+- **Auth**: human login (GitHub OAuth → session; magic-link was never built); per-agent bearer tokens; the edge
   `{principal, tenant}` resolver + **hard-isolation guard** (with the isolation tests first).
 - **`packages/contract`**: zod schemas for the A2A-aligned types, verbs, and the normalized activity
   envelope — plus their first (failing) tests. *Contract before code.*
@@ -18,7 +18,7 @@ human gate, live on a multi-tenant board.*
 - **Board DO**: stages/cards/tasks/runs/events in DO SQLite; the **state-machine reducer**
   ([03](./03-card-lifecycle.md)) with its full transition-table test suite.
 - **WebSocket hub** (hibernatable) + event log ([07](./07-realtime-and-ui.md)).
-- **React board**: columns, cards, drag-and-drop, card drawer, live updates. Humans move cards
+- **Board UI** (shipped as SvelteKit/Svelte 5, not React): columns, cards, drag-and-drop, card drawer, live updates. Humans move cards
   manually — proves the real-time multi-tenant core end to end.
 
 ## P2 — Agent contract over REST
@@ -35,7 +35,7 @@ human gate, live on a multi-tenant board.*
 - Comment-→-follow-up primitive; request-changes re-opens a stage as a new attempt.
 
 ## P4 — MCP server  🎯 **DEMO MILESTONE**
-- `/mcp` Streamable HTTP, OAuth 2.1 Resource Server, tools with honest annotations, `isError`
+- `/mcp` Streamable HTTP, OAuth Resource Server *shell* (bearer only — no AS shipped), tools with honest annotations, `isError`
   semantics, elicitation-as-gate.
 - **Contract-parity tests** (MCP ≡ REST).
 - Ship the demo: Claude Code over MCP runs a `research → review(gate) → publish` pipeline live.

@@ -48,6 +48,11 @@ stream progress, and pass cards through stages.
 ### Integrations & references (P4–P5, P7)
 - **MCP server** over Streamable HTTP (OAuth 2.1 resource server) mirroring the
   REST verbs — self-describing, with work discovery.
+  > *Correction (2026-08-14): "OAuth 2.1 resource server" overstated what shipped. `/mcp` is a
+  > Resource Server **shell** — a `401` + RFC 9728 metadata over a bearer token. No authorization
+  > server, PKCE, or audience validation was ever built. See
+  > [docs/05 §2](./docs/05-integration-surfaces.md). Left as written above because a changelog is a
+  > dated record; this note corrects it rather than rewriting it.*
 - **REST + webhook API** over the one shared contract.
 - **First-class external references** (GitHub issue / PR / repo / docs) —
   idempotent upsert keyed `(card, url)`, with GitHub **webhook sync** and a

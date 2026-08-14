@@ -28,6 +28,22 @@ Card ──< Task (one per stage / rework, A2A-immutable) ──< Run (one per a
 > **Rule of thumb:** durable board state lives on the **Card**; the canonical state machine
 > lives on the **Task**; ephemeral live progress lives on the **Run**.
 
+> **⚠️ Task is not implemented — read this before designing against it.** The above is the intended
+> model. In the code there is **no `tasks` table** and no `task_` id is ever minted: the Board DO
+> stores `cards`, `runs`, `activities`, `gates`, `elicitations`, `card_references`, and the **A2A
+> `state` lives directly on the card row**. So today the hierarchy is two levels, not three:
+>
+> ```
+> Card (carries the A2A state) ──< Run (one per attempt) ──< Activity
+> ```
+>
+> Everywhere the specs say "the Task's state", the shipped system means `card.state`; where they say
+> "advancing a stage creates a new Task", the card's stage and state are updated in place and the
+> history is the ordered `runs` + `activities`. The A2A immutability property that a new Task would
+> give us is therefore **not** enforced. `contextId` exists on the card. Introducing a real Task
+> record is design intent, and it is the single largest gap between [01](./01-domain-model-and-glossary.md)/[03](./03-card-lifecycle.md)
+> and the code.
+
 ## Entities
 
 ### Tenant *(a.k.a. Workspace)*
@@ -56,18 +72,32 @@ A shared mapping never becomes a shared keyspace; isolation stays local, on `ten
 
 ### User & Membership
 A human principal and their role within a tenant. `Membership(userId, tenantId, role)` where
-`role ∈ {owner, admin, member, viewer}`. Humans authenticate via OAuth / magic-link → session.
+`role ∈ {owner, admin, member, viewer}`, ids prefixed `mbr_`.
+
+Humans authenticate with **GitHub OAuth → a signed session cookie** (`kaambaan_session`, HMAC over
+`SESSION_SECRET`, 30 days, stateless — there is no session store). Signing in creates a personal
+workspace with the user as `owner`. **⚠️ There is no magic-link and no email sending anywhere in the
+repo** — earlier drafts listed it as a login method; it was never built. GitHub is the only provider.
+
+**⚠️ `role` is recorded but never enforced.** Nothing reads it to authorize a request: any member of
+a tenant can do anything within it. The same is true of an agent token's `scopes`. Role- and
+scope-based authorization is design intent, not a control that exists.
 
 ### Agent *(registered worker)*
 An external worker registered to a tenant. It is an **app-actor identity** (per Linear's
-`actor=app`), *not* a human user, and is always badged as an agent in the UI. Fields:
-- `id`, `tenantId`, `name`, `iconUrl`
+`actor=app`), *not* a human user, and is always badged as an agent in the UI. Fields on the
+`agents` row:
+- `id` (`agt_`), `tenantId`, `name`, `iconUrl`
 - `capabilities` — tags it can service (e.g. `research`, `code`, `review`); drives routing
-- `agentCard` — its A2A AgentCard (skills, input/output modes, streaming/push support)
-- `tokens` — per-agent bearer credentials, with `scopes` (capability flags)
+- `tokens` — per-agent `kbn_` bearer credentials, stored as SHA-256 hashes, carrying `scopes`
+  (**recorded, never enforced**)
 - `concurrency` — max simultaneous claimed cards
-- `status` — `online | busy | offline` (derived from recent heartbeats/claims)
-- `connection` — how it integrates: `mcp | rest | webhook` (may support several)
+- `status` — `online | busy | offline`
+- `connection` — how it integrates: `mcp | rest | webhook | acp`
+
+**⚠️ `agentCard` does not exist.** There is no column, no upload path and no endpoint serving an A2A
+AgentCard ([04 §1](./04-agent-contract.md)); capability tags are the whole of what an agent
+advertises today.
 
 ### Board
 A named workspace surface within a tenant containing one pipeline and its cards. Fields:
@@ -95,8 +125,9 @@ The durable unit of work. Fields:
 - `currentTaskId` — the active A2A Task, if any
 - timestamps, `archivedAt`
 
-### Task *(A2A-aligned)*
-One unit of agent work on a card at a stage. Fields mirror A2A:
+### Task *(A2A-aligned)* — **⚠️ not implemented**
+The intended unit of agent work on a card at a stage; see the warning at the top of this document.
+No `tasks` table exists, so the fields below describe the design, not a record you can read:
 - `id`, `cardId`, `contextId` (shared across all tasks of the card), `stageKey`
 - `state` — the A2A `TaskState` (see [Card Lifecycle](./03-card-lifecycle.md))
 - `artifacts[]` — outputs produced (A2A `Artifact`; may reference R2 blobs)
@@ -105,8 +136,11 @@ One unit of agent work on a card at a stage. Fields mirror A2A:
 - timestamps, terminal-ness
 
 ### Run *(Session / attempt)*
-One attempt to execute a Task. Fields (Linear Session × Hermes task_run):
-- `id`, `taskId`, `agentId`, `startedAt`, `endedAt`
+One attempt to execute a card's stage work. **A run belongs to the agent that claimed it** — every
+run verb and the run read compare the caller against `run.agentId` and refuse a mismatch with
+`403 NOT_RUN_OWNER`, distinct from the `409 STALE_LEASE` that means "your lease lapsed, re-claim".
+Fields (Linear Session × Hermes task_run; `taskId` is `cardId` in practice, there being no Task):
+- `id` (`run_`), `cardId`, `agentId`, `stageKey`, `leaseEpoch`, `startedAt`, `endedAt`
 - `outcome` — `completed | blocked | rejected | crashed | timed_out | reclaimed | canceled`
 - `lastHeartbeatAt`, `workerRef` (opaque agent-side identifier)
 - `activities[]` — the typed activity stream
@@ -115,23 +149,49 @@ One attempt to execute a Task. Fields (Linear Session × Hermes task_run):
 A typed, append-only progress event emitted by an agent (or human) onto a Run. Types (Linear
 verbatim): `thought | action | response | elicitation | error` (plus `prompt` = human input).
 `thought`/`action` may be **ephemeral** (rendered transiently, replaced by the next activity).
-The Task/Run state is **derived** from the latest meaningful activity. Fields: `id`, `runId`,
-`type`, `body`/`action`/`parameter`/`result`, `ephemeral`, `signal?`, `signalMetadata?`,
-`authorKind` (`agent | human`), `createdAt`. Activities are **immutable snapshots** — the
-source of truth agents read back from (never read mutable card fields mid-run).
+Fields: `id`, `runId`, `type`, `body`/`action`/`parameter`/`result`, `ephemeral`, `signal?`,
+`usage?`, `createdAt`. Activities are **immutable snapshots** — the source of truth agents read
+back from (never read mutable card fields mid-run).
+
+There is **no `signalMetadata`** — a signal's structured payload rides in **`parameter`**, and the
+second carrier was removed in #36 because nothing read it (a test pins its absence). Note also that
+state is derived from activity only for `elicitation`; `response` and `error` do **not** move the
+card — see the warning in [04 §4](./04-agent-contract.md).
 
 ### Signal
 Optional typed metadata attached to an activity that tells the recipient how to interpret/
 render it. Initial set (Linear): `stop` (human→agent: halt now), `auth` (agent→human: link an
 account/credential), `select` (agent→human: choose from options — **this is how an approval
-gate renders Approve / Request changes / Reject**). Signals are an **open enum**; Kaambaan adds
-`approve`/`reject` semantics on top of `select` as needed. Fields: `signal`, `signalMetadata`.
+gate renders Approve / Request changes / Reject**). The coded enum is
+`stop | auth | select | approve | reject`. The payload rides in the activity's **`parameter`** —
+`{ "options": [{ "name", "title" }] }` for `select` — and that is the **only** carrier.
 
 ### Gate / Approval
-A pause where a human decision is required before a card advances. Realized as a Task in state
-`input-required` carrying a `select` signal. A human resolves it (approve → advance; request
-changes → back to the agent with feedback; reject → terminal `rejected`). See
-[Card Lifecycle](./03-card-lifecycle.md).
+A pause where a human decision is required before a card advances. Realized as a card in state
+`input-required` carrying a `select` signal, with a `gate_` row recording the decision. A human
+resolves it at `POST /v1/boards/:boardId/gates/:gateId/resolve` (approve → advance; request changes
+→ back to the agent with feedback; reject → terminal `rejected`). The producer cannot resolve their
+own gate (`403 SEPARATION_OF_DUTIES`). See [Card Lifecycle](./03-card-lifecycle.md).
+
+### Elicitation *(an answerable question)*
+A question an agent asked, persisted so it can be **answered** — the activity stream is append-only
+history, and history cannot be replied to. Fields: `id` (`elc_`), `cardId`, `runId`, `stageKey`,
+`agentId` (who asked), `question`, `signal`, `options[]` (`{name, title, promptFill?, interactive?}`),
+`status` (`pending | answered | cancelled`), `answer` (`{option, text, answeredBy, answeredAt}` or
+`null`), `createdAt`.
+
+- **Raised** by posting an `elicitation` activity; the options ride in the activity's `parameter`.
+  The card parks in `input-required` (or `auth-required` for an `auth` signal) and **the asking run
+  keeps its lease** — the agent is waiting, not finished.
+- **Answered** by a signed-in human at `POST /v1/boards/:boardId/elicitations/:elicitationId/answer`.
+  This is deliberately not an agent route, and the board separately refuses an answer from the agent
+  that asked (`403 SEPARATION_OF_DUTIES`). Answering twice is `409 ELICITATION_NOT_PENDING`.
+- **Collected** by the asking agent re-reading the run it already holds
+  (`GET /v1/boards/:boardId/runs/:runId` → `elicitations[]`) — no human credential and no second
+  authorization rule. Only one question per card can be pending: a new one supersedes the old, and a
+  question whose run ends or whose card moves on becomes `cancelled`.
+
+Full path and semantics in [04 §4](./04-agent-contract.md).
 
 ### Reference *(external link / attachment)*
 A first-class link from a card to an external resource. Modeled on Linear's idempotent
@@ -140,7 +200,7 @@ attachments. Fields: `id`, `cardId`, `url` (**dedup key** within a card), `title
 (`issue | pull_request | repo | branch | commit | doc | url`), `externalId` (e.g. GitHub
 `node_id` or `owner/repo#n`), `metadata` (JSON: state, merged, draft, refs…), `syncState`
 (`synced | stale | error`), `lastSyncedAt`. Upsert is idempotent on `(cardId, url)`. Detailed
-in `06-external-references` (planned).
+in [06 — External References](./06-external-references.md).
 
 ### Event
 The append-only audit + realtime feed for a board. Every meaningful change (card created,
@@ -156,8 +216,9 @@ Events drive the WebSocket broadcast to UI clients and the webhook dispatch to s
 | **Board** | A pipeline + its cards; one Durable Object |
 | **Pipeline / Stage** | The ordered columns a card flows through |
 | **Card** | The durable unit of work; has a human owner |
-| **Task** | A2A-style unit of agent work on a card at a stage; immutable when terminal |
-| **Run / Session** | One attempt to execute a Task by one agent |
+| **Task** | A2A-style unit of agent work on a card at a stage; immutable when terminal. **⚠️ Not implemented — the state lives on the Card** |
+| **Run / Session** | One attempt to execute a card's stage work by one agent; owned by that agent (`403 NOT_RUN_OWNER` for anyone else) |
+| **Elicitation** | A question an agent asked, with its options and its answer; answered by a human, collected off the run |
 | **contextId** | Groups all Tasks belonging to one Card (A2A) |
 | **delegate** | The agent currently executing a card (never the owner) |
 | **owner** | The accountable human for a card |
