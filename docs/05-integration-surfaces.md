@@ -29,13 +29,17 @@ consensus (OTel-GenAI / OpenInference).
   "kind": "AGENT | LLM | TOOL | THINKING | MESSAGE | STAGE_TRANSITION", // render/observability hint
   "ephemeral": true,
   "body": "…",                          // markdown (message/thought)
-  "action": "web.fetch", "parameter": {…}, "result": {…},        // for type=action
-  "signal": "select", "signalMetadata": {…},                     // doc 04 §4
+  "action": "web.fetch", "parameter": {…}, "result": {…},        // args for type=action,
+  "signal": "select",                          // …and a signal's payload: an elicitation's options
   "usage": { "inputTokens": 1200, "outputTokens": 300,
              "model": "claude-opus-4-8", "costUsd": 0.07 },       // optional metering
   "idempotencyKey": "…"
 }
 ```
+A signal's structured payload rides in **`parameter`** — there is exactly one carrier. (An earlier
+draft showed a second field, `signalMetadata`; nothing ever read it, so an elicitation's options put
+there were silently dropped and the human was shown a question with no answers to pick.)
+
 Adapters translate each harness's native stream into this envelope (see §6). Non-ephemeral
 activities are the immutable record; `usage` feeds per-tenant metering ([07](./07-realtime-and-ui.md)).
 
@@ -123,6 +127,7 @@ doesn't speak MCP. Tokens are per-agent bearers (tenant + capability scoped).
 | addReference | `PUT /v1/cards/:cardId/references` *(idempotent on url)* |
 | submitForReview | `POST /v1/runs/:runId/submit` |
 | complete / block / release / fail | `POST /v1/runs/:runId/{complete,block,release,fail}` |
+| answerElicitation *(human)* | `POST /v1/boards/:boardId/elicitations/:elicitationId/answer` |
 | discover | `GET /.well-known/agent-card.json` · `GET /v1/boards` |
 
 All mutating endpoints accept an `Idempotency-Key` header (see [08](./08-reliability-and-durable-execution.md)).
@@ -135,6 +140,11 @@ and the agent's registered capabilities, so the client never asserts them. `@kaa
 speaks this by default — see [its README](../packages/agent-sdk/README.md). The dev-mode
 `X-Tenant-Id` / `X-Agent-Id` headers only work against a server run with `DEV_AUTH=true`
 ([12](./12-deploy.md)).
+
+Answering an elicitation is deliberately **not** an agent route: it is a human decision on a
+tenant-shared board, so it sits behind the session cookie with gate resolution, and the board
+refuses an answer from the agent that asked (`403 SEPARATION_OF_DUTIES`) on every surface — the same
+rule that stops the producer of a gate approving it.
 
 Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims`,
 `GET /v1/boards/:id/runs/:runId` and `POST /v1/boards/:id/runs/:runId/:action`. Board/card
@@ -158,9 +168,17 @@ the MCP tools pass the token's agent into the same Board DO methods.
   "card": { …the claimed card… },
   "stage": { …the card's current stage… },
   "handoff": { …the upstream stage's handoff… },
-  "references": [ …the card's external links… ]
+  "references": [ …the card's external links… ],
+  "elicitations": [ …the questions this run asked, each with its answer once given… ]
 }
 ```
+
+`elicitations` is also **how a blocked agent gets unblocked**. An agent that asks a question
+(`activity` type `elicitation`) keeps its lease and polls this same read until its question turns
+`answered`; the answer arrives with no human credential and no second authorization rule, because
+the run it already holds is the thing being read. A card that moves on without an answer marks the
+question `cancelled` — a signal to stop waiting. Push (a WebSocket or a `work.available`-style
+webhook) can shorten the wait later; it does not change who may read what.
 
 It is **run-scoped, not board-scoped**, and authorized by the same predicate as the run verbs — *a
 run belongs to the agent that claimed it* — so there is one ownership rule, not two:
