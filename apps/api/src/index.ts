@@ -39,13 +39,20 @@ function statusForCode(code: BoardErrorCode): number {
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
+    case 'INVALID_ANSWER':
+      return 400;
     case 'CARD_NOT_FOUND':
     case 'RUN_NOT_FOUND':
     case 'NOT_INITIALIZED':
     case 'GATE_NOT_FOUND':
+    case 'ELICITATION_NOT_FOUND':
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
+    // The question was already settled (answered, or retired with its run) — a conflict with the
+    // state the caller believed in, not a bad request. Retrying it will never succeed.
+    case 'ELICITATION_NOT_PENDING':
+    case 'CARD_NOT_WAITING':
       return 409;
     case 'SEPARATION_OF_DUTIES':
     // The caller authenticated, but this run is another agent's: a permanent refusal of an
@@ -456,6 +463,25 @@ export default {
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
+      }
+
+      // POST /v1/boards/:id/elicitations/:elicitationId/answer — the signed-in human answers an
+      // agent's question (docs/04 §4), which returns the card to `working` and unblocks the agent.
+      //
+      // Deliberately a *human* route: agent tokens authenticate `claims` and `runs/*` only, so an
+      // agent cannot reach this at all — and the DO refuses the asking agent's identity besides, so
+      // the rule holds on every surface rather than only at this door.
+      const answerMatch = rest.match(/^elicitations\/([^/]+)\/answer$/);
+      if (answerMatch && request.method === 'POST') {
+        const ap = (await request.json()) as { option?: string; text?: string };
+        const result = await stub.answerElicitation({
+          elicitationId: answerMatch[1]!,
+          answeredBy: user?.userId ?? 'usr_dev',
+          option: ap.option,
+          text: ap.text,
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
       }
 
       return Response.json({ error: 'method not allowed' }, { status: 405 });

@@ -1,7 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { TaskState } from '@kaambaan/contract';
+import { canTransition, nextState, type TaskEventType, type TaskState } from '@kaambaan/contract';
 import type { Env } from '../env';
 import { newId } from '../ids';
+import { parseElicitationOptions } from './elicitation';
 import { verifyGithubSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
 import { estimateCostUsd } from '../metering/pricing';
@@ -158,6 +159,12 @@ export interface RunContext {
   stage: StageDef | null;
   handoff: JsonValue | null;
   references: ReferenceView[];
+  /**
+   * The questions this run asked, oldest first, each carrying its answer once a human gives one.
+   * This is how a blocked agent collects a decision: it re-reads the run it already holds, with the
+   * token it already has. No human credential, and no second authorization rule.
+   */
+  elicitations: ElicitationView[];
 }
 
 /** One run of a card, surfaced for the attempts comparison view (docs/07 §5). */
@@ -202,12 +209,54 @@ export interface BoardEvent {
   ts: string;
 }
 
-/** A choice presented to a human at an approval gate (HumanLayer-style options, docs/08 §6). */
+/**
+ * A choice presented to a human — at an approval gate, or on an agent's elicitation (HumanLayer-style
+ * options, docs/08 §6). A gate is an elicitation with a `select` signal, so both use one shape.
+ */
 export interface GateOption {
   name: string;
   title: string;
   promptFill?: string;
   interactive?: boolean;
+}
+
+/**
+ * An agent's open question to a human (docs/04 §4), persisted so it can be answered.
+ *
+ * The agent asks by posting an `elicitation` activity — `body` is the question, `parameter` carries
+ * the `options` — which parks the card in `input-required` (or `auth-required` on an `auth` signal)
+ * while the agent keeps its lease. A human's answer transitions the card back to `working` through
+ * the state machine's own `human_reply` / `account_linked` transition, and the asking agent collects
+ * the answer from the run it already owns.
+ *
+ * `agentId` is who asked — and therefore who may not answer.
+ */
+export interface ElicitationView {
+  id: string;
+  cardId: string;
+  runId: string;
+  stageKey: string;
+  agentId: string;
+  question: string;
+  signal: string | null;
+  options: GateOption[];
+  status: ElicitationStatus;
+  answer: ElicitationAnswer | null;
+  createdAt: string;
+}
+
+/**
+ * `pending` — waiting on a human. `answered` — a human replied and the card moved on.
+ * `cancelled` — the question outlived its usefulness (the run ended, or the card was moved/superseded)
+ * and can no longer be answered, so no stale prompt is left for a human to act on.
+ */
+export type ElicitationStatus = 'pending' | 'answered' | 'cancelled';
+
+export interface ElicitationAnswer {
+  option: string | null;
+  text: string | null;
+  answeredBy: string;
+  answeredAt: string;
 }
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
@@ -262,6 +311,8 @@ export interface BoardSnapshot {
   stages: StageDef[];
   cards: CardView[];
   gates: GateView[];
+  /** The questions agents are currently blocked on, waiting for a human (docs/04 §4). */
+  elicitations: ElicitationView[];
   references: ReferenceView[];
   usage: BoardUsage;
   github: { issueTrigger: boolean; webhookConfigured: boolean };
@@ -305,6 +356,10 @@ export type BoardErrorCode =
   | 'STALE_LEASE'
   | 'GATE_NOT_FOUND'
   | 'GATE_NOT_PENDING'
+  | 'ELICITATION_NOT_FOUND'
+  | 'ELICITATION_NOT_PENDING'
+  | 'INVALID_ANSWER'
+  | 'CARD_NOT_WAITING'
   | 'SEPARATION_OF_DUTIES'
   | 'INVALID_URL'
   | 'INVALID_SIGNATURE'
@@ -374,6 +429,12 @@ export interface BoardStub {
     decidedBy: string;
     comment?: string;
   }): Promise<Result<CardView>>;
+  answerElicitation(input: {
+    elicitationId: string;
+    answeredBy: string;
+    option?: string;
+    text?: string;
+  }): Promise<Result<{ card: CardView; elicitation: ElicitationView }>>;
   fetch(request: Request): Promise<Response>;
 }
 
@@ -567,6 +628,28 @@ export class BoardDO extends DurableObject<Env> {
       )`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_card ON gates(card_id)`);
+    // An agent's open question to a human (docs/04 §4). Persisting it is what makes an answer
+    // possible: the activity stream is append-only history, and history cannot be replied to.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS elicitations (
+        id TEXT PRIMARY KEY,
+        card_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        stage_key TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        signal TEXT,
+        options_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        answer_option TEXT,
+        answer_text TEXT,
+        answered_by TEXT,
+        created_at TEXT NOT NULL,
+        answered_at TEXT
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_elicitations_card ON elicitations(card_id)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_elicitations_run ON elicitations(run_id)`);
     // `references` is a SQL keyword, so the table is `card_references`. UNIQUE(card_id, url) is the
     // idempotent-upsert dedup key (docs/06 §1).
     this.sql.exec(
@@ -699,6 +782,7 @@ export class BoardDO extends DurableObject<Env> {
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
     this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
+    this.cancelElicitationsForCard(cardId);
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL, failure_count = 0, updated_at = ? WHERE id = ?`,
       target.key,
@@ -747,7 +831,7 @@ export class BoardDO extends DurableObject<Env> {
   async deleteCard(cardId: string): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
-    for (const t of ['usage_records', 'activities', 'runs', 'gates', 'card_references', 'notifications']) {
+    for (const t of ['usage_records', 'activities', 'runs', 'gates', 'elicitations', 'card_references', 'notifications']) {
       this.sql.exec(`DELETE FROM ${t} WHERE card_id = ?`, cardId);
     }
     this.sql.exec(`DELETE FROM cards WHERE id = ?`, cardId);
@@ -1264,6 +1348,7 @@ export class BoardDO extends DurableObject<Env> {
           .exec(`SELECT * FROM card_references WHERE card_id = ? ORDER BY created_at ASC`, cardId)
           .toArray()
           .map((r) => this.rowToReference(r)),
+        elicitations: this.elicitationsForRun(input.runId),
       },
     };
   }
@@ -1432,6 +1517,7 @@ export class BoardDO extends DurableObject<Env> {
     if (input.type === 'elicitation') {
       cardState = input.signal === 'auth' ? 'auth-required' : 'input-required';
       this.sql.exec(`UPDATE cards SET state = ?, updated_at = ? WHERE id = ?`, cardState, now, cardId);
+      this.openElicitation(input, run, cardId, now);
     }
     this.emit('activity', { runId: input.runId, cardId, activityType: input.type });
     await this.scheduleReclaim();
@@ -1446,6 +1532,7 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = run.card_id as string;
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ? WHERE id = ?`, now, input.runId);
+    this.cancelElicitationsForRun(input.runId);
 
     const card = this.mustGetCard(cardId);
     const handoffJson = input.handoff !== undefined ? JSON.stringify(input.handoff) : null;
@@ -1462,6 +1549,7 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = run.card_id as string;
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'submitted', ended_at = ? WHERE id = ?`, now, input.runId);
+    this.cancelElicitationsForRun(input.runId);
     const card = this.mustGetCard(cardId);
     this.sql.exec(
       `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
@@ -1531,6 +1619,107 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: this.mustGetCard(cardId) };
   }
 
+  /**
+   * Answer an agent's question (docs/04 §4) — the human half of the elicitation return path.
+   *
+   * Authorization has two halves and both matter. The **edge** only exposes this to a human
+   * principal (a session; agent tokens reach `claims` and `runs/*` and nothing else). Here, where
+   * every surface must pass, the **asking agent is refused by identity**: an elicitation an agent
+   * can answer itself is decorative, and this is the same separation-of-duties rule `resolveGate`
+   * already enforces for the producer of a gate.
+   *
+   * The card moves through the **state machine's own** transition — `human_reply` out of
+   * `input-required`, `account_linked` out of `auth-required` — rather than a second, parallel
+   * path: if the contract stops allowing it, this stops doing it.
+   *
+   * Answering a settled question is a typed conflict, never a second transition, so a double-click
+   * (or a retried delivery) cannot move a card twice.
+   */
+  async answerElicitation(input: {
+    elicitationId: string;
+    answeredBy: string;
+    option?: string;
+    text?: string;
+  }): Promise<Result<{ card: CardView; elicitation: ElicitationView }>> {
+    const row = this.sql.exec(`SELECT * FROM elicitations WHERE id = ?`, input.elicitationId).toArray()[0];
+    if (!row) {
+      return { ok: false, code: 'ELICITATION_NOT_FOUND', message: `elicitation not found: ${input.elicitationId}` };
+    }
+    const elicitation = this.rowToElicitation(row);
+    if (elicitation.status !== 'pending') {
+      return {
+        ok: false,
+        code: 'ELICITATION_NOT_PENDING',
+        message: `this question is already ${elicitation.status}`,
+      };
+    }
+    if (input.answeredBy === elicitation.agentId) {
+      return { ok: false, code: 'SEPARATION_OF_DUTIES', message: 'the agent that asked cannot answer its own question' };
+    }
+    const card = this.getCard(elicitation.cardId);
+    if (!card) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${elicitation.cardId}` };
+
+    const text = input.text?.trim() ?? '';
+    const option = input.option?.trim() ?? '';
+    if (option !== '' && !elicitation.options.some((o) => o.name === option)) {
+      return { ok: false, code: 'INVALID_ANSWER', message: `"${option}" is not one of the offered options` };
+    }
+    if (option === '' && text === '') {
+      return {
+        ok: false,
+        code: 'INVALID_ANSWER',
+        message: elicitation.options.length > 0 ? 'pick one of the offered options' : 'an answer needs some text',
+      };
+    }
+
+    // The card must still be waiting on this answer, and it moves by the contract's transition.
+    const event: TaskEventType = card.state === 'auth-required' ? 'account_linked' : 'human_reply';
+    if (!canTransition(card.state, event)) {
+      return { ok: false, code: 'CARD_NOT_WAITING', message: `a card in "${card.state}" is not waiting on an answer` };
+    }
+    const resumed = nextState(card.state, event);
+
+    const now = this.now();
+    this.sql.exec(
+      `UPDATE elicitations SET status = 'answered', answer_option = ?, answer_text = ?, answered_by = ?, answered_at = ? WHERE id = ?`,
+      option === '' ? null : option,
+      text === '' ? null : text,
+      input.answeredBy,
+      now,
+      elicitation.id,
+    );
+    this.sql.exec(`UPDATE cards SET state = ?, updated_at = ? WHERE id = ?`, resumed, now, card.id);
+
+    // The answer joins the card's replay as a `prompt` — the human-authored activity type, which is
+    // exactly what "resumes working" means in the activity vocabulary (docs/04 §4).
+    const chosen = elicitation.options.find((o) => o.name === option);
+    const body = [chosen?.title ?? option, text].filter((s) => s !== '' && s !== undefined).join(' — ');
+    this.sql.exec(
+      `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
+       VALUES (?, ?, 'prompt', 0, ?, NULL, ?, ?)`,
+      elicitation.runId,
+      card.id,
+      body,
+      JSON.stringify({
+        parameter: { elicitationId: elicitation.id, option: option === '' ? null : option },
+        result: null,
+        signal: null,
+      }),
+      now,
+    );
+    this.emit('elicitation.answered', {
+      elicitationId: elicitation.id,
+      cardId: card.id,
+      runId: elicitation.runId,
+      option: option === '' ? null : option,
+      answeredBy: input.answeredBy,
+    });
+    return {
+      ok: true,
+      value: { card: this.mustGetCard(card.id), elicitation: this.mustGetElicitation(elicitation.id) },
+    };
+  }
+
   /** Escalate to a human — the card parks in input-required (docs/08 §6 — gates resolve in P3). */
   async block(input: RunVerbInput & { reason: string }): Promise<Result<CardView>> {
     const auth = this.authorizeRun(input);
@@ -1539,6 +1728,7 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = run.card_id as string;
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'blocked', ended_at = ? WHERE id = ?`, now, input.runId);
+    this.cancelElicitationsForRun(input.runId);
     this.sql.exec(
       `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
       now,
@@ -1556,6 +1746,7 @@ export class BoardDO extends DurableObject<Env> {
     const run = auth.run;
     const cardId = run.card_id as string;
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'crashed', ended_at = ? WHERE id = ?`, this.now(), input.runId);
+    this.cancelElicitationsForRun(input.runId);
     this.endAttempt(cardId, 'card.failed', input.reason);
     this.notify('failed', cardId, input.reason || 'Run failed');
     return { ok: true, value: this.mustGetCard(cardId) };
@@ -1569,6 +1760,7 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = run.card_id as string;
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'released', ended_at = ? WHERE id = ?`, now, input.runId);
+    this.cancelElicitationsForRun(input.runId);
     this.sql.exec(
       `UPDATE cards SET state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
       now,
@@ -1595,6 +1787,7 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     for (const r of rows) {
       this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'reclaimed', ended_at = ? WHERE id = ?`, now, r.id);
+      this.cancelElicitationsForRun(r.id as string);
       this.endAttempt(r.card_id as string, 'run.reclaimed', null, String(r.id)); // endAttempt re-queues + notifies work.available
       this.notify('reclaimed', r.card_id as string, 'Agent went dark — run reclaimed');
     }
@@ -1702,6 +1895,104 @@ export class BoardDO extends DurableObject<Env> {
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);
     return id;
+  }
+
+  /**
+   * Persist the question an agent just asked, so a human has something to answer (docs/04 §4).
+   * The card can only be waiting on one thing at a time, so a new question supersedes any earlier
+   * pending one on the same card — the agent is blocked on its latest ask, and a superseded question
+   * is no longer answerable rather than lingering as a prompt nobody can act on.
+   */
+  private openElicitation(input: AgentActivityInput, run: Row, cardId: string, now: string): void {
+    this.cancelElicitationsForCard(cardId);
+    const id = newId('elc');
+    const question = input.body ?? '';
+    this.sql.exec(
+      `INSERT INTO elicitations
+        (id, card_id, run_id, stage_key, agent_id, question, signal, options_json, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      id,
+      cardId,
+      input.runId,
+      run.stage_key as string,
+      run.agent_id as string,
+      question,
+      input.signal ?? null,
+      JSON.stringify(parseElicitationOptions(input.parameter)),
+      now,
+    );
+    this.emit('elicitation.opened', { elicitationId: id, cardId, runId: input.runId, signal: input.signal ?? null });
+    this.notify('input', cardId, question === '' ? 'An agent is waiting on you' : question);
+  }
+
+  /**
+   * Retire questions nobody can usefully answer any more. A pending elicitation belongs to a live
+   * run and a waiting card; once either is gone (the run ended or was reclaimed, the card was moved
+   * away, a newer question superseded it) the prompt would otherwise sit in the board's "needs you"
+   * queue forever, and answering it would transition a card that has already moved on.
+   */
+  private cancelElicitationsForRun(runId: string): void {
+    this.sql.exec(
+      `UPDATE elicitations SET status = 'cancelled', answered_at = ? WHERE status = 'pending' AND run_id = ?`,
+      this.now(),
+      runId,
+    );
+  }
+
+  /** As above, for every run on a card — the card itself has stopped waiting. */
+  private cancelElicitationsForCard(cardId: string): void {
+    this.sql.exec(
+      `UPDATE elicitations SET status = 'cancelled', answered_at = ? WHERE status = 'pending' AND card_id = ?`,
+      this.now(),
+      cardId,
+    );
+  }
+
+  private rowToElicitation(row: Row): ElicitationView {
+    const answeredBy = (row.answered_by as string | null) ?? null;
+    return {
+      id: row.id as string,
+      cardId: row.card_id as string,
+      runId: row.run_id as string,
+      stageKey: row.stage_key as string,
+      agentId: row.agent_id as string,
+      question: row.question as string,
+      signal: (row.signal as string | null) ?? null,
+      options: JSON.parse(row.options_json as string) as GateOption[],
+      status: row.status as ElicitationStatus,
+      answer:
+        row.status === 'answered' && answeredBy
+          ? {
+              option: (row.answer_option as string | null) ?? null,
+              text: (row.answer_text as string | null) ?? null,
+              answeredBy,
+              answeredAt: (row.answered_at as string | null) ?? '',
+            }
+          : null,
+      createdAt: row.created_at as string,
+    };
+  }
+
+  private mustGetElicitation(id: string): ElicitationView {
+    const row = this.sql.exec(`SELECT * FROM elicitations WHERE id = ?`, id).toArray()[0];
+    if (!row) throw new Error(`invariant violation: elicitation ${id} missing immediately after write`);
+    return this.rowToElicitation(row);
+  }
+
+  /** Every question a run asked, oldest first — the agent read surface's view (docs/04 §3). */
+  private elicitationsForRun(runId: string): ElicitationView[] {
+    return this.sql
+      .exec(`SELECT * FROM elicitations WHERE run_id = ? ORDER BY created_at ASC, rowid ASC`, runId)
+      .toArray()
+      .map((r) => this.rowToElicitation(r));
+  }
+
+  /** Every question currently waiting on a human, board-wide — the human's view. */
+  private pendingElicitations(): ElicitationView[] {
+    return this.sql
+      .exec(`SELECT * FROM elicitations WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC`)
+      .toArray()
+      .map((r) => this.rowToElicitation(r));
   }
 
   private isAgentClaimable(stage: StageDef): boolean {
@@ -1999,6 +2290,7 @@ export class BoardDO extends DurableObject<Env> {
       stages: this.stages(),
       cards: boardId ? this.allCards() : [],
       gates: boardId ? this.pendingGates() : [],
+      elicitations: boardId ? this.pendingElicitations() : [],
       references: boardId ? this.allReferences() : [],
       usage: boardId ? this.boardUsage() : { totalCostUsd: 0, estimatedCostUsd: 0, budgetUsd: null, cardUsdCap: null, overBudget: false },
       github: { issueTrigger: this.getMeta('githubIssueTrigger') === '1', webhookConfigured: this.getMeta('githubWebhookSecret') !== null },
