@@ -22,6 +22,7 @@ import {
   type BoardSummary,
   type Card,
   type Gate,
+  type Elicitation,
   type Reference,
   type Notification,
   type User,
@@ -88,7 +89,8 @@ class AppStore {
       if (f.states.length && !f.states.includes(c.state)) return false;
       if (f.owners.length && !f.owners.includes(c.ownerUserId)) return false;
       if (f.minPriority !== null && c.priority < f.minPriority) return false;
-      if (f.needsReview && !b.gates.some((g) => g.cardId === c.id)) return false;
+      if (f.needsReview && !b.gates.some((g) => g.cardId === c.id) && !b.elicitations.some((e) => e.cardId === c.id))
+        return false;
       if (f.live && c.state !== 'working') return false;
       if (f.overBudget && !c.overBudget) return false;
       return true;
@@ -103,13 +105,19 @@ class AppStore {
   gateForCard(id: string): Gate | undefined {
     return this.board?.gates.find((g) => g.cardId === id && g.status === 'pending');
   }
+  /** The question an agent is waiting on a human to answer for this card, if any (docs/04 §4). */
+  elicitationForCard(id: string): Elicitation | undefined {
+    return this.board?.elicitations.find((e) => e.cardId === id && e.status === 'pending');
+  }
   referencesForCard(id: string): Reference[] {
     return this.board?.references.filter((r) => r.cardId === id) ?? [];
   }
-  /** The "Needs You" triage queue: cards at a pending gate, over budget, or failed. */
+  /** The "Needs You" triage queue: cards at a pending gate or question, over budget, or failed. */
   needsYou(): Card[] {
     const cards = this.board?.cards ?? [];
-    return cards.filter((c) => this.gateForCard(c.id) || c.overBudget || c.state === 'failed');
+    return cards.filter(
+      (c) => this.gateForCard(c.id) || this.elicitationForCard(c.id) || c.overBudget || c.state === 'failed',
+    );
   }
 
   // ---- actions ----

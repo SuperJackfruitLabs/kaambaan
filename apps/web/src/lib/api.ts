@@ -123,6 +123,24 @@ export interface Gate {
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
 
+/**
+ * A question an agent stopped to ask (docs/04 §4). The card waits in `input-required` while the
+ * agent holds its lease; answering it here is what lets the agent carry on.
+ */
+export interface Elicitation {
+  id: string;
+  cardId: string;
+  runId: string;
+  stageKey: string;
+  agentId: string;
+  question: string;
+  signal: string | null;
+  options: GateOption[];
+  status: 'pending' | 'answered' | 'cancelled';
+  answer: { option: string | null; text: string | null; answeredBy: string; answeredAt: string } | null;
+  createdAt: string;
+}
+
 export interface Reference {
   id: string;
   cardId: string;
@@ -143,6 +161,7 @@ export interface BoardSnapshot {
   stages: Stage[];
   cards: Card[];
   gates: Gate[];
+  elicitations: Elicitation[];
   references: Reference[];
   usage: BoardUsage;
   github: { issueTrigger: boolean; webhookConfigured: boolean };
@@ -334,6 +353,22 @@ export function resolveGate(
     method: 'POST',
     headers,
     body: JSON.stringify({ decision, comment }),
+  });
+}
+
+/**
+ * Answer an agent's question. The answerer is the signed-in user (set by the server), which is also
+ * how the board refuses an agent answering its own question.
+ */
+export function answerElicitation(
+  boardId: string,
+  elicitationId: string,
+  answer: { option?: string; text?: string },
+): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/elicitations/${elicitationId}/answer`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(answer),
   });
 }
 
