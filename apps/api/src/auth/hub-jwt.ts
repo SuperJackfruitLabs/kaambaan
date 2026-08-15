@@ -28,6 +28,13 @@ export interface HubClaims extends JWTPayload {
   principalKind: 'human' | 'agent' | 'service';
   /** AgentPod's isolation boundary — `fleet_…`, NOT one of ours. */
   tenant: string;
+  /**
+   * The control pair's first half, namespaced per plane. Present and possibly
+   * empty from an issuer that speaks it; ABSENT from one that does not, and the
+   * difference matters — absent must not be read as "permitted nothing".
+   */
+  mayDispatch?: string[];
+  mayGrantReach?: boolean;
 }
 
 export interface VerifyOptions {

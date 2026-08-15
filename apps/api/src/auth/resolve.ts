@@ -14,6 +14,14 @@ import { verifyHubToken } from './hub-jwt';
 export interface UserPrincipal {
   userId: string;
   tenantId: string;
+  /**
+   * What this caller is permitted to dispatch, from a verified hub token.
+   *
+   * Present only when the caller authenticated with one — a session cookie
+   * carries no grant, and `undefined` therefore means "no authority
+   * accompanied this act", which is not the same as an empty grant.
+   */
+  mayDispatch?: string[];
   name?: string;
   login?: string;
   avatarUrl?: string;
@@ -114,5 +122,5 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
   const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
   if (!tenantId) return null;
 
-  return { userId: claims.sub, tenantId };
+  return { userId: claims.sub, tenantId, mayDispatch: claims.mayDispatch ?? [] };
 }

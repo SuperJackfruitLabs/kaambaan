@@ -22,6 +22,18 @@ export interface Env {
    * the tenant external mapping takes.
    */
   HUB_ISSUER?: string;
+  /**
+   * When "true", the control pair is enforced: a card is only claimable if its
+   * recorded `queued_grant` permits the claiming agent
+   * (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4).
+   *
+   * An explicit switch rather than "is any grant recorded", because those differ
+   * in the dangerous case — a deployment that MEANT to enforce, whose grants
+   * never arrived, would silently enforce nothing. Populate grants first, then
+   * switch this on: with it on and nothing recorded, every card parks in
+   * input-required, which is correct and is also an outage.
+   */
+  ENFORCE_CONTROL_PAIR?: string;
   /** When "true", accept dev-mode X-Tenant-Id / X-Agent-Id headers (local + tests). Never in prod. */
   DEV_AUTH?: string;
   /** Static web assets (the SPA), served for non-API routes when deployed same-origin. */
