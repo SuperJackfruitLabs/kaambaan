@@ -19,7 +19,7 @@
  *     issue measured the lag.
  */
 
-import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
+import { createLocalJWKSet, jwtVerify, type JSONWebKeySet, type JWTPayload } from 'jose';
 
 /** The claims kaambaan reads. Names pinned by agentpod fixtures/ecosystem-identity/token_claims.json. */
 export interface HubClaims extends JWTPayload {
@@ -38,35 +38,60 @@ export interface VerifyOptions {
 }
 
 /**
- * Cached per issuer. Module scope, which on Workers means per isolate — the
- * warm-isolate case is the common one, and a cold isolate simply pays one fetch.
+ * The key set, fetched and cached by us rather than by jose.
+ *
+ * `createRemoteJWKSet` was the obvious choice and is the wrong one here. When a
+ * token names a `kid` it has not seen, it kicks off a background reload whose
+ * promise rejects independently of the verify — so a `try/catch` around
+ * `jwtVerify` catches the verify's failure while the reload's rejection escapes
+ * as an **unhandled rejection**. In a test run that fails the run with every
+ * assertion passing. In production it is one unhandled rejection per token
+ * carrying an unknown key, which is exactly what an attacker sends.
+ *
+ * Fetching it ourselves makes every failure path synchronous and catchable, and
+ * makes the two properties the decision actually asks for explicit rather than
+ * inherited from a library's defaults:
+ *
+ *   - **No network in the verify path** while the cache is warm.
+ *   - **Serve the last good set** if a refresh fails, so an issuer outage
+ *     degrades new keys rather than stopping work.
  */
-const cache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+interface CachedSet {
+  keys: JSONWebKeySet;
+  verify: ReturnType<typeof createLocalJWKSet>;
+  fetchedAt: number;
+}
+
+const cache = new Map<string, CachedSet>();
+
+/** How long a fetched key set is used without re-checking. */
+const JWKS_TTL_MS = 10 * 60 * 1000;
 
 /** Test-only: drop the cache so each case starts cold. */
 export function __resetJwksCacheForTests(): void {
   cache.clear();
 }
 
-function keySet(opts: VerifyOptions) {
-  const existing = cache.get(opts.issuer);
-  if (existing) return existing;
+async function keySet(opts: VerifyOptions): Promise<CachedSet | null> {
+  const now = Date.now();
+  const cached = cache.get(opts.issuer);
+  if (cached && now - cached.fetchedAt < JWKS_TTL_MS) return cached;
 
-  const set = createRemoteJWKSet(new URL(`${opts.issuer}/api/auth/jwks`), {
-    // Long enough that a verify is normally offline; short enough that a
-    // rotation propagates without a deploy.
-    cacheMaxAge: 10 * 60 * 1000,
-    // Do not hammer the issuer when a token names a key we have never seen —
-    // that is the shape of an attack as well as of a rotation.
-    cooldownDuration: 30 * 1000,
-    // jose's supported injection point. An invented symbol here silently does
-    // nothing and the fetch goes out anyway — which is exactly how a first pass
-    // at this "measured" zero network calls while measuring nothing.
-    ...(opts.fetch ? { [customFetch]: opts.fetch } : {}),
-  });
+  const doFetch = opts.fetch ?? fetch;
+  try {
+    const res = await doFetch(`${opts.issuer}/api/auth/jwks`);
+    if (!res.ok) return cached ?? null;
+    const keys = (await res.json()) as JSONWebKeySet;
+    if (!Array.isArray(keys?.keys) || keys.keys.length === 0) return cached ?? null;
 
-  cache.set(opts.issuer, set);
-  return set;
+    const fresh: CachedSet = { keys, verify: createLocalJWKSet(keys), fetchedAt: now };
+    cache.set(opts.issuer, fresh);
+    return fresh;
+  } catch {
+    // The issuer is unreachable. A stale set still verifies every token signed
+    // by a key we already know, which is the whole point of verifying offline.
+    return cached ?? null;
+  }
 }
 
 /**
@@ -105,7 +130,10 @@ export async function verifyHubToken(
   }
 
   try {
-    const { payload } = await jwtVerify(token, keySet(opts), {
+    const set = await keySet(opts);
+    if (!set) return null;
+
+    const { payload } = await jwtVerify(token, set.verify, {
       issuer: opts.issuer,
       audience: opts.issuer,
       // Pinned, never taken from the token's own header — otherwise `alg: none`

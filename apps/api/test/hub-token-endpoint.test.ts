@@ -58,12 +58,20 @@ beforeAll(async () => {
 
 describe('GET /v1/agents with a hub-issued token', () => {
   it('refuses when no issuer is configured, rather than trusting any issuer', async () => {
-    // HUB_ISSUER is unset in the test env. An unset issuer must mean "this path
-    // is off", never "accept whoever signed it".
-    const res = await SELF.fetch('https://api.test/v1/agents', {
-      headers: { Authorization: `Bearer ${await hubToken()}` },
-    });
-    expect(res.status).toBe(401);
+    // HUB_ISSUER now ships in wrangler.jsonc, so the test environment inherits
+    // one — this case has to remove it rather than assume its absence. That is
+    // the whole assertion: an unset issuer means "this path is off", never
+    // "accept whoever signed it".
+    const saved = (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    try {
+      const res = await SELF.fetch('https://api.test/v1/agents', {
+        headers: { Authorization: `Bearer ${await hubToken()}` },
+      });
+      expect(res.status).toBe(401);
+    } finally {
+      if (saved !== undefined) (env as unknown as Record<string, unknown>).HUB_ISSUER = saved;
+    }
   });
 
   it('still refuses an unauthenticated request', async () => {
@@ -82,6 +90,12 @@ describe('GET /v1/agents with a hub-issued token', () => {
   });
 
   it('does not accept a hub token on POST, only on the read', async () => {
+    // Independent of whether an issuer is configured: this must refuse either
+    // way, so the issuer is removed to keep the case about the one thing it
+    // names.
+    const saved = (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    try {
     // A first integration should not also be the first credential able to mint
     // an agent token.
     const res = await SELF.fetch('https://api.test/v1/agents', {
@@ -93,6 +107,9 @@ describe('GET /v1/agents with a hub-issued token', () => {
       body: JSON.stringify({ name: 'should not be created' }),
     });
     expect(res.status).toBe(401);
+    } finally {
+      if (saved !== undefined) (env as unknown as Record<string, unknown>).HUB_ISSUER = saved;
+    }
   });
 
   it('authorizes a real hub token, resolving to the same tenant a dev caller gets', async () => {
@@ -154,11 +171,20 @@ describe('GET /v1/agents with a hub-issued token', () => {
   });
 
   it('never lets a hub token through as a kbn_ agent credential', async () => {
+    // Independent of whether an issuer is configured: this must refuse either
+    // way, so the issuer is removed to keep the case about the one thing it
+    // names.
+    const saved = (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    try {
     // `kbn_` is the agent credential and is resolved from the catalog by hash.
     // A JWT that happened to start with that prefix must not be looked up as one.
     const res = await SELF.fetch('https://api.test/v1/agents', {
       headers: { Authorization: `Bearer kbn_${await hubToken()}` },
     });
     expect(res.status).toBe(401);
+    } finally {
+      if (saved !== undefined) (env as unknown as Record<string, unknown>).HUB_ISSUER = saved;
+    }
   });
 });
