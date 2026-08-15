@@ -73,6 +73,15 @@ export interface CardView {
   title: string;
   spec: JsonValue;
   ownerUserId: string;
+  /**
+   * The principal who last deliberately queued this card — its creator, or
+   * whoever moved it into a dispatchable stage. Not the same as `ownerUserId`,
+   * and null on a card created before this was recorded.
+   *
+   * This is what the control pair reads to ask "who may dispatch which agent"
+   * at claim time; without it a claim has no principal to check.
+   */
+  queuedBy: string | null;
   currentStageKey: string;
   state: TaskState;
   delegateAgentId: string | null;
@@ -599,6 +608,36 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * Who queued this card — the principal on whose behalf an agent runs it.
+     *
+     * The control pair asks "who may dispatch which agent"
+     * (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4), and to
+     * answer that at claim time this board has to know who caused the card to
+     * become claimable in the first place.
+     *
+     * It is NOT the same as `owner_user_id`: a card can be moved into a
+     * dispatchable stage by someone other than the person who created it, and it
+     * is the mover who dispatched.
+     *
+     * Nullable on purpose. A card reaches the claimable state from six places
+     * and only two of them are a human act — creating it, and moving it. The
+     * other four are automatic: a stage advancing after a run completes, a
+     * release, a reclaim, a gate resolving. Those must NOT overwrite this: the
+     * pipeline that follows is the continuation of the work a person queued, so
+     * the value persists as "who last deliberately queued this card".
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN queued_by TEXT`);
+    } catch {
+      // column already exists
+    }
+    /** The queuer, pinned onto the run, so an attempt records whose work it was. */
+    try {
+      this.sql.exec(`ALTER TABLE runs ADD COLUMN queued_by TEXT`);
+    } catch {
+      // column already exists
+    }
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS notifications (
@@ -709,8 +748,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?)`,
       id,
       input.title,
       JSON.stringify(input.spec ?? {}),
@@ -720,6 +759,9 @@ export class BoardDO extends DurableObject<Env> {
       contextId,
       now,
       now,
+      // Creating a card in the first stage IS queueing it: it is claimable the
+      // moment it exists, so the creator is the principal who dispatched it.
+      input.ownerUserId,
     );
     const card = this.mustGetCard(id);
     this.emit('card.created', { card });
@@ -783,10 +825,16 @@ export class BoardDO extends DurableObject<Env> {
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
     this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
     this.cancelElicitationsForCard(cardId);
+    // A move by a person re-queues the card, so the mover becomes the queuer —
+    // they are the one dispatching it now, which is not necessarily the person
+    // who created it. Without an actor (an internal move) the previous queuer
+    // stands: COALESCE leaves it alone rather than blanking it.
     this.sql.exec(
-      `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL, failure_count = 0, updated_at = ? WHERE id = ?`,
+      `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
+              failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by) WHERE id = ?`,
       target.key,
       now,
+      actorUserId ?? null,
       cardId,
     );
     const updated = this.mustGetCard(cardId);
@@ -1419,8 +1467,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     const nowMs = this.nowMs();
     this.sql.exec(
-      `INSERT INTO runs (id, card_id, stage_key, agent_id, lease_epoch, status, outcome, last_heartbeat_ms, started_at, ended_at, profile_key)
-       VALUES (?, ?, ?, ?, ?, 'working', NULL, ?, ?, NULL, ?)`,
+      `INSERT INTO runs (id, card_id, stage_key, agent_id, lease_epoch, status, outcome, last_heartbeat_ms, started_at, ended_at, profile_key, queued_by)
+       VALUES (?, ?, ?, ?, ?, 'working', NULL, ?, ?, NULL, ?, ?)`,
       runId,
       card.id,
       card.currentStageKey,
@@ -1429,6 +1477,9 @@ export class BoardDO extends DurableObject<Env> {
       nowMs,
       now,
       input.profileKey ?? null,
+      // Pinned onto the attempt so a run records WHOSE work it was, and stays
+      // answerable after the card has moved on.
+      (row.queued_by as string | null) ?? null,
     );
     this.sql.exec(
       `UPDATE cards SET state = 'working', delegate_agent_id = ?, current_run_id = ?, claim_seq = ?, updated_at = ? WHERE id = ?`,
@@ -2169,6 +2220,7 @@ export class BoardDO extends DurableObject<Env> {
       title: row.title as string,
       spec: JSON.parse(row.spec_json as string),
       ownerUserId: row.owner_user_id as string,
+      queuedBy: (row.queued_by as string | null) ?? null,
       currentStageKey: row.current_stage_key as string,
       state: row.state as TaskState,
       delegateAgentId: (row.delegate_agent_id as string | null) ?? null,

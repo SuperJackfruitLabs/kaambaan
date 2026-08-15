@@ -230,7 +230,11 @@ export default {
       const moveMatch = rest.match(/^cards\/([^/]+)\/move$/);
       if (moveMatch && request.method === 'POST') {
         const body = (await request.json()) as { toStageKey: string };
-        const result = await stub.moveCard(moveMatch[1]!, body.toStageKey);
+        // The mover is passed through: whoever moves a card into a dispatchable
+        // stage is the one dispatching it now, and the control pair needs a
+        // principal to check at claim time. `moveCard` has always accepted an
+        // actor; this route never sent one, so every move looked anonymous.
+        const result = await stub.moveCard(moveMatch[1]!, body.toStageKey, user!.userId);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
       }
