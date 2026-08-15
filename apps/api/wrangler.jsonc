@@ -11,6 +11,15 @@
   // headers as a credential) is opt-IN: `pnpm dev` passes `--var DEV_AUTH:true` and the test runner
   // sets it in vitest.config.ts. Setting it here would make every `wrangler deploy` that forgot to
   // override it ship an app where any X-Tenant-Id header is a full credential for that tenant.
+  // The suite's token issuer (charter decisions/2026-08-15-one-issuer-and-offline-verification.md).
+  //
+  // Safe to set here, unlike DEV_AUTH above, because it is not a credential and it grants nothing on
+  // its own: it names WHO we will believe, and a token still has to verify against that issuer's
+  // published JWKS and then map its `fleet_` tenant onto one of ours. An unset value means the path
+  // is off; a wrong value means every hub token is refused. Neither fails open.
+  "vars": {
+    "HUB_ISSUER": "https://hub.agentpod.dev"
+  },
   "d1_databases": [
     {
       "binding": "DB",
