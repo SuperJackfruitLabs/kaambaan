@@ -168,6 +168,10 @@ export default {
       tenantId = agent.tenantId;
     } else {
       user = await resolveUser(request, env);
+      // A hub-issued token is accepted on the human routes too, because the
+      // routes that QUEUE work are where authority has to arrive: the grant is
+      // recorded with the card and outlives the token that carried it.
+      if (!user) user = await resolveHubUser(request, env);
       if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
       tenantId = user.tenantId;
     }
@@ -221,7 +225,15 @@ export default {
           spec?: JsonValue;
           priority?: number;
         };
-        const result = await stub.createCard({ ...body, ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_dev' });
+        // The authority that accompanied the act, recorded with the card. A
+        // session-cookie caller carries none, and `undefined` there means "no
+        // one with permission asked for this to run" — which is refused under
+        // enforcement rather than treated as an empty grant.
+        const result = await stub.createCard({
+          ...body,
+          ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_dev',
+          queuedGrant: user?.mayDispatch ?? null,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value }, { status: 201 });
       }
@@ -234,7 +246,7 @@ export default {
         // stage is the one dispatching it now, and the control pair needs a
         // principal to check at claim time. `moveCard` has always accepted an
         // actor; this route never sent one, so every move looked anonymous.
-        const result = await stub.moveCard(moveMatch[1]!, body.toStageKey, user!.userId);
+        const result = await stub.moveCard(moveMatch[1]!, body.toStageKey, user!.userId, user!.mayDispatch ?? null);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
       }

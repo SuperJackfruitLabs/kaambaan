@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { canTransition, nextState, type TaskEventType, type TaskState } from '@kaambaan/contract';
 import type { Env } from '../env';
 import { newId } from '../ids';
+import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
 import { parseElicitationOptions } from './elicitation';
 import { verifyGithubSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
@@ -82,6 +83,8 @@ export interface CardView {
    * at claim time; without it a claim has no principal to check.
    */
   queuedBy: string | null;
+  /** What the queuer was permitted to dispatch, as granted when they queued it. */
+  queuedGrant: string[] | null;
   currentStageKey: string;
   state: TaskState;
   delegateAgentId: string | null;
@@ -383,12 +386,20 @@ export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCo
 export interface BoardStub {
   init(board: BoardInit): Promise<BoardSnapshot>;
   createCard(input: {
+    /** What the queuer was permitted to dispatch, as granted at this moment. */
+    queuedGrant?: string[] | null;
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
     priority?: number;
   }): Promise<Result<CardView>>;
-  moveCard(cardId: string, toStageKey: string, actorUserId?: string): Promise<Result<CardView>>;
+  moveCard(
+    cardId: string,
+    toStageKey: string,
+    actorUserId?: string,
+    /** What the mover was permitted to dispatch, recorded with the card. */
+    queuedGrant?: string[] | null,
+  ): Promise<Result<CardView>>;
   updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
@@ -638,6 +649,28 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * What the queuer was PERMITTED to dispatch, as granted at the moment they
+     * queued it.
+     *
+     * Authority is captured at the moment of the act, not looked up later. An
+     * agent claims work minutes or hours after a human queued it and the human
+     * is not present, so there is no caller to ask "may you dispatch this?" —
+     * the answer has to have been written down when it was still askable.
+     *
+     * Recorded as granted THEN. A later change to someone's grant does not
+     * retroactively authorise or deauthorise work already queued, which is what
+     * makes this an audit record and not a cache.
+     *
+     * NULL means no authorising token accompanied the act. Under enforcement
+     * that card is not claimable — nobody with authority ever asked for it to
+     * run.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN queued_grant TEXT`);
+    } catch {
+      // column already exists
+    }
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS notifications (
@@ -733,6 +766,8 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   async createCard(input: {
+    /** What the queuer was permitted to dispatch, as granted at this moment. */
+    queuedGrant?: string[] | null;
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
@@ -748,8 +783,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
       JSON.stringify(input.spec ?? {}),
@@ -762,6 +797,7 @@ export class BoardDO extends DurableObject<Env> {
       // Creating a card in the first stage IS queueing it: it is claimable the
       // moment it exists, so the creator is the principal who dispatched it.
       input.ownerUserId,
+      input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
     );
     const card = this.mustGetCard(id);
     this.emit('card.created', { card });
@@ -803,7 +839,12 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Human move (docs/03). Enforces stage existence and the target stage's WIP limit. */
-  async moveCard(cardId: string, toStageKey: string, actorUserId?: string): Promise<Result<CardView>> {
+  async moveCard(
+    cardId: string,
+    toStageKey: string,
+    actorUserId?: string,
+    queuedGrant?: string[] | null,
+  ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     }
@@ -831,10 +872,15 @@ export class BoardDO extends DurableObject<Env> {
     // stands: COALESCE leaves it alone rather than blanking it.
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
-              failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by) WHERE id = ?`,
+              failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
+              queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END WHERE id = ?`,
       target.key,
       now,
       actorUserId ?? null,
+      // Same COALESCE reasoning as the queuer: an internal move leaves the
+      // recorded authority standing rather than blanking it.
+      queuedGrant === undefined || queuedGrant === null ? null : JSON.stringify(queuedGrant),
+      queuedGrant === undefined || queuedGrant === null ? null : JSON.stringify(queuedGrant),
       cardId,
     );
     const updated = this.mustGetCard(cardId);
@@ -1460,6 +1506,36 @@ export class BoardDO extends DurableObject<Env> {
       )
       .toArray()[0];
     if (!row) return { claimed: false };
+
+    // ── The control pair, at the moment the work is handed out ──────────────
+    //
+    // The card records what its queuer was PERMITTED to dispatch
+    // (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4). The
+    // human is long gone by now, which is exactly why the answer was written
+    // down when it was still askable.
+    //
+    // A refusal is made VISIBLE rather than skipped. Silently passing over the
+    // card would leave a board that looks idle while work sits on it — the
+    // decision requires a denial to be reported, never dropped — so the card is
+    // parked in `input-required`, which is this board's existing way of saying a
+    // person has to do something. That also bounds the noise: the card leaves
+    // `submitted`, so this is evaluated once and not on every poll.
+    if (isControlPairEnforced(this.env)) {
+      const grant = row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null;
+      if (!grantPermitsAgent(grant, input.agentId)) {
+        const why = grant
+          ? `the operator who queued this card may not dispatch ${input.agentId}`
+          : 'this card was queued without an authorising token, so no one with permission asked for it to run';
+        this.sql.exec(
+          `UPDATE cards SET state = 'input-required', updated_at = ? WHERE id = ?`,
+          this.now(),
+          row.id as string,
+        );
+        this.notify('control-pair', row.id as string, `Not dispatched: ${why}`);
+        this.emit('card.blocked', { cardId: row.id as string, reason: why });
+        return { claimed: false };
+      }
+    }
 
     const card = this.rowToCard(row);
     const leaseEpoch = Number(row.claim_seq) + 1;
@@ -2221,6 +2297,7 @@ export class BoardDO extends DurableObject<Env> {
       spec: JSON.parse(row.spec_json as string),
       ownerUserId: row.owner_user_id as string,
       queuedBy: (row.queued_by as string | null) ?? null,
+      queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
       currentStageKey: row.current_stage_key as string,
       state: row.state as TaskState,
       delegateAgentId: (row.delegate_agent_id as string | null) ?? null,
