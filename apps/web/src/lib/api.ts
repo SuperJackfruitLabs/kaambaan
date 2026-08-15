@@ -3,6 +3,8 @@
  * (sent automatically, same-origin); the `X-Tenant-Id` header is a no-op there and only enables the
  * local dev workspace (when the server runs with DEV_AUTH on).
  */
+import { withAuthority } from './hub-token';
+
 const TENANT = 'tnt_dev';
 const headers = { 'X-Tenant-Id': TENANT, 'Content-Type': 'application/json' };
 
@@ -284,10 +286,16 @@ export async function getBoard(boardId: string): Promise<BoardSnapshot> {
   return (await res.json()) as BoardSnapshot;
 }
 
+/**
+ * Creating a card in the first stage IS queueing it — it is claimable the moment
+ * it exists — so this carries the operator's authority, and the server records
+ * what it permits against the card. Without it the card is queued by nobody with
+ * permission, and under enforcement no agent may run it.
+ */
 export async function createCard(boardId: string, title: string): Promise<void> {
   const res = await fetch(`/v1/boards/${boardId}/cards`, {
     method: 'POST',
-    headers,
+    headers: await withAuthority(headers),
     body: JSON.stringify({ title }), // owner is the signed-in user, set by the server
   });
   if (!res.ok) throw new Error(`createCard failed (${res.status})`);
@@ -308,11 +316,18 @@ export function addReference(boardId: string, cardId: string, ref: { url: string
   return fetch(`/v1/boards/${boardId}/cards/${cardId}/references`, { method: 'PUT', headers, body: JSON.stringify({ ...ref, addedBy: 'user' }) });
 }
 
-/** Returns the raw response so callers can surface WIP-limit (409) and unknown-stage (400) cases. */
-export function moveCard(boardId: string, cardId: string, toStageKey: string): Promise<Response> {
+/**
+ * Returns the raw response so callers can surface WIP-limit (409) and
+ * unknown-stage (400) cases.
+ *
+ * Carries authority for the same reason `createCard` does: whoever moves a card
+ * into a dispatchable stage is the one dispatching it now, and that need not be
+ * the person who created it.
+ */
+export async function moveCard(boardId: string, cardId: string, toStageKey: string): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}/move`, {
     method: 'POST',
-    headers,
+    headers: await withAuthority(headers),
     body: JSON.stringify({ toStageKey }),
   });
 }

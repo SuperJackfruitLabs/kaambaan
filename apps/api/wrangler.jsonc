@@ -18,7 +18,19 @@
   // published JWKS and then map its `fleet_` tenant onto one of ours. An unset value means the path
   // is off; a wrong value means every hub token is refused. Neither fails open.
   "vars": {
-    "HUB_ISSUER": "https://hub.agentpod.dev"
+    "HUB_ISSUER": "https://hub.agentpod.dev",
+    // The control pair is enforced: a card is claimable only if the grant
+    // recorded when it was queued permits the claiming agent
+    // (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4).
+    //
+    // Safe here for the same reason HUB_ISSUER is — it grants nothing, it only
+    // decides whether a recorded grant is CHECKED, and every path fails closed.
+    //
+    // A card queued WITHOUT an authorising token parks in input-required and
+    // says why. That is why the web app now carries a hub token (see
+    // apps/web/src/lib/hub-token.ts): before it did, enabling this would have
+    // made the board unusable through its own UI (kaambaan#43).
+    "ENFORCE_CONTROL_PAIR": "true"
   },
   "d1_databases": [
     {
