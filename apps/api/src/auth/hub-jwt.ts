@@ -82,6 +82,28 @@ export async function verifyHubToken(
 ): Promise<HubClaims | null> {
   if (!token) return null;
 
+  // Reject an unsupported algorithm BEFORE asking jose to verify.
+  //
+  // `jwtVerify` with `algorithms: ['EdDSA']` also rejects it — but by then it
+  // has begun resolving a key from the remote set, and that in-flight promise
+  // rejects out of band once the verify has already failed. The result is an
+  // unhandled rejection that fails a test run whose assertions all passed, and
+  // in production an unhandled rejection per malformed token.
+  //
+  // Checking here means an unsupported `alg` never causes a key lookup at all,
+  // which is also the better posture: a caller should not be able to make us
+  // fetch anything by sending a header we do not support.
+  const header = token.split('.')[0];
+  if (!header) return null;
+  try {
+    const decoded = JSON.parse(atob(header.replace(/-/g, "+").replace(/_/g, "/"))) as {
+      alg?: unknown;
+    };
+    if (decoded.alg !== "EdDSA") return null;
+  } catch {
+    return null; // not even a JWT
+  }
+
   try {
     const { payload } = await jwtVerify(token, keySet(opts), {
       issuer: opts.issuer,
