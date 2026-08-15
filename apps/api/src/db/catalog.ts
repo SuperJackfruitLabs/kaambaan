@@ -233,3 +233,32 @@ export class CatalogRepository {
     return this.run<T>(tenantScopedSelect('agents', tenantId));
   }
 }
+
+/**
+ * The kaambaan tenant that a foreign system's id maps onto.
+ *
+ * Migration 0002 added `external_source` + `external_id` so the same real
+ * organisation can be recognised across two products that each keep their own
+ * local boundary and neither of which mints the other's ids. A hub token names
+ * AgentPod's boundary (`fleet_…`); this is how that becomes a `tnt_…`.
+ *
+ * BOTH halves must match. An `external_id` on its own could belong to any
+ * system, and matching it alone would let one system's id select a tenant
+ * mapped to a different system entirely.
+ *
+ * Returns null when nothing is mapped, which is the normal state for a
+ * standalone board and must stay workable: a caller whose tenant cannot be
+ * resolved is refused, not given a default.
+ */
+export async function findTenantByExternal(
+  db: D1Database,
+  source: string,
+  externalId: string,
+): Promise<string | null> {
+  if (!source || !externalId) return null;
+  const row = await db
+    .prepare(`SELECT id FROM tenants WHERE external_source = ? AND external_id = ?`)
+    .bind(source, externalId)
+    .first<{ id: string }>();
+  return row?.id ?? null;
+}

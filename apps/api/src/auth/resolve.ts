@@ -8,7 +8,8 @@
 import type { Env } from '../env';
 import { readSessionToken, verifySession } from './session';
 import { hashToken } from './agent-token';
-import { findAgentByTokenHash } from '../db/catalog';
+import { findAgentByTokenHash, findTenantByExternal } from '../db/catalog';
+import { verifyHubToken } from './hub-jwt';
 
 export interface UserPrincipal {
   userId: string;
@@ -77,4 +78,41 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
     }
   }
   return null;
+}
+
+/**
+ * Resolve a human from a token issued by the suite's hub, verified offline.
+ *
+ * Deliberately a SEPARATE function rather than another branch inside
+ * `resolveUser`: this is the first endpoint to accept a hub token, and keeping
+ * the seam narrow means the blast radius of getting it wrong is one route
+ * instead of the whole surface. Widening it is a later, deliberate step.
+ *
+ * Two refusals worth naming, because both fail closed:
+ *
+ *   - **No issuer configured** → no hub-token path at all. A standalone board
+ *     must work with no issuer anywhere, and an unset issuer must never mean
+ *     "trust any issuer".
+ *   - **A verified token whose tenant maps to nothing here** → refused. The
+ *     claim names AgentPod's boundary (`fleet_…`); ours is `tnt_…`, and neither
+ *     product mints the other's ids. With no mapping there is no tenant to act
+ *     in, and falling back to a default would hand one board's data to a token
+ *     that never named it.
+ */
+export async function resolveHubUser(request: Request, env: Env): Promise<UserPrincipal | null> {
+  const issuer = env.HUB_ISSUER;
+  if (!issuer) return null;
+
+  const token = bearer(request);
+  // `kbn_` tokens are the agent credential and are resolved elsewhere; anything
+  // else is a candidate JWT.
+  if (!token || token.startsWith('kbn_')) return null;
+
+  const claims = await verifyHubToken(token, { issuer });
+  if (!claims) return null;
+
+  const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
+  if (!tenantId) return null;
+
+  return { userId: claims.sub, tenantId };
 }

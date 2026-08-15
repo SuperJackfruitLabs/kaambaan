@@ -33,7 +33,7 @@ import { boardStub } from './board/stub';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
-import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal } from './auth/resolve';
+import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, deleteAgent } from './db/catalog';
 
@@ -106,7 +106,20 @@ export default {
     // plaintext token is returned ONCE on create; thereafter only its hash is stored.
     const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+))?$/);
     if (agentsMatch) {
-      const u = await resolveUser(request, env);
+      // The first endpoint to accept a hub-issued token
+      // (charter decisions/2026-08-15-one-issuer-and-offline-verification.md).
+      //
+      // Read-only, and only as a FALLBACK: the session cookie and `kbn_` token
+      // paths are untouched and still take precedence, so nothing that works
+      // today changes. The hub token is verified offline against a cached JWKS —
+      // no network call in this path — and resolves to the same principal shape,
+      // so nothing downstream can tell which credential arrived.
+      //
+      // Deliberately not extended to POST or DELETE yet: proving the contract
+      // needs a read, and a first integration should not also be the first
+      // credential able to mint an agent token.
+      let u = await resolveUser(request, env);
+      if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
       if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
       const agentId = agentsMatch[1];
       if (agentId) {
