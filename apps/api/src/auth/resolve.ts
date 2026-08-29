@@ -92,9 +92,18 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
  * Resolve a human from a token issued by the suite's hub, verified offline.
  *
  * Deliberately a SEPARATE function rather than another branch inside
- * `resolveUser`: this is the first endpoint to accept a hub token, and keeping
- * the seam narrow means the blast radius of getting it wrong is one route
- * instead of the whole surface. Widening it is a later, deliberate step.
+ * `resolveUser`, so the hub-token path is one readable thing rather than a
+ * condition buried in the session path.
+ *
+ * **Corrected 2026-08-30.** This comment used to say "this is the first
+ * endpoint to accept a hub token, and keeping the seam narrow means the blast
+ * radius of getting it wrong is one route instead of the whole surface." That
+ * stopped being true: `index.ts` calls this for every human route (and, for
+ * GET, on the board-list path above it). The widening happened; the comment
+ * did not. Read as written it would tell a reviewer that approving a gate with
+ * a hub token needs new wiring, when in fact it already worked — which is
+ * exactly the kind of drift `charter`'s README warns about, a claim about code
+ * kept somewhere the code cannot contradict it.
  *
  * Two refusals worth naming, because both fail closed:
  *

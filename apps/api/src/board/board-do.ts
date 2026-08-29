@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { canTransition, nextState, type TaskEventType, type TaskState } from '@kaambaan/contract';
+import { canTransition, nextState, type GateDecision, type TaskEventType, type TaskState } from '@kaambaan/contract';
 import type { Env } from '../env';
 import { newId } from '../ids';
 import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
@@ -283,7 +283,10 @@ export interface ElicitationAnswer {
   answeredAt: string;
 }
 
-export type GateDecision = 'approve' | 'request_changes' | 'reject';
+// Defined in `@kaambaan/contract` — it is a cross-repo contract value that
+// AgentPod's bridge and supermessage both read. Re-exported so the many
+// existing importers of it from this module keep working.
+export type { GateDecision };
 
 export interface GateView {
   id: string;

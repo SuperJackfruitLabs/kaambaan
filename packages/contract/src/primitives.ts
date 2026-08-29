@@ -99,3 +99,23 @@ export type ReferenceSourceType = z.infer<typeof ReferenceSourceType>;
 
 export const SyncState = z.enum(['synced', 'stale', 'error']);
 export type SyncState = z.infer<typeof SyncState>;
+
+/**
+ * What a human may decide at an approval gate.
+ *
+ * Defined here rather than beside the state machine that consumes it because
+ * it is a **cross-repo contract value**, not an internal one. AgentPod's
+ * Application Service projects these into a Matrix room as an option list and
+ * sends one back to resolve the gate; supermessage draws a button per value.
+ * Pinned by `fixtures/ecosystem-identity/matrix_gate_events.json` in AgentPod,
+ * which all three repos validate against.
+ *
+ * The consequence of that, and the reason this comment is here: adding a value
+ * is not a local change. A gate offering an option no client knows renders a
+ * button that resolves nothing — see `charter` →
+ * `decisions/2026-08-30-a-gate-closes-over-chat.md`, which records free-form
+ * option ids as the one correction to kaambaan#34 that would have failed at
+ * runtime rather than in review.
+ */
+export const GateDecision = z.enum(['approve', 'request_changes', 'reject']);
+export type GateDecision = z.infer<typeof GateDecision>;
