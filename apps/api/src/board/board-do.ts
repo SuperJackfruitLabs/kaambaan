@@ -20,6 +20,18 @@ const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
 const CIRCUIT_BREAKER_LIMIT = 2;
 /** Push delivery attempts before a delivery is dead-lettered (docs/05 §4). */
 const MAX_PUSH_ATTEMPTS = 5;
+/**
+ * How long after a delivery is queued the alarm drains it, doubling per attempt
+ * (docs/05 §4): 5s, 10s, 20s, 40s, 80s, then dead-lettered.
+ *
+ * Before this existed, `dispatchPushDeliveries` was reachable only from `POST
+ * …/push/dispatch` — so a queued delivery sat pending until something outside
+ * the board happened to poke it. That was survivable for `work.available`,
+ * which has the pull path underneath it, and is not survivable for a gate: a
+ * gate that never rings is a card blocked forever on an approval nobody was
+ * asked for.
+ */
+const PUSH_DRAIN_BASE_MS = 5_000;
 
 /** The decisions a human can take at an approval gate (docs/08 §6). */
 const DEFAULT_GATE_OPTIONS: GateOption[] = [
@@ -1950,6 +1962,10 @@ export class BoardDO extends DurableObject<Env> {
   /** DO alarm: reclaim lapsed runs, then re-arm for the next-earliest heartbeat deadline. */
   async alarm(): Promise<void> {
     this.reclaimExpired(this.nowMs());
+    // The queue's only unattended drain. See PUSH_DRAIN_BASE_MS for what this
+    // fixes; `scheduleReclaim` below is what brings the alarm back while
+    // anything is still pending.
+    await this.dispatchPushDeliveries();
     await this.scheduleReclaim();
   }
 
@@ -2021,6 +2037,7 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);
+    this.notifyGatePending(id, cardId, stageKey, returnStageKey, producedBy);
     return id;
   }
 
@@ -2198,13 +2215,93 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: false, code: 'NOT_RUN_OWNER', message: 'this run belongs to another agent' };
   }
 
+  /**
+   * Set the single alarm to whichever comes first: a run's reclaim deadline, or
+   * the next push-delivery attempt.
+   *
+   * One alarm, two jobs, because a Durable Object has exactly one — and the
+   * earlier deadline has to win or the later job silently cancels it. Reclaim
+   * used to own it alone and `deleteAlarm()` on an idle board would have thrown
+   * away a queued delivery's only chance to leave.
+   *
+   * Backoff doubles from the LEAST-tried pending row, so one delivery that has
+   * failed four times cannot hold back one queued a second ago.
+   */
   private async scheduleReclaim(): Promise<void> {
     const min = this.sql.exec(`SELECT MIN(last_heartbeat_ms) AS m FROM runs WHERE status = 'working'`).one().m;
-    if (min === null || min === undefined) {
+    const reclaimAt = min === null || min === undefined ? null : Number(min) + HEARTBEAT_TIMEOUT_MS;
+
+    const queued = this.sql
+      .exec(
+        `SELECT MIN(attempts) AS a, COUNT(*) AS n FROM push_deliveries
+         WHERE status IN ('pending', 'failed') AND attempts < ?`,
+        MAX_PUSH_ATTEMPTS,
+      )
+      .one();
+    const drainAt =
+      Number(queued.n) > 0 ? this.nowMs() + PUSH_DRAIN_BASE_MS * 2 ** Number(queued.a ?? 0) : null;
+
+    const next = [reclaimAt, drainAt].filter((t): t is number => t !== null).sort((a, b) => a - b)[0];
+    if (next === undefined) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    await this.ctx.storage.setAlarm(Number(min) + HEARTBEAT_TIMEOUT_MS);
+    await this.ctx.storage.setAlarm(next);
+  }
+
+  /**
+   * Queue `gate.pending` deliveries for a gate that just opened (docs/05 §4).
+   *
+   * **Fan-out is by subscription only** — deliberately unlike
+   * `notifyWorkAvailable`, and this is the one thing about this method worth
+   * reading twice. `work.available` is addressed to whoever could *claim* the
+   * stage, so it matches on capability. A gate is addressed to the card's
+   * **owner**, a human. Copying the capability match would send approval
+   * requests to whichever agents happen to advertise the review stage's
+   * capability — and, because a review stage is human-owned, to nobody at all.
+   *
+   * The body carries what a projection needs to render a question without a
+   * second round trip: the card's title, the stage, who produced the work, and
+   * the options. `producedBy` is included because it is the subject of the
+   * separation-of-duties check at resolution.
+   */
+  private notifyGatePending(
+    gateId: string,
+    cardId: string,
+    stageKey: string,
+    returnStageKey: string,
+    producedBy: string,
+  ): void {
+    const card = this.getCard(cardId);
+    if (!card) return;
+    const boardId = this.getMeta('boardId');
+    const ts = this.now();
+    const body = JSON.stringify({
+      event: 'gate.pending',
+      boardId,
+      cardId,
+      gateId,
+      stageKey,
+      returnStageKey,
+      cardTitle: card.title,
+      producedBy,
+      // `id`/`label`, not `name`/`title`: the wire names are pinned by
+      // agentpod fixtures/ecosystem-identity/matrix_gate_events.json, which
+      // three repos validate against. The board's own vocabulary stops here.
+      options: DEFAULT_GATE_OPTIONS.map((o) => ({ id: o.name, label: o.title })),
+      ts,
+    });
+    for (const cfg of this.sql.exec(`SELECT * FROM push_configs`).toArray()) {
+      const events = JSON.parse(cfg.events_json as string) as string[];
+      if (!events.includes('gate.pending')) continue;
+      this.sql.exec(
+        `INSERT INTO push_deliveries (config_id, url, body, status, attempts, created_at) VALUES (?, ?, ?, 'pending', 0, ?)`,
+        cfg.id,
+        cfg.url,
+        body,
+        ts,
+      );
+    }
   }
 
   /** Record an in-app notification for the card's owner and broadcast it (docs/07 §7). */

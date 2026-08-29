@@ -268,8 +268,8 @@ Pull is the default ([04 §3](./04-agent-contract.md)); push is an **accelerator
 an agent to call `claim`. Modeled on A2A **PushNotificationConfig**:
 - Config: `{ url, token, authentication: { schemes: ["Bearer"], credentials } }`, registered per
   agent/board.
-- Events: `work.available` (a card the agent can claim entered a stage), `gate.resolved`,
-  `run.reclaimed`, `card.canceled`.
+- Events: `work.available` (a card the agent can claim entered a stage), `gate.pending` (a card
+  is waiting on a human's approval), `gate.resolved`, `run.reclaimed`, `card.canceled`.
 - **Delivery is durable**: enqueued to a **Queue**, delivered by a **Workflow** with retries +
   exponential backoff; each delivery is **HMAC/JWT-signed**; the receiver verifies and may then
   `claim`. SSRF defense: webhook URLs are allowlisted/ownership-verified.
@@ -288,14 +288,37 @@ verifier, `src/crypto/hmac.ts`) and POSTs it (`src/push/deliver.ts`), marking ea
 against an **SSRF denylist** (`src/push/ssrf.ts` — only public http(s); blocks localhost, loopback,
 RFC1918, link-local/169.254 metadata, IPv6 ULA/link-local).
 
-- **⚠️ Best-effort today**: this slice is **at-most-once** — a `failed` delivery is terminal (not
-  retried). Push is only an accelerator over the always-available pull path, so a dropped ping just
-  means the agent learns of work on its next poll. **Durable transport** (Cloudflare **Queue** →
-  **Workflow** with exponential backoff + retry caps) is the upgrade to at-least-once.
-- **⚠️ Remaining**: events beyond `work.available` (`gate.resolved`, `run.reclaimed`,
-  `card.canceled`); **URL ownership-verification** (the literal-IP denylist doesn't stop DNS
-  rebinding — a host allowlist / challenge-response is the durable fix); auth on `push/dispatch` +
-  `push/deliveries` when real auth replaces the dev headers.
+- **At-least-once, within a cap.** A `failed` delivery is retried: the drain re-picks rows in
+  `status IN ('pending','failed')` while `attempts < MAX_PUSH_ATTEMPTS` (5), and an exhausted row
+  is dead-lettered to `status = 'dead'` rather than deleted, so a delivery nobody could receive
+  stays visible in `GET …/push/deliveries`.
+- **The alarm drains the queue** (`alarm()` → `dispatchPushDeliveries`), with backoff doubling
+  from `PUSH_DRAIN_BASE_MS` (5s) off the least-tried pending row: 5s, 10s, 20s, 40s, 80s. The DO
+  has one alarm and two jobs, so `scheduleReclaim` sets whichever of the reclaim deadline and the
+  next drain comes first — the later job must never cancel the earlier one.
+
+  > **Corrected 2026-08-30.** This section previously said the slice was *"at-most-once — a
+  > `failed` delivery is terminal (not retried)"*. Retry and dead-lettering were already built;
+  > the doc had not caught up. The real gap was narrower and worse: `dispatchPushDeliveries` was
+  > reachable **only** from `POST …/push/dispatch`, so nothing drained the queue unattended and a
+  > queued delivery sat pending until something outside the board poked it. Survivable for
+  > `work.available`, which has pull underneath it; not survivable for `gate.pending`, which has
+  > nothing underneath it — a gate that never rings is a card blocked forever on an approval
+  > nobody was asked for. Found while implementing
+  > `charter → decisions/2026-08-30-a-gate-closes-over-chat.md`.
+
+- **⚠️ Remaining**: events beyond `work.available` and `gate.pending` (`gate.resolved`,
+  `run.reclaimed`, `card.canceled`); **URL ownership-verification** (the literal-IP denylist
+  doesn't stop DNS rebinding — a host allowlist / challenge-response is the durable fix); auth on
+  `push/dispatch` + `push/deliveries` when real auth replaces the dev headers. **Durable transport**
+  (Cloudflare **Queue** → **Workflow**) remains the heavier upgrade; the alarm above buys the same
+  at-least-once property for a fraction of it.
+
+**`gate.pending` fan-out is by subscription only**, deliberately unlike `work.available`. That one
+asks *who could claim this stage* and matches on capability; a gate asks *who owns this card*, and
+its owner is a human. Copying the capability match would deliver approval requests to whichever
+agents advertise the review stage's capability — and, because a review stage is human-owned, to
+nobody at all.
 
 ## 5. Harness adapters (the "any harness, anywhere" layer)
 
