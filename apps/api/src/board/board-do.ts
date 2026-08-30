@@ -347,6 +347,36 @@ export interface GateView {
   createdAt: string;
 }
 
+/**
+ * What a `gate.pending` carries — the same object however it travels.
+ *
+ * Pushed when the gate opens, and read back by the hub's reconciliation sweep
+ * (`charter → decisions/2026-08-30-a-gate-closes-over-chat.md` §5). Two paths
+ * deliver this; exactly one builds it, because a swept gate that rendered
+ * differently from a pushed one would only ever be seen on the path that had
+ * already failed once.
+ *
+ * The field names are the wire's, not the board's: `gateId` rather than `id`,
+ * `options[].id`/`label` rather than `name`/`title`. They are pinned by
+ * agentpod `fixtures/ecosystem-identity/matrix_gate_events.json`, which three
+ * repositories validate against, so this shape stops being ours to rename.
+ */
+export interface GatePendingBody {
+  event: 'gate.pending';
+  boardId: string | null;
+  cardId: string;
+  gateId: string;
+  stageKey: string;
+  returnStageKey: string;
+  cardTitle: string;
+  producedBy: string;
+  /** What the reviewer is being asked to approve; null when nothing was handed forward. */
+  handoffSummary: string | null;
+  options: Array<{ id: string; label: string }>;
+  /** When the gate opened. The gate's own clock, so a re-read is byte-identical. */
+  ts: string;
+}
+
 /** A first-class external link on a card (docs/06). Idempotent on (cardId, url). */
 export interface ReferenceView {
   id: string;
@@ -491,6 +521,7 @@ export interface BoardStub {
   markNotificationRead(seq: number): Promise<Result<{ ok: true }>>;
   registerPushConfig(input: PushConfigInput): Promise<Result<{ configId: string }>>;
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
+  pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
   setGithubConfig(input: { secret?: string; issueTrigger?: boolean }): Promise<Result<{ ok: true }>>;
@@ -2088,7 +2119,7 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);
-    this.notifyGatePending(id, cardId, stageKey, returnStageKey, producedBy);
+    this.notifyGatePending(id);
     return id;
   }
 
@@ -2301,41 +2332,34 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
-   * Queue `gate.pending` deliveries for a gate that just opened (docs/05 §4).
+   * The body a gate travels in, built once from the gate's own row.
    *
-   * **Fan-out is by subscription only** — deliberately unlike
-   * `notifyWorkAvailable`, and this is the one thing about this method worth
-   * reading twice. `work.available` is addressed to whoever could *claim* the
-   * stage, so it matches on capability. A gate is addressed to the card's
-   * **owner**, a human. Copying the capability match would send approval
-   * requests to whichever agents happen to advertise the review stage's
-   * capability — and, because a review stage is human-owned, to nobody at all.
-   *
-   * The body carries what a projection needs to render a question without a
-   * second round trip: the card's title, the stage, who produced the work, and
-   * the options. `producedBy` is included because it is the subject of the
+   * It carries what a projection needs to render a question without a second
+   * round trip: the card's title, the stage, who produced the work, and the
+   * options. `producedBy` is included because it is the subject of the
    * separation-of-duties check at resolution.
+   *
+   * Read from the row rather than from `DEFAULT_GATE_OPTIONS` so that a gate
+   * keeps the options it opened with. They are the same today; a gate whose
+   * wording changed under it after the fact would be a question answered
+   * against a different set than the one it was asked with.
+   *
+   * `null` when the card is gone — a gate whose card was deleted has nothing
+   * to ask about.
    */
-  private notifyGatePending(
-    gateId: string,
-    cardId: string,
-    stageKey: string,
-    returnStageKey: string,
-    producedBy: string,
-  ): void {
+  private gatePendingBody(gate: Row): GatePendingBody | null {
+    const cardId = gate.card_id as string;
     const card = this.getCard(cardId);
-    if (!card) return;
-    const boardId = this.getMeta('boardId');
-    const ts = this.now();
-    const body = JSON.stringify({
+    if (!card) return null;
+    return {
       event: 'gate.pending',
-      boardId,
+      boardId: this.getMeta('boardId'),
       cardId,
-      gateId,
-      stageKey,
-      returnStageKey,
+      gateId: gate.id as string,
+      stageKey: gate.stage_key as string,
+      returnStageKey: gate.return_stage_key as string,
       cardTitle: card.title,
-      producedBy,
+      producedBy: gate.produced_by as string,
       // What the reviewer is being asked to approve.
       //
       // Without it a gate asks someone to approve work they cannot see, and
@@ -2346,9 +2370,57 @@ export class BoardDO extends DurableObject<Env> {
       // `id`/`label`, not `name`/`title`: the wire names are pinned by
       // agentpod fixtures/ecosystem-identity/matrix_gate_events.json, which
       // three repos validate against. The board's own vocabulary stops here.
-      options: DEFAULT_GATE_OPTIONS.map((o) => ({ id: o.name, label: o.title })),
-      ts,
-    });
+      options: (JSON.parse(gate.options_json as string) as GateOption[]).map((o) => ({
+        id: o.name,
+        label: o.title,
+      })),
+      ts: gate.created_at as string,
+    };
+  }
+
+  /** The gate row, or null. */
+  private getGateRow(gateId: string): Row | null {
+    return (this.sql.exec(`SELECT * FROM gates WHERE id = ?`, gateId).toArray()[0] as Row) ?? null;
+  }
+
+  /**
+   * Every gate still waiting on a human, in the body a push carries.
+   *
+   * The floor beneath push. kaambaan retries a delivery five times and then
+   * dead-letters it, at which point the gate is silent: the card is blocked on
+   * an approval nobody was told about, and neither side is looking. This is
+   * what lets the hub ask independently rather than wait to be told.
+   *
+   * Deliberately not the board snapshot, which carries the same gates and is a
+   * human route. See `test/gate-sweep.test.ts` for why that distinction is the
+   * reason this method exists.
+   */
+  async pendingGateDeliveries(): Promise<GatePendingBody[]> {
+    return this.sql
+      .exec(`SELECT * FROM gates WHERE status = 'pending' ORDER BY created_at ASC`)
+      .toArray()
+      .map((r) => this.gatePendingBody(r as Row))
+      .filter((b): b is GatePendingBody => b !== null);
+  }
+
+  /**
+   * Queue `gate.pending` deliveries for a gate that just opened (docs/05 §4).
+   *
+   * **Fan-out is by subscription only** — deliberately unlike
+   * `notifyWorkAvailable`, and this is the one thing about this method worth
+   * reading twice. `work.available` is addressed to whoever could *claim* the
+   * stage, so it matches on capability. A gate is addressed to the card's
+   * **owner**, a human. Copying the capability match would send approval
+   * requests to whichever agents happen to advertise the review stage's
+   * capability — and, because a review stage is human-owned, to nobody at all.
+   */
+  private notifyGatePending(gateId: string): void {
+    const gate = this.getGateRow(gateId);
+    if (!gate) return;
+    const payload = this.gatePendingBody(gate);
+    if (!payload) return;
+    const body = JSON.stringify(payload);
+    const ts = this.now();
     for (const cfg of this.sql.exec(`SELECT * FROM push_configs`).toArray()) {
       const events = JSON.parse(cfg.events_json as string) as string[];
       if (!events.includes('gate.pending')) continue;

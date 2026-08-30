@@ -152,7 +152,14 @@ export default {
 
     // Resolve the caller by route type: agent routes carry a token; the GitHub webhook
     // self-authenticates (HMAC) and carries ?tenant=; everything else is a human (session cookie).
-    const isAgentRoute = !!boardId && (rest === 'claims' || rest.startsWith('runs/'));
+    // `gates/pending` joins `claims` and `runs/*` as an agent route. It is a
+    // read that names nobody and carries no authority — the widening is one
+    // GET, not the surface. The alternative was for agentpod's bridge to mint
+    // an assertion for a human on a timer so it could use the human-routed
+    // board snapshot, which would make "a service may speak as a person" a
+    // background job rather than the carrying of an answer that person gave.
+    const isAgentRoute =
+      !!boardId && (rest === 'claims' || rest.startsWith('runs/') || rest === 'gates/pending');
     const isWebhook = !!boardId && rest === 'webhooks/github';
     let tenantId: string;
     let user: UserPrincipal | null = null;
@@ -489,6 +496,16 @@ export default {
           default:
             return Response.json({ error: `unknown run action: ${action}` }, { status: 404 });
         }
+      }
+
+      // GET /v1/boards/:id/gates/pending — every gate still waiting on a human.
+      //
+      // The read half of the hub's reconciliation sweep (`charter →
+      // decisions/2026-08-30-a-gate-closes-over-chat.md` §5). Push carries a
+      // gate when it opens and dead-letters after five attempts; this is how a
+      // gate that was never delivered is found rather than waited for.
+      if (rest === 'gates/pending' && request.method === 'GET') {
+        return Response.json({ gates: await stub.pendingGateDeliveries() });
       }
 
       // POST /v1/boards/:id/gates/:gateId/resolve — the signed-in human resolves an approval gate (docs/08 §6)

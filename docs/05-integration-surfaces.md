@@ -214,10 +214,21 @@ refuses an answer from the agent that asked (`403 SEPARATION_OF_DUTIES`) on ever
 rule that stops the producer of a gate approving it.
 
 Agent tokens authorize the **agent routes only** — `POST /v1/boards/:id/claims`,
-`GET /v1/boards/:id/runs/:runId` and `POST /v1/boards/:id/runs/:runId/:action`. Board/card
+`GET /v1/boards/:id/runs/:runId`, `POST /v1/boards/:id/runs/:runId/:action` and
+`GET /v1/boards/:id/gates/pending`. Board/card
 administration is a human surface behind a session cookie, and a session cookie is *not* a
 credential on the agent routes (a human moves work by moving a card or resolving a gate, never by
 driving someone's run).
+
+`gates/pending` is the one agent route that is **board-scoped rather than run-scoped**, and the
+widening is deliberate. It exists for agentpod's reconciliation sweep (`charter →
+decisions/2026-08-30-a-gate-closes-over-chat.md` §5): a `gate.pending` push retries five times and
+then dead-letters, and a gate nobody was told about blocks a card indefinitely with neither side
+looking. The board snapshot carries the same gates and is a human route — reaching it would have
+meant the bridge minting an assertion for a person on a timer, which is a much larger thing to
+allow than a read. It names no one, carries no authority, and resolves nothing: **an agent that can
+see a gate still cannot answer one**, which stays a human decision behind the session cookie or a
+hub-issued assertion for a real person.
 
 Within the tenant, a token reaches **its own runs**: the authenticated agent is compared against
 `run.agentId` on every run verb and on the run read ([04 §1](./04-agent-contract.md)), so
@@ -227,7 +238,8 @@ the MCP tools pass the token's agent into the same Board DO methods.
 
 ### The agent read surface
 
-`GET /v1/boards/:boardId/runs/:runId` is the whole of what an agent may read:
+`GET /v1/boards/:boardId/runs/:runId` is the whole of what an agent may read **about work** —
+`gates/pending` above is the only other read, and it is about approvals rather than runs:
 
 ```jsonc
 {
