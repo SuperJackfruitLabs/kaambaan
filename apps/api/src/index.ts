@@ -423,6 +423,7 @@ export default {
           capabilities: agent!.capabilities ?? payload.capabilities ?? [],
           maxConcurrency: payload.maxConcurrency,
           profileKey: payload.profileKey,
+          principalId: agent!.externalId,
         });
         return Response.json(claimResult);
       }

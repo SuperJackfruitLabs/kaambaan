@@ -35,7 +35,9 @@ export async function resolveMcpAuth(request: Request, env: Env): Promise<McpAut
   const token = match ? match[1]!.trim() : null;
   if (token && token.startsWith('kbn_')) {
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
-    return found ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities } : null;
+    return found
+      ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: found.externalId }
+      : null;
   }
   if (env.DEV_AUTH === 'true') return resolveBearer(request);
   return null;

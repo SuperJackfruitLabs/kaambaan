@@ -38,6 +38,13 @@ export interface AgentPrincipal {
   agentId: string | null;
   /** From the token's agent (catalog); null in dev where capabilities come from the request body. */
   capabilities: string[] | null;
+  /**
+   * The agent's mapped suite principal id (`agents.external_id`), already known from the same
+   * catalog row a `kbn_` token resolves. **Absent** (not `null`) when this auth path never looked
+   * it up — the dev-header path, which carries no DB-backed identity at all — so a consumer can
+   * tell "resolved, and there is none" from "not resolved here, look it up yourself".
+   */
+  externalId?: string | null;
 }
 
 function devAuth(env: Env): boolean {
@@ -73,7 +80,9 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
   const token = bearer(request);
   if (token && token.startsWith('kbn_')) {
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
-    return found ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities } : null;
+    return found
+      ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: found.externalId }
+      : null;
   }
   if (devAuth(env)) {
     // Dev: the tenant (X-Tenant-Id) locates the board DO; X-Agent-Id identifies the agent. Sending

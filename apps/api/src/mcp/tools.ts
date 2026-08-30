@@ -18,6 +18,12 @@ export interface McpAuth {
   tenantId: string;
   agentId: string;
   capabilities: string[];
+  /**
+   * The agent's mapped suite principal id (`agents.external_id`), already known from the same
+   * catalog row the `kbn_` token resolved against. Absent when this auth path never looked it up
+   * (the dev bearer) — see `AgentPrincipal.externalId` in `auth/resolve.ts`, which this mirrors.
+   */
+  externalId?: string | null;
 }
 
 export interface ToolDeps {
@@ -80,6 +86,7 @@ export function registerKaambaanTools(server: McpServer, deps: ToolDeps): void {
         agentId: auth.agentId,
         capabilities: auth.capabilities,
         maxConcurrency,
+        principalId: auth.externalId,
       });
       return ok(claim);
     },

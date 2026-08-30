@@ -212,21 +212,34 @@ export async function createAgentToken(db: D1Database, tenantId: string, agentId
   return { id, token };
 }
 
-/** Resolve a presented bearer token (by hash) to its agent + tenant + capabilities. */
+/**
+ * Resolve a presented bearer token (by hash) to its agent + tenant + capabilities.
+ *
+ * Also returns `externalId` — the agent's mapped suite principal id, if any — straight off the
+ * same JOIN this already runs against `agents`. A caller that needs the principal id (the claim
+ * route, so it can match a grant by equality) gets it here instead of issuing a second D1 read
+ * for a row this query already fetched.
+ */
 export async function findAgentByTokenHash(
   db: D1Database,
   hash: string,
-): Promise<{ tenantId: string; agentId: string; scopes: string[]; capabilities: string[] } | null> {
+): Promise<{ tenantId: string; agentId: string; scopes: string[]; capabilities: string[]; externalId: string | null } | null> {
   const row = await db
     .prepare(
-      `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps
+      `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps, a.external_id AS externalId
        FROM agent_tokens at JOIN agents a ON a.id = at.agent_id
        WHERE at.token_hash = ? AND at.revoked_at IS NULL`,
     )
     .bind(hash)
-    .first<{ tenantId: string; agentId: string; scopes: string; caps: string }>();
+    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null }>();
   if (!row) return null;
-  return { tenantId: row.tenantId, agentId: row.agentId, scopes: JSON.parse(row.scopes), capabilities: JSON.parse(row.caps) };
+  return {
+    tenantId: row.tenantId,
+    agentId: row.agentId,
+    scopes: JSON.parse(row.scopes),
+    capabilities: JSON.parse(row.caps),
+    externalId: row.externalId,
+  };
 }
 
 export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecord[]> {
