@@ -259,6 +259,22 @@
   .drawer-in {
     animation: drawer-in 0.16s ease-out;
   }
+  /* The rail, when it is an overlay on a narrow screen. Slides from the left
+     because that is the edge it lives on — `drawer-in` comes from the right
+     and reusing it would have the panel arrive from the wrong side. */
+  .rail-in {
+    animation: rail-in 0.16s ease-out;
+  }
+  @keyframes rail-in {
+    from {
+      transform: translateX(-12px);
+      opacity: 0.4;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
   @keyframes drawer-in {
     from {
       transform: translateX(12px);
@@ -787,6 +803,7 @@
   /* kill all keyframe animations */
   .live-dot,
   .drawer-in,
+  .rail-in,
   .cmdk-box {
     animation: none;
   }

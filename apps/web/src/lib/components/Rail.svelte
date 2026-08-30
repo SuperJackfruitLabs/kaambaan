@@ -6,10 +6,40 @@
     await logout();
     location.reload();
   }
+
+  /**
+   * Escape closes the rail, but only when it is an overlay.
+   *
+   * At desktop widths the rail is not dismissable, so swallowing Escape there
+   * would take the key away from the command palette and the card drawer for
+   * no gain.
+   */
+  function onKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && app.railOpen) app.closeRail();
+  }
 </script>
 
+<svelte:window onkeydown={onKeydown} />
+
+<!--
+  Below `md` the rail is an overlay with a scrim; at `md` and above it is the
+  column it has always been. One element serves both, via `max-md:` variants,
+  rather than two copies of the same markup that would drift.
+-->
+{#if app.railOpen}
+  <button
+    class="fixed inset-0 z-40 bg-black/55 md:hidden"
+    onclick={() => app.closeRail()}
+    aria-label="Close navigation"
+    tabindex="-1"
+  ></button>
+{/if}
+
 <nav
-  class="bg-surface border-border flex h-screen w-[208px] shrink-0 flex-col border-r"
+  class="bg-surface border-border h-screen w-[208px] shrink-0 flex-col border-r
+    md:flex
+    max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:shadow-2xl
+    {app.railOpen ? 'max-md:rail-in max-md:flex' : 'max-md:hidden'}"
   aria-label="Main navigation"
 >
   <!-- Wordmark -->

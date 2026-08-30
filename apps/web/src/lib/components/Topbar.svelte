@@ -123,6 +123,20 @@
 <header class="border-border bg-surface/80 flex flex-col border-b backdrop-blur-sm">
   <!-- Main topbar row -->
   <div class="flex items-center gap-3 px-4 py-2.5">
+    <!--
+      The way back to navigation on a phone. `md:hidden` because above that
+      the rail is always on screen and a button to reveal it would do nothing.
+    -->
+    <button
+      onclick={() => app.toggleRail()}
+      class="text-muted-foreground hover:text-foreground -ml-1 shrink-0 md:hidden"
+      aria-label="Navigation"
+      aria-expanded={app.railOpen}
+    >
+      <svg class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M4 7h16M4 12h16M4 17h16" />
+      </svg>
+    </button>
     <!-- Board name / switcher -->
     <div class="relative flex-1 min-w-0">
       <button
