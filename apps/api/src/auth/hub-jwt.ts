@@ -23,6 +23,24 @@ import { createLocalJWKSet, jwtVerify, type JSONWebKeySet, type JWTPayload } fro
 
 /** The claims kaambaan reads. Names pinned by agentpod fixtures/ecosystem-identity/token_claims.json. */
 export interface HubClaims extends JWTPayload {
+  /**
+   * Present when a SERVICE minted this token while asserting a principal who
+   * was not present to sign in — RFC 8693's actor claim. `sub` is still the
+   * human; `act.sub` is who spoke for them.
+   *
+   * Today that is AgentPod's Application Service resolving an approval gate on
+   * behalf of whoever tapped a button in a Matrix room, which
+   * `charter → decisions/2026-08-14-approvals-cross-planes-as-events.md`
+   * requires to arrive as the human rather than as the bridge.
+   *
+   * **Carries no authority.** Nothing here may grant more because it is present
+   * or less because it is absent — the claims beside it are built by the same
+   * code path a session token uses, so an assertion can never carry reach the
+   * person's own token would not. It is here to be *recorded*: an audit that
+   * cannot tell "she approved it" from "the bridge approved it for her" has
+   * lost the distinction the separation-of-duties check exists to protect.
+   */
+  act?: { sub?: string };
   sub: string;
   /** What kind of principal `sub` names. */
   principalKind: 'human' | 'agent' | 'service';
