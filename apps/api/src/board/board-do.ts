@@ -33,6 +33,54 @@ const MAX_PUSH_ATTEMPTS = 5;
  */
 const PUSH_DRAIN_BASE_MS = 5_000;
 
+/**
+ * How much of the previous stage's handoff a gate carries into a room.
+ *
+ * A room is not a document store, and supermessage caps a custom event's
+ * content at 8 KiB before a renderer ever sees it — so this is cut somewhere
+ * regardless. Better to cut it deliberately here, where the whole value is
+ * still in hand, than to have a client truncate a blob it cannot interpret.
+ */
+const HANDOFF_SUMMARY_MAX_CHARS = 600;
+
+/**
+ * The part of a handoff worth showing a reviewer.
+ *
+ * A handoff is arbitrary JSON — whatever the previous stage chose to hand
+ * forward. Agents overwhelmingly put the readable part under `summary` or
+ * `output`, so those are preferred; anything else is compacted so the reviewer
+ * at least sees the shape rather than nothing.
+ *
+ * Returns null rather than "{}" for an empty handoff: a card carrying nothing
+ * should show no summary row at all, not an empty one that reads like a bug.
+ */
+export function handoffSummary(raw: string | null): string | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Not JSON at all. Show it anyway — it is still what was handed forward.
+    parsed = raw;
+  }
+  let text: string;
+  if (typeof parsed === 'string') {
+    text = parsed;
+  } else if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const o = parsed as Record<string, unknown>;
+    const preferred = [o.summary, o.output, o.result, o.text].find((v) => typeof v === 'string' && v.trim() !== '');
+    text = typeof preferred === 'string' ? preferred : JSON.stringify(o);
+    if (text === '{}') return null;
+  } else {
+    text = JSON.stringify(parsed);
+  }
+  text = text.trim();
+  if (text === '') return null;
+  return text.length > HANDOFF_SUMMARY_MAX_CHARS
+    ? text.slice(0, HANDOFF_SUMMARY_MAX_CHARS - 1) + '…'
+    : text;
+}
+
 /** The decisions a human can take at an approval gate (docs/08 §6). */
 const DEFAULT_GATE_OPTIONS: GateOption[] = [
   { name: 'approve', title: 'Approve' },
@@ -2288,6 +2336,13 @@ export class BoardDO extends DurableObject<Env> {
       returnStageKey,
       cardTitle: card.title,
       producedBy,
+      // What the reviewer is being asked to approve.
+      //
+      // Without it a gate asks someone to approve work they cannot see, and
+      // the only way to read it is to leave for the board. That was the state
+      // for a day (supermessage#37) because every test asserted the gate's
+      // SHAPE rather than whether a human could act on one.
+      handoffSummary: handoffSummary(this.getCardHandoffJson(cardId)),
       // `id`/`label`, not `name`/`title`: the wire names are pinned by
       // agentpod fixtures/ecosystem-identity/matrix_gate_events.json, which
       // three repos validate against. The board's own vocabulary stops here.

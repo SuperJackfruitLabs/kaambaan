@@ -13,7 +13,7 @@
  */
 import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
-import { BoardDO, type BoardInit } from '../src/board/board-do';
+import { BoardDO, handoffSummary, type BoardInit } from '../src/board/board-do';
 
 const REVIEW_PIPELINE: BoardInit['stages'] = [
   { key: 'research', name: 'Research', order: 0, ownerKind: 'capability', owner: 'research' },
@@ -38,6 +38,39 @@ async function openGate(board: BoardDO, boardId: string): Promise<string> {
   return card.value.id;
 }
 
+describe('what a reviewer is shown', () => {
+  // supermessage#37: a gate asked someone to approve work they could not see.
+  it('prefers the readable field an agent actually writes', () => {
+    expect(handoffSummary(JSON.stringify({ summary: 'Wrote the haiku.' }))).toBe('Wrote the haiku.');
+    expect(handoffSummary(JSON.stringify({ output: 'Three lines.' }))).toBe('Three lines.');
+  });
+
+  it('falls back to the shape rather than showing nothing', () => {
+    // A reviewer seeing `{"files":2}` at least knows something was handed
+    // forward. Showing nothing reads as a card that failed to load.
+    expect(handoffSummary(JSON.stringify({ files: 2 }))).toBe('{"files":2}');
+  });
+
+  it('shows a plain string handoff as itself', () => {
+    expect(handoffSummary('"just text"')).toBe('just text');
+    // Not JSON at all is still what was handed forward.
+    expect(handoffSummary('bare text')).toBe('bare text');
+  });
+
+  it('returns null for nothing, rather than an empty row that reads like a bug', () => {
+    expect(handoffSummary(null)).toBeNull();
+    expect(handoffSummary('{}')).toBeNull();
+    expect(handoffSummary('"   "')).toBeNull();
+  });
+
+  it('truncates rather than letting a room become a document store', () => {
+    const long = JSON.stringify({ summary: 'x'.repeat(2000) });
+    const out = handoffSummary(long)!;
+    expect(out.length).toBe(600);
+    expect(out.endsWith('…')).toBe(true);
+  });
+});
+
 describe('BoardDO — gate.pending (charter 2026-08-30)', () => {
   it('queues a delivery carrying everything a projection needs', async () => {
     await runInDurableObject(stubFor('gp-queue'), async (board: BoardDO) => {
@@ -59,6 +92,8 @@ describe('BoardDO — gate.pending (charter 2026-08-30)', () => {
         producedBy: 'agt_r',
       });
       expect(body.gateId).toMatch(/^gate_/);
+      // What the reviewer is being asked to approve — see supermessage#37.
+      expect(body.handoffSummary).toBe('drafted');
     });
   });
 
