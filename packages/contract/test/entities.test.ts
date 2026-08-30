@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Board, Card, Reference, Tenant } from '../src';
+import { Agent, Board, Card, Reference, Tenant } from '../src';
 
 describe('entity schemas', () => {
   it('parses a board with a pipeline and applies stage defaults', () => {
@@ -105,5 +105,47 @@ describe('tenant external mapping', () => {
   it('rejects an empty string as a stand-in for either half', () => {
     expect(Tenant.safeParse({ ...base, externalId: '', externalSource: 'agentpod' }).success).toBe(false);
     expect(Tenant.safeParse({ ...base, externalId: 'org_1', externalSource: '' }).success).toBe(false);
+  });
+});
+
+/**
+ * An agent maps to a suite principal the same way a tenant maps to a real organisation:
+ * `externalId` + `externalSource`, all-or-nothing (apps/api/migrations/0003_agent_external_mapping.sql).
+ * `kbn_`, the agent's bearer token, is untouched by any of this — it is a separate, permanent
+ * credential (charter decisions/2026-08-30-an-agent-is-a-principal.md §5).
+ */
+describe('agent external mapping', () => {
+  const base = {
+    id: 'agt_abc123',
+    tenantId: 'tnt_abc123',
+    name: 'Forge',
+    createdAt: '2026-06-20T10:00:00.000Z',
+  };
+
+  it('a freshly registered agent carries no external mapping', () => {
+    const a = Agent.parse(base);
+    expect(a.externalId).toBeUndefined();
+    expect(a.externalSource).toBeUndefined();
+  });
+
+  it('accepts an explicit absence on both halves', () => {
+    expect(Agent.safeParse({ ...base, externalId: null, externalSource: null }).success).toBe(true);
+  });
+
+  it('accepts both halves together', () => {
+    const a = Agent.parse({ ...base, externalId: 'prn_0123456789abcdef0123', externalSource: 'org-plane' });
+    expect(a.externalSource).toBe('org-plane');
+  });
+
+  it('rejects half a mapping, either half missing the other', () => {
+    expect(Agent.safeParse({ ...base, externalId: 'prn_1' }).success).toBe(false);
+    expect(Agent.safeParse({ ...base, externalSource: 'org-plane' }).success).toBe(false);
+    expect(Agent.safeParse({ ...base, externalId: 'prn_1', externalSource: null }).success).toBe(false);
+    expect(Agent.safeParse({ ...base, externalSource: 'org-plane', externalId: null }).success).toBe(false);
+  });
+
+  it('rejects an empty string as a stand-in for either half', () => {
+    expect(Agent.safeParse({ ...base, externalId: '', externalSource: 'org-plane' }).success).toBe(false);
+    expect(Agent.safeParse({ ...base, externalId: 'prn_1', externalSource: '' }).success).toBe(false);
   });
 });

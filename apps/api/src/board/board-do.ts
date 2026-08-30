@@ -1570,6 +1570,20 @@ export class BoardDO extends DurableObject<Env> {
 
   // ----- RPC: agent contract (docs/04) -----
 
+  /**
+   * The suite principal id this local agent maps to (`agents.external_id`), or `null` if it has
+   * never been linked to one. A grant enumerates principal ids
+   * (charter decisions/2026-08-30-an-agent-is-a-principal.md §3/§5), not kaambaan's local
+   * `agt_…` ids — no external token has ever heard of the latter — so this is the id
+   * `grantPermitsAgent` actually needs to compare against.
+   */
+  private async principalIdFor(agentId: string): Promise<string | null> {
+    const row = await this.env.DB.prepare(`SELECT external_id FROM agents WHERE id = ?`)
+      .bind(agentId)
+      .first<{ external_id: string | null }>();
+    return row?.external_id ?? null;
+  }
+
   /** Atomically hand a ready, capability-matched card to an agent, within its concurrency limit. */
   async claim(input: {
     agentId: string;
@@ -1616,7 +1630,8 @@ export class BoardDO extends DurableObject<Env> {
     // `submitted`, so this is evaluated once and not on every poll.
     if (isControlPairEnforced(this.env)) {
       const grant = row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null;
-      if (!grantPermitsAgent(grant, input.agentId)) {
+      const principalId = await this.principalIdFor(input.agentId);
+      if (!grantPermitsAgent(grant, principalId)) {
         const why = grant
           ? `the operator who queued this card may not dispatch ${input.agentId}`
           : 'this card was queued without an authorising token, so no one with permission asked for it to run';

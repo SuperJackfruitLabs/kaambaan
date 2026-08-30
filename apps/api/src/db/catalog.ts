@@ -36,11 +36,28 @@ export class ExternalMappingError extends Error {
   }
 }
 
+/**
+ * A registered kaambaan agent — always addressable by its native `agt_…` id and `kbn_` bearer
+ * token, which are permanent regardless of the external pair below.
+ *
+ * The external pair optionally records that this same agent is also known as a suite principal
+ * elsewhere: `externalSource` names the system (`'org-plane'`, once one exists), `externalId` is
+ * that system's id for it (a `prn_…`, opaque here — see `setAgentExternalMapping` and
+ * migrations/0003_agent_external_mapping.sql). Exactly the pair `tenants` already carries.
+ */
 export interface AgentRecord {
   id: string;
   tenantId: string;
   name: string;
   capabilities: string[];
+  externalId: string | null;
+  externalSource: string | null;
+}
+
+/** Where an agent is also known, as a suite principal outside kaambaan. */
+export interface AgentExternalMapping {
+  externalId: string;
+  externalSource: string;
 }
 
 function slugify(s: string): string {
@@ -126,7 +143,62 @@ export async function createAgent(db: D1Database, tenantId: string, input: { nam
   const id = newId('agt');
   const capabilities = input.capabilities ?? [];
   await db.prepare(`INSERT INTO agents (id, tenant_id, name, capabilities_json) VALUES (?, ?, ?, ?)`).bind(id, tenantId, input.name, JSON.stringify(capabilities)).run();
-  return { id, tenantId, name: input.name, capabilities };
+  // No external mapping: a freshly registered agent answers to nothing outside kaambaan, and
+  // that is a complete agent. A mapping is recorded later, by whoever links it to a principal.
+  return { id, tenantId, name: input.name, capabilities, externalId: null, externalSource: null };
+}
+
+/**
+ * Record (or clear, with `null`) where this agent is also known, as a suite principal, outside
+ * kaambaan. Mirrors `setTenantExternalMapping` exactly — same all-or-nothing guard, same
+ * database-enforced CHECK (`agents_external_pair`, migration 0003) backing it up.
+ *
+ * Nothing calls this yet — the shape is reserved ahead of its first writer, which is the only
+ * moment it is free to get right. It changes no existing behaviour: an agent with no mapping is
+ * exactly the agent kaambaan has today.
+ */
+export async function setAgentExternalMapping(
+  db: D1Database,
+  agentId: string,
+  mapping: AgentExternalMapping | null,
+): Promise<void> {
+  if (mapping !== null) {
+    const { externalId, externalSource } = mapping;
+    if (typeof externalId !== 'string' || externalId.trim() === '') {
+      throw new ExternalMappingError('an external mapping needs an externalId');
+    }
+    if (typeof externalSource !== 'string' || externalSource.trim() === '') {
+      throw new ExternalMappingError('an external mapping needs an externalSource naming whose id it is');
+    }
+  }
+  await db
+    .prepare(`UPDATE agents SET external_id = ?, external_source = ?, updated_at = datetime('now') WHERE id = ?`)
+    .bind(mapping?.externalId ?? null, mapping?.externalSource ?? null, agentId)
+    .run();
+}
+
+/**
+ * Resolve a suite principal id back to the local agent it names.
+ *
+ * The reverse of `setAgentExternalMapping`: given the system and id an outside plane knows this
+ * agent by, find kaambaan's own row for it. `null` for "no local agent maps to that principal" —
+ * the ordinary case for every principal that isn't one of kaambaan's agents.
+ */
+export async function findAgentByExternal(
+  db: D1Database,
+  source: string,
+  externalId: string,
+): Promise<{ tenantId: string; agentId: string; capabilities: string[] } | null> {
+  if (!source || !externalId) return null;
+  const row = await db
+    .prepare(
+      `SELECT tenant_id AS tenantId, id AS agentId, capabilities_json AS caps
+       FROM agents WHERE external_source = ? AND external_id = ?`,
+    )
+    .bind(source, externalId)
+    .first<{ tenantId: string; agentId: string; caps: string }>();
+  if (!row) return null;
+  return { tenantId: row.tenantId, agentId: row.agentId, capabilities: JSON.parse(row.caps) };
 }
 
 /** Mint a per-agent bearer token. The plaintext is returned once; only the hash is stored. */
@@ -159,10 +231,20 @@ export async function findAgentByTokenHash(
 
 export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecord[]> {
   const { results } = await db
-    .prepare(`SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps FROM agents WHERE tenant_id = ? ORDER BY created_at ASC`)
+    .prepare(
+      `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, external_id AS externalId, external_source AS externalSource
+       FROM agents WHERE tenant_id = ? ORDER BY created_at ASC`,
+    )
     .bind(tenantId)
-    .all<{ id: string; tenantId: string; name: string; caps: string }>();
-  return results.map((r) => ({ id: r.id, tenantId: r.tenantId, name: r.name, capabilities: JSON.parse(r.caps) }));
+    .all<{ id: string; tenantId: string; name: string; caps: string; externalId: string | null; externalSource: string | null }>();
+  return results.map((r) => ({
+    id: r.id,
+    tenantId: r.tenantId,
+    name: r.name,
+    capabilities: JSON.parse(r.caps),
+    externalId: r.externalId,
+    externalSource: r.externalSource,
+  }));
 }
 
 /** Index a board in the catalog so a workspace can list its boards (the DO holds the live state). */

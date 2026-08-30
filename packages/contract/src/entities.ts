@@ -98,18 +98,33 @@ export const Board = z.object({
 });
 export type Board = z.infer<typeof Board>;
 
-/** A registered external worker (app-actor, never a human user). */
-export const Agent = z.object({
-  id: AgentId,
-  tenantId: TenantId,
-  name: z.string().min(1),
-  iconUrl: z.string().optional(),
-  capabilities: z.array(z.string()).default([]),
-  connection: z.array(ConnectionType).default(['rest']),
-  concurrency: z.number().int().min(1).default(1),
-  status: AgentStatus.default('offline'),
-  ...timestamps,
-});
+/**
+ * A registered external worker (app-actor, never a human user).
+ *
+ * `externalId` + `externalSource` optionally record that this same agent is also known as a
+ * suite principal elsewhere — exactly the pair `Tenant` already carries, and the pair is
+ * all-or-nothing for the identical reason (charter decisions/2026-08-30-an-agent-is-a-principal.md
+ * §5, migrations/0003_agent_external_mapping.sql). `kbn_` (the agent's bearer token) is a
+ * separate, permanent credential and is untouched by this mapping either way.
+ */
+export const Agent = z
+  .object({
+    id: AgentId,
+    tenantId: TenantId,
+    name: z.string().min(1),
+    iconUrl: z.string().optional(),
+    capabilities: z.array(z.string()).default([]),
+    connection: z.array(ConnectionType).default(['rest']),
+    concurrency: z.number().int().min(1).default(1),
+    status: AgentStatus.default('offline'),
+    externalId: z.string().min(1).nullish(),
+    externalSource: z.string().min(1).nullish(),
+    ...timestamps,
+  })
+  .refine((a) => (a.externalId == null) === (a.externalSource == null), {
+    message: 'externalId and externalSource must be set together, or not at all',
+    path: ['externalSource'],
+  });
 export type Agent = z.infer<typeof Agent>;
 
 /** First-class external link (docs/06). Idempotent on (cardId, url). */

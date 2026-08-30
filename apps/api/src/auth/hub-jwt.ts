@@ -47,9 +47,12 @@ export interface HubClaims extends JWTPayload {
   /** AgentPod's isolation boundary — `fleet_…`, NOT one of ours. */
   tenant: string;
   /**
-   * The control pair's first half, namespaced per plane. Present and possibly
-   * empty from an issuer that speaks it; ABSENT from one that does not, and the
-   * difference matters — absent must not be read as "permitted nothing".
+   * The control pair's first half — bare `prn_…` principal ids, matched by
+   * EQUALITY (charter decisions/2026-08-30-an-agent-is-a-principal.md §3; the
+   * namespaced, pattern-matched form this used to carry was deleted, not
+   * deprecated). Present and possibly empty from an issuer that speaks it;
+   * ABSENT from one that does not, and the difference matters — absent must
+   * not be read as "permitted nothing".
    */
   mayDispatch?: string[];
   mayGrantReach?: boolean;
