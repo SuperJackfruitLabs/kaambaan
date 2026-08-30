@@ -121,7 +121,20 @@ class AppStore {
   }
 
   // ---- actions ----
-  async init(): Promise<void> {
+  /**
+   * Boot the board.
+   *
+   * `preferred` is what the URL asked for. **It wins over the remembered
+   * board**, and that ordering is the whole point of addressable cards: a link
+   * someone was sent has to open what it names, not whatever board they
+   * happened to have open last. Getting this the other way round produces a
+   * link that appears to work — it loads a board — while showing the wrong one.
+   *
+   * A preferred board that does not resolve falls back to the remembered one
+   * rather than erroring. Stale links are the normal case: a gate lives in a
+   * Matrix room forever, and the board it names can be deleted long after.
+   */
+  async init(preferred?: { boardId?: string | null; cardId?: string | null }): Promise<void> {
     this.initTheme();
     try {
       this.user = await getMe();
@@ -130,13 +143,28 @@ class AppStore {
         return;
       }
       this.authState = 'ready';
-      let id = localStorage.getItem(BOARD_KEY);
-      if (id) {
+
+      let id: string | null = null;
+      if (preferred?.boardId) {
         try {
-          await getBoard(id);
+          await getBoard(preferred.boardId);
+          id = preferred.boardId;
         } catch {
+          // Deleted, or another tenant's — the API answers 404 to both, by
+          // construction, so this cannot tell them apart and must not try.
           id = null;
-          localStorage.removeItem(BOARD_KEY);
+        }
+      }
+
+      if (!id) {
+        id = localStorage.getItem(BOARD_KEY);
+        if (id) {
+          try {
+            await getBoard(id);
+          } catch {
+            id = null;
+            localStorage.removeItem(BOARD_KEY);
+          }
         }
       }
       if (!id) {
@@ -148,6 +176,15 @@ class AppStore {
         return;
       }
       await this.openBoard(id);
+
+      // Only after the board is loaded, and only if the card is really on it.
+      // A drawer opened on a card the snapshot does not contain renders empty,
+      // which reads as a broken card rather than a stale link.
+      if (preferred?.cardId && id === preferred.boardId) {
+        this.openCardId = this.board?.cards.some((c) => c.id === preferred.cardId)
+          ? preferred.cardId
+          : null;
+      }
     } catch (e) {
       this.error = String(e);
     }
