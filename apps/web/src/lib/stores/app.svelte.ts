@@ -70,6 +70,18 @@ class AppStore {
 
   // overlays
   openCardId = $state<string | null>(null);
+  /**
+   * Whether the navigation rail is showing on a narrow screen.
+   *
+   * Only meaningful below `md`, where the rail is an overlay. At desktop
+   * widths it is always visible and this is ignored — the alternative was a
+   * second piece of state meaning "collapsed on desktop", which is a different
+   * feature nobody asked for.
+   *
+   * Lives here rather than inside `Rail.svelte` because more than the rail
+   * closes it: choosing a screen does, and so should anything that navigates.
+   */
+  railOpen = $state(false);
   cmdkOpen = $state(false);
 
   #socket: WebSocket | undefined;
@@ -289,6 +301,17 @@ class AppStore {
   }
   setScreen(s: Screen): void {
     this.screen = s;
+    // A nav rail that stays open over the thing you just navigated to is the
+    // most common version of this bug, so choosing a screen closes it.
+    this.railOpen = false;
+  }
+
+  toggleRail(): void {
+    this.railOpen = !this.railOpen;
+  }
+
+  closeRail(): void {
+    this.railOpen = false;
   }
   /** Mirror the theme the inline app.html script already applied to <html> into reactive state. */
   initTheme(): void {
