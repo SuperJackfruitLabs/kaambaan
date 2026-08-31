@@ -114,7 +114,7 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
  * exactly the kind of drift `charter`'s README warns about, a claim about code
  * kept somewhere the code cannot contradict it.
  *
- * Two refusals worth naming, because both fail closed:
+ * Three refusals worth naming, because all three fail closed:
  *
  *   - **No issuer configured** → no hub-token path at all. A standalone board
  *     must work with no issuer anywhere, and an unset issuer must never mean
@@ -124,6 +124,12 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
  *     product mints the other's ids. With no mapping there is no tenant to act
  *     in, and falling back to a default would hand one board's data to a token
  *     that never named it.
+ *   - **A verified token whose `principalKind` is not `"human"`** → refused. Since
+ *     `charter → decisions/2026-08-30-an-agent-is-a-principal.md` a node can exchange its own
+ *     credential for a token naming a station's agent principal, so "a valid hub token" and
+ *     "a person" stopped being the same thing. `resolveHubAgent` refuses the converse for the
+ *     same reason and says so in the same words: one plane's credential must not double as the
+ *     other kind just because it verifies.
  */
 export async function resolveHubUser(request: Request, env: Env): Promise<UserPrincipal | null> {
   const issuer = env.HUB_ISSUER;
@@ -136,6 +142,12 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
 
   const claims = await verifyHubToken(token, { issuer });
   if (!claims) return null;
+  // An agent's token must never double as a human credential — the exact mirror of the refusal
+  // `resolveHubAgent` has always made in the other direction, and the more dangerous half now
+  // that a node can mint an agent-kind token for any station it hosts. Anything that is not a
+  // human (`agent`, `service`, or a kind this issuer has yet to invent) fails closed here,
+  // because this function is `index.ts`'s fallback for EVERY non-agent route and method.
+  if (claims.principalKind !== 'human') return null;
 
   const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
   if (!tenantId) return null;
