@@ -35,7 +35,7 @@ import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, agentBelongsToTenant } from './db/catalog';
 
 export { BoardDO };
 
@@ -141,6 +141,35 @@ export default {
         if (request.method === 'DELETE') {
           await deleteAgent(env.DB, u.tenantId, agentId);
           return new Response(null, { status: 204 });
+        }
+        // PATCH links (or clears) this agent's suite principal (charter
+        // decisions/2026-08-30-an-agent-is-a-principal.md §5): `{ externalId: "prn_…" }` to link,
+        // `{ externalId: null }` to clear. `setAgentExternalMapping` has existed since an earlier
+        // task with no caller — this is that caller. It is what lets `resolveHubAgent` turn an
+        // agent-kind hub token into a local agent; with no mapping there is nothing for that
+        // resolver to find, and NULL stays the normal state for a standalone board.
+        if (request.method === 'PATCH') {
+          // `setAgentExternalMapping` itself matches by agentId alone (mirroring the read side,
+          // `findAgentByExternal`) — this is the tenant check that keeps a session from one
+          // tenant repointing an agent it does not own.
+          if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
+            return Response.json({ error: 'agent not found' }, { status: 404 });
+          }
+          const body = (await request.json()) as { externalId?: string | null };
+          if (body.externalId === undefined) {
+            return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
+          }
+          if (body.externalId === null) {
+            await setAgentExternalMapping(env.DB, agentId, null);
+            return Response.json({ ok: true });
+          }
+          // Caught here, not left to the CHECK constraint or a downstream join: a typo becomes a
+          // 400 that names the mistake, not a mapping that silently matches nothing.
+          if (!/^prn_[0-9a-f]{20}$/.test(body.externalId)) {
+            return Response.json({ error: 'externalId must look like prn_ followed by 20 lowercase hex characters' }, { status: 400 });
+          }
+          await setAgentExternalMapping(env.DB, agentId, { externalId: body.externalId, externalSource: 'org-plane' });
+          return Response.json({ ok: true });
         }
         return Response.json({ error: 'method not allowed' }, { status: 405 });
       }

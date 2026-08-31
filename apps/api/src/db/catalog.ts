@@ -52,6 +52,13 @@ export interface AgentRecord {
   capabilities: string[];
   externalId: string | null;
   externalSource: string | null;
+  /**
+   * Ids of this agent's active (non-revoked) `kbn_` tokens — what the console needs to offer a
+   * "revoke" action without holding onto the one-time plaintext-mint response. Empty is a real,
+   * complete state (an agent with nothing active cannot authenticate until reconnected), not an
+   * omission.
+   */
+  tokenIds: string[];
 }
 
 /** Where an agent is also known, as a suite principal outside kaambaan. */
@@ -145,7 +152,8 @@ export async function createAgent(db: D1Database, tenantId: string, input: { nam
   await db.prepare(`INSERT INTO agents (id, tenant_id, name, capabilities_json) VALUES (?, ?, ?, ?)`).bind(id, tenantId, input.name, JSON.stringify(capabilities)).run();
   // No external mapping: a freshly registered agent answers to nothing outside kaambaan, and
   // that is a complete agent. A mapping is recorded later, by whoever links it to a principal.
-  return { id, tenantId, name: input.name, capabilities, externalId: null, externalSource: null };
+  // No tokens either — this function mints none; the REST route mints one right after.
+  return { id, tenantId, name: input.name, capabilities, externalId: null, externalSource: null, tokenIds: [] };
 }
 
 /**
@@ -153,9 +161,11 @@ export async function createAgent(db: D1Database, tenantId: string, input: { nam
  * kaambaan. Mirrors `setTenantExternalMapping` exactly — same all-or-nothing guard, same
  * database-enforced CHECK (`agents_external_pair`, migration 0003) backing it up.
  *
- * Nothing calls this yet — the shape is reserved ahead of its first writer, which is the only
- * moment it is free to get right. It changes no existing behaviour: an agent with no mapping is
- * exactly the agent kaambaan has today.
+ * **Corrected 2026-08-31.** This used to say "nothing calls this yet". The one caller is
+ * `PATCH /v1/agents/:id` (index.ts): a human validates the `prn_[0-9a-f]{20}` shape and calls
+ * this. It is what lets `resolveHubAgent` turn an agent-kind hub token into a local agent — until
+ * a mapping is recorded, there is nothing for that resolver to find. It changes no existing
+ * behaviour on its own: an agent nobody has linked is exactly the agent kaambaan has today.
  */
 export async function setAgentExternalMapping(
   db: D1Database,
@@ -264,14 +274,18 @@ export async function findAgentByTokenHash(
   };
 }
 
+// The token ids are a correlated subquery, not a JOIN: an agent with several tokens must not
+// multiply into several rows, and one with none must still list (COALESCE — json_group_array
+// over zero matching rows is NULL, not '[]').
 export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecord[]> {
   const { results } = await db
     .prepare(
-      `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, external_id AS externalId, external_source AS externalSource
-       FROM agents WHERE tenant_id = ? ORDER BY created_at ASC`,
+      `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, external_id AS externalId, external_source AS externalSource,
+              COALESCE((SELECT json_group_array(t.id) FROM agent_tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL), '[]') AS tokenIdsJson
+       FROM agents a WHERE tenant_id = ? ORDER BY created_at ASC`,
     )
     .bind(tenantId)
-    .all<{ id: string; tenantId: string; name: string; caps: string; externalId: string | null; externalSource: string | null }>();
+    .all<{ id: string; tenantId: string; name: string; caps: string; externalId: string | null; externalSource: string | null; tokenIdsJson: string }>();
   return results.map((r) => ({
     id: r.id,
     tenantId: r.tenantId,
@@ -279,6 +293,7 @@ export async function listAgents(db: D1Database, tenantId: string): Promise<Agen
     capabilities: JSON.parse(r.caps),
     externalId: r.externalId,
     externalSource: r.externalSource,
+    tokenIds: JSON.parse(r.tokenIdsJson),
   }));
 }
 
@@ -311,6 +326,18 @@ export async function deleteAgent(db: D1Database, tenantId: string, agentId: str
     db.prepare(`DELETE FROM agent_tokens WHERE tenant_id = ? AND agent_id = ?`).bind(tenantId, agentId),
     db.prepare(`DELETE FROM agents WHERE tenant_id = ? AND id = ?`).bind(tenantId, agentId),
   ]);
+}
+
+/**
+ * Does this agent belong to this tenant? `setAgentExternalMapping` itself is not tenant-scoped
+ * (it matches by `agentId` alone, same as `findAgentByExternal`'s read side) — this is the check
+ * its one caller (`PATCH /v1/agents/:id`) runs first, the same shape `deleteAgent`'s own WHERE
+ * clause enforces. Without it, a signed-in user of one tenant could hand an agent id from a
+ * different tenant and repoint someone else's agent at a principal of their choosing.
+ */
+export async function agentBelongsToTenant(db: D1Database, tenantId: string, agentId: string): Promise<boolean> {
+  const row = await db.prepare(`SELECT 1 FROM agents WHERE id = ? AND tenant_id = ?`).bind(agentId, tenantId).first();
+  return row !== null;
 }
 
 /**
