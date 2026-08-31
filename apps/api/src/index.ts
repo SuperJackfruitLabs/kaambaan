@@ -35,7 +35,7 @@ import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, deleteAgent } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent } from './db/catalog';
 
 export { BoardDO };
 
@@ -102,9 +102,12 @@ export default {
       return handleMcpRequest(request, env, auth);
     }
 
-    // /v1/agents[/:id] — a workspace's agents + token minting (the "connect an agent" surface). The
-    // plaintext token is returned ONCE on create; thereafter only its hash is stored.
-    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+))?$/);
+    // /v1/agents[/:id[/tokens/:tokenId]] — a workspace's agents + token minting (the "connect an
+    // agent" surface) + token revocation, right beside it. The plaintext token is returned ONCE
+    // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
+    // `findAgentByTokenHash` already refuses anything revoked (catalog.ts), so this write is the
+    // whole mechanism.
+    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/tokens\/([^/]+))?)?$/);
     if (agentsMatch) {
       // The first endpoint to accept a hub-issued token
       // (charter decisions/2026-08-15-one-issuer-and-offline-verification.md).
@@ -122,6 +125,18 @@ export default {
       if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
       if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
       const agentId = agentsMatch[1];
+      const tokenId = agentsMatch[2];
+      if (agentId && tokenId) {
+        // Revoking a credential is a HUMAN act, same as minting one: `u` above came ONLY from
+        // `resolveUser` (session cookie or dev headers) — never from a `kbn_` bearer or a hub
+        // token — so an agent can never revoke its own token, or a peer's, to escape an audit
+        // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+        if (request.method === 'DELETE') {
+          await revokeAgentToken(env.DB, u.tenantId, agentId, tokenId);
+          return new Response(null, { status: 204 });
+        }
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      }
       if (agentId) {
         if (request.method === 'DELETE') {
           await deleteAgent(env.DB, u.tenantId, agentId);
@@ -134,8 +149,8 @@ export default {
         const body = (await request.json()) as { name?: string; capabilities?: string[] };
         if (!body.name || body.name.trim() === '') return Response.json({ error: 'name is required' }, { status: 400 });
         const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: body.capabilities ?? [] });
-        const { token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
-        return Response.json({ agent: created, token }, { status: 201 });
+        const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
+        return Response.json({ agent: created, token, tokenId }, { status: 201 });
       }
       return Response.json({ error: 'method not allowed' }, { status: 405 });
     }

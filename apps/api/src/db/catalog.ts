@@ -213,6 +213,28 @@ export async function createAgentToken(db: D1Database, tenantId: string, agentId
 }
 
 /**
+ * Revoke a single per-agent bearer token. The read side already refuses a revoked token
+ * (`findAgentByTokenHash` filters `WHERE at.revoked_at IS NULL`); this is the write it was
+ * waiting on (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+ *
+ * Revocation is per CREDENTIAL, not per agent — an agent with two tokens keeps working on the
+ * one not named here; suspending the agent itself is a separate lever, built elsewhere in this
+ * slice. Tenant- and agent-scoped, like every other write in this file, so one tenant can never
+ * reach into another's tokens by guessing an id.
+ *
+ * Idempotent and silent about absence, deliberately: an operator hitting the button twice, a
+ * retried request, and a token id that never existed (or belongs to someone else) all take the
+ * same `UPDATE … WHERE revoked_at IS NULL` no-op path and return with no error — nothing here
+ * lets a caller distinguish "already revoked" from "never existed" from "not yours".
+ */
+export async function revokeAgentToken(db: D1Database, tenantId: string, agentId: string, tokenId: string): Promise<void> {
+  await db
+    .prepare(`UPDATE agent_tokens SET revoked_at = datetime('now') WHERE id = ? AND tenant_id = ? AND agent_id = ? AND revoked_at IS NULL`)
+    .bind(tokenId, tenantId, agentId)
+    .run();
+}
+
+/**
  * Resolve a presented bearer token (by hash) to its agent + tenant + capabilities.
  *
  * Also returns `externalId` — the agent's mapped suite principal id, if any — straight off the
