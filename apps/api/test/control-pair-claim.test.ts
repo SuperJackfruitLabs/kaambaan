@@ -6,14 +6,18 @@ import { valuePermitsAgent, grantPermitsAgent } from '../src/auth/grant-match';
 /**
  * The control pair, enforced where work is handed out.
  *
- * `charter` → `decisions/2026-08-13-ecosystem-identity.md` Decision 4, and the
- * namespacing from `decisions/2026-08-15-a-grant-names-an-agent-per-plane.md`.
+ * `charter` → `decisions/2026-08-13-ecosystem-identity.md` Decision 4, and, since 2026-08-30,
+ * `decisions/2026-08-30-an-agent-is-a-principal.md` §3: a grant now names bare `prn_…` principal
+ * ids, matched by EQUALITY — no per-plane namespace, no wildcard. The two pattern-matched forms
+ * this suite used to enforce were deleted, not deprecated.
  *
  * The idea being tested: **authority is captured at the moment of the act**. An
  * agent claims work long after a human queued it and the human is not present,
  * so there is no caller to ask "may you dispatch this?". The answer has to have
  * been written down while it was still askable — which is what `queued_grant`
- * is — and the claim checks the recorded answer.
+ * is — and the claim checks the recorded answer, against the PRINCIPAL id the
+ * claiming agent maps to (`agents.external_id`), not its local `agt_…` id —
+ * nothing outside kaambaan has ever heard of the latter.
  */
 
 const PIPELINE = [
@@ -48,6 +52,20 @@ async function claim(tenant: string, boardId: string, agentId: string) {
 async function cards(tenant: string, boardId: string) {
   const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: dev(tenant) });
   return (await res.json<{ cards: Array<Record<string, unknown>> }>()).cards;
+}
+
+/**
+ * Register the local agent a `claim()` call names, so `claim()`'s D1 lookup of
+ * `agents.external_id` has a row to find. Mapped to `principalId` when given one — `null` leaves
+ * the agent registered but unmapped, which is the ordinary, standalone-kaambaan state.
+ */
+async function agentMappedTo(tenant: string, agentId: string, principalId: string | null): Promise<void> {
+  await env.DB.prepare(`INSERT OR IGNORE INTO agents (id, tenant_id, name) VALUES (?, ?, ?)`)
+    .bind(agentId, tenant, agentId)
+    .run();
+  await env.DB.prepare(`UPDATE agents SET external_id = ?, external_source = ? WHERE id = ?`)
+    .bind(principalId, principalId ? 'org-plane' : null, agentId)
+    .run();
 }
 
 const ISSUER = 'https://issuer.test';
@@ -102,39 +120,48 @@ afterEach(() => {
 });
 
 describe('matching, which is the fixture\'s contract', () => {
-  it('matches this plane\'s namespace, exactly or by prefix', () => {
-    expect(valuePermitsAgent('kaambaan:agt_x', 'agt_x')).toBe(true);
-    expect(valuePermitsAgent('kaambaan:agt_x', 'agt_y')).toBe(false);
-    expect(valuePermitsAgent('kaambaan:*', 'agt_anything')).toBe(true);
+  it('matches a principal id by equality, character for character', () => {
+    expect(valuePermitsAgent('prn_0123456789abcdef0123', 'prn_0123456789abcdef0123')).toBe(true);
+    expect(valuePermitsAgent('prn_0123456789abcdef0123', 'prn_ffffffffffffffffffff')).toBe(false);
   });
 
-  it('ignores another plane\'s namespace rather than denying on it', () => {
-    // A plane that refused what it did not understand would break the day a
-    // third plane appeared, and a claim is read by more planes over time.
-    expect(valuePermitsAgent('agentpod:hermes:*', 'agt_x')).toBe(false);
-    expect(grantPermitsAgent(['agentpod:hermes:*'], 'agt_x')).toBe(false);
+  it('a wildcard is a string that never equals a real id — not a pattern', () => {
+    // Patterns were deleted, not deprecated: `hermes:*` silently spanned nodes, and a
+    // namespaced wildcard grant once reached a root station that should never have existed
+    // (charter decisions/2026-08-30-an-agent-is-a-principal.md §3).
+    expect(valuePermitsAgent('*', 'prn_0123456789abcdef0123')).toBe(false);
+    expect(valuePermitsAgent('prn_*', 'prn_0123456789abcdef0123')).toBe(false);
+    expect(grantPermitsAgent(['prn_*'], 'prn_0123456789abcdef0123')).toBe(false);
   });
 
-  it('matches nothing for an unprefixed value', () => {
-    // AgentPod's retired format. Honouring it here would mean a half-migrated
-    // suite enforcing two different rules depending on which plane read it.
-    expect(valuePermitsAgent('agt_x', 'agt_x')).toBe(false);
+  it('a retired per-plane value is simply not equal to any real id — ignored, not denied', () => {
+    // The old `kaambaan:` namespace form. It never matches under equality, but its presence
+    // alongside a real id must not sink the whole grant: a consumer ignores what it does not
+    // recognise, it never denies on it.
+    expect(grantPermitsAgent(['kaambaan:agt_x', 'prn_target'], 'prn_target')).toBe(true);
   });
 
   it('treats no grant and an empty grant alike, and both as no', () => {
-    expect(grantPermitsAgent(null, 'agt_x')).toBe(false);
-    expect(grantPermitsAgent([], 'agt_x')).toBe(false);
+    expect(grantPermitsAgent(null, 'prn_target')).toBe(false);
+    expect(grantPermitsAgent([], 'prn_target')).toBe(false);
+  });
+
+  it('an agent never linked to a principal cannot be named by any grant', () => {
+    // Behaviour change, and a correct one: a local agent with no suite identity is not a weaker
+    // caller, it is unenumerable — nothing outside kaambaan has ever heard of it.
+    expect(grantPermitsAgent(['prn_target'], null)).toBe(false);
   });
 });
 
 describe('claiming under enforcement', () => {
-  it('hands out work when the queuer\'s token permitted this agent', async () => {
+  it('hands out work when the queuer\'s token permitted this agent\'s principal', async () => {
     const t = 'tnt_cp1';
     const boardId = await board(t);
+    await agentMappedTo(t, 'agt_worker', 'prn_0000000000000000cp01');
 
     await withIssuer(t, async () => {
       (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
-      const jwt = await tokenGranting(['kaambaan:agt_worker']);
+      const jwt = await tokenGranting(['prn_0000000000000000cp01']);
 
       const created = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
         method: 'POST',
@@ -154,34 +181,39 @@ describe('claiming under enforcement', () => {
     // whole design.
     const t = 'tnt_cp_forge';
     const boardId = await board(t);
+    await agentMappedTo(t, 'agt_permitted', 'prn_0000000000000forgepr');
+    await agentMappedTo(t, 'agt_other', 'prn_0000000000000forgeot');
 
     await withIssuer(t, async () => {
       (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
-      const jwt = await tokenGranting(['kaambaan:agt_permitted']);
+      const jwt = await tokenGranting(['prn_0000000000000forgepr']);
 
       await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-        // A caller asserting authority they were never granted.
-        body: JSON.stringify({ title: 'forged', queuedGrant: ['kaambaan:*'] }),
+        // A caller asserting authority they were never granted — a wildcard, which the fixture's
+        // reject case requires never be read as "every agent".
+        body: JSON.stringify({ title: 'forged', queuedGrant: ['prn_*'] }),
       });
 
       const [card] = await cards(t, boardId);
-      expect(card!.queuedGrant).toEqual(['kaambaan:agt_permitted']);
+      expect(card!.queuedGrant).toEqual(['prn_0000000000000forgepr']);
       // And the forged wildcard buys nothing.
       expect((await claim(t, boardId, 'agt_other')).claimed).toBe(false);
     });
   });
 
-  it('refuses, and says so on the card, when the grant does not cover the agent', async () => {
+  it('refuses, and says so on the card, when the grant does not cover the agent\'s principal', async () => {
     const t = 'tnt_cp2';
     const boardId = await board(t);
+    await agentMappedTo(t, 'agt_worker', 'prn_0000000000000000cp02');
+
     (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
 
     await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
       method: 'POST',
       headers: dev(t, 'usr_owner'),
-      body: JSON.stringify({ title: 'not for this agent', queuedGrant: ['kaambaan:agt_someone_else'] }),
+      body: JSON.stringify({ title: 'not for this agent', queuedGrant: ['prn_0000000000someoneels'] }),
     });
 
     expect((await claim(t, boardId, 'agt_worker')).claimed).toBe(false);
@@ -192,12 +224,32 @@ describe('claiming under enforcement', () => {
     expect(card!.state).toBe('input-required');
   });
 
+  it('refuses an agent that has never been linked to a principal, even with a matching-looking grant', async () => {
+    // An agent this plane has never mapped to a suite principal cannot be named by ANY grant —
+    // there is no id to enumerate. This is the direct behavioural consequence of equality
+    // matching on principal ids rather than kaambaan's local `agt_…` id.
+    const t = 'tnt_cp_unmapped';
+    const boardId = await board(t);
+    await agentMappedTo(t, 'agt_nobody', null);
+
+    (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+
+    await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+      method: 'POST',
+      headers: dev(t, 'usr_owner'),
+      body: JSON.stringify({ title: 'unreachable', queuedGrant: ['agt_nobody'] }),
+    });
+
+    expect((await claim(t, boardId, 'agt_nobody')).claimed).toBe(false);
+  });
+
   it('refuses a card queued with no authority at all', async () => {
     // Null is not an empty grant — it means no one with permission ever asked
     // for this to run, which is exactly a session-cookie caller under
     // enforcement.
     const t = 'tnt_cp3';
     const boardId = await board(t);
+    await agentMappedTo(t, 'agt_worker', 'prn_0000000000000000cp03');
     (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
 
     await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
@@ -213,7 +265,8 @@ describe('claiming under enforcement', () => {
 
   it('hands out the same card when enforcement is off', async () => {
     // The switch, and the reason it is explicit: a deployment that has not
-    // populated grants yet must keep working exactly as before.
+    // populated grants yet must keep working exactly as before. No agent mapping needed —
+    // enforcement off means the grant is never even read.
     const t = 'tnt_cp4';
     const boardId = await board(t);
 
@@ -232,9 +285,10 @@ describe('claiming under enforcement', () => {
     // makes this an audit record rather than a cache.
     const t = 'tnt_cp5';
     const boardId = await board(t);
+    await agentMappedTo(t, 'agt_worker', 'prn_0000000000000000cp05');
 
     await withIssuer(t, async () => {
-      const jwt = await tokenGranting(['kaambaan:agt_worker']);
+      const jwt = await tokenGranting(['prn_0000000000000000cp05']);
       await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
@@ -242,7 +296,7 @@ describe('claiming under enforcement', () => {
       });
 
       const [card] = await cards(t, boardId);
-      expect(card!.queuedGrant).toEqual(['kaambaan:agt_worker']);
+      expect(card!.queuedGrant).toEqual(['prn_0000000000000000cp05']);
     });
   });
 });

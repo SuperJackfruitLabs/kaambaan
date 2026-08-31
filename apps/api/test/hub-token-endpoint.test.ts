@@ -187,4 +187,78 @@ describe('GET /v1/agents with a hub-issued token', () => {
       if (saved !== undefined) (env as unknown as Record<string, unknown>).HUB_ISSUER = saved;
     }
   });
+  /**
+   * A station token is NOT a human credential.
+   *
+   * `charter → decisions/2026-08-30-an-agent-is-a-principal.md` lets a node exchange
+   * `<nodeId>:<nodeSecret>` for a short-lived hub token whose `principalKind` is `"agent"`.
+   * `index.ts` makes `resolveHubUser` the fallback for every non-agent route, so without a
+   * kind check that token signs in as a PERSON — on board creation, card creation, gate
+   * resolution — carrying `mayDispatch` as though someone had authorised it. Worse, that path
+   * needs no local `agents` row at all: it only needs the claim's tenant to map, so the
+   * org-plane mapping is no barrier.
+   *
+   * `resolveHubAgent` has refused the converse from the start ("a human's token must never
+   * double as an agent credential"). These two cases hold the mirror of that.
+   */
+  async function withIssuer(fn: () => Promise<void>): Promise<void> {
+    const realFetch = globalThis.fetch;
+    (env as unknown as Record<string, unknown>).HUB_ISSUER = issuerOrigin;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === `${issuerOrigin}/api/auth/jwks`) {
+        return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
+      }
+      return realFetch(input as RequestInfo, init);
+    }) as typeof fetch;
+    try {
+      await fn();
+    } finally {
+      globalThis.fetch = realFetch;
+      delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
+    }
+  }
+
+  /** Exactly what the station-token exchange mints: a bare principal id, kind `agent`. */
+  const stationToken = () =>
+    hubToken({ sub: 'prn_0000000000000000stn1', principalKind: 'agent', act: { sub: 'nod_1' } });
+
+  it('refuses a station-style agent token on a human read', async () => {
+    await withIssuer(async () => {
+      // The token verifies and its tenant maps — everything `resolveHubUser` used to check.
+      // The kind is the only thing standing between a node's credential and a person's reach.
+      const res = await SELF.fetch('https://api.test/v1/agents', {
+        headers: { Authorization: `Bearer ${await stationToken()}` },
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  it('refuses a station-style agent token on a human WRITE', async () => {
+    await withIssuer(async () => {
+      // The read above is the smaller half. This is the one that matters: board creation is a
+      // human route reached with `mayDispatch` attached, and no `agents` row is involved
+      // anywhere on this path.
+      const res = await SELF.fetch('https://api.test/v1/boards', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${await stationToken()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name: 'minted by a node', stages: [] }),
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  it('still admits a human-kind token on the same routes', async () => {
+    // The refusal above must be about the KIND and nothing else — otherwise it would pass just
+    // as well by breaking the hub path entirely.
+    await withIssuer(async () => {
+      const res = await SELF.fetch('https://api.test/v1/agents', {
+        headers: { Authorization: `Bearer ${await hubToken()}` },
+      });
+      expect(res.status).toBe(200);
+    });
+  });
 });

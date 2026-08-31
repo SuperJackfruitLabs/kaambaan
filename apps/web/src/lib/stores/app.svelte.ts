@@ -26,6 +26,7 @@ import {
   type Reference,
   type Notification,
   type User,
+  type AgentSummary,
 } from '$lib/api';
 
 const BOARD_KEY = 'kaambaan.boardId';
@@ -59,7 +60,7 @@ class AppStore {
 
   // collaboration data
   notifications = $state<Notification[]>([]);
-  agents = $state<Array<{ id: string; name: string; capabilities: string[] }>>([]);
+  agents = $state<AgentSummary[]>([]);
 
   // navigation + view
   screen = $state<Screen>('board');

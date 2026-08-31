@@ -5,8 +5,14 @@
     createAgent,
     getAgents,
     deleteAgent,
+    setAgentPrincipal,
+    getWorkspace,
+    setWorkspaceFleet,
+    type WorkspaceTenant,
+    revokeAgentToken,
     BOARD_TEMPLATES,
     type AgentToken,
+    type AgentSummary,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
   import NewBoardDialog from '$lib/components/NewBoardDialog.svelte';
@@ -51,12 +57,28 @@
 
   // agents manager
   let showConnect = $state(false);
-  let agents = $state<Array<{ id: string; name: string; capabilities: string[] }>>([]);
+  let agents = $state<AgentSummary[]>([]);
   const ALL_CAPS = ['research', 'review', 'publish'];
   let agentName = $state('');
   let newCaps = $state<string[]>(['research', 'review', 'publish']);
   let minted = $state<AgentToken | null>(null);
   let minting = $state(false);
+
+  // linking THIS WORKSPACE to a hub fleet — the row both hub-token resolvers require
+  let workspace = $state<WorkspaceTenant | null>(null);
+  let fleetInput = $state('');
+  let fleetError = $state<string | null>(null);
+  let fleetSaving = $state(false);
+  let editingFleet = $state(false);
+
+  // linking a suite principal, one agent's input open at a time
+  let linkingAgentId = $state<string | null>(null);
+  let principalInput = $state('');
+  let principalError = $state<string | null>(null);
+  let linking = $state(false);
+
+  // revoking a token, one confirmation-in-flight at a time
+  let revokingTokenId = $state<string | null>(null);
 
   const mcpSnippet = $derived(
     minted
@@ -112,11 +134,15 @@
   async function openAgents(): Promise<void> {
     showConnect = true;
     minted = null;
+    editingFleet = false;
+    fleetError = null;
     try {
       agents = await getAgents();
     } catch {
       agents = [];
     }
+    // The workspace's own fleet link, read alongside the agents it gates.
+    await refreshWorkspace().catch(() => {});
   }
 
   function toggleCap(cap: string): void {
@@ -142,10 +168,101 @@
     if (res.ok) agents = await getAgents();
   }
 
+  // ---- link this workspace to a hub fleet ----
+  //
+  // Deliberately in the same panel as the per-agent principal control, because linking an agent
+  // to a principal does nothing at all while the fleet that principal belongs to is unlinked:
+  // `resolveHubAgent` maps the claim's tenant through this row and refuses when it is missing.
+  // Two controls, one act, and the order matters — so they are next to each other.
+  async function refreshWorkspace(): Promise<void> {
+    workspace = await getWorkspace();
+  }
+
+  function startFleetEdit(): void {
+    editingFleet = true;
+    fleetInput = workspace?.externalId ?? '';
+    fleetError = null;
+  }
+
+  async function saveFleet(): Promise<void> {
+    const value = fleetInput.trim();
+    fleetSaving = true;
+    fleetError = null;
+    try {
+      const res = await setWorkspaceFleet(value === '' ? null : value);
+      if (!res.ok) {
+        // The server's own sentence — "externalId must look like fleet_ …" — not a generic
+        // failure, same as the principal control below.
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        fleetError = body?.error ?? `Linking failed (${res.status})`;
+        return;
+      }
+      await refreshWorkspace();
+      editingFleet = false;
+    } finally {
+      fleetSaving = false;
+    }
+  }
+
+  // ---- link a suite principal ----
+  function startLinking(agent: AgentSummary): void {
+    linkingAgentId = agent.id;
+    principalInput = agent.externalId ?? '';
+    principalError = null;
+  }
+
+  function cancelLinking(): void {
+    linkingAgentId = null;
+    principalInput = '';
+    principalError = null;
+  }
+
+  async function saveLinking(): Promise<void> {
+    if (!linkingAgentId) return;
+    const value = principalInput.trim();
+    linking = true;
+    principalError = null;
+    try {
+      const res = await setAgentPrincipal(linkingAgentId, value === '' ? null : value);
+      if (!res.ok) {
+        // The server's own refusal (a malformed id, or an agent this session doesn't own) —
+        // not a generic "failed" message.
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        principalError = body?.error ?? `Linking failed (${res.status})`;
+        return;
+      }
+      agents = await getAgents();
+      linkingAgentId = null;
+      principalInput = '';
+    } finally {
+      linking = false;
+    }
+  }
+
+  async function unlinkPrincipal(agent: AgentSummary): Promise<void> {
+    const res = await setAgentPrincipal(agent.id, null);
+    if (res.ok) agents = await getAgents();
+  }
+
+  // ---- revoke a token ----
+  async function onRevokeToken(agentId: string, tokenId: string): Promise<void> {
+    // Immediate and irreversible: the very next request carrying it is refused. A confirm() names
+    // the consequence rather than letting a stray click do it silently.
+    if (!confirm('Revoke this token? The agent loses access immediately, and this cannot be undone.')) return;
+    revokingTokenId = tokenId;
+    try {
+      const res = await revokeAgentToken(agentId, tokenId);
+      if (res.ok) agents = await getAgents();
+    } finally {
+      revokingTokenId = null;
+    }
+  }
+
   function closeConnect(): void {
     showConnect = false;
     minted = null;
     agentName = '';
+    cancelLinking();
   }
 
   // ---- board created callback ----
@@ -307,21 +424,106 @@
           <p class="text-muted-foreground mt-2 text-xs leading-relaxed">The agent claims cards whose stage matches its capabilities, works them, and hands off down the pipeline.</p>
           <div class="mt-5 flex justify-end"><Button onclick={() => (minted = null)}>Done</Button></div>
         {:else}
-          <div class="mt-4 max-h-52 space-y-1.5 overflow-y-auto">
+          <!--
+            This workspace's hub fleet. Above the agent list on purpose: an agent linked to a
+            principal resolves nothing while the fleet is unlinked, so the order on screen is the
+            order the two acts have to happen in.
+          -->
+          <div class="bg-inset border-border mt-4 rounded-[8px] border px-3 py-2">
+            {#if editingFleet}
+              <div class="flex items-center gap-1.5">
+                <input
+                  bind:value={fleetInput}
+                  placeholder="fleet_…  (empty to unlink)"
+                  class="bg-surface border-border mono min-w-0 flex-1 rounded-[5px] border px-2 py-1 text-[11px]"
+                />
+                <button onclick={() => void saveFleet()} disabled={fleetSaving} class="shrink-0 text-[11px] hover:brightness-110" style="color:var(--marigold)">save</button>
+                <button onclick={() => (editingFleet = false)} class="text-muted-foreground shrink-0 text-[11px] hover:brightness-110">cancel</button>
+              </div>
+              {#if fleetError}<p class="text-coral mono mt-1 text-[10px] leading-relaxed">{fleetError}</p>{/if}
+            {:else if workspace?.externalId}
+              <div class="mono flex items-center gap-1.5 text-[11px]">
+                <span class="text-muted-foreground shrink-0">fleet</span>
+                <span class="truncate">{workspace.externalId}</span>
+                <button onclick={startFleetEdit} class="text-muted-foreground ml-auto shrink-0 hover:brightness-110">change</button>
+              </div>
+            {:else}
+              <div class="flex items-center gap-1.5">
+                <p class="text-muted-foreground min-w-0 flex-1 text-[11px] leading-relaxed">
+                  not linked to an agentpod fleet — link one so tokens its hub issues are accepted here
+                </p>
+                <button onclick={startFleetEdit} class="shrink-0 text-[11px] hover:brightness-110" style="color:var(--marigold)">link</button>
+              </div>
+            {/if}
+          </div>
+
+          <div class="mt-4 max-h-72 space-y-2 overflow-y-auto">
             {#if agents.length === 0}
               <p class="text-muted-foreground text-sm">No agents yet. Create one below — you'll get a token to point an AI agent at this workspace.</p>
             {:else}
               {#each agents as a (a.id)}
-                <div class="bg-inset border-border group flex items-center justify-between gap-2 rounded-[8px] border px-3 py-2">
-                  <div class="min-w-0">
-                    <div class="truncate text-sm">{a.name}</div>
-                    <div class="mt-1 flex flex-wrap gap-1">
-                      {#each a.capabilities as c (c)}<span class="border-border mono text-muted-foreground rounded-[4px] border px-1 py-0.5 text-[10px]">{c}</span>{/each}
+                <div class="bg-inset border-border group rounded-[8px] border px-3 py-2">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="min-w-0">
+                      <div class="truncate text-sm">{a.name}</div>
+                      <div class="mt-1 flex flex-wrap gap-1">
+                        {#each a.capabilities as c (c)}<span class="border-border mono text-muted-foreground rounded-[4px] border px-1 py-0.5 text-[10px]">{c}</span>{/each}
+                      </div>
                     </div>
+                    <button onclick={() => void onDeleteAgent(a.id)} aria-label="Delete agent" title="Delete this agent and every one of its tokens" class="text-muted-foreground hover:text-coral shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
+                      <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                    </button>
                   </div>
-                  <button onclick={() => void onDeleteAgent(a.id)} aria-label="Revoke agent" title="Revoke agent + its token" class="text-muted-foreground hover:text-coral shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
-                    <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
-                  </button>
+
+                  <!-- suite principal: absent is the normal state for a standalone board, and says so -->
+                  <div class="border-border/60 mt-2 border-t pt-2">
+                    {#if linkingAgentId === a.id}
+                      <div class="flex items-center gap-1.5">
+                        <input
+                          bind:value={principalInput}
+                          placeholder="prn_… from agentpod"
+                          onkeydown={(e) => { if (e.key === 'Enter') void saveLinking(); if (e.key === 'Escape') cancelLinking(); }}
+                          class="bg-surface border-border focus:border-marigold mono min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-[11px] outline-none"
+                        />
+                        <button onclick={() => void saveLinking()} disabled={linking} class="mono shrink-0 text-[11px] hover:brightness-110" style="color:var(--marigold)">{linking ? 'saving…' : 'save'}</button>
+                        <button onclick={cancelLinking} class="text-muted-foreground hover:text-foreground shrink-0 text-[11px]">cancel</button>
+                      </div>
+                      {#if principalError}<p class="text-coral mono mt-1 text-[10px] leading-relaxed">{principalError}</p>{/if}
+                    {:else if a.externalId}
+                      <div class="flex items-center gap-1.5 text-[11px]">
+                        <span class="text-muted-foreground shrink-0">principal</span>
+                        <span class="mono truncate">{a.externalId}</span>
+                        <button onclick={() => startLinking(a)} class="text-muted-foreground hover:text-foreground shrink-0">change</button>
+                        <button onclick={() => void unlinkPrincipal(a)} class="text-muted-foreground hover:text-coral shrink-0">unlink</button>
+                      </div>
+                    {:else}
+                      <button onclick={() => startLinking(a)} class="text-muted-foreground hover:text-foreground text-left text-[11px] leading-relaxed">
+                        not linked to a suite principal — link one so its agentpod-issued tokens are accepted here too
+                      </button>
+                    {/if}
+                  </div>
+
+                  <!-- tokens: an agent with none cannot authenticate, and that is a real state, not silence -->
+                  <div class="mt-2 flex flex-wrap items-center gap-1.5">
+                    {#if a.tokenIds.length === 0}
+                      <span class="text-muted-foreground text-[11px] leading-relaxed">no active token — this agent cannot authenticate until reconnected</span>
+                    {:else}
+                      {#each a.tokenIds as t (t)}
+                        <span class="border-border mono text-muted-foreground flex items-center gap-1 rounded-[4px] border px-1.5 py-0.5 text-[10px]">
+                          {t}
+                          <button
+                            onclick={() => void onRevokeToken(a.id, t)}
+                            disabled={revokingTokenId === t}
+                            aria-label="Revoke token {t}"
+                            title="Revoke this token — immediate and irreversible"
+                            class="hover:text-coral"
+                          >
+                            {revokingTokenId === t ? '…' : '×'}
+                          </button>
+                        </span>
+                      {/each}
+                    {/if}
+                  </div>
                 </div>
               {/each}
             {/if}

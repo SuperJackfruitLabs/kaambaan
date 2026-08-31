@@ -24,6 +24,19 @@ export interface BoardSummary {
 export interface AgentToken {
   agent: { id: string; name: string; capabilities: string[] };
   token: string;
+  tokenId: string;
+}
+
+/** One agent as the console sees it — including whether it's linked to a suite principal, and what it can still authenticate with. */
+export interface AgentSummary {
+  id: string;
+  name: string;
+  capabilities: string[];
+  /** Its mapped suite principal (`prn_…`), or null — the normal state for a standalone board. */
+  externalId: string | null;
+  externalSource: string | null;
+  /** Active (non-revoked) token ids. Empty means this agent cannot authenticate right now. */
+  tokenIds: string[];
 }
 
 export interface Stage {
@@ -440,10 +453,10 @@ export async function getUsage(boardId: string, window: '5h' | '7d' = '7d'): Pro
 }
 
 /** The agents registered in the signed-in user's workspace. */
-export async function getAgents(): Promise<Array<{ id: string; name: string; capabilities: string[] }>> {
+export async function getAgents(): Promise<AgentSummary[]> {
   const res = await fetch('/v1/agents', { headers });
   if (!res.ok) throw new Error(`getAgents failed (${res.status})`);
-  return ((await res.json()) as { agents: Array<{ id: string; name: string; capabilities: string[] }> }).agents;
+  return ((await res.json()) as { agents: AgentSummary[] }).agents;
 }
 
 /** Rename a board. */
@@ -475,6 +488,59 @@ export function createProfile(boardId: string, input: { key: string; name?: stri
 /** Revoke an agent and all of its tokens. */
 export function deleteAgent(agentId: string): Promise<Response> {
   return fetch(`/v1/agents/${agentId}`, { method: 'DELETE', headers });
+}
+
+/**
+ * Link (or, with `null`, clear) an agent's suite principal id.
+ *
+ * A console action, same as minting or revoking a token — carries no `withAuthority`, because
+ * this changes what a hub token can resolve to, not something the change itself needs authority
+ * for. Returns the raw response so the caller can read the server's own refusal (a malformed id,
+ * or an agent it doesn't own) instead of a generic failure.
+ */
+export function setAgentPrincipal(agentId: string, externalId: string | null): Promise<Response> {
+  return fetch(`/v1/agents/${agentId}`, { method: 'PATCH', headers, body: JSON.stringify({ externalId }) });
+}
+
+/** This workspace, and the hub fleet it is linked to (or null for a standalone board). */
+export interface WorkspaceTenant {
+  id: string;
+  slug: string;
+  name: string;
+  externalId: string | null;
+  externalSource: string | null;
+}
+
+/** Read this workspace, so an operator can see whether it is linked to a hub fleet. */
+export async function getWorkspace(): Promise<WorkspaceTenant | null> {
+  const res = await fetch('/v1/tenant', { headers });
+  if (!res.ok) return null;
+  return ((await res.json()) as { tenant: WorkspaceTenant }).tenant;
+}
+
+/**
+ * Link (or, with `null`, unlink) this workspace to a hub fleet.
+ *
+ * The counterpart of {@link setAgentPrincipal} one plane up, and the operator-facing half of the
+ * whole-branch review's Important: `tenants.external_id` had no writer at all, while BOTH
+ * `resolveHubUser` and `resolveHubAgent` require it before any hub-issued credential can do
+ * anything here — so the row existed only where somebody had made it by hand. Linking an agent
+ * is useless while the fleet it belongs to is unlinked, which is why this belongs beside that
+ * control rather than in a settings page nobody visits.
+ *
+ * Returns the raw response so the caller can read the server's own refusal (a malformed fleet id)
+ * rather than a generic failure, exactly as `setAgentPrincipal` does.
+ */
+export function setWorkspaceFleet(externalId: string | null): Promise<Response> {
+  return fetch('/v1/tenant', { method: 'PATCH', headers, body: JSON.stringify({ externalId }) });
+}
+
+/**
+ * Revoke ONE token, not the agent. Immediate and irreversible: `findAgentByTokenHash` refuses a
+ * revoked token on every request from the moment this call succeeds — there is no undo.
+ */
+export function revokeAgentToken(agentId: string, tokenId: string): Promise<Response> {
+  return fetch(`/v1/agents/${agentId}/tokens/${tokenId}`, { method: 'DELETE', headers });
 }
 
 /** Subscribe to the board's live event feed; `onEvent` fires on every server message. */

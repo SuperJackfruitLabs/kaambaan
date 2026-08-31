@@ -45,7 +45,10 @@ const dev = (user?: string) => ({
 });
 
 async function hubToken(sub = HUMAN): Promise<string> {
-  return new SignJWT({ sub, principalKind: 'human', tenant: FLEET, mayDispatch: ['kaambaan:*'] })
+  // mayDispatch is required on the claim, but never checked by gate resolution (these tests
+  // claim/complete via dev headers, not this token) — a real-shaped `prn_…` id is here only so
+  // nothing in this file models the retired `kaambaan:*` namespace-and-wildcard form.
+  return new SignJWT({ sub, principalKind: 'human', tenant: FLEET, mayDispatch: ['prn_0000000000000000ghtk'] })
     .setProtectedHeader({ alg: 'EdDSA', kid: 'g-kid' })
     .setIssuedAt()
     .setIssuer(ISSUER)
