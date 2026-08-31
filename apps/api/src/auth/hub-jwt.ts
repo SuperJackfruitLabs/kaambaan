@@ -233,15 +233,26 @@ export async function verifyHubToken(
     if (!set) return null;
 
     // `keySet` already refetched once if `kid` was missing; if it's STILL
-    // missing (the kid exists nowhere, not just somewhere we hadn't fetched
-    // yet), stop here rather than handing it to `jwtVerify`. Not just an
-    // optimization: jose's local key resolver throws synchronously from
-    // inside an async function when no candidate matches, and adopting that
+    // missing, stop here rather than handing it to `jwtVerify`. This removes
+    // the COMMON case (the kid exists nowhere we've fetched from) before it
+    // can reach jose's local key resolver, which throws synchronously from
+    // inside an async function when no candidate matches — and adopting that
     // rejected promise through the implicit `return` in `createLocalJWKSet`
-    // costs one microtask — long enough for this runtime's rejection tracking
-    // to flag it as unhandled before our own `catch` below gets to see it,
-    // even though it does. Exactly the failure mode this file already avoids
-    // `createRemoteJWKSet` for; same fix, applied one call earlier.
+    // costs one microtask, long enough for this runtime's rejection tracking
+    // to flag it as unhandled before our own `catch` below gets to see it.
+    //
+    // It is NOT a complete guard, and does not claim to be: `hasKid` compares
+    // only the `kid` string, while jose's own matching also requires `alg`,
+    // `use`, `key_ops` and `kty`/`crv` to agree. A `kid` collision across
+    // differently-typed keys — plausible mid-rotation, e.g. an issuer reusing
+    // a `kid` value across an algorithm change — passes this guard and still
+    // reaches jose's synchronous throw below. The token is still rejected
+    // either way (the outer `catch` below handles it one tick later); the
+    // residual is a noisier rejection path for that one case, not a wrongly
+    // admitted token. Widening `hasKid` to mirror jose's full matching
+    // criteria was considered and rejected: duplicating a library's matching
+    // rules in our own code, where they will drift from the library's own, is
+    // a worse defect than the warning it would remove.
     if (!hasKid(set, kid)) return null;
 
     const { payload } = await jwtVerify(token, set.verify, {

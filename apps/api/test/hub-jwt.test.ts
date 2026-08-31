@@ -209,12 +209,29 @@ describe('verifying a hub token at the edge', () => {
     expect(fetchCount).toBe(1); // still no refetch for an expired token
   });
 
-  it('rejects rather than admits a token when the refetch itself fails', async () => {
-    // Fail closed: an unknown kid whose refetch cannot reach the issuer must
-    // not fall back to the stale set (which, by definition, is exactly the
-    // set that doesn't have this key) and must not be treated as valid.
+  it('rejects when the refetch for an unknown kid fails, without corrupting the cache', async () => {
+    // What this test can and cannot prove. It CANNOT discriminate "return
+    // null" from "fall back to the stale set" as the failure-path
+    // implementation, for a structural reason: this branch only runs when
+    // `hasKid` has already found the stale set does NOT contain this token's
+    // kid, and jose's own matching also requires an exact kid match — so a
+    // stale-set fallback would reject this exact token too. Any token that
+    // reaches this failure path is, by construction, one no cached set (old
+    // or new) can verify; the two implementations are behaviourally
+    // indistinguishable for it. Constructing a token that a fallback WOULD
+    // wrongly admit is therefore not possible here without breaking the very
+    // invariant (`hasKid` gates on an unknown kid) that makes the fix work.
+    //
+    // What IS observable, and what this test asserts instead: exactly one
+    // refetch is attempted (no retry loop, no silent skip), the token is
+    // rejected, and — the part a naive "just don't cache the bad response"
+    // fix could still get wrong — the failure leaves the module's cache
+    // exactly as it was: a later verification using the already-known kid
+    // still succeeds with zero further network calls.
     __resetJwksCacheForTests();
+    fetchCount = 0;
     await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() }); // warm
+    expect(fetchCount).toBe(1);
 
     const unknown = await generateKeyPair('EdDSA', { extractable: true });
     const tokenWithUnknownKid = await new SignJWT({
@@ -229,12 +246,22 @@ describe('verifying a hub token at the edge', () => {
       .setExpirationTime('5m')
       .sign(unknown.privateKey);
 
+    let deadCalls = 0;
     const dead = (async () => {
+      deadCalls++;
       throw new Error('connection refused');
     }) as unknown as typeof fetch;
 
     const claims = await verifyHubToken(tokenWithUnknownKid, { issuer: ISSUER, fetch: dead });
     expect(claims).toBeNull();
+    expect(deadCalls).toBe(1); // exactly one refetch attempted, no retry loop
+
+    const stillWorks = await verifyHubToken(await makeToken(), {
+      issuer: ISSUER,
+      fetch: countingFetch(),
+    });
+    expect(stillWorks).not.toBeNull();
+    expect(fetchCount).toBe(1); // unchanged: the known kid needed no fetch at all
   });
 
   it('shares one refetch across concurrent verifications of the same unknown kid', async () => {
