@@ -35,7 +35,7 @@ import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 
 export { BoardDO };
 
@@ -77,6 +77,19 @@ function statusForCode(code: BoardErrorCode): number {
   }
 }
 
+/**
+ * What an error nobody planned for looks like on the wire.
+ *
+ * One shape, shared by every route block, so a client can read a failure the
+ * same way wherever it came from. `{ error: { message } }` rather than a bare
+ * string because that is what the boards routes have always answered with and
+ * the web app already parses.
+ */
+function unexpected(err: unknown): Response {
+  const message = (err as { message?: string })?.message ?? 'unexpected error';
+  return Response.json({ error: { message } }, { status: 500 });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -102,6 +115,82 @@ export default {
       return handleMcpRequest(request, env, auth);
     }
 
+    // PATCH /v1/tenant — link this workspace to a hub fleet, or unlink it.
+    //
+    // The whole-branch review's Important: `setTenantExternalMapping` had NO production caller,
+    // only tests — the fifth column in this programme with none — while BOTH `resolveHubUser` and
+    // `resolveHubAgent` require `findTenantByExternal(db, 'agentpod', claims.tenant)` to resolve
+    // before a hub credential can do anything here. So the row existed only where somebody had
+    // made it by hand, which is the "no SQL at any point" rule broken at the exact seam between
+    // the two repositories. This is that writer.
+    //
+    // Shaped as the deliberate mirror of `PATCH /v1/agents/:id` below, because it is the same act
+    // one plane up: `{ externalId: "fleet_…" }` to link, `{ externalId: null }` to unlink, the
+    // source hardcoded rather than accepted from the body.
+    //
+    // **Human-only, and not merely by convention.** `u` comes from `resolveUser` alone — session
+    // cookie or dev headers, never a `kbn_` bearer and never a hub token. Linking a plane is at
+    // least as consequential as revoking a credential (charter
+    // decisions/2026-08-13-ecosystem-identity.md Decision 3), and the hub-token path could not
+    // work here anyway: `resolveHubUser` needs this mapping to already exist, so a token can
+    // never establish the mapping that makes that token resolve. It is human-only or it is
+    // unreachable.
+    //
+    // Deliberately NOT scoped to owners today. `memberships.role` exists and nothing else in this
+    // file reads it; adding the first role check here would make this route the one place in
+    // kaambaan where membership is not enough, which is a decision about the whole product rather
+    // than about this endpoint. Recorded as a limit rather than settled in passing.
+    if (path === '/v1/tenant') {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+
+        if (request.method === 'GET') {
+          const tenant = await tenantById(env.DB, u.tenantId);
+          if (!tenant) return Response.json({ error: 'workspace not found' }, { status: 404 });
+          return Response.json({ tenant });
+        }
+        if (request.method !== 'PATCH') return Response.json({ error: 'method not allowed' }, { status: 405 });
+
+        const body = (await request.json()) as { externalId?: string | null };
+        if (body.externalId === undefined) {
+          return Response.json({ error: 'externalId is required (a fleet_… string, or null to unlink)' }, { status: 400 });
+        }
+        if (body.externalId === null) {
+          await setTenantExternalMapping(env.DB, u.tenantId, null);
+          return Response.json({ ok: true });
+        }
+        // Validated here, not left to the CHECK constraint or a downstream join, for the reason
+        // the agent route gives: a typo becomes a 400 that names the mistake rather than a
+        // mapping that silently matches nothing. `fleet_` + 20 hex is the hub's own TenantId
+        // shape (apps/hub db/schema/tenants.ts).
+        if (!/^fleet_[0-9a-f]{20}$/.test(body.externalId)) {
+          return Response.json({ error: 'externalId must look like fleet_ followed by 20 lowercase hex characters' }, { status: 400 });
+        }
+        // **No uniqueness check here, and no unique index behind it — deliberately, and not by
+        // omission.** The obvious mirror of the agent route would 409 when another workspace
+        // already claims this fleet, and migration 0005 was written to enforce it before
+        // migration 0002's own comment settled the question the other way: "Deliberately NOT
+        // unique. kaambaan is one-tenant-per-user, so two people in the same real organisation
+        // legitimately map two local boundaries onto one external id. A shared mapping must
+        // never become a shared keyspace: isolation stays local, on tenant_id."
+        // `test/tenant-external-mapping.test.ts` asserts exactly that. A fix wave is not the
+        // place to reverse a documented decision, so the mapping stays many-to-one.
+        //
+        // That leaves a REAL residual, recorded rather than quietly patched: under a shared
+        // mapping, `findTenantByExternal` runs `.first()` with no `ORDER BY`, so a hub credential
+        // for a shared fleet lands in an ARBITRARY one of the sharing workspaces —
+        // `resolveHubUser` admits into it, and `resolveHubAgent` fails closed unpredictably when
+        // the agent's own row sits in the other. That ambiguity predates this route and is a
+        // question about whether hub-token resolution is well-defined under a many-to-one
+        // mapping at all, which is a decision above this endpoint.
+        await setTenantExternalMapping(env.DB, u.tenantId, { externalId: body.externalId, externalSource: 'agentpod' });
+        return Response.json({ ok: true });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     // /v1/agents[/:id[/tokens/:tokenId]] — a workspace's agents + token minting (the "connect an
     // agent" surface) + token revocation, right beside it. The plaintext token is returned ONCE
     // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
@@ -109,87 +198,101 @@ export default {
     // whole mechanism.
     const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/tokens\/([^/]+))?)?$/);
     if (agentsMatch) {
-      // The first endpoint to accept a hub-issued token
-      // (charter decisions/2026-08-15-one-issuer-and-offline-verification.md).
-      //
-      // Read-only, and only as a FALLBACK: the session cookie and `kbn_` token
-      // paths are untouched and still take precedence, so nothing that works
-      // today changes. The hub token is verified offline against a cached JWKS —
-      // no network call in this path — and resolves to the same principal shape,
-      // so nothing downstream can tell which credential arrived.
-      //
-      // Deliberately not extended to POST or DELETE yet: proving the contract
-      // needs a read, and a first integration should not also be the first
-      // credential able to mint an agent token.
-      let u = await resolveUser(request, env);
-      if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
-      if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
-      const agentId = agentsMatch[1];
-      const tokenId = agentsMatch[2];
-      if (agentId && tokenId) {
-        // Revoking a credential is a HUMAN act, same as minting one: `u` above came ONLY from
-        // `resolveUser` (session cookie or dev headers) — never from a `kbn_` bearer or a hub
-        // token — so an agent can never revoke its own token, or a peer's, to escape an audit
-        // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
-        if (request.method === 'DELETE') {
-          await revokeAgentToken(env.DB, u.tenantId, agentId, tokenId);
-          return new Response(null, { status: 204 });
-        }
-        return Response.json({ error: 'method not allowed' }, { status: 405 });
-      }
-      if (agentId) {
-        if (request.method === 'DELETE') {
-          await deleteAgent(env.DB, u.tenantId, agentId);
-          return new Response(null, { status: 204 });
-        }
-        // PATCH links (or clears) this agent's suite principal (charter
-        // decisions/2026-08-30-an-agent-is-a-principal.md §5): `{ externalId: "prn_…" }` to link,
-        // `{ externalId: null }` to clear. `setAgentExternalMapping` has existed since an earlier
-        // task with no caller — this is that caller. It is what lets `resolveHubAgent` turn an
-        // agent-kind hub token into a local agent; with no mapping there is nothing for that
-        // resolver to find, and NULL stays the normal state for a standalone board.
-        if (request.method === 'PATCH') {
-          // `setAgentExternalMapping` is itself tenant-scoped (mirroring `revokeAgentToken`) —
-          // this check is what turns a cross-tenant PATCH into a 404 instead of a 200 whose write
-          // silently landed nowhere.
-          if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
-            return Response.json({ error: 'agent not found' }, { status: 404 });
+      // Every route below is inside this, and the whole-branch review is why.
+      // The only catch-all in this file wrapped `/v1/boards` alone, so an
+      // unexpected error anywhere in the agents routes — a raced UNIQUE write
+      // against `agents_external_pair_unique`, a malformed body, a D1 hiccup —
+      // escaped the Worker's fetch handler entirely instead of becoming a
+      // structured 500. Same write safety, strictly worse failure: the caller
+      // got a bare Worker error with no shape a client could read. Kept out of
+      // an earlier narrow fix round on purpose, because it is a property of the
+      // whole route block rather than of one endpoint, and a route-wide change
+      // belongs in one deliberate edit.
+      try {
+        // The first endpoint to accept a hub-issued token
+        // (charter decisions/2026-08-15-one-issuer-and-offline-verification.md).
+        //
+        // Read-only, and only as a FALLBACK: the session cookie and `kbn_` token
+        // paths are untouched and still take precedence, so nothing that works
+        // today changes. The hub token is verified offline against a cached JWKS —
+        // no network call in this path — and resolves to the same principal shape,
+        // so nothing downstream can tell which credential arrived.
+        //
+        // Deliberately not extended to POST or DELETE yet: proving the contract
+        // needs a read, and a first integration should not also be the first
+        // credential able to mint an agent token.
+        let u = await resolveUser(request, env);
+        if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const agentId = agentsMatch[1];
+        const tokenId = agentsMatch[2];
+        if (agentId && tokenId) {
+          // Revoking a credential is a HUMAN act, same as minting one: `u` above came ONLY from
+          // `resolveUser` (session cookie or dev headers) — never from a `kbn_` bearer or a hub
+          // token — so an agent can never revoke its own token, or a peer's, to escape an audit
+          // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+          if (request.method === 'DELETE') {
+            await revokeAgentToken(env.DB, u.tenantId, agentId, tokenId);
+            return new Response(null, { status: 204 });
           }
-          const body = (await request.json()) as { externalId?: string | null };
-          if (body.externalId === undefined) {
-            return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
+          return Response.json({ error: 'method not allowed' }, { status: 405 });
+        }
+        if (agentId) {
+          if (request.method === 'DELETE') {
+            await deleteAgent(env.DB, u.tenantId, agentId);
+            return new Response(null, { status: 204 });
           }
-          if (body.externalId === null) {
-            await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);
+          // PATCH links (or clears) this agent's suite principal (charter
+          // decisions/2026-08-30-an-agent-is-a-principal.md §5): `{ externalId: "prn_…" }` to link,
+          // `{ externalId: null }` to clear. `setAgentExternalMapping` has existed since an earlier
+          // task with no caller — this is that caller. It is what lets `resolveHubAgent` turn an
+          // agent-kind hub token into a local agent; with no mapping there is nothing for that
+          // resolver to find, and NULL stays the normal state for a standalone board.
+          if (request.method === 'PATCH') {
+            // `setAgentExternalMapping` is itself tenant-scoped (mirroring `revokeAgentToken`) —
+            // this check is what turns a cross-tenant PATCH into a 404 instead of a 200 whose write
+            // silently landed nowhere.
+            if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
+              return Response.json({ error: 'agent not found' }, { status: 404 });
+            }
+            const body = (await request.json()) as { externalId?: string | null };
+            if (body.externalId === undefined) {
+              return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
+            }
+            if (body.externalId === null) {
+              await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);
+              return Response.json({ ok: true });
+            }
+            // Caught here, not left to the CHECK constraint or a downstream join: a typo becomes a
+            // 400 that names the mistake, not a mapping that silently matches nothing.
+            if (!/^prn_[0-9a-f]{20}$/.test(body.externalId)) {
+              return Response.json({ error: 'externalId must look like prn_ followed by 20 lowercase hex characters' }, { status: 400 });
+            }
+            // A principal is one agent (the premise `agents_external_pair_unique`, migration 0004,
+            // enforces in the schema). Checked here first so a collision reads as a sentence, not a
+            // raw UNIQUE-constraint failure; re-linking THIS agent to the principal it already has
+            // is not a collision — that stays idempotent.
+            const claimedBy = await findAgentByExternal(env.DB, 'org-plane', body.externalId);
+            if (claimedBy && claimedBy.agentId !== agentId) {
+              return Response.json({ error: `${body.externalId} is already linked to a different agent` }, { status: 409 });
+            }
+            await setAgentExternalMapping(env.DB, u.tenantId, agentId, { externalId: body.externalId, externalSource: 'org-plane' });
             return Response.json({ ok: true });
           }
-          // Caught here, not left to the CHECK constraint or a downstream join: a typo becomes a
-          // 400 that names the mistake, not a mapping that silently matches nothing.
-          if (!/^prn_[0-9a-f]{20}$/.test(body.externalId)) {
-            return Response.json({ error: 'externalId must look like prn_ followed by 20 lowercase hex characters' }, { status: 400 });
-          }
-          // A principal is one agent (the premise `agents_external_pair_unique`, migration 0004,
-          // enforces in the schema). Checked here first so a collision reads as a sentence, not a
-          // raw UNIQUE-constraint failure; re-linking THIS agent to the principal it already has
-          // is not a collision — that stays idempotent.
-          const claimedBy = await findAgentByExternal(env.DB, 'org-plane', body.externalId);
-          if (claimedBy && claimedBy.agentId !== agentId) {
-            return Response.json({ error: `${body.externalId} is already linked to a different agent` }, { status: 409 });
-          }
-          await setAgentExternalMapping(env.DB, u.tenantId, agentId, { externalId: body.externalId, externalSource: 'org-plane' });
-          return Response.json({ ok: true });
+          return Response.json({ error: 'method not allowed' }, { status: 405 });
+        }
+        if (request.method === 'GET') return Response.json({ agents: await listAgents(env.DB, u.tenantId) });
+        if (request.method === 'POST') {
+          const body = (await request.json()) as { name?: string; capabilities?: string[] };
+          if (!body.name || body.name.trim() === '') return Response.json({ error: 'name is required' }, { status: 400 });
+          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: body.capabilities ?? [] });
+          const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
+          return Response.json({ agent: created, token, tokenId }, { status: 201 });
         }
         return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
       }
-      if (request.method === 'GET') return Response.json({ agents: await listAgents(env.DB, u.tenantId) });
-      if (request.method === 'POST') {
-        const body = (await request.json()) as { name?: string; capabilities?: string[] };
-        if (!body.name || body.name.trim() === '') return Response.json({ error: 'name is required' }, { status: 400 });
-        const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: body.capabilities ?? [] });
-        const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
-        return Response.json({ agent: created, token, tokenId }, { status: 201 });
-      }
-      return Response.json({ error: 'method not allowed' }, { status: 405 });
     }
 
     const match = path.match(/^\/v1\/boards(?:\/([^/]+))?(?:\/(.*))?$/);
@@ -600,8 +703,7 @@ export default {
 
       return Response.json({ error: 'method not allowed' }, { status: 405 });
     } catch (err) {
-      const message = (err as { message?: string })?.message ?? 'unexpected error';
-      return Response.json({ error: { message } }, { status: 500 });
+      return unexpected(err);
     }
   },
 } satisfies ExportedHandler<Env>;

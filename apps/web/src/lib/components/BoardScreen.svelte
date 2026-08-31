@@ -6,6 +6,9 @@
     getAgents,
     deleteAgent,
     setAgentPrincipal,
+    getWorkspace,
+    setWorkspaceFleet,
+    type WorkspaceTenant,
     revokeAgentToken,
     BOARD_TEMPLATES,
     type AgentToken,
@@ -60,6 +63,13 @@
   let newCaps = $state<string[]>(['research', 'review', 'publish']);
   let minted = $state<AgentToken | null>(null);
   let minting = $state(false);
+
+  // linking THIS WORKSPACE to a hub fleet — the row both hub-token resolvers require
+  let workspace = $state<WorkspaceTenant | null>(null);
+  let fleetInput = $state('');
+  let fleetError = $state<string | null>(null);
+  let fleetSaving = $state(false);
+  let editingFleet = $state(false);
 
   // linking a suite principal, one agent's input open at a time
   let linkingAgentId = $state<string | null>(null);
@@ -124,11 +134,15 @@
   async function openAgents(): Promise<void> {
     showConnect = true;
     minted = null;
+    editingFleet = false;
+    fleetError = null;
     try {
       agents = await getAgents();
     } catch {
       agents = [];
     }
+    // The workspace's own fleet link, read alongside the agents it gates.
+    await refreshWorkspace().catch(() => {});
   }
 
   function toggleCap(cap: string): void {
@@ -152,6 +166,42 @@
   async function onDeleteAgent(id: string): Promise<void> {
     const res = await deleteAgent(id);
     if (res.ok) agents = await getAgents();
+  }
+
+  // ---- link this workspace to a hub fleet ----
+  //
+  // Deliberately in the same panel as the per-agent principal control, because linking an agent
+  // to a principal does nothing at all while the fleet that principal belongs to is unlinked:
+  // `resolveHubAgent` maps the claim's tenant through this row and refuses when it is missing.
+  // Two controls, one act, and the order matters — so they are next to each other.
+  async function refreshWorkspace(): Promise<void> {
+    workspace = await getWorkspace();
+  }
+
+  function startFleetEdit(): void {
+    editingFleet = true;
+    fleetInput = workspace?.externalId ?? '';
+    fleetError = null;
+  }
+
+  async function saveFleet(): Promise<void> {
+    const value = fleetInput.trim();
+    fleetSaving = true;
+    fleetError = null;
+    try {
+      const res = await setWorkspaceFleet(value === '' ? null : value);
+      if (!res.ok) {
+        // The server's own sentence — "externalId must look like fleet_ …" — not a generic
+        // failure, same as the principal control below.
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        fleetError = body?.error ?? `Linking failed (${res.status})`;
+        return;
+      }
+      await refreshWorkspace();
+      editingFleet = false;
+    } finally {
+      fleetSaving = false;
+    }
   }
 
   // ---- link a suite principal ----
@@ -374,6 +424,39 @@
           <p class="text-muted-foreground mt-2 text-xs leading-relaxed">The agent claims cards whose stage matches its capabilities, works them, and hands off down the pipeline.</p>
           <div class="mt-5 flex justify-end"><Button onclick={() => (minted = null)}>Done</Button></div>
         {:else}
+          <!--
+            This workspace's hub fleet. Above the agent list on purpose: an agent linked to a
+            principal resolves nothing while the fleet is unlinked, so the order on screen is the
+            order the two acts have to happen in.
+          -->
+          <div class="bg-inset border-border mt-4 rounded-[8px] border px-3 py-2">
+            {#if editingFleet}
+              <div class="flex items-center gap-1.5">
+                <input
+                  bind:value={fleetInput}
+                  placeholder="fleet_…  (empty to unlink)"
+                  class="bg-surface border-border mono min-w-0 flex-1 rounded-[5px] border px-2 py-1 text-[11px]"
+                />
+                <button onclick={() => void saveFleet()} disabled={fleetSaving} class="shrink-0 text-[11px] hover:brightness-110" style="color:var(--marigold)">save</button>
+                <button onclick={() => (editingFleet = false)} class="text-muted-foreground shrink-0 text-[11px] hover:brightness-110">cancel</button>
+              </div>
+              {#if fleetError}<p class="text-coral mono mt-1 text-[10px] leading-relaxed">{fleetError}</p>{/if}
+            {:else if workspace?.externalId}
+              <div class="mono flex items-center gap-1.5 text-[11px]">
+                <span class="text-muted-foreground shrink-0">fleet</span>
+                <span class="truncate">{workspace.externalId}</span>
+                <button onclick={startFleetEdit} class="text-muted-foreground ml-auto shrink-0 hover:brightness-110">change</button>
+              </div>
+            {:else}
+              <div class="flex items-center gap-1.5">
+                <p class="text-muted-foreground min-w-0 flex-1 text-[11px] leading-relaxed">
+                  not linked to an agentpod fleet — link one so tokens its hub issues are accepted here
+                </p>
+                <button onclick={startFleetEdit} class="shrink-0 text-[11px] hover:brightness-110" style="color:var(--marigold)">link</button>
+              </div>
+            {/if}
+          </div>
+
           <div class="mt-4 max-h-72 space-y-2 overflow-y-auto">
             {#if agents.length === 0}
               <p class="text-muted-foreground text-sm">No agents yet. Create one below — you'll get a token to point an AI agent at this workspace.</p>

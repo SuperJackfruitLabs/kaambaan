@@ -115,6 +115,24 @@ export async function primaryTenant(db: D1Database, userId: string): Promise<Ten
 }
 
 /**
+ * One workspace by id, mapping and all.
+ *
+ * `primaryTenant` above answers "which workspace is this person's", keyed by user. This answers
+ * "what is this workspace", keyed by the tenant a request has already resolved to — which is what
+ * `GET /v1/tenant` needs in order to show an operator whether their workspace is linked to a hub
+ * fleet, and to which one.
+ */
+export async function tenantById(db: D1Database, tenantId: string): Promise<TenantRecord | null> {
+  return db
+    .prepare(
+      `SELECT id, slug, name, external_id AS externalId, external_source AS externalSource
+       FROM tenants WHERE id = ?`,
+    )
+    .bind(tenantId)
+    .first<TenantRecord>();
+}
+
+/**
  * Record (or clear, with `null`) where this tenant is also known outside kaambaan.
  *
  * The pair is all-or-nothing and the database enforces it (`tenants_external_pair`); this guard
@@ -122,9 +140,17 @@ export async function primaryTenant(db: D1Database, userId: string): Promise<Ten
  * an id without the system it came from is worse than recording nothing: an unattributed id
  * cannot be joined against anything, and a wrong join is harder to notice than a missing one.
  *
- * Nothing calls this yet — the shape is reserved ahead of its first writer, which is the only
- * moment it is free to get right. It changes no existing behaviour: a tenant with no mapping is
- * exactly the tenant kaambaan has today.
+ * **Corrected 2026-08-31.** This used to say "nothing calls this yet", and the whole-branch
+ * review found that still true long after it mattered: `resolveHubUser` and `resolveHubAgent`
+ * BOTH require `findTenantByExternal(db, 'agentpod', claims.tenant)` to resolve before a
+ * hub-issued credential can do anything in kaambaan, and nothing wrote that row — so it existed
+ * only where somebody had made it by hand, which is "no SQL at any point" broken at the seam
+ * between the two repositories.
+ *
+ * The one caller is `PATCH /v1/tenant` (index.ts), the deliberate mirror of `PATCH
+ * /v1/agents/:id`: a human validates the `fleet_[0-9a-f]{20}` shape and calls this. It changes no
+ * existing behaviour on its own — a workspace nobody has linked is exactly the workspace
+ * kaambaan has today, and that stays the normal state for a standalone board.
  */
 export async function setTenantExternalMapping(
   db: D1Database,
