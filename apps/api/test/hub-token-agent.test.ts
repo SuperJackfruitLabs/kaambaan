@@ -86,7 +86,7 @@ async function mapTenant(fleet: string, tenantId: string): Promise<void> {
 describe('resolving an agent-kind hub token', () => {
   it('resolves to the local agent its sub maps to, with the agent\'s OWN capabilities', async () => {
     const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Researcher', capabilities: ['research', 'review'] });
-    await setAgentExternalMapping(env.DB, agent.id, {
+    await setAgentExternalMapping(env.DB, 'tnt_hta', agent.id, {
       externalId: 'prn_0000000000000000hbtaA',
       externalSource: 'org-plane',
     });
@@ -114,7 +114,7 @@ describe('resolving an agent-kind hub token', () => {
     // trivially with one fleet mapped to one tenant today — it exists to keep failing once a
     // second fleet is mapped to a second tenant.
     const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Wrong-fleet target', capabilities: ['research'] });
-    await setAgentExternalMapping(env.DB, agent.id, {
+    await setAgentExternalMapping(env.DB, 'tnt_hta', agent.id, {
       externalId: 'prn_0000000000000000wrong',
       externalSource: 'org-plane',
     });
@@ -139,7 +139,7 @@ describe('resolving an agent-kind hub token', () => {
     // Same sub, same mapped agent — the only thing different is principalKind. If this resolved,
     // any human's token would double as an agent credential.
     const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Human-in-agent-clothes' });
-    await setAgentExternalMapping(env.DB, agent.id, {
+    await setAgentExternalMapping(env.DB, 'tnt_hta', agent.id, {
       externalId: 'prn_humansub000000000000',
       externalSource: 'org-plane',
     });
@@ -164,7 +164,7 @@ describe('resolving an agent-kind hub token', () => {
 
   it('without HUB_ISSUER configured, resolves nothing (no hub in existence)', async () => {
     const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Standalone' });
-    await setAgentExternalMapping(env.DB, agent.id, {
+    await setAgentExternalMapping(env.DB, 'tnt_hta', agent.id, {
       externalId: 'prn_standalone000000000',
       externalSource: 'org-plane',
     });

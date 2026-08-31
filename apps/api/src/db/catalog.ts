@@ -166,9 +166,17 @@ export async function createAgent(db: D1Database, tenantId: string, input: { nam
  * this. It is what lets `resolveHubAgent` turn an agent-kind hub token into a local agent — until
  * a mapping is recorded, there is nothing for that resolver to find. It changes no existing
  * behaviour on its own: an agent nobody has linked is exactly the agent kaambaan has today.
+ *
+ * **Tenant-scoped, like `revokeAgentToken`.** `agents.id` is a bare primary key with no
+ * per-tenant uniqueness (a previous review found that load-bearing for `revokeAgentToken`'s own
+ * `WHERE`); the same is true here. The route caller already runs `agentBelongsToTenant` first —
+ * that check is real and this is not, today, a reachable bug through it — but a guard that lives
+ * only in one caller protects that caller and nobody else. The `WHERE` clause below is that
+ * defence in depth, not a replacement for the route's 404.
  */
 export async function setAgentExternalMapping(
   db: D1Database,
+  tenantId: string,
   agentId: string,
   mapping: AgentExternalMapping | null,
 ): Promise<void> {
@@ -182,8 +190,8 @@ export async function setAgentExternalMapping(
     }
   }
   await db
-    .prepare(`UPDATE agents SET external_id = ?, external_source = ?, updated_at = datetime('now') WHERE id = ?`)
-    .bind(mapping?.externalId ?? null, mapping?.externalSource ?? null, agentId)
+    .prepare(`UPDATE agents SET external_id = ?, external_source = ?, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+    .bind(mapping?.externalId ?? null, mapping?.externalSource ?? null, agentId, tenantId)
     .run();
 }
 
@@ -329,11 +337,11 @@ export async function deleteAgent(db: D1Database, tenantId: string, agentId: str
 }
 
 /**
- * Does this agent belong to this tenant? `setAgentExternalMapping` itself is not tenant-scoped
- * (it matches by `agentId` alone, same as `findAgentByExternal`'s read side) — this is the check
- * its one caller (`PATCH /v1/agents/:id`) runs first, the same shape `deleteAgent`'s own WHERE
- * clause enforces. Without it, a signed-in user of one tenant could hand an agent id from a
- * different tenant and repoint someone else's agent at a principal of their choosing.
+ * Does this agent belong to this tenant? `setAgentExternalMapping` is itself tenant-scoped now
+ * (same `WHERE id = ? AND tenant_id = ?` shape as `deleteAgent` and `revokeAgentToken`), but this
+ * check stays: it is what turns a cross-tenant PATCH into a 404 instead of a silent no-op update
+ * that changed nothing. Without it, a signed-in user of one tenant could hand an agent id from a
+ * different tenant and get back a 200 with no idea their write did not land anywhere.
  */
 export async function agentBelongsToTenant(db: D1Database, tenantId: string, agentId: string): Promise<boolean> {
   const row = await db.prepare(`SELECT 1 FROM agents WHERE id = ? AND tenant_id = ?`).bind(agentId, tenantId).first();

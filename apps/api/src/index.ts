@@ -35,7 +35,7 @@ import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, agentBelongsToTenant } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant } from './db/catalog';
 
 export { BoardDO };
 
@@ -149,9 +149,9 @@ export default {
         // agent-kind hub token into a local agent; with no mapping there is nothing for that
         // resolver to find, and NULL stays the normal state for a standalone board.
         if (request.method === 'PATCH') {
-          // `setAgentExternalMapping` itself matches by agentId alone (mirroring the read side,
-          // `findAgentByExternal`) — this is the tenant check that keeps a session from one
-          // tenant repointing an agent it does not own.
+          // `setAgentExternalMapping` is itself tenant-scoped (mirroring `revokeAgentToken`) —
+          // this check is what turns a cross-tenant PATCH into a 404 instead of a 200 whose write
+          // silently landed nowhere.
           if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
             return Response.json({ error: 'agent not found' }, { status: 404 });
           }
@@ -160,7 +160,7 @@ export default {
             return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
           }
           if (body.externalId === null) {
-            await setAgentExternalMapping(env.DB, agentId, null);
+            await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);
             return Response.json({ ok: true });
           }
           // Caught here, not left to the CHECK constraint or a downstream join: a typo becomes a
@@ -168,7 +168,15 @@ export default {
           if (!/^prn_[0-9a-f]{20}$/.test(body.externalId)) {
             return Response.json({ error: 'externalId must look like prn_ followed by 20 lowercase hex characters' }, { status: 400 });
           }
-          await setAgentExternalMapping(env.DB, agentId, { externalId: body.externalId, externalSource: 'org-plane' });
+          // A principal is one agent (the premise `agents_external_pair_unique`, migration 0004,
+          // enforces in the schema). Checked here first so a collision reads as a sentence, not a
+          // raw UNIQUE-constraint failure; re-linking THIS agent to the principal it already has
+          // is not a collision — that stays idempotent.
+          const claimedBy = await findAgentByExternal(env.DB, 'org-plane', body.externalId);
+          if (claimedBy && claimedBy.agentId !== agentId) {
+            return Response.json({ error: `${body.externalId} is already linked to a different agent` }, { status: 409 });
+          }
+          await setAgentExternalMapping(env.DB, u.tenantId, agentId, { externalId: body.externalId, externalSource: 'org-plane' });
           return Response.json({ ok: true });
         }
         return Response.json({ error: 'method not allowed' }, { status: 405 });

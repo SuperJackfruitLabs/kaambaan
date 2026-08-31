@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:test';
 import tenantExternalMapping from '../../migrations/0002_tenant_external_mapping.sql?raw';
 import agentExternalMapping from '../../migrations/0003_agent_external_mapping.sql?raw';
+import agentExternalPairUnique from '../../migrations/0004_agent_external_pair_unique.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -31,6 +32,12 @@ async function tableHasColumn(table: string, column: string): Promise<boolean> {
   return Boolean(row?.sql?.includes(column));
 }
 
+/** Has this index already been created? Same "storage may persist across beforeAll's" guard. */
+async function indexExists(name: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`).bind(name).first();
+  return row !== null;
+}
+
 export async function setupCatalog(): Promise<void> {
   for (const s of STATEMENTS) await env.DB.prepare(s).run();
   // Run the REAL migrations rather than hand-copied mirrors, so the CHECK constraints the suite
@@ -41,5 +48,8 @@ export async function setupCatalog(): Promise<void> {
   }
   if (!(await tableHasColumn('agents', 'external_id'))) {
     for (const s of statementsOf(agentExternalMapping)) await env.DB.prepare(s).run();
+  }
+  if (!(await indexExists('agents_external_pair_unique'))) {
+    for (const s of statementsOf(agentExternalPairUnique)) await env.DB.prepare(s).run();
   }
 }

@@ -189,4 +189,59 @@ describe('PATCH /v1/agents/:id — link a suite principal', () => {
     }>();
     expect(list.agents.find((a) => a.id === owned.id)?.externalId).toBeNull();
   });
+
+  // --- Finding B: one principal, one agent -----------------------------------------------------
+
+  it('refuses a second agent claiming a principal already linked to a different agent, with 409', async () => {
+    const first = await createAgentViaRest('tnt_prt_claim', 'First claimant');
+    const second = await createAgentViaRest('tnt_prt_claim', 'Second claimant');
+    const sub = prn(7);
+
+    const linkFirst = await SELF.fetch(`https://api.test/v1/agents/${first.id}`, {
+      method: 'PATCH',
+      headers: dev('tnt_prt_claim'),
+      body: JSON.stringify({ externalId: sub }),
+    });
+    expect(linkFirst.status).toBe(200);
+
+    const linkSecond = await SELF.fetch(`https://api.test/v1/agents/${second.id}`, {
+      method: 'PATCH',
+      headers: dev('tnt_prt_claim'),
+      body: JSON.stringify({ externalId: sub }),
+    });
+    expect(linkSecond.status).toBe(409);
+    const body = await linkSecond.json<{ error: string }>();
+    expect(body.error).toMatch(new RegExp(sub));
+
+    // The second attempt changed nothing: the principal is still the first agent's alone.
+    const list = await (await SELF.fetch('https://api.test/v1/agents', { headers: dev('tnt_prt_claim') })).json<{
+      agents: Array<{ id: string; externalId: string | null }>;
+    }>();
+    expect(list.agents.find((a) => a.id === first.id)?.externalId).toBe(sub);
+    expect(list.agents.find((a) => a.id === second.id)?.externalId).toBeNull();
+  });
+
+  it('re-linking an agent to the principal it already has stays idempotent, not a 409', async () => {
+    const agent = await createAgentViaRest('tnt_prt_relink', 'Relinkable');
+    const sub = prn(8);
+
+    const first = await SELF.fetch(`https://api.test/v1/agents/${agent.id}`, {
+      method: 'PATCH',
+      headers: dev('tnt_prt_relink'),
+      body: JSON.stringify({ externalId: sub }),
+    });
+    expect(first.status).toBe(200);
+
+    const again = await SELF.fetch(`https://api.test/v1/agents/${agent.id}`, {
+      method: 'PATCH',
+      headers: dev('tnt_prt_relink'),
+      body: JSON.stringify({ externalId: sub }),
+    });
+    expect(again.status).toBe(200);
+
+    const list = await (await SELF.fetch('https://api.test/v1/agents', { headers: dev('tnt_prt_relink') })).json<{
+      agents: Array<{ id: string; externalId: string | null }>;
+    }>();
+    expect(list.agents.find((a) => a.id === agent.id)?.externalId).toBe(sub);
+  });
 });
