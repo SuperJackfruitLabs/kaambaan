@@ -17,6 +17,17 @@
  *   - Retiring a signing key does NOT take effect here until this cache
  *     expires. Key deletion is not an emergency revocation lever, and the same
  *     issue measured the lag.
+ *
+ * That second point is deliberately one-directional. A key ADDED to the
+ * published set is picked up right away: a token naming a `kid` this cache
+ * has not seen triggers exactly one refetch before rejecting (see `keySet`
+ * below). Without that, rotation would be safe to perform but unsafe to rely
+ * on for up to `JWKS_TTL_MS` afterwards — the one case where that lag bites is
+ * a suspected key compromise, exactly when you need the new key trusted
+ * immediately, not in ten minutes. A key REMOVED from the set is a different
+ * story: its `kid` is still in our cache, so nothing here notices until the
+ * TTL turns over, which is why revocation-via-deletion still is not an
+ * emergency lever.
  */
 
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet, type JWTPayload } from 'jose';
@@ -95,31 +106,83 @@ const cache = new Map<string, CachedSet>();
 /** How long a fetched key set is used without re-checking. */
 const JWKS_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * One fetch in flight per issuer, shared by every caller that needs it at the
+ * same moment — whether they're here because the TTL lapsed or because a
+ * `kid` is missing from an otherwise-fresh set.
+ *
+ * Without this, a burst of tokens all naming the same just-rotated-in `kid`
+ * (the normal shape of traffic right after a rotation — old tokens keep
+ * arriving on the old key, new ones start arriving on the new one, all at
+ * once) would each fire their own request at the issuer. One rotation should
+ * cost the issuer one extra request, not one per in-flight verification.
+ */
+const inflight = new Map<string, Promise<CachedSet | null>>();
+
 /** Test-only: drop the cache so each case starts cold. */
 export function __resetJwksCacheForTests(): void {
   cache.clear();
+  inflight.clear();
 }
 
-async function keySet(opts: VerifyOptions): Promise<CachedSet | null> {
+function hasKid(set: CachedSet | undefined, kid: string): boolean {
+  return !!set && set.keys.keys.some((key) => key.kid === kid);
+}
+
+/** Fetch a fresh set for `opts.issuer`, coalescing concurrent callers onto one request. */
+function fetchFresh(opts: VerifyOptions): Promise<CachedSet | null> {
+  const existing = inflight.get(opts.issuer);
+  if (existing) return existing;
+
+  const promise = (async (): Promise<CachedSet | null> => {
+    const doFetch = opts.fetch ?? fetch;
+    try {
+      const res = await doFetch(`${opts.issuer}/api/auth/jwks`);
+      if (!res.ok) return null;
+      const keys = (await res.json()) as JSONWebKeySet;
+      if (!Array.isArray(keys?.keys) || keys.keys.length === 0) return null;
+
+      const fresh: CachedSet = { keys, verify: createLocalJWKSet(keys), fetchedAt: Date.now() };
+      cache.set(opts.issuer, fresh);
+      return fresh;
+    } catch {
+      return null;
+    }
+  })();
+
+  inflight.set(opts.issuer, promise);
+  promise.finally(() => {
+    // Only the fetch that's still current clears the slot — otherwise a fetch
+    // that finishes after a newer one has already started could delete the
+    // newer one's in-flight entry out from under it.
+    if (inflight.get(opts.issuer) === promise) inflight.delete(opts.issuer);
+  });
+  return promise;
+}
+
+async function keySet(opts: VerifyOptions, kid: string): Promise<CachedSet | null> {
   const now = Date.now();
   const cached = cache.get(opts.issuer);
-  if (cached && now - cached.fetchedAt < JWKS_TTL_MS) return cached;
+  const isFresh = !!cached && now - cached.fetchedAt < JWKS_TTL_MS;
 
-  const doFetch = opts.fetch ?? fetch;
-  try {
-    const res = await doFetch(`${opts.issuer}/api/auth/jwks`);
-    if (!res.ok) return cached ?? null;
-    const keys = (await res.json()) as JSONWebKeySet;
-    if (!Array.isArray(keys?.keys) || keys.keys.length === 0) return cached ?? null;
+  if (isFresh && hasKid(cached, kid)) return cached;
 
-    const fresh: CachedSet = { keys, verify: createLocalJWKSet(keys), fetchedAt: now };
-    cache.set(opts.issuer, fresh);
-    return fresh;
-  } catch {
-    // The issuer is unreachable. A stale set still verifies every token signed
-    // by a key we already know, which is the whole point of verifying offline.
-    return cached ?? null;
+  if (isFresh) {
+    // The TTL hasn't lapsed, but this `kid` isn't in the set we're holding —
+    // the signature of a rotation since our last fetch. Refetch once. A
+    // failure here does NOT fall back to the set we already have: that set is
+    // by definition the one missing this key, so serving it stale would just
+    // relocate the same wrong rejection rather than fix it, while quietly
+    // making "the refetch failed" indistinguishable from "the key doesn't
+    // exist". Fail closed instead — reject, and let the next attempt retry.
+    return await fetchFresh(opts);
   }
+
+  // Cold cache or the TTL genuinely expired: the existing periodic refresh.
+  // An issuer outage degrades new keys, not verification of tokens signed by
+  // a key we already hold.
+  const fresh = await fetchFresh(opts);
+  return fresh ?? cached ?? null;
 }
 
 /**
@@ -135,31 +198,51 @@ export async function verifyHubToken(
 ): Promise<HubClaims | null> {
   if (!token) return null;
 
-  // Reject an unsupported algorithm BEFORE asking jose to verify.
+  // Reject an unsupported algorithm, or a header naming no `kid` at all,
+  // BEFORE asking jose to verify or touching the key set.
   //
-  // `jwtVerify` with `algorithms: ['EdDSA']` also rejects it — but by then it
-  // has begun resolving a key from the remote set, and that in-flight promise
-  // rejects out of band once the verify has already failed. The result is an
-  // unhandled rejection that fails a test run whose assertions all passed, and
-  // in production an unhandled rejection per malformed token.
+  // `jwtVerify` with `algorithms: ['EdDSA']` also rejects a bad alg — but by
+  // then it has begun resolving a key from the remote set, and that in-flight
+  // promise rejects out of band once the verify has already failed. The
+  // result is an unhandled rejection that fails a test run whose assertions
+  // all passed, and in production an unhandled rejection per malformed token.
   //
-  // Checking here means an unsupported `alg` never causes a key lookup at all,
-  // which is also the better posture: a caller should not be able to make us
-  // fetch anything by sending a header we do not support.
+  // Requiring a string `kid` here matters more now than it used to: `kid` is
+  // what decides whether we refetch. A token with no `kid` (or a non-string
+  // one) can never match anything in the set, so if it reached `keySet` it
+  // would look exactly like a rotation and trigger a refetch — meaning a
+  // flood of headers with no `kid` would be a flood of requests at the
+  // issuer. Rejecting it here, before any key lookup, closes that off.
   const header = token.split('.')[0];
   if (!header) return null;
+  let kid: string;
   try {
     const decoded = JSON.parse(atob(header.replace(/-/g, "+").replace(/_/g, "/"))) as {
       alg?: unknown;
+      kid?: unknown;
     };
     if (decoded.alg !== "EdDSA") return null;
+    if (typeof decoded.kid !== "string" || decoded.kid === "") return null;
+    kid = decoded.kid;
   } catch {
     return null; // not even a JWT
   }
 
   try {
-    const set = await keySet(opts);
+    const set = await keySet(opts, kid);
     if (!set) return null;
+
+    // `keySet` already refetched once if `kid` was missing; if it's STILL
+    // missing (the kid exists nowhere, not just somewhere we hadn't fetched
+    // yet), stop here rather than handing it to `jwtVerify`. Not just an
+    // optimization: jose's local key resolver throws synchronously from
+    // inside an async function when no candidate matches, and adopting that
+    // rejected promise through the implicit `return` in `createLocalJWKSet`
+    // costs one microtask — long enough for this runtime's rejection tracking
+    // to flag it as unhandled before our own `catch` below gets to see it,
+    // even though it does. Exactly the failure mode this file already avoids
+    // `createRemoteJWKSet` for; same fix, applied one call earlier.
+    if (!hasKid(set, kid)) return null;
 
     const { payload } = await jwtVerify(token, set.verify, {
       issuer: opts.issuer,

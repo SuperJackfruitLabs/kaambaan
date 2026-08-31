@@ -114,6 +114,169 @@ describe('verifying a hub token at the edge', () => {
     expect(claims).not.toBeNull();
   });
 
+  it('verifies a token signed by a key rotated in after the cache was warm', async () => {
+    // The regression the spike found: retiring/adding a key on the issuer's
+    // side does not invalidate anything, and a freshly minted token signed by
+    // a just-published key must verify — even though our cache doesn't know
+    // about it yet — by refetching once, not by waiting out the 10-minute TTL.
+    __resetJwksCacheForTests();
+    fetchCount = 0;
+    const originalJwks = jwks;
+    try {
+      await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() });
+      expect(fetchCount).toBe(1); // cache is now warm
+
+      const rotatedIn = await generateKeyPair('EdDSA', { extractable: true });
+      const rotatedPub = await exportJWK(rotatedIn.publicKey);
+      jwks = {
+        keys: [...originalJwks.keys, { ...rotatedPub, alg: 'EdDSA', kid: 'rotated-in-kid' }],
+      };
+
+      const rotatedToken = await new SignJWT({
+        sub: 'user_abc',
+        principalKind: 'human',
+        tenant: FLEET,
+      })
+        .setProtectedHeader({ alg: 'EdDSA', kid: 'rotated-in-kid' })
+        .setIssuedAt()
+        .setIssuer(ISSUER)
+        .setAudience(ISSUER)
+        .setExpirationTime('5m')
+        .sign(rotatedIn.privateKey);
+
+      const claims = await verifyHubToken(rotatedToken, { issuer: ISSUER, fetch: countingFetch() });
+      expect(claims).not.toBeNull();
+      expect(claims!.sub).toBe('user_abc');
+      expect(fetchCount).toBe(2); // exactly one refetch, triggered by the unknown kid
+    } finally {
+      jwks = originalJwks;
+    }
+  });
+
+  it('rejects a kid that exists nowhere, after at most one refetch', async () => {
+    __resetJwksCacheForTests();
+    fetchCount = 0;
+    await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() });
+    expect(fetchCount).toBe(1); // cache is now warm
+
+    const ghost = await generateKeyPair('EdDSA', { extractable: true });
+    const ghostToken = await new SignJWT({ sub: 'user_abc', principalKind: 'human', tenant: FLEET })
+      .setProtectedHeader({ alg: 'EdDSA', kid: 'ghost-kid-nowhere' })
+      .setIssuedAt()
+      .setIssuer(ISSUER)
+      .setAudience(ISSUER)
+      .setExpirationTime('5m')
+      .sign(ghost.privateKey);
+
+    const claims = await verifyHubToken(ghostToken, { issuer: ISSUER, fetch: countingFetch() });
+    expect(claims).toBeNull();
+    expect(fetchCount).toBe(2); // exactly one refetch, no retry loop
+  });
+
+  it('does not refetch for a bad signature or an expired token carrying a known kid', async () => {
+    // The flip side of refetch-on-unknown-kid: these have a `kid` we already
+    // hold, so the failure is discovered without ever touching the network.
+    // Otherwise a flood of malformed tokens becomes a flood of requests
+    // against the issuer.
+    __resetJwksCacheForTests();
+    fetchCount = 0;
+    await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() });
+    expect(fetchCount).toBe(1); // cache is now warm, and knows 'test-kid'
+
+    const other = await generateKeyPair('EdDSA', { extractable: true });
+    const badSignature = await new SignJWT({ sub: 'user_evil', principalKind: 'human', tenant: FLEET })
+      .setProtectedHeader({ alg: 'EdDSA', kid: 'test-kid' })
+      .setIssuedAt()
+      .setIssuer(ISSUER)
+      .setAudience(ISSUER)
+      .setExpirationTime('5m')
+      .sign(other.privateKey);
+
+    expect(
+      await verifyHubToken(badSignature, { issuer: ISSUER, fetch: countingFetch() })
+    ).toBeNull();
+    expect(fetchCount).toBe(1); // no refetch for a bad signature
+
+    const expired = await new SignJWT({ sub: 'user_abc', principalKind: 'human', tenant: FLEET })
+      .setProtectedHeader({ alg: 'EdDSA', kid: 'test-kid' })
+      .setIssuedAt(Math.floor(Date.now() / 1000) - 600)
+      .setIssuer(ISSUER)
+      .setAudience(ISSUER)
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 300)
+      .sign(signingKey);
+
+    expect(await verifyHubToken(expired, { issuer: ISSUER, fetch: countingFetch() })).toBeNull();
+    expect(fetchCount).toBe(1); // still no refetch for an expired token
+  });
+
+  it('rejects rather than admits a token when the refetch itself fails', async () => {
+    // Fail closed: an unknown kid whose refetch cannot reach the issuer must
+    // not fall back to the stale set (which, by definition, is exactly the
+    // set that doesn't have this key) and must not be treated as valid.
+    __resetJwksCacheForTests();
+    await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() }); // warm
+
+    const unknown = await generateKeyPair('EdDSA', { extractable: true });
+    const tokenWithUnknownKid = await new SignJWT({
+      sub: 'user_abc',
+      principalKind: 'human',
+      tenant: FLEET,
+    })
+      .setProtectedHeader({ alg: 'EdDSA', kid: 'unreachable-refetch-kid' })
+      .setIssuedAt()
+      .setIssuer(ISSUER)
+      .setAudience(ISSUER)
+      .setExpirationTime('5m')
+      .sign(unknown.privateKey);
+
+    const dead = (async () => {
+      throw new Error('connection refused');
+    }) as unknown as typeof fetch;
+
+    const claims = await verifyHubToken(tokenWithUnknownKid, { issuer: ISSUER, fetch: dead });
+    expect(claims).toBeNull();
+  });
+
+  it('shares one refetch across concurrent verifications of the same unknown kid', async () => {
+    __resetJwksCacheForTests();
+    fetchCount = 0;
+    const originalJwks = jwks;
+    try {
+      await verifyHubToken(await makeToken(), { issuer: ISSUER, fetch: countingFetch() });
+      expect(fetchCount).toBe(1); // warm
+
+      const rotatedIn = await generateKeyPair('EdDSA', { extractable: true });
+      const rotatedPub = await exportJWK(rotatedIn.publicKey);
+      jwks = {
+        keys: [...originalJwks.keys, { ...rotatedPub, alg: 'EdDSA', kid: 'concurrent-rotated-kid' }],
+      };
+
+      const rotatedToken = await new SignJWT({
+        sub: 'user_abc',
+        principalKind: 'human',
+        tenant: FLEET,
+      })
+        .setProtectedHeader({ alg: 'EdDSA', kid: 'concurrent-rotated-kid' })
+        .setIssuedAt()
+        .setIssuer(ISSUER)
+        .setAudience(ISSUER)
+        .setExpirationTime('5m')
+        .sign(rotatedIn.privateKey);
+
+      const shared = countingFetch();
+      const [a, b] = await Promise.all([
+        verifyHubToken(rotatedToken, { issuer: ISSUER, fetch: shared }),
+        verifyHubToken(rotatedToken, { issuer: ISSUER, fetch: shared }),
+      ]);
+
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      expect(fetchCount).toBe(2); // one refetch shared by both, not two
+    } finally {
+      jwks = originalJwks;
+    }
+  });
+
   it('refuses a token signed by a key that is not in the set', async () => {
     __resetJwksCacheForTests();
     const other = await generateKeyPair('EdDSA', { extractable: true });
