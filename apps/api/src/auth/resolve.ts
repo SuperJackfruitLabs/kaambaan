@@ -157,7 +157,7 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
  * `findAgentByExternal` looks up kaambaan's OWN `agents` row for that principal and its
  * capabilities come from there, never from the token.
  *
- * Three refusals, all failing closed, same posture as `resolveHubUser`:
+ * Four refusals, all failing closed, same posture as `resolveHubUser`:
  *
  *   - **No issuer configured** → no hub-token path at all. A standalone board works with no
  *     issuer anywhere.
@@ -165,6 +165,13 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
  *     no capability set to act with.
  *   - **`principalKind` is not `"agent"`** → refused. A human's token must never double as an
  *     agent credential just because its `sub` happens to also be mapped as one.
+ *   - **The claim's `tenant` does not map to the SAME kaambaan tenant the agent row names** →
+ *     refused. `resolveHubUser` already maps `claims.tenant` through `findTenantByExternal` and
+ *     refuses an unmapped one; this mirrors that rather than trusting the agent row alone, so a
+ *     token minted for one fleet cannot resolve into an agent whose row happens to sit in a
+ *     different kaambaan tenant. charter → decisions/2026-08-15-tenancy-is-local-and-mapped.md:
+ *     an unmapped tenant is "invisible to the other plane, and silently so" — the check makes
+ *     that invisibility a refusal instead of a silent cross-tenant hop.
  */
 export async function resolveHubAgent(request: Request, env: Env): Promise<AgentPrincipal | null> {
   const issuer = env.HUB_ISSUER;
@@ -181,6 +188,12 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
 
   const found = await findAgentByExternal(env.DB, 'org-plane', claims.sub);
   if (!found) return null;
+
+  // Same mapping resolveHubUser performs on the human path — the claim's tenant must land on the
+  // exact kaambaan tenant the agent row names, not merely on some tenant. A mismatch is a
+  // cross-fleet confusion nothing else in this path would catch.
+  const claimTenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
+  if (!claimTenantId || claimTenantId !== found.tenantId) return null;
 
   return { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: claims.sub };
 }

@@ -7,7 +7,7 @@
  * exactly the way `resolveHubUser` already accepts a human-kind token, mirrored here rather
  * than reinvented.
  *
- * Two properties this file exists to protect, both named in the task brief:
+ * Three properties this file exists to protect:
  *
  *   - **Capabilities never come from the claim.** They are kaambaan's own vocabulary
  *     (`charter → decisions/2026-08-15-a-grant-names-an-agent-per-plane.md` calls putting them
@@ -16,6 +16,10 @@
  *     `findAgentByExternal(db, 'org-plane', sub)`.
  *   - **A `kbn_` token keeps working, unchanged.** It is kaambaan's native agent credential and
  *     a standalone board — one with no hub in existence — depends on it entirely.
+ *   - **The claim's tenant must map onto the SAME kaambaan tenant the agent row names**, the
+ *     same check `resolveHubUser` performs on the human path (`findTenantByExternal`). A token
+ *     minted for one fleet resolving into an agent whose row sits in a different kaambaan tenant
+ *     is a cross-fleet confusion nothing else on this path would catch.
  */
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
@@ -71,6 +75,14 @@ function req(token: string): Request {
   });
 }
 
+/** Map a fleet id onto a kaambaan tenant — the same external mapping resolveHubUser reads. */
+async function mapTenant(fleet: string, tenantId: string): Promise<void> {
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'T')`)
+    .bind(tenantId, `slug-${tenantId}`).run();
+  await env.DB.prepare(`UPDATE tenants SET external_source = 'agentpod', external_id = ? WHERE id = ?`)
+    .bind(fleet, tenantId).run();
+}
+
 describe('resolving an agent-kind hub token', () => {
   it('resolves to the local agent its sub maps to, with the agent\'s OWN capabilities', async () => {
     const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Researcher', capabilities: ['research', 'review'] });
@@ -78,6 +90,7 @@ describe('resolving an agent-kind hub token', () => {
       externalId: 'prn_0000000000000000hbtaA',
       externalSource: 'org-plane',
     });
+    await mapTenant(FLEET, 'tnt_hta');
 
     await withIssuer(async () => {
       const token = await hubToken({ sub: 'prn_0000000000000000hbtaA', principalKind: 'agent' });
@@ -91,6 +104,27 @@ describe('resolving an agent-kind hub token', () => {
       // resolved capabilities are exactly the local row's, not empty and not invented.
       expect(resolved!.capabilities).toEqual(['research', 'review']);
       expect(resolved!.externalId).toBe('prn_0000000000000000hbtaA');
+    });
+  });
+
+  it('refuses when the claim\'s tenant maps to a DIFFERENT kaambaan tenant than the agent\'s own row', async () => {
+    // Same shape resolveHubUser guards against on the human path, mirrored here rather than
+    // trusted-away: the agent row pins one kaambaan tenant regardless of what the token claims,
+    // so nothing else on this path would catch a token minted for the wrong fleet. This passes
+    // trivially with one fleet mapped to one tenant today — it exists to keep failing once a
+    // second fleet is mapped to a second tenant.
+    const agent = await createAgent(env.DB, 'tnt_hta', { name: 'Wrong-fleet target', capabilities: ['research'] });
+    await setAgentExternalMapping(env.DB, agent.id, {
+      externalId: 'prn_0000000000000000wrong',
+      externalSource: 'org-plane',
+    });
+    const OTHER_FLEET = 'fleet_0000000000000000othr';
+    await mapTenant(OTHER_FLEET, 'tnt_other_fleet');
+
+    await withIssuer(async () => {
+      // sub resolves to an agent in tnt_hta, but the claim's own tenant maps to tnt_other_fleet.
+      const token = await hubToken({ sub: 'prn_0000000000000000wrong', principalKind: 'agent', tenant: OTHER_FLEET });
+      expect(await resolveHubAgent(req(token), env)).toBeNull();
     });
   });
 
