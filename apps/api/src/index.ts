@@ -33,7 +33,7 @@ import { boardStub } from './board/stub';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
-import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser } from './auth/resolve';
+import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, deleteAgent } from './db/catalog';
 
@@ -171,6 +171,10 @@ export default {
       tenantId = t;
     } else if (isAgentRoute) {
       agent = await resolveAgent(request, env);
+      // Mirrors the human fallback below: a node can now exchange its own credential for a
+      // short-lived hub token whose sub is an agent principal, and kaambaan must accept it as
+      // that agent — capabilities still come from kaambaan's own agents row, never the claim.
+      if (!agent) agent = await resolveHubAgent(request, env);
       if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
       tenantId = agent.tenantId;
     } else {

@@ -8,7 +8,7 @@
 import type { Env } from '../env';
 import { readSessionToken, verifySession } from './session';
 import { hashToken } from './agent-token';
-import { findAgentByTokenHash, findTenantByExternal } from '../db/catalog';
+import { findAgentByExternal, findAgentByTokenHash, findTenantByExternal } from '../db/catalog';
 import { verifyHubToken } from './hub-jwt';
 
 export interface UserPrincipal {
@@ -141,4 +141,46 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
   if (!tenantId) return null;
 
   return { userId: claims.sub, tenantId, mayDispatch: claims.mayDispatch ?? [] };
+}
+
+/**
+ * Resolve an agent from a token issued by the suite's hub, verified offline.
+ *
+ * The agent-kind sibling of `resolveHubUser` above — same shape, deliberately: a node can now
+ * exchange its own credential for a short-lived hub token whose `sub` is a bare `prn_…`
+ * principal id and whose `principalKind` is `"agent"` (charter
+ * decisions/2026-08-30-an-agent-is-a-principal.md), and kaambaan must accept it AS THAT AGENT.
+ *
+ * **Capabilities never come from the claim.** They are kaambaan's own vocabulary — charter
+ * decisions/2026-08-15-a-grant-names-an-agent-per-plane.md calls putting them in a cross-plane
+ * claim "a trap — the same word, two vocabularies". The token names a principal (`sub`);
+ * `findAgentByExternal` looks up kaambaan's OWN `agents` row for that principal and its
+ * capabilities come from there, never from the token.
+ *
+ * Three refusals, all failing closed, same posture as `resolveHubUser`:
+ *
+ *   - **No issuer configured** → no hub-token path at all. A standalone board works with no
+ *     issuer anywhere.
+ *   - **A `sub` that maps to no local agent** → refused, not admitted with a null agent. There is
+ *     no capability set to act with.
+ *   - **`principalKind` is not `"agent"`** → refused. A human's token must never double as an
+ *     agent credential just because its `sub` happens to also be mapped as one.
+ */
+export async function resolveHubAgent(request: Request, env: Env): Promise<AgentPrincipal | null> {
+  const issuer = env.HUB_ISSUER;
+  if (!issuer) return null;
+
+  const token = bearer(request);
+  // `kbn_` tokens are the native agent credential and are resolved elsewhere; anything else is a
+  // candidate JWT.
+  if (!token || token.startsWith('kbn_')) return null;
+
+  const claims = await verifyHubToken(token, { issuer });
+  if (!claims) return null;
+  if (claims.principalKind !== 'agent') return null;
+
+  const found = await findAgentByExternal(env.DB, 'org-plane', claims.sub);
+  if (!found) return null;
+
+  return { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: claims.sub };
 }
