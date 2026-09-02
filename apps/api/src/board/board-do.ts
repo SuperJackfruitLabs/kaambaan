@@ -345,6 +345,18 @@ export interface GateView {
   options: GateOption[];
   producedBy: string;
   createdAt: string;
+  /**
+   * Who decided, and what they said.
+   *
+   * Both columns have been written on every resolution since gates existed and appeared in no
+   * read shape at all — so who approved what, and the feedback they gave with it, was recorded
+   * and unreadable. An approval nobody can attribute is not much of an approval.
+   *
+   * Null while pending, which is the ordinary state for everything this method returns.
+   */
+  decidedBy: string | null;
+  comment: string | null;
+  resolvedAt: string | null;
 }
 
 /**
@@ -532,7 +544,8 @@ export interface BoardStub {
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
-  getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }>;
+  getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }>;
+  getEvents(limit?: number): Promise<BoardEvent[]>;
   estimateCardCost(cardId: string): Promise<Result<EstimateView>>;
   getNotifications(opts?: { unreadOnly?: boolean; userId?: string }): Promise<NotificationView[]>;
   markNotificationRead(seq: number): Promise<Result<{ ok: true }>>;
@@ -1628,7 +1641,7 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** A card's session replay: its durable activity waterfall + the handoff carried into it (docs/07 §4). */
-  async getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }> {
+  async getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }> {
     const activities = this.sql
       .exec(`SELECT * FROM activities WHERE card_id = ? AND ephemeral = 0 ORDER BY seq ASC`, cardId)
       .toArray()
@@ -1650,7 +1663,10 @@ export class BoardDO extends DurableObject<Env> {
           signal: detail.signal ?? null,
         };
       });
-    return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)) };
+    // Gates ride along with the timeline rather than getting their own route: "who approved this
+    // and what did they say" is a question about the card's history, which is what this endpoint
+    // already answers.
+    return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)), gates: this.gatesForCard(cardId) };
   }
 
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
@@ -2442,6 +2458,36 @@ export class BoardDO extends DurableObject<Env> {
         options: JSON.parse(r.options_json as string) as GateOption[],
         producedBy: r.produced_by as string,
         createdAt: r.created_at as string,
+        decidedBy: (r.decided_by as string | null) ?? null,
+        comment: (r.comment as string | null) ?? null,
+        resolvedAt: (r.resolved_at as string | null) ?? null,
+      }));
+  }
+
+  /**
+   * Every gate on a card, decided ones included.
+   *
+   * `pendingGates` above answers "what is waiting on a human right now" and is what the board
+   * snapshot carries. This answers "what was decided on this card, by whom, and with what
+   * comment" — a question `gates.decided_by` and `gates.comment` could always have answered and
+   * no read shape ever asked.
+   */
+  private gatesForCard(cardId: string): GateView[] {
+    return this.sql
+      .exec(`SELECT * FROM gates WHERE card_id = ? ORDER BY created_at ASC`, cardId)
+      .toArray()
+      .map((r) => ({
+        id: r.id as string,
+        cardId: r.card_id as string,
+        stageKey: r.stage_key as string,
+        status: r.status as 'pending' | 'resolved',
+        decision: (r.decision as string | null) ?? null,
+        options: JSON.parse(r.options_json as string) as GateOption[],
+        producedBy: r.produced_by as string,
+        createdAt: r.created_at as string,
+        decidedBy: (r.decided_by as string | null) ?? null,
+        comment: (r.comment as string | null) ?? null,
+        resolvedAt: (r.resolved_at as string | null) ?? null,
       }));
   }
 

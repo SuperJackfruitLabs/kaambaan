@@ -25,6 +25,7 @@
   // priority and a spec — so a card could only be created bare and then edited. Collapsed by
   // default, because the one-line dispatch is the common act and should stay one line.
   let composeOpen = $state(false);
+  let titleEl = $state<HTMLInputElement | null>(null);
   let newPriority = $state(0);
   let newDue = $state('');
   let newDescription = $state('');
@@ -95,6 +96,19 @@
     await markNotificationRead(app.boardId, seq);
     await app.refresh();
   }
+
+  /**
+   * The palette's "Dispatch a card" lands here.
+   *
+   * That row used to close the palette and do nothing. The compose field belongs to this
+   * component, so the palette raises a counter and this focuses it — a counter rather than a flag
+   * because asking twice in a row is two requests.
+   */
+  $effect(() => {
+    if (app.composeRequest === 0) return;
+    void app.composeRequest; // read it so this re-runs on every request, not only the first
+    titleEl?.focus();
+  });
 
   // ---- dispatch ----
   async function onAdd(e: SubmitEvent): Promise<void> {
@@ -205,6 +219,7 @@
     <!-- Dispatch form -->
     <form class="relative flex items-center gap-1.5" onsubmit={onAdd}>
       <input
+        bind:this={titleEl}
         bind:value={title}
         data-testid="dispatch-title"
         placeholder="Dispatch a card…"

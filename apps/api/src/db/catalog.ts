@@ -402,7 +402,28 @@ export async function recordBoard(db: D1Database, tenantId: string, input: { id:
 }
 
 export async function listBoards(db: D1Database, tenantId: string): Promise<Array<{ id: string; name: string }>> {
-  const { results } = await db.prepare(`SELECT id, name FROM boards WHERE tenant_id = ? ORDER BY created_at DESC`).bind(tenantId).all<{ id: string; name: string }>();
+  // Through `tenantScopedSelect`, not around it. The guard's whole claim is that "there is NO
+  // unscoped query builder" — and until this, every production read was hand-written SQL and the
+  // builder was used only by its own tests. A guard nothing routes through guards nothing.
+  const q = tenantScopedSelect('boards', tenantId, { columns: ['id', 'name'] });
+  const { results } = await db.prepare(`${q.sql} ORDER BY created_at DESC`).bind(...q.params).all<{ id: string; name: string }>();
+  return results;
+}
+
+/**
+ * Every board in the deployment, tenant and all.
+ *
+ * **Deliberately unscoped, and named so.** Every other read here takes a tenantId because it
+ * answers a question somebody asked; this one exists for the scheduled sweep, which has no
+ * caller and therefore no tenant. Fabricating one would be worse than admitting there is none:
+ * the sweep would silently drain one workspace's delivery queue and no other.
+ *
+ * Not exported through any route. The only caller is `scheduled()`.
+ */
+export async function listAllBoards(db: D1Database): Promise<Array<{ id: string; tenantId: string }>> {
+  const { results } = await db
+    .prepare(`SELECT id, tenant_id AS tenantId FROM boards ORDER BY created_at ASC`)
+    .all<{ id: string; tenantId: string }>();
   return results;
 }
 
@@ -444,46 +465,9 @@ export async function deleteAgent(db: D1Database, tenantId: string, agentId: str
  * different tenant and get back a 200 with no idea their write did not land anywhere.
  */
 export async function agentBelongsToTenant(db: D1Database, tenantId: string, agentId: string): Promise<boolean> {
-  const row = await db.prepare(`SELECT 1 FROM agents WHERE id = ? AND tenant_id = ?`).bind(agentId, tenantId).first();
+  const q = tenantScopedSelect('agents', tenantId, { columns: ['id'], where: { id: agentId } });
+  const row = await db.prepare(q.sql).bind(...q.params).first();
   return row !== null;
-}
-
-/**
- * Minimal subset of the D1 query API we depend on — declared structurally so the repository can be
- * unit-tested with a fake (and so the catalog isn't coupled to a specific runtime type).
- */
-export interface D1Like {
-  prepare(sql: string): D1StatementLike;
-}
-export interface D1StatementLike {
-  bind(...params: unknown[]): D1BoundLike;
-}
-export interface D1BoundLike {
-  all<T = Record<string, unknown>>(): Promise<{ results: T[] }>;
-}
-
-/**
- * Tenant-scoped catalog reads. Every method requires a tenantId and routes through
- * `tenantScopedSelect`, so there is no path to read another tenant's rows.
- */
-export class CatalogRepository {
-  constructor(private readonly db: D1Like) {}
-
-  private run<T>(query: ScopedQuery): Promise<{ results: T[] }> {
-    return this.db.prepare(query.sql).bind(...query.params).all<T>();
-  }
-
-  listBoards<T = Record<string, unknown>>(tenantId: string) {
-    return this.run<T>(tenantScopedSelect('boards', tenantId));
-  }
-
-  getBoard<T = Record<string, unknown>>(tenantId: string, boardId: string) {
-    return this.run<T>(tenantScopedSelect('boards', tenantId, { where: { id: boardId } }));
-  }
-
-  listAgents<T = Record<string, unknown>>(tenantId: string) {
-    return this.run<T>(tenantScopedSelect('agents', tenantId));
-  }
 }
 
 /**

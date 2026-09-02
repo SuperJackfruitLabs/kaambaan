@@ -30,6 +30,8 @@
 
   // ---- local async state ----
   let cardDetail = $state<CardActivities | null>(null);
+  /** Gates that have been decided — the pending one is rendered by its own control above. */
+  const decidedGates = $derived((cardDetail?.gates ?? []).filter((g) => g.status !== 'pending'));
   let drawerAttempts = $state<Attempt[]>([]);
   let cardEstimate = $state<Estimate | null>(null);
 
@@ -595,6 +597,37 @@
             {/if}
           {/if}
         </section>
+
+        <!--
+          Approval history.
+
+          `gates.decided_by` and `gates.comment` were written on every resolution and appeared in
+          no read shape at all, so who approved a card — and the feedback they gave with it — was
+          recorded and unreadable. An approval nobody can attribute is not much of an approval.
+        -->
+        {#if decidedGates.length > 0}
+          <section class="sec">
+            <div class="sec-h eyebrow">decisions</div>
+            <div class="space-y-1.5">
+              {#each decidedGates as g (g.id)}
+                <div class="bg-inset border-border rounded-[8px] border px-3 py-2 text-[11px]">
+                  <div class="flex items-center gap-1.5">
+                    <span class="mono" style="color:{g.decision === 'approve' ? 'var(--live)' : 'var(--coral)'}">{g.decision ?? g.status}</span>
+                    <span class="text-muted-foreground">at</span>
+                    <span class="mono">{g.stageKey}</span>
+                    {#if g.decidedBy}
+                      <span class="text-muted-foreground">by</span>
+                      <span class="mono truncate">{g.decidedBy}</span>
+                    {/if}
+                  </div>
+                  {#if g.comment}
+                    <p class="text-muted-foreground mt-1 leading-relaxed">{g.comment}</p>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          </section>
+        {/if}
 
         <!-- handoff from prior stage -->
         {#if cardDetail?.handoff && Object.keys(cardDetail.handoff).length > 0}

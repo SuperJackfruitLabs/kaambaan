@@ -56,6 +56,29 @@ class AppStore {
   boardId = $state<string | null>(null);
   board = $state<BoardSnapshot | null>(null);
   connected = $state(false);
+
+  /**
+   * Requests the command palette makes of screens it does not own.
+   *
+   * Two palette rows — an Agents row, and "Dispatch a card" — closed the palette and did nothing
+   * at all. They cannot act directly: the agents panel belongs to BoardScreen and the compose
+   * field to Topbar, and the palette is a sibling of both. These are the signals they watch.
+   *
+   * A counter rather than a boolean for `composeRequest`, so asking twice in a row is two
+   * requests: a flag that is already true cannot be raised again.
+   */
+  agentsPanelFor = $state<string | null>(null);
+  composeRequest = $state(0);
+
+  openAgentsPanel(agentId?: string): void {
+    this.setScreen('board');
+    this.agentsPanelFor = agentId ?? '';
+  }
+
+  requestCompose(): void {
+    this.setScreen('board');
+    this.composeRequest += 1;
+  }
   error = $state<string | null>(null);
 
   // collaboration data

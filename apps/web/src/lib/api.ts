@@ -95,9 +95,31 @@ export interface Activity {
   signal: string | null;
 }
 
+export interface BoardEvent {
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+  ts: string;
+}
+
+/**
+ * The board's own log.
+ *
+ * `BoardDO.getEvents` has existed since the DO did and had no route: every state change was
+ * appended to `events` and there was no way to read them back, so the only audit trail the
+ * product keeps was unreachable.
+ */
+export async function getBoardEvents(boardId: string, limit = 100): Promise<BoardEvent[]> {
+  const res = await fetch(`/v1/boards/${boardId}/events?limit=${limit}`, { headers });
+  if (!res.ok) throw new Error(`getBoardEvents failed (${res.status})`);
+  return ((await res.json()) as { events: BoardEvent[] }).events;
+}
+
 export interface CardActivities {
   activities: Activity[];
   handoff: Record<string, unknown> | null;
+  /** Every gate on this card, decided ones included — the card's approval history. */
+  gates: Gate[];
 }
 
 export interface Notification {
@@ -142,6 +164,15 @@ export interface Gate {
   status: string;
   options: GateOption[];
   producedBy: string;
+  decision?: string | null;
+  /**
+   * Who decided, and what they said. Both columns were written on every resolution and appeared
+   * in no read shape at all — so who approved what, and the feedback they gave with it, was
+   * recorded and unreadable. Null while the gate is pending.
+   */
+  decidedBy?: string | null;
+  comment?: string | null;
+  resolvedAt?: string | null;
 }
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
@@ -556,12 +587,17 @@ export async function getEstimate(boardId: string, cardId: string): Promise<Esti
   return (await res.json()) as Estimate;
 }
 
-/** Cost/usage rollup for the telemetry view; `window` filters to a recent span. */
+/**
+ * Cost/usage rollup for the telemetry view; `window` filters to a recent span.
+ *
+ * **Throws on failure rather than returning zeros.** It used to answer a failed fetch with a
+ * fully zeroed summary, which made a broken telemetry API indistinguishable from a board that has
+ * spent nothing — the one reading an operator would act on. "$0.00" is a claim, and a claim the
+ * client cannot support must not be made.
+ */
 export async function getUsage(boardId: string, window: '5h' | '7d' = '7d'): Promise<UsageSummary> {
   const res = await fetch(`/v1/boards/${boardId}/usage?window=${window}`, { headers });
-  if (!res.ok) {
-    return { totalCostUsd: 0, estimatedCostUsd: 0, totalInputTokens: 0, totalOutputTokens: 0, unpricedRecords: 0, byModel: [], byAgent: [], byCard: [] };
-  }
+  if (!res.ok) throw new Error(`getUsage failed (${res.status})`);
   return (await res.json()) as UsageSummary;
 }
 

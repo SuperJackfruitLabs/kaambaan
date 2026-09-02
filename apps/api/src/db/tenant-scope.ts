@@ -31,7 +31,6 @@ export const TENANT_SCOPED_TABLES = new Set<string>([
   'boards',
   'agents',
   'agent_tokens',
-  'webhooks',
 ]);
 
 export interface ScopedSelectOptions {

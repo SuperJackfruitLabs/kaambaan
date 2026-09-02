@@ -40,7 +40,7 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 
@@ -766,6 +766,18 @@ export default {
         return Response.json(result.value);
       }
 
+      // GET /v1/boards/:id/events — the board's own event log (docs/03).
+      //
+      // `BoardDO.getEvents` has existed since the DO did, with no route and no caller: every
+      // state change on a board — created, moved, claimed, blocked, resolved — was appended to
+      // `events` and there was no way to read it back. The only audit trail the product keeps was
+      // unreachable, which is the same as not keeping one.
+      if (rest === 'events' && request.method === 'GET') {
+        const limitParam = Number(url.searchParams.get('limit'));
+        const limit = Number.isInteger(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : 100;
+        return Response.json({ events: await stub.getEvents(limit) });
+      }
+
       // GET /v1/boards/:id/usage — cost/usage rollup (docs/07 §6). `?window=` filters to a recent span.
       if (rest === 'usage' && request.method === 'GET') {
         const window = url.searchParams.get('window');
@@ -1028,5 +1040,30 @@ export default {
     } catch (err) {
       return unexpected(err);
     }
+  },
+
+  /**
+   * Drain every board's push delivery queue.
+   *
+   * `POST /v1/boards/:id/push/dispatch` has always existed and nothing ever called it on a
+   * schedule: the queue drained only on a DO alarm or when somebody POSTed by hand, so a delivery
+   * whose alarm was missed sat there indefinitely. A queue with no drain is a queue that loses
+   * things quietly.
+   *
+   * Best-effort per board, and deliberately so: one board whose DO throws must not stop the sweep
+   * for every other board in the deployment.
+   */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        for (const board of await listAllBoards(env.DB)) {
+          try {
+            await boardStub(env, board.tenantId, board.id).dispatchPushDeliveries();
+          } catch {
+            /* one board's failure is not the sweep's */
+          }
+        }
+      })(),
+    );
   },
 } satisfies ExportedHandler<Env>;

@@ -32,6 +32,16 @@
     // made the board unusable through its own UI (kaambaan#43).
     "ENFORCE_CONTROL_PAIR": "true"
   },
+  // The push delivery queue drains here, on a schedule.
+  //
+  // `POST /v1/boards/:id/push/dispatch` has always existed and nothing called it on a timer: the
+  // queue drained only on a DO alarm or a manual POST, so a delivery whose alarm was missed sat
+  // there indefinitely. Five minutes is chosen against the delivery's own five-attempt backoff —
+  // frequent enough that a missed alarm is a delay rather than a loss, rare enough that a
+  // deployment with no pending deliveries costs almost nothing.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",

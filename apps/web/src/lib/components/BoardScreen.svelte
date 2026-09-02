@@ -212,6 +212,19 @@
     if (location.pathname !== next) replaceState(next, {});
   });
 
+  /**
+   * The command palette's Agents row lands here.
+   *
+   * The palette is a sibling of this screen and cannot open a panel this component owns, so it
+   * raises a request and this answers it. Cleared immediately, so the same row selected twice is
+   * two requests rather than one that latches.
+   */
+  $effect(() => {
+    if (app.agentsPanelFor === null) return;
+    app.agentsPanelFor = null;
+    void openAgents();
+  });
+
   // ---- onboarding / first board ----
   async function createFirstBoard(): Promise<void> {
     creating = true;

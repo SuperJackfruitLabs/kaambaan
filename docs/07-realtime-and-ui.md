@@ -146,7 +146,9 @@ see what's modeled vs reported. Surfaces:
 - **Pre-run estimate** (§6) — `estimateCardCost(cardId)` averages historical runs at the card's stage
   (`GET …/cards/:id/estimate`).
 - **AG-UI adapter** (§1) — `normalizeClaudeStreamLine` translates Claude Code `stream-json` →
-  normalized activities (`src/adapters/claude-code.ts`); a bridge POSTs each, including usage.
+  normalized activities (`packages/agent-sdk/src/claude-code.ts`, re-exported from `@kaambaan/agent-sdk`); a bridge POSTs
+  each, including usage. It lives in the SDK because that is what a bridge imports — inside the
+  Worker it had no caller and could not have had one.
 - **In-app notifications** (§7) — notify-worthy transitions (gate opened, failed, reclaimed) record a
   notification for the card owner; `getNotifications`/`markNotificationRead`, a 🔔 unread badge + feed.
 

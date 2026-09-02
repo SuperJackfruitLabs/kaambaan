@@ -1,11 +1,16 @@
 <script lang="ts">
-  import { getUsage, type UsageSummary } from '$lib/api';
+  import { getUsage, getBoardEvents, type UsageSummary, type BoardEvent } from '$lib/api';
   import { app } from '$lib/stores/app.svelte';
   import { agentColor, initialOf } from '$lib/components/agentColor';
 
   // ---- reactive data ----
   let usage = $state<UsageSummary | null>(null);
   let loading = $state(false);
+  // Distinct from `usage === null`: a failed fetch used to arrive as a zeroed summary, so a
+  // broken telemetry API read exactly like a board that had spent nothing.
+  let usageError = $state<string | null>(null);
+  let events = $state<BoardEvent[]>([]);
+  let eventsError = $state<string | null>(null);
   let window_ = $state<'5h' | '7d'>('7d');
 
   // ---- derived from store ----
@@ -67,14 +72,34 @@
   // ---- fetch ----
   async function load(id: string, win: '5h' | '7d') {
     loading = true;
+    usageError = null;
     try {
       usage = await getUsage(id, win);
-    } catch {
-      // getUsage already returns empty summary on failure
+    } catch (e) {
       usage = null;
+      usageError = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
     }
+    eventsError = null;
+    try {
+      events = await getBoardEvents(id, 60);
+    } catch (e) {
+      events = [];
+      eventsError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  function eventSummary(e: BoardEvent): string {
+    const p = e.payload as Record<string, unknown>;
+    const bits = ['cardId', 'agentId', 'to', 'from', 'name', 'reason', 'decision']
+      .filter((k) => typeof p[k] === 'string')
+      .map((k) => `${k}=${p[k] as string}`);
+    return bits.join(' · ');
+  }
+
+  function timeOf(iso: string): string {
+    return iso.slice(11, 19);
   }
 
   // re-fetch whenever boardId or window changes (covers first render too)
@@ -98,6 +123,7 @@
           {window_ === '7d' ? '7 days' : '5 hours'}
         </button>
         {#if loading}<span class="mono text-muted-foreground text-xs ml-2">loading…</span>{/if}
+        {#if usageError}<span class="mono text-coral text-xs ml-2">couldn't load usage — {usageError}</span>{/if}
       </p>
     </div>
   </div>
@@ -219,6 +245,32 @@
       </div>
     {:else}
       <p class="tele-empty">No card cost data yet.</p>
+    {/if}
+  </div>
+
+  <!--
+    The board log.
+
+    `BoardDO.getEvents` had no route and no caller: every state change was appended to `events`
+    and there was no way to read them back, so the only audit trail the product keeps was
+    unreachable — which is the same as not keeping one.
+  -->
+  <div class="tele-panel mt-5">
+    <div class="eyebrow mb-2">board log</div>
+    {#if eventsError}
+      <p class="tele-empty">Couldn't load the board log — {eventsError}</p>
+    {:else if events.length === 0}
+      <p class="tele-empty">Nothing has happened on this board yet.</p>
+    {:else}
+      <div class="space-y-1">
+        {#each [...events].reverse() as e (e.seq)}
+          <div class="mono flex items-baseline gap-2 text-[11px]">
+            <span class="text-muted-foreground shrink-0">{timeOf(e.ts)}</span>
+            <span class="shrink-0">{e.type}</span>
+            <span class="text-muted-foreground truncate">{eventSummary(e)}</span>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 

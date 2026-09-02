@@ -52,7 +52,21 @@ to every reference matching the event's `externalId` — no global routing index
 webhook is board-scoped. Verify + dedup + mutate are co-located in the DO (it owns the secret and the
 references). The sub-state shows as a chip suffix on the card. **Trap #1** (closing keywords only
 auto-close on the default branch) is recorded as `mergedToDefaultBranch`; **trap #2**
-(`includeClosedPrs: true`) lives in the reconciliation query builders (`src/references/github-graphql.ts`).
+(`includeClosedPrs: true`) is recorded below rather than in code.
+
+**The reconciliation query builders were deleted on 2026-09-02**, and the traps they encoded are
+kept here instead. They had no importer outside their own test and could not be given one:
+reconciliation needs a GitHub App installation token, and kaambaan stores no GitHub token at all —
+`src/auth/github.ts` exchanges the OAuth code, reads the profile and discards the token. Code that
+cannot run is not a partial feature; it is a claim about the product that nothing can contradict.
+Whoever wires the cron Workflow writes the queries then, against these two rules:
+
+- **Trap #2** — `closedByPullRequestsReferences` excludes closed and merged PRs by default. The
+  query MUST pass `includeClosedPrs: true`, or an issue whose PR has already merged reads as
+  unlinked.
+- **Trap #1** — a PR only auto-closes its linked issues when it targets the repository's default
+  branch, so the query must select `baseRefName` and compare it against the repo default. Kaambaan
+  records the outcome as `mergedToDefaultBranch`.
 
 - The sub-state machine models `pull_request` (opened/synchronize/ready_for_review/converted_to_draft/
   closed/reopened) and `issues` (assigned/closed/reopened). Review/comment events
