@@ -35,6 +35,16 @@
  * human surface behind a session cookie and is deliberately not exposed here.
  */
 
+/**
+ * Claude Code stream normalisation, re-exported here because THIS is where its callers are.
+ *
+ * It lived in `apps/api/src/adapters/` — inside the Worker, which never calls it. The audit found
+ * it with no importer outside its own test, and the reason is structural rather than an oversight:
+ * the thing that translates a harness's output into activity envelopes runs in the bridge, and a
+ * bridge imports this package, not the Worker's private source tree.
+ */
+export { normalizeClaudeStreamLine, type NormalizedActivity } from './claude-code';
+
 export interface HttpResponse {
   status: number;
   ok: boolean;

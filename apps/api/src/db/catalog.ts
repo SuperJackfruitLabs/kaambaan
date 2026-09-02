@@ -50,6 +50,14 @@ export interface AgentRecord {
   tenantId: string;
   name: string;
   capabilities: string[];
+  /** An avatar for the board's card tiles. Null is ordinary — the tile falls back to an initial. */
+  iconUrl: string | null;
+  /**
+   * How many cards this agent may hold at once. The column has existed since migration 0001 and
+   * was never read; it is the default `maxConcurrency` at claim time, which an agent's own claim
+   * request may still lower but not raise beyond what its operator set here.
+   */
+  concurrency: number;
   externalId: string | null;
   externalSource: string | null;
   /**
@@ -179,7 +187,56 @@ export async function createAgent(db: D1Database, tenantId: string, input: { nam
   // No external mapping: a freshly registered agent answers to nothing outside kaambaan, and
   // that is a complete agent. A mapping is recorded later, by whoever links it to a principal.
   // No tokens either — this function mints none; the REST route mints one right after.
-  return { id, tenantId, name: input.name, capabilities, externalId: null, externalSource: null, tokenIds: [] };
+  return { id, tenantId, name: input.name, capabilities, iconUrl: null, concurrency: 1, externalId: null, externalSource: null, tokenIds: [] };
+}
+
+/**
+ * Change an agent's own properties, after it exists.
+ *
+ * Until this, `capabilities_json` was written exactly once, in the INSERT inside `createAgent`,
+ * and nothing anywhere could change it: the only remedy for a wrong capability set was to delete
+ * the agent and make another — which, for a linked agent, discards its principal link too. The
+ * shipped board templates need `code`, `test`, `deploy`, `triage`, so an agent staffed with the
+ * wrong set could not be moved to the right one.
+ *
+ * Partial by construction: an omitted field is left alone rather than blanked, so a caller
+ * changing an icon cannot silently erase a capability set it never mentioned. `iconUrl` is the
+ * one field where `null` is a value (clear it) rather than an omission, which is why it is
+ * compared against `undefined`.
+ *
+ * Tenant-scoped for the reason `setAgentExternalMapping` gives: `agents.id` is a bare primary key
+ * with no per-tenant uniqueness, so the `WHERE` clause is the defence, not the caller's check.
+ */
+export async function updateAgent(
+  db: D1Database,
+  tenantId: string,
+  agentId: string,
+  patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number },
+): Promise<void> {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (patch.name !== undefined) {
+    sets.push('name = ?');
+    vals.push(patch.name);
+  }
+  if (patch.capabilities !== undefined) {
+    sets.push('capabilities_json = ?');
+    vals.push(JSON.stringify(patch.capabilities));
+  }
+  if (patch.iconUrl !== undefined) {
+    sets.push('icon_url = ?');
+    vals.push(patch.iconUrl);
+  }
+  if (patch.concurrency !== undefined) {
+    sets.push('concurrency = ?');
+    vals.push(patch.concurrency);
+  }
+  if (sets.length === 0) return;
+  sets.push(`updated_at = datetime('now')`);
+  await db
+    .prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ? AND tenant_id = ?`)
+    .bind(...vals, agentId, tenantId)
+    .run();
 }
 
 /**
@@ -289,15 +346,16 @@ export async function revokeAgentToken(db: D1Database, tenantId: string, agentId
 export async function findAgentByTokenHash(
   db: D1Database,
   hash: string,
-): Promise<{ tenantId: string; agentId: string; scopes: string[]; capabilities: string[]; externalId: string | null } | null> {
+): Promise<{ tenantId: string; agentId: string; scopes: string[]; capabilities: string[]; externalId: string | null; concurrency: number } | null> {
   const row = await db
     .prepare(
-      `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps, a.external_id AS externalId
+      `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps,
+              a.external_id AS externalId, a.concurrency AS concurrency
        FROM agent_tokens at JOIN agents a ON a.id = at.agent_id
        WHERE at.token_hash = ? AND at.revoked_at IS NULL`,
     )
     .bind(hash)
-    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null }>();
+    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null; concurrency: number }>();
   if (!row) return null;
   return {
     tenantId: row.tenantId,
@@ -305,6 +363,7 @@ export async function findAgentByTokenHash(
     scopes: JSON.parse(row.scopes),
     capabilities: JSON.parse(row.caps),
     externalId: row.externalId,
+    concurrency: Number(row.concurrency ?? 1),
   };
 }
 
@@ -314,17 +373,20 @@ export async function findAgentByTokenHash(
 export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecord[]> {
   const { results } = await db
     .prepare(
-      `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, external_id AS externalId, external_source AS externalSource,
+      `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, icon_url AS iconUrl, concurrency,
+              external_id AS externalId, external_source AS externalSource,
               COALESCE((SELECT json_group_array(t.id) FROM agent_tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL), '[]') AS tokenIdsJson
        FROM agents a WHERE tenant_id = ? ORDER BY created_at ASC`,
     )
     .bind(tenantId)
-    .all<{ id: string; tenantId: string; name: string; caps: string; externalId: string | null; externalSource: string | null; tokenIdsJson: string }>();
+    .all<{ id: string; tenantId: string; name: string; caps: string; iconUrl: string | null; concurrency: number; externalId: string | null; externalSource: string | null; tokenIdsJson: string }>();
   return results.map((r) => ({
     id: r.id,
     tenantId: r.tenantId,
     name: r.name,
     capabilities: JSON.parse(r.caps),
+    iconUrl: r.iconUrl,
+    concurrency: Number(r.concurrency ?? 1),
     externalId: r.externalId,
     externalSource: r.externalSource,
     tokenIds: JSON.parse(r.tokenIdsJson),
@@ -340,13 +402,46 @@ export async function recordBoard(db: D1Database, tenantId: string, input: { id:
 }
 
 export async function listBoards(db: D1Database, tenantId: string): Promise<Array<{ id: string; name: string }>> {
-  const { results } = await db.prepare(`SELECT id, name FROM boards WHERE tenant_id = ? ORDER BY created_at DESC`).bind(tenantId).all<{ id: string; name: string }>();
+  // Through `tenantScopedSelect`, not around it. The guard's whole claim is that "there is NO
+  // unscoped query builder" — and until this, every production read was hand-written SQL and the
+  // builder was used only by its own tests. A guard nothing routes through guards nothing.
+  const q = tenantScopedSelect('boards', tenantId, { columns: ['id', 'name'] });
+  const { results } = await db.prepare(`${q.sql} ORDER BY created_at DESC`).bind(...q.params).all<{ id: string; name: string }>();
+  return results;
+}
+
+/**
+ * Every board in the deployment, tenant and all.
+ *
+ * **Deliberately unscoped, and named so.** Every other read here takes a tenantId because it
+ * answers a question somebody asked; this one exists for the scheduled sweep, which has no
+ * caller and therefore no tenant. Fabricating one would be worse than admitting there is none:
+ * the sweep would silently drain one workspace's delivery queue and no other.
+ *
+ * Not exported through any route. The only caller is `scheduled()`.
+ */
+export async function listAllBoards(db: D1Database): Promise<Array<{ id: string; tenantId: string }>> {
+  const { results } = await db
+    .prepare(`SELECT id, tenant_id AS tenantId FROM boards ORDER BY created_at ASC`)
+    .all<{ id: string; tenantId: string }>();
   return results;
 }
 
 /** Rename a board's catalog row (the DO's name is updated alongside). */
 export async function renameBoard(db: D1Database, tenantId: string, boardId: string, name: string): Promise<void> {
   await db.prepare(`UPDATE boards SET name = ?, updated_at = datetime('now') WHERE tenant_id = ? AND id = ?`).bind(name, tenantId, boardId).run();
+}
+
+/**
+ * Mirror a reworked pipeline into the catalog row.
+ *
+ * `boards.stages_json` is a copy: the Durable Object holds the live definition and every claim
+ * reads it from there. The copy exists so a board can be listed and described without waking its
+ * DO, which means a stale copy is a board that DESCRIBES itself wrongly — hence this writer, and
+ * hence the route calling it only after the DO has accepted the change.
+ */
+export async function updateBoardStages(db: D1Database, tenantId: string, boardId: string, stagesJson: string): Promise<void> {
+  await db.prepare(`UPDATE boards SET stages_json = ?, updated_at = datetime('now') WHERE tenant_id = ? AND id = ?`).bind(stagesJson, tenantId, boardId).run();
 }
 
 /** Remove a board from the catalog (tenant-scoped). The DO's live state is left untouched. */
@@ -370,46 +465,9 @@ export async function deleteAgent(db: D1Database, tenantId: string, agentId: str
  * different tenant and get back a 200 with no idea their write did not land anywhere.
  */
 export async function agentBelongsToTenant(db: D1Database, tenantId: string, agentId: string): Promise<boolean> {
-  const row = await db.prepare(`SELECT 1 FROM agents WHERE id = ? AND tenant_id = ?`).bind(agentId, tenantId).first();
+  const q = tenantScopedSelect('agents', tenantId, { columns: ['id'], where: { id: agentId } });
+  const row = await db.prepare(q.sql).bind(...q.params).first();
   return row !== null;
-}
-
-/**
- * Minimal subset of the D1 query API we depend on — declared structurally so the repository can be
- * unit-tested with a fake (and so the catalog isn't coupled to a specific runtime type).
- */
-export interface D1Like {
-  prepare(sql: string): D1StatementLike;
-}
-export interface D1StatementLike {
-  bind(...params: unknown[]): D1BoundLike;
-}
-export interface D1BoundLike {
-  all<T = Record<string, unknown>>(): Promise<{ results: T[] }>;
-}
-
-/**
- * Tenant-scoped catalog reads. Every method requires a tenantId and routes through
- * `tenantScopedSelect`, so there is no path to read another tenant's rows.
- */
-export class CatalogRepository {
-  constructor(private readonly db: D1Like) {}
-
-  private run<T>(query: ScopedQuery): Promise<{ results: T[] }> {
-    return this.db.prepare(query.sql).bind(...query.params).all<T>();
-  }
-
-  listBoards<T = Record<string, unknown>>(tenantId: string) {
-    return this.run<T>(tenantScopedSelect('boards', tenantId));
-  }
-
-  getBoard<T = Record<string, unknown>>(tenantId: string, boardId: string) {
-    return this.run<T>(tenantScopedSelect('boards', tenantId, { where: { id: boardId } }));
-  }
-
-  listAgents<T = Record<string, unknown>>(tenantId: string) {
-    return this.run<T>(tenantScopedSelect('agents', tenantId));
-  }
 }
 
 /**

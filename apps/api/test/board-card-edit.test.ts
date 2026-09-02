@@ -47,3 +47,27 @@ describe('BoardDO — updateCard / deleteCard (docs/07)', () => {
     });
   });
 });
+
+/**
+ * A card's owner was fixed to whoever created it: no reassign, no "assign to me", no unassign, on
+ * a board whose whole purpose is handing work between people and agents.
+ */
+describe('BoardDO — a card can be reassigned', () => {
+  it('changes the owner without touching the recorded dispatch authority', async () => {
+    await runInDurableObject(stubFor('ce-owner'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_ce_o', tenantId: 'tnt_a', name: 'CE', stages: PIPE });
+      const made = await board.createCard({ title: 'x', ownerUserId: 'usr_a', queuedGrant: ['prn_0123456789abcdef0123'] });
+      expect(made.ok).toBe(true);
+      if (!made.ok) return;
+
+      const r = await board.updateCard(made.value.id, { ownerUserId: 'usr_b' });
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(r.value.ownerUserId).toBe('usr_b');
+      // Who is answerable for a card and who authorised its dispatch are different questions, and
+      // only the second is checked at claim time — so reassigning must not rewrite it.
+      expect(r.value.queuedGrant).toEqual(['prn_0123456789abcdef0123']);
+      expect(r.value.queuedBy).toBe('usr_a');
+    });
+  });
+});

@@ -345,6 +345,18 @@ export interface GateView {
   options: GateOption[];
   producedBy: string;
   createdAt: string;
+  /**
+   * Who decided, and what they said.
+   *
+   * Both columns have been written on every resolution since gates existed and appeared in no
+   * read shape at all — so who approved what, and the feedback they gave with it, was recorded
+   * and unreadable. An approval nobody can attribute is not much of an approval.
+   *
+   * Null while pending, which is the ordinary state for everything this method returns.
+   */
+  decidedBy: string | null;
+  comment: string | null;
+  resolvedAt: string | null;
 }
 
 /**
@@ -420,7 +432,21 @@ export interface BoardSnapshot {
   elicitations: ElicitationView[];
   references: ReferenceView[];
   usage: BoardUsage;
-  github: { issueTrigger: boolean; webhookConfigured: boolean };
+  github: {
+    issueTrigger: boolean;
+    webhookConfigured: boolean;
+    /**
+     * How many principals the board's standing trigger grant names, or null when
+     * no grant is recorded.
+     *
+     * The count, never the ids: this snapshot is read by every board viewer, and
+     * which agents a particular operator may dispatch is that operator's
+     * business. What a viewer needs to know is whether automation on this board
+     * is authorised at all — because a board wired to a repository with no grant
+     * produces cards no agent can ever claim.
+     */
+    triggerGrantCount: number | null;
+  };
 }
 
 /** Board-level cost rollup + budget state (docs/07 §6). */
@@ -471,6 +497,8 @@ export type BoardErrorCode =
   | 'NOT_CONFIGURED'
   | 'INVALID_DELIVERY'
   | 'INVALID_USAGE'
+  | 'INVALID_STAGES'
+  | 'STAGE_NOT_EMPTY'
   | 'BUDGET_EXCEEDED';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
@@ -493,9 +521,11 @@ export interface BoardStub {
     /** What the mover was permitted to dispatch, recorded with the card. */
     queuedGrant?: string[] | null,
   ): Promise<Result<CardView>>;
-  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>>;
+  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
+  setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
+  destroy(): Promise<{ ok: true }>;
   getState(): Promise<BoardSnapshot>;
   getEvents(limit?: number): Promise<BoardEvent[]>;
   // Agent contract (docs/04 §3)
@@ -515,20 +545,22 @@ export interface BoardStub {
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
-  getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }>;
+  getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }>;
+  getEvents(limit?: number): Promise<BoardEvent[]>;
   estimateCardCost(cardId: string): Promise<Result<EstimateView>>;
-  getNotifications(opts?: { unreadOnly?: boolean }): Promise<NotificationView[]>;
+  getNotifications(opts?: { unreadOnly?: boolean; userId?: string }): Promise<NotificationView[]>;
   markNotificationRead(seq: number): Promise<Result<{ ok: true }>>;
   registerPushConfig(input: PushConfigInput): Promise<Result<{ configId: string }>>;
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
-  setGithubConfig(input: { secret?: string; issueTrigger?: boolean }): Promise<Result<{ ok: true }>>;
+  setGithubConfig(input: { secret?: string; issueTrigger?: boolean; triggerGrant?: string[] | null }): Promise<Result<{ ok: true }>>;
   createCardFromTrigger(input: {
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
+    queuedGrant?: string[] | null;
     source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
   }): Promise<Result<{ card: CardView; reference: ReferenceView | null; referenceError?: string }>>;
   handleGithubWebhook(input: {
@@ -907,9 +939,23 @@ export class BoardDO extends DurableObject<Env> {
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
+    /**
+     * The authority the caller carried, when there was a caller. A live human on
+     * `POST /v1/boards/:id/triggers` has one; a GitHub webhook does not, and
+     * falls back to the board's standing grant below.
+     */
+    queuedGrant?: string[] | null;
     source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
   }): Promise<Result<{ card: CardView; reference: ReferenceView | null; referenceError?: string }>> {
-    const created = await this.createCard({ title: input.title, ownerUserId: input.ownerUserId, spec: input.spec });
+    const created = await this.createCard({
+      title: input.title,
+      ownerUserId: input.ownerUserId,
+      spec: input.spec,
+      // Without this the automation path produced cards that could never be
+      // claimed under enforcement — created, visible on the board, and parked on
+      // first claim forever, on the one path with no human watching.
+      queuedGrant: input.queuedGrant ?? this.triggerGrant(),
+    });
     if (!created.ok) return { ok: false, code: created.code, message: created.message };
     let reference: ReferenceView | null = null;
     let referenceError: string | undefined;
@@ -987,8 +1033,16 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: updated };
   }
 
-  /** Edit a card's title / spec / priority (human, docs/07 §4). */
-  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>> {
+  /**
+   * Edit a card's title / spec / priority / owner (human, docs/07 §4).
+   *
+   * `ownerUserId` is here because a card's owner was fixed to whoever created it, with no
+   * reassign, no "assign to me" and no unassign — on a board whose whole purpose is handing work
+   * between people and agents. It is deliberately NOT `queued_by`: who is answerable for a card
+   * and who authorised its dispatch are different questions, and reassignment must not silently
+   * rewrite the recorded authority a claim is checked against.
+   */
+  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
@@ -1004,6 +1058,10 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
       vals.push(patch.priority);
+    }
+    if (patch.ownerUserId !== undefined) {
+      sets.push('owner_user_id = ?');
+      vals.push(patch.ownerUserId);
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
@@ -1028,6 +1086,69 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Rename the board (the catalog row is renamed alongside, by the Worker). */
+  /**
+   * Rework the board's pipeline, after it exists.
+   *
+   * Stages were written once — in `init`, and mirrored into the catalog row — and there was no
+   * update route and no method here. Not one field could be changed afterwards: name, order, WIP
+   * limit, approval gate, owner, routing. A mistyped stage name or a WIP limit set one too low
+   * meant recreating the board and losing every card on it.
+   *
+   * **A stage key is identity, not a label.** Cards carry `current_stage_key`, runs carry
+   * `stage_key`, and gates carry it too; renaming a key in place would orphan all three silently.
+   * So every field is editable EXCEPT the key, and changing a key is expressed as adding one
+   * stage and removing another — which the emptiness rule below then makes safe.
+   *
+   * **A stage that still holds cards cannot be removed.** Refusing is the only honest answer: the
+   * alternatives are deleting the operator's work without being asked, or moving it somewhere
+   * this method has no basis for choosing. The caller empties the stage and tries again.
+   *
+   * The whole payload is the new pipeline — a PUT, not a patch — because order is a property of
+   * the list rather than of any stage in it, and a partial update cannot express a reorder.
+   */
+  async setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!Array.isArray(stages) || stages.length === 0) {
+      return { ok: false, code: 'INVALID_STAGES', message: 'a board needs at least one stage' };
+    }
+    for (const s of stages) {
+      if (!s || typeof s.key !== 'string' || s.key.trim() === '') {
+        return { ok: false, code: 'INVALID_STAGES', message: 'every stage needs a key' };
+      }
+      if (typeof s.name !== 'string' || s.name.trim() === '') {
+        return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a name` };
+      }
+      if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
+        return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a WIP limit of at least 1, or none` };
+      }
+    }
+    const keys = stages.map((s) => s.key);
+    const duplicate = keys.find((k, i) => keys.indexOf(k) !== i);
+    if (duplicate) {
+      // Two stages sharing a key is not a pipeline: `stages().find(...)` would resolve every card
+      // in both to whichever came first, and the other would be unreachable.
+      return { ok: false, code: 'INVALID_STAGES', message: `two stages share the key "${duplicate}"` };
+    }
+
+    const kept = new Set(keys);
+    for (const existing of this.stages()) {
+      if (kept.has(existing.key)) continue;
+      const held = this.countInStage(existing.key);
+      if (held > 0) {
+        return {
+          ok: false,
+          code: 'STAGE_NOT_EMPTY',
+          message: `stage "${existing.key}" still holds ${held} card${held === 1 ? '' : 's'} — move them before removing it`,
+        };
+      }
+    }
+
+    const ordered = [...stages].sort((a, b) => a.order - b.order);
+    this.setMeta('stages', JSON.stringify(ordered));
+    this.emit('board.stages_changed', { stages: ordered });
+    return { ok: true, value: { stages: ordered } };
+  }
+
   async setName(name: string): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     this.setMeta('name', name);
@@ -1037,6 +1158,46 @@ export class BoardDO extends DurableObject<Env> {
 
   async getState(): Promise<BoardSnapshot> {
     return this.snapshot();
+  }
+
+  /**
+   * Erase this board.
+   *
+   * `DELETE /v1/boards/:id` removed the catalog row and nothing else, so the Durable Object and
+   * every card, run, activity, gate, reference and usage record it held survived — unreachable
+   * through any route, undeleted, and still billing storage. A person who deleted a board had
+   * every reason to believe its contents were gone.
+   *
+   * Rows are deleted rather than `storage.deleteAll()`. On a SQLite-backed DO `deleteAll` drops
+   * the tables themselves, and the schema is created in the constructor — so the live instance
+   * would go on serving requests against tables that no longer exist, answering 500 where it
+   * should answer "no such board". Emptying every table leaves `meta` with no `boardId`, which is
+   * precisely how an uninitialised board already reads.
+   *
+   * The alarm goes too: a reclaim scheduled for a board that no longer exists would wake this
+   * object for nothing, on a timer, forever.
+   */
+  async destroy(): Promise<{ ok: true }> {
+    for (const t of [
+      'usage_records',
+      'activities',
+      'runs',
+      'gates',
+      'elicitations',
+      'card_references',
+      'notifications',
+      'push_deliveries',
+      'push_configs',
+      'profiles',
+      'webhook_deliveries',
+      'events',
+      'cards',
+      'meta',
+    ]) {
+      this.sql.exec(`DELETE FROM ${t}`);
+    }
+    await this.ctx.storage.deleteAlarm();
+    return { ok: true };
   }
 
   async getEvents(limit = 100): Promise<BoardEvent[]> {
@@ -1143,13 +1304,54 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Configure GitHub integration: webhook secret + whether opened issues auto-create cards (docs/05 §6). */
-  async setGithubConfig(input: { secret?: string; issueTrigger?: boolean }): Promise<Result<{ ok: true }>> {
+  async setGithubConfig(input: {
+    secret?: string;
+    issueTrigger?: boolean;
+    /** See `triggerGrant()` — the standing authority for cards nobody is present to queue. */
+    triggerGrant?: string[] | null;
+  }): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     }
     if (input.secret !== undefined) this.setMeta('githubWebhookSecret', input.secret);
     if (input.issueTrigger !== undefined) this.setMeta('githubIssueTrigger', input.issueTrigger ? '1' : '0');
+    if (input.triggerGrant !== undefined) this.setTriggerGrant(input.triggerGrant);
     return { ok: true, value: { ok: true } };
+  }
+
+  /**
+   * The authority a card gets when nobody is present to carry one.
+   *
+   * Every other queueing path has a live human on the request, so the grant that
+   * accompanies the act is read off their token. A GitHub webhook has none: the
+   * person who wired the repository to this board is long gone by the time an
+   * issue is opened. That wiring IS the act of authorising automated dispatch,
+   * so the grant is captured then and stored here — the same answer, written
+   * down while it was still askable, which is the whole shape of the control
+   * pair (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4).
+   *
+   * `null` stays an ordinary answer. A standalone board whose operator never
+   * held a hub token records nothing, and under enforcement its trigger-born
+   * cards park in `input-required` and say why — which is the honest outcome,
+   * and is what the audit found happening silently to every such card.
+   */
+  private triggerGrant(): string[] | null {
+    const raw = this.getMeta('triggerGrant');
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as string[]) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private setTriggerGrant(grant: string[] | null): void {
+    // Cleared by deleting the row rather than storing "null": `getMeta` answers
+    // null for an absent key, so an absent row and a cleared grant read the same
+    // — one state, not two that a later reader has to tell apart.
+    if (grant === null) this.sql.exec(`DELETE FROM meta WHERE k = ?`, 'triggerGrant');
+    else this.setMeta('triggerGrant', JSON.stringify(grant));
   }
 
   /**
@@ -1261,11 +1463,32 @@ export class BoardDO extends DurableObject<Env> {
     return this.computeUsage(since);
   }
 
-  /** In-app notifications for this board, newest first (docs/07 §7). */
-  async getNotifications(opts?: { unreadOnly?: boolean }): Promise<NotificationView[]> {
-    const where = opts?.unreadOnly ? `WHERE read = 0` : '';
+  /**
+   * In-app notifications for this board, newest first (docs/07 §7).
+   *
+   * `notifications.user_id` is written from the card owner and was never used as a filter, so
+   * every board notification was returned to every caller. With one member per workspace that was
+   * invisible; the moment a second person joins it is a disclosure — a notification body names a
+   * card and says what happened to it.
+   *
+   * A null `user_id` is addressed to nobody in particular (work became available, a card was
+   * refused at claim time) and reaches everyone. That is the design, not a gap: those are facts
+   * about the board rather than about a person.
+   *
+   * An omitted `userId` keeps the unfiltered read, for internal callers that have no person to
+   * filter by. Every route passes one.
+   */
+  async getNotifications(opts?: { unreadOnly?: boolean; userId?: string }): Promise<NotificationView[]> {
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (opts?.unreadOnly) predicates.push('read = 0');
+    if (opts?.userId !== undefined) {
+      predicates.push('(user_id IS NULL OR user_id = ?)');
+      params.push(opts.userId);
+    }
+    const where = predicates.length > 0 ? `WHERE ${predicates.join(' AND ')}` : '';
     return this.sql
-      .exec(`SELECT * FROM notifications ${where} ORDER BY seq DESC LIMIT 200`)
+      .exec(`SELECT * FROM notifications ${where} ORDER BY seq DESC LIMIT 200`, ...params)
       .toArray()
       .map((r) => ({
         seq: Number(r.seq),
@@ -1459,7 +1682,7 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** A card's session replay: its durable activity waterfall + the handoff carried into it (docs/07 §4). */
-  async getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }> {
+  async getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }> {
     const activities = this.sql
       .exec(`SELECT * FROM activities WHERE card_id = ? AND ephemeral = 0 ORDER BY seq ASC`, cardId)
       .toArray()
@@ -1481,7 +1704,10 @@ export class BoardDO extends DurableObject<Env> {
           signal: detail.signal ?? null,
         };
       });
-    return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)) };
+    // Gates ride along with the timeline rather than getting their own route: "who approved this
+    // and what did they say" is a question about the card's history, which is what this endpoint
+    // already answers.
+    return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)), gates: this.gatesForCard(cardId) };
   }
 
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
@@ -2273,6 +2499,36 @@ export class BoardDO extends DurableObject<Env> {
         options: JSON.parse(r.options_json as string) as GateOption[],
         producedBy: r.produced_by as string,
         createdAt: r.created_at as string,
+        decidedBy: (r.decided_by as string | null) ?? null,
+        comment: (r.comment as string | null) ?? null,
+        resolvedAt: (r.resolved_at as string | null) ?? null,
+      }));
+  }
+
+  /**
+   * Every gate on a card, decided ones included.
+   *
+   * `pendingGates` above answers "what is waiting on a human right now" and is what the board
+   * snapshot carries. This answers "what was decided on this card, by whom, and with what
+   * comment" — a question `gates.decided_by` and `gates.comment` could always have answered and
+   * no read shape ever asked.
+   */
+  private gatesForCard(cardId: string): GateView[] {
+    return this.sql
+      .exec(`SELECT * FROM gates WHERE card_id = ? ORDER BY created_at ASC`, cardId)
+      .toArray()
+      .map((r) => ({
+        id: r.id as string,
+        cardId: r.card_id as string,
+        stageKey: r.stage_key as string,
+        status: r.status as 'pending' | 'resolved',
+        decision: (r.decision as string | null) ?? null,
+        options: JSON.parse(r.options_json as string) as GateOption[],
+        producedBy: r.produced_by as string,
+        createdAt: r.created_at as string,
+        decidedBy: (r.decided_by as string | null) ?? null,
+        comment: (r.comment as string | null) ?? null,
+        resolvedAt: (r.resolved_at as string | null) ?? null,
       }));
   }
 
@@ -2675,7 +2931,11 @@ export class BoardDO extends DurableObject<Env> {
       elicitations: boardId ? this.pendingElicitations() : [],
       references: boardId ? this.allReferences() : [],
       usage: boardId ? this.boardUsage() : { totalCostUsd: 0, estimatedCostUsd: 0, budgetUsd: null, cardUsdCap: null, overBudget: false },
-      github: { issueTrigger: this.getMeta('githubIssueTrigger') === '1', webhookConfigured: this.getMeta('githubWebhookSecret') !== null },
+      github: {
+        issueTrigger: this.getMeta('githubIssueTrigger') === '1',
+        webhookConfigured: this.getMeta('githubWebhookSecret') !== null,
+        triggerGrantCount: this.triggerGrant()?.length ?? null,
+      },
     };
   }
 

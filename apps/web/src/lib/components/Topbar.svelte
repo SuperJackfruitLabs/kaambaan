@@ -21,6 +21,14 @@
 
   // Dispatch form
   let title = $state('');
+  // The compose form captured a title and nothing else, though the API has always accepted
+  // priority and a spec — so a card could only be created bare and then edited. Collapsed by
+  // default, because the one-line dispatch is the common act and should stay one line.
+  let composeOpen = $state(false);
+  let titleEl = $state<HTMLInputElement | null>(null);
+  let newPriority = $state(0);
+  let newDue = $state('');
+  let newDescription = $state('');
 
   // Filters (local, synced to store via $effect)
   let filters = $state<CardFilters>({
@@ -89,13 +97,53 @@
     await app.refresh();
   }
 
+  /**
+   * The palette's "Dispatch a card" lands here.
+   *
+   * That row used to close the palette and do nothing. The compose field belongs to this
+   * component, so the palette raises a counter and this focuses it — a counter rather than a flag
+   * because asking twice in a row is two requests.
+   */
+  $effect(() => {
+    if (app.composeRequest === 0) return;
+    void app.composeRequest; // read it so this re-runs on every request, not only the first
+    titleEl?.focus();
+  });
+
+  // ---- errors ----
+  let retrying = $state(false);
+
+  async function onRetry(): Promise<void> {
+    retrying = true;
+    try {
+      error = null;
+      await app.retry();
+      if (app.error) error = app.error;
+    } finally {
+      retrying = false;
+    }
+  }
+
+  function dismissError(): void {
+    error = null;
+    app.dismissError();
+  }
+
   // ---- dispatch ----
   async function onAdd(e: SubmitEvent): Promise<void> {
     e.preventDefault();
     if (!app.boardId || title.trim() === '') return;
     try {
-      await app.dispatchCard(title.trim());
+      await app.dispatchCard(title.trim(), {
+        priority: Number(newPriority) || 0,
+        description: newDescription,
+        due: newDue,
+      });
       title = '';
+      newPriority = 0;
+      newDue = '';
+      newDescription = '';
+      composeOpen = false;
     } catch (err) {
       error = String(err);
     }
@@ -104,6 +152,13 @@
   // ---- board switch + board delete ----
   async function onDeleteBoard(id: string): Promise<void> {
     showBoardMenu = false;
+    // One click on a hover-revealed control used to delete a board outright — no confirmation, no
+    // undo, no archive. It now also takes the board's cards and history with it (it always should
+    // have; before, those survived unreachable), which makes saying so first the minimum.
+    const target = app.boards.find((b) => b.id === id);
+    const count = id === app.boardId ? (app.board?.cards.length ?? 0) : null;
+    const cards = count === null ? '' : ` and its ${count} card${count === 1 ? '' : 's'}`;
+    if (!confirm(`Delete "${target?.name ?? 'this board'}"${cards}? Its cards, runs and history go with it. This cannot be undone.`)) return;
     await app.deleteBoard(id);
     if (app.error) error = app.error;
   }
@@ -188,14 +243,46 @@
     </div>
 
     <!-- Dispatch form -->
-    <form class="flex items-center gap-1.5" onsubmit={onAdd}>
+    <form class="relative flex items-center gap-1.5" onsubmit={onAdd}>
       <input
+        bind:this={titleEl}
         bind:value={title}
+        data-testid="dispatch-title"
         placeholder="Dispatch a card…"
         aria-label="New card title"
         class="bg-inset border-border focus:border-marigold mono w-44 rounded-[7px] border px-2.5 py-1.5 text-xs outline-none"
       />
+      <button
+        type="button"
+        onclick={() => (composeOpen = !composeOpen)}
+        aria-expanded={composeOpen}
+        aria-label="More card details"
+        title="Priority, due date and description"
+        class="text-muted-foreground hover:text-foreground mono shrink-0 px-1 text-xs"
+      >{composeOpen ? '–' : '+'}</button>
       <Button type="submit" size="sm">Dispatch</Button>
+
+      {#if composeOpen}
+        <div class="bg-surface border-border absolute top-full right-0 z-30 mt-1.5 w-72 rounded-[9px] border p-3 shadow-xl">
+          <div class="flex items-center gap-3">
+            <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+              priority
+              <input type="number" bind:value={newPriority} class="bg-inset border-border focus:border-marigold w-14 rounded-[5px] border px-1.5 py-1 outline-none" />
+            </label>
+            <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+              due
+              <input type="date" bind:value={newDue} aria-label="Due date" class="bg-inset border-border focus:border-marigold rounded-[5px] border px-1.5 py-1 outline-none" />
+            </label>
+          </div>
+          <textarea
+            bind:value={newDescription}
+            rows="3"
+            aria-label="Description"
+            placeholder="Brief for the agent…"
+            class="bg-inset border-border focus:border-marigold mt-2 w-full resize-none rounded-[6px] border px-2.5 py-2 text-xs outline-none"
+          ></textarea>
+        </div>
+      {/if}
     </form>
 
     <!-- View toggle -->
@@ -391,10 +478,20 @@
     </div>
   {/if}
 
-  <!-- Error bar -->
+  <!--
+    Error bar.
+
+    It carried a sentence and nothing else — no retry, no dismiss — so the only way past a failure
+    was to reload the page. An error a person cannot act on is a dead end, and a dead end that
+    stays on screen teaches them to ignore the bar.
+  -->
   {#if error || app.error}
-    <div role="alert" class="border-coral/40 text-coral mono border-t px-4 py-1.5 text-xs" style="background:rgba(255,107,87,.08)">
-      {error ?? app.error}
+    <div role="alert" class="border-coral/40 text-coral mono flex items-center gap-3 border-t px-4 py-1.5 text-xs" style="background:rgba(255,107,87,.08)">
+      <span class="min-w-0 flex-1">{error ?? app.error}</span>
+      <button onclick={() => void onRetry()} disabled={retrying} class="shrink-0 underline underline-offset-2 hover:brightness-125 disabled:opacity-50">
+        {retrying ? 'retrying…' : 'retry'}
+      </button>
+      <button onclick={dismissError} class="shrink-0 underline underline-offset-2 hover:brightness-125">dismiss</button>
     </div>
   {/if}
 </header>

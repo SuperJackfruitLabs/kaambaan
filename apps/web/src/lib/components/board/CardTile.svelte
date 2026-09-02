@@ -71,12 +71,22 @@
     return `$${n.toFixed(2)}`;
   }
 
-  // Cost bar width (capped at 100%)
+  /**
+   * Cost against the card's budget cap.
+   *
+   * This used to compute `costUsd / (costUsd * 1.5)` — arithmetic that is 67% for every card with
+   * any cost at all, regardless of budget. It looked like a spend gauge and measured nothing. A
+   * bar is only meaningful against a ceiling, so when there is no cap there is no bar: the figure
+   * alone is the honest reading.
+   */
+  const cardCap = $derived(app.board?.usage.cardUsdCap ?? null);
   const costBarPct = $derived(
-    card.costUsd > 0 ? Math.min(100, Math.round((card.costUsd / (card.costUsd * 1.5 || 1)) * 100)) : 0,
+    cardCap && cardCap > 0 ? Math.min(100, Math.round((card.costUsd / cardCap) * 100)) : null,
   );
 
-  // Delegate avatar
+  // Delegate avatar. `agents.icon_url` has existed since migration 0001 and was read by nothing;
+  // the coloured initial stays the fallback, which is what most agents will always have.
+  const delegate = $derived(app.agents.find((a) => a.id === card.delegateAgentId) ?? null);
   const avatarColor = $derived(agentColor(card.delegateAgentId));
   const avatarInitial = $derived(
     card.delegateAgentId ? initialOf(card.delegateAgentId).toUpperCase() : null,
@@ -87,19 +97,60 @@
     Array.isArray(card.spec?.labels) ? (card.spec.labels as string[]) : [],
   );
 
-  // Due date from spec
+  // Due date from spec. Overdue is a state worth showing: a date rendered in the same grey as
+  // everything else says when, and never says "and that has passed".
   const due = $derived(
     typeof card.spec?.due === 'string' ? card.spec.due : null,
+  );
+  const overdue = $derived(
+    due !== null && card.state !== 'completed' && new Date(`${due}T23:59:59`).getTime() < Date.now(),
   );
 
   function handleClick() {
     app.openCard(card.id);
   }
 
+  /**
+   * Moving a card was mouse-only — drag and drop with no keyboard or menu alternative — so the
+   * board's central action was unavailable to keyboard and assistive-technology users.
+   *
+   * `Alt` + arrow rather than a bare arrow: bare arrows are how a keyboard user moves BETWEEN
+   * cards, and stealing them to move the card itself would make the board impossible to read.
+   */
+  const orderedStages = $derived([...(app.board?.stages ?? [])].sort((a, b) => a.order - b.order));
+  const stageIndex = $derived(orderedStages.findIndex((s) => s.key === card.currentStageKey));
+  let moveMenuOpen = $state(false);
+  let moveAnnouncement = $state('');
+
+  async function moveTo(stageKey: string): Promise<void> {
+    const target = orderedStages.find((s) => s.key === stageKey);
+    if (!target || stageKey === card.currentStageKey) return;
+    moveMenuOpen = false;
+    await app.moveCard(card.id, stageKey);
+    // Said out loud, because a keyboard user gets no visual feedback from a card that moved to a
+    // column they cannot see. A refusal (a WIP limit) already lands in the error bar.
+    moveAnnouncement = app.error ? '' : `${card.title} moved to ${target.name}`;
+  }
+
+  function shiftStage(by: number): void {
+    const next = orderedStages[stageIndex + by];
+    if (next) void moveTo(next.key);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
       app.openCard(card.id);
+      return;
+    }
+    if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault();
+      shiftStage(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
+    if (e.key === 'm' || e.key === 'M') {
+      e.preventDefault();
+      moveMenuOpen = !moveMenuOpen;
     }
   }
 
@@ -122,11 +173,46 @@
   use:cardDraggable={{ cardId: card.id }}
   role="button"
   tabindex="0"
-  aria-label="Open {card.title}"
+  aria-label="{card.title}, in {orderedStages[stageIndex]?.name ?? card.currentStageKey}. Enter to open, M to move, Alt with left or right arrow to move between stages."
   onclick={handleClick}
   onkeydown={handleKeydown}
-  class="tile bg-surface border-border cursor-grab rounded-[10px] border p-3 text-left active:cursor-grabbing {gate ? 'tile-gate' : ''}"
+  class="tile bg-surface border-border group relative cursor-grab rounded-[10px] border p-3 text-left active:cursor-grabbing {gate ? 'tile-gate' : ''}"
 >
+  <!-- What just happened, for a reader who cannot see the column the card landed in. -->
+  <span aria-live="polite" class="sr-only">{moveAnnouncement}</span>
+
+  <!--
+    The menu alternative to dragging. Reachable by keyboard (M, or Tab to the control) and by a
+    pointer that cannot drag — a touch screen, a trackpad the user finds hard to hold.
+  -->
+  <div class="absolute top-2 right-2">
+    <button
+      onclick={(e) => { e.stopPropagation(); moveMenuOpen = !moveMenuOpen; }}
+      aria-label="Move {card.title} to another stage"
+      aria-expanded={moveMenuOpen}
+      title="Move to…"
+      class="text-muted-foreground hover:text-foreground mono px-1 text-[11px] leading-none opacity-0 focus:opacity-100 group-hover:opacity-100"
+      style="opacity:{moveMenuOpen ? 1 : undefined}"
+    >⇄</button>
+    {#if moveMenuOpen}
+      <div
+        role="menu"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); moveMenuOpen = false; } }}
+        class="bg-surface border-border absolute top-full right-0 z-20 mt-1 w-40 rounded-[8px] border py-1 shadow-xl"
+      >
+        {#each orderedStages as s (s.key)}
+          <button
+            role="menuitem"
+            onclick={() => void moveTo(s.key)}
+            disabled={s.key === card.currentStageKey}
+            class="hover:bg-inset block w-full px-2.5 py-1 text-left text-xs disabled:opacity-40"
+          >{s.name}{s.key === card.currentStageKey ? ' · here' : ''}</button>
+        {/each}
+      </div>
+    {/if}
+  </div>
   <!-- row1: priority chip + title + live dot -->
   <div class="row1 mb-2 flex items-start gap-2">
     {#if card.priority > 0}
@@ -172,11 +258,13 @@
   <!-- meta row: avatar, owner, cost, due -->
   <div class="meta flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
     <!-- delegate avatar -->
-    {#if card.delegateAgentId && avatarInitial}
+    {#if card.delegateAgentId && delegate?.iconUrl}
+      <img src={delegate.iconUrl} alt="" title={delegate.name} class="size-5 shrink-0 rounded-full object-cover" />
+    {:else if card.delegateAgentId && avatarInitial}
       <span
         class="inline-grid size-5 shrink-0 place-items-center rounded-full font-mono text-[9px] font-semibold"
         style="background:{avatarColor}; color: #0f1118"
-        title={card.delegateAgentId}
+        title={delegate?.name ?? card.delegateAgentId}
       >{avatarInitial}</span>
     {:else}
       <span class="eyebrow" style="padding:0">unassigned</span>
@@ -193,7 +281,7 @@
 
     <!-- due -->
     {#if due}
-      <span>· {due}</span>
+      <span class={overdue ? 'text-coral' : ''} title={overdue ? `Due ${due} — overdue` : `Due ${due}`}>· {due}{overdue ? ' ⚠' : ''}</span>
     {/if}
 
     <!-- owner avatar -->
@@ -204,9 +292,9 @@
     >{card.ownerUserId.slice(0, 1).toUpperCase()}</span>
   </div>
 
-  <!-- cost bar -->
-  {#if card.costUsd > 0}
-    <div class="costbar">
+  <!-- cost bar — only where there is a cap for it to be a fraction OF -->
+  {#if card.costUsd > 0 && costBarPct !== null}
+    <div class="costbar" title="{fmtUsd(card.costUsd)} of the {fmtUsd(cardCap!)} card cap">
       <span
         class="costbar-fill {card.overBudget ? 'costbar-fill-over' : ''}"
         style="width:{card.overBudget ? 100 : costBarPct}%"

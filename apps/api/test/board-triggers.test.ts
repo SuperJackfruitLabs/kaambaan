@@ -92,3 +92,76 @@ describe('BoardDO — inbound triggers (docs/05 §6)', () => {
     });
   });
 });
+
+/**
+ * The audit's first still-broken finding: a card born from a GitHub issue carried
+ * no grant, so under `ENFORCE_CONTROL_PAIR` it parked in `input-required` on its
+ * first claim and stayed there. The automation path — the reason to wire a board
+ * to a repository at all — was the one path with no human present to notice.
+ *
+ * The fix records the grant when the repository is wired, because that IS the act
+ * of authorising automated dispatch, and it is the last moment a human is present
+ * to be asked.
+ */
+describe('BoardDO — a trigger-born card carries authority', () => {
+  const GRANT = ['prn_0123456789abcdef0123'];
+
+  it('stamps the board grant onto a card the webhook creates', async () => {
+    await runInDurableObject(stubFor('tg-webhook'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_tg1', tenantId: 'tnt_a', name: 'TG', stages: PIPE });
+      await board.setGithubConfig({ secret: 'hook', issueTrigger: true, triggerGrant: GRANT });
+      const body = JSON.stringify({
+        action: 'opened',
+        issue: { number: 3, title: 'Auto', state: 'open', html_url: 'https://github.com/org/repo/issues/3' },
+        repository: { full_name: 'org/repo' },
+      });
+      await board.handleGithubWebhook({ rawBody: body, signature: await githubSignatureHeader('hook', body), deliveryId: 'tg1', event: 'issues' });
+
+      const snap = await board.getState();
+      expect(snap.cards).toHaveLength(1);
+      expect(snap.cards[0]!.queuedGrant).toEqual(GRANT);
+    });
+  });
+
+  it('prefers a grant the caller carried over the board default', async () => {
+    await runInDurableObject(stubFor('tg-caller'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_tg2', tenantId: 'tnt_a', name: 'TG', stages: PIPE });
+      await board.setGithubConfig({ triggerGrant: GRANT });
+      const caller = ['prn_ffffffffffffffffffff'];
+      const r = await board.createCardFromTrigger({ title: 'x', ownerUserId: 'usr_a', queuedGrant: caller });
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value.card.queuedGrant).toEqual(caller);
+    });
+  });
+
+  it('leaves the grant null when the board has none — a standalone board is unchanged', async () => {
+    await runInDurableObject(stubFor('tg-none'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_tg3', tenantId: 'tnt_a', name: 'TG', stages: PIPE });
+      const r = await board.createCardFromTrigger({ title: 'x', ownerUserId: 'usr_a' });
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value.card.queuedGrant).toBeNull();
+    });
+  });
+
+  it('clears the standing grant when the operator no longer carries one', async () => {
+    await runInDurableObject(stubFor('tg-clear'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_tg4', tenantId: 'tnt_a', name: 'TG', stages: PIPE });
+      await board.setGithubConfig({ triggerGrant: GRANT });
+      expect((await board.getState()).github.triggerGrantCount).toBe(1);
+      await board.setGithubConfig({ triggerGrant: null });
+      expect((await board.getState()).github.triggerGrantCount).toBeNull();
+      const r = await board.createCardFromTrigger({ title: 'x', ownerUserId: 'usr_a' });
+      if (r.ok) expect(r.value.card.queuedGrant).toBeNull();
+    });
+  });
+
+  it('reports the grant as a count, never as the principal ids', async () => {
+    await runInDurableObject(stubFor('tg-count'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_tg5', tenantId: 'tnt_a', name: 'TG', stages: PIPE });
+      await board.setGithubConfig({ triggerGrant: ['prn_aaaaaaaaaaaaaaaaaaaa', 'prn_bbbbbbbbbbbbbbbbbbbb'] });
+      const snap = await board.getState();
+      expect(snap.github.triggerGrantCount).toBe(2);
+      expect(JSON.stringify(snap.github)).not.toContain('prn_');
+    });
+  });
+});

@@ -35,7 +35,15 @@ export interface AgentSummary {
   /** Its mapped suite principal (`prn_…`), or null — the normal state for a standalone board. */
   externalId: string | null;
   externalSource: string | null;
-  /** Active (non-revoked) token ids. Empty means this agent cannot authenticate right now. */
+  /** An avatar for card tiles, or null — the tile falls back to a coloured initial. */
+  iconUrl: string | null;
+  /** How many cards this agent may hold at once. */
+  concurrency: number;
+  /**
+   * Active (non-revoked) token ids. Empty means this agent cannot authenticate with a `kbn_`
+   * token right now — which for a linked agent is the ordinary state, since it authenticates
+   * with hub-issued tokens instead.
+   */
   tokenIds: string[];
 }
 
@@ -87,9 +95,31 @@ export interface Activity {
   signal: string | null;
 }
 
+export interface BoardEvent {
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+  ts: string;
+}
+
+/**
+ * The board's own log.
+ *
+ * `BoardDO.getEvents` has existed since the DO did and had no route: every state change was
+ * appended to `events` and there was no way to read them back, so the only audit trail the
+ * product keeps was unreachable.
+ */
+export async function getBoardEvents(boardId: string, limit = 100): Promise<BoardEvent[]> {
+  const res = await fetch(`/v1/boards/${boardId}/events?limit=${limit}`, { headers });
+  if (!res.ok) throw new Error(`getBoardEvents failed (${res.status})`);
+  return ((await res.json()) as { events: BoardEvent[] }).events;
+}
+
 export interface CardActivities {
   activities: Activity[];
   handoff: Record<string, unknown> | null;
+  /** Every gate on this card, decided ones included — the card's approval history. */
+  gates: Gate[];
 }
 
 export interface Notification {
@@ -134,6 +164,15 @@ export interface Gate {
   status: string;
   options: GateOption[];
   producedBy: string;
+  decision?: string | null;
+  /**
+   * Who decided, and what they said. Both columns were written on every resolution and appeared
+   * in no read shape at all — so who approved what, and the feedback they gave with it, was
+   * recorded and unreadable. Null while the gate is pending.
+   */
+  decidedBy?: string | null;
+  comment?: string | null;
+  resolvedAt?: string | null;
 }
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
@@ -179,7 +218,16 @@ export interface BoardSnapshot {
   elicitations: Elicitation[];
   references: Reference[];
   usage: BoardUsage;
-  github: { issueTrigger: boolean; webhookConfigured: boolean };
+  github: {
+    issueTrigger: boolean;
+    webhookConfigured: boolean;
+    /**
+     * How many principals the board's standing trigger grant names, or null when it has none.
+     * Null with `issueTrigger` on means every card the integration creates will be refused at
+     * claim time — which is worth saying out loud, because nothing else notices.
+     */
+    triggerGrantCount: number | null;
+  };
 }
 
 export interface Profile {
@@ -305,18 +353,45 @@ export async function getBoard(boardId: string): Promise<BoardSnapshot> {
  * what it permits against the card. Without it the card is queued by nobody with
  * permission, and under enforcement no agent may run it.
  */
-export async function createCard(boardId: string, title: string): Promise<void> {
+export async function createCard(
+  boardId: string,
+  title: string,
+  detail?: { priority?: number; spec?: Record<string, unknown> },
+): Promise<void> {
   const res = await fetch(`/v1/boards/${boardId}/cards`, {
     method: 'POST',
     headers: await withAuthority(headers),
-    body: JSON.stringify({ title }), // owner is the signed-in user, set by the server
+    // Owner is the signed-in user, set by the server. Priority and spec are sent only when given,
+    // so a one-line dispatch produces exactly the request it always did.
+    body: JSON.stringify({ title, ...(detail?.priority !== undefined ? { priority: detail.priority } : {}), ...(detail?.spec ? { spec: detail.spec } : {}) }),
   });
   if (!res.ok) throw new Error(`createCard failed (${res.status})`);
 }
 
-/** Edit a card's title / description (spec) / priority. */
-export function updateCard(boardId: string, cardId: string, patch: { title?: string; spec?: Record<string, unknown>; priority?: number }): Promise<Response> {
+/**
+ * Edit a card's title / description (spec) / priority / owner.
+ *
+ * `ownerUserId` reassigns. It is deliberately not `queuedBy`: who is answerable for a card and
+ * who authorised its dispatch are different questions, and only the second is checked at claim.
+ */
+export function updateCard(
+  boardId: string,
+  cardId: string,
+  patch: { title?: string; spec?: Record<string, unknown>; priority?: number; ownerUserId?: string },
+): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
+}
+
+/**
+ * Rework a board's pipeline.
+ *
+ * The whole list, not a patch: order is a property of the list rather than of any stage in it, so
+ * a partial update cannot express a reorder. Returns the raw response so a caller can show the
+ * server's own refusal — "stage \"todo\" still holds 3 cards" is the useful sentence, and a
+ * generic failure would hide the one fact the operator needs.
+ */
+export function setStages(boardId: string, stages: Stage[]): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/stages`, { method: 'PUT', headers, body: JSON.stringify({ stages }) });
 }
 
 /** Delete a card and everything scoped to it. */
@@ -512,12 +587,17 @@ export async function getEstimate(boardId: string, cardId: string): Promise<Esti
   return (await res.json()) as Estimate;
 }
 
-/** Cost/usage rollup for the telemetry view; `window` filters to a recent span. */
+/**
+ * Cost/usage rollup for the telemetry view; `window` filters to a recent span.
+ *
+ * **Throws on failure rather than returning zeros.** It used to answer a failed fetch with a
+ * fully zeroed summary, which made a broken telemetry API indistinguishable from a board that has
+ * spent nothing — the one reading an operator would act on. "$0.00" is a claim, and a claim the
+ * client cannot support must not be made.
+ */
 export async function getUsage(boardId: string, window: '5h' | '7d' = '7d'): Promise<UsageSummary> {
   const res = await fetch(`/v1/boards/${boardId}/usage?window=${window}`, { headers });
-  if (!res.ok) {
-    return { totalCostUsd: 0, estimatedCostUsd: 0, totalInputTokens: 0, totalOutputTokens: 0, unpricedRecords: 0, byModel: [], byAgent: [], byCard: [] };
-  }
+  if (!res.ok) throw new Error(`getUsage failed (${res.status})`);
   return (await res.json()) as UsageSummary;
 }
 
@@ -569,6 +649,77 @@ export function deleteAgent(agentId: string): Promise<Response> {
  */
 export function setAgentPrincipal(agentId: string, externalId: string | null): Promise<Response> {
   return fetch(`/v1/agents/${agentId}`, { method: 'PATCH', headers, body: JSON.stringify({ externalId }) });
+}
+
+/**
+ * Change an agent's own properties after it exists.
+ *
+ * Until the API grew this, `capabilities` was fixed at creation: an agent staffed for the wrong
+ * stages could only be deleted and remade, which for a linked agent threw away its principal link
+ * too. Deliberately separate from {@link setAgentPrincipal} even though both are a PATCH to the
+ * same route — linking an identity and editing a description are different acts, and a caller
+ * should not have to think about one to do the other.
+ */
+export function updateAgent(
+  agentId: string,
+  patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number },
+): Promise<Response> {
+  return fetch(`/v1/agents/${agentId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
+}
+
+/**
+ * Issue a fresh `kbn_` token for an agent that already exists.
+ *
+ * The missing half of revocation: the UI has always said a revoked agent "cannot authenticate
+ * until reconnected", and there was no reconnect — tokens were minted only when an agent was
+ * created. The plaintext comes back exactly once, as it does on create.
+ */
+export async function issueAgentToken(agentId: string): Promise<{ token: string; tokenId: string }> {
+  const res = await fetch(`/v1/agents/${agentId}/tokens`, { method: 'POST', headers });
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(detail?.error ?? `issueAgentToken failed (${res.status})`);
+  }
+  return (await res.json()) as { token: string; tokenId: string };
+}
+
+/**
+ * Who is in this workspace, and what they may do.
+ *
+ * `memberships.role` was CHECK-constrained, written once as 'owner' and read by zero queries, so
+ * a workspace was permanently one person. These are the calls that make it a real model.
+ */
+export type Role = 'viewer' | 'member' | 'admin' | 'owner';
+
+export interface Member {
+  userId: string;
+  email: string;
+  name: string | null;
+  role: Role;
+  createdAt: string;
+}
+
+/** Everyone in the workspace, oldest membership first — the founding owner at the top. */
+export async function getMembers(): Promise<Member[]> {
+  const res = await fetch('/v1/members', { headers });
+  if (!res.ok) return [];
+  return ((await res.json()) as { members: Member[] }).members;
+}
+
+/**
+ * Add someone by email. No mail is sent: `users` is keyed on the address GitHub gives at sign-in,
+ * so recording the membership first means the invitee signs in and finds the workspace waiting.
+ */
+export function addMember(email: string, role: Role): Promise<Response> {
+  return fetch('/v1/members', { method: 'POST', headers, body: JSON.stringify({ email, role }) });
+}
+
+export function setMemberRole(userId: string, role: Role): Promise<Response> {
+  return fetch(`/v1/members/${userId}`, { method: 'PATCH', headers, body: JSON.stringify({ role }) });
+}
+
+export function removeMember(userId: string): Promise<Response> {
+  return fetch(`/v1/members/${userId}`, { method: 'DELETE', headers });
 }
 
 /** This workspace, and the hub fleet it is linked to (or null for a standalone board). */

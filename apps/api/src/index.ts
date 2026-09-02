@@ -14,8 +14,12 @@
  *                   mechanism awaiting "OAuth/magic-link"; real login shipped, and no magic-link was
  *                   ever built.)
  *
- * `role` and token `scopes` are stored but not enforced anywhere — membership in the tenant is the
- * granularity of human authorization today.
+ * Both recorded permissions are now checked, where before neither was:
+ *   - token `scopes` on the agent routes (auth/scopes.ts) — `claim` to take a card, `run` to drive
+ *     one, with `claim` grandfathering `run` for tokens minted before the split.
+ *   - `memberships.role` on every human route (db/members.ts) — viewer reads, member works the
+ *     board, admin manages boards and agents, owner manages people and the fleet link. A caller
+ *     with no membership is refused rather than demoted to a reader.
  */
 import {
   BoardDO,
@@ -36,7 +40,9 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
+import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 
 export { BoardDO };
 
@@ -48,6 +54,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_URL':
     case 'INVALID_DELIVERY':
     case 'INVALID_USAGE':
+    case 'INVALID_STAGES':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -65,6 +72,9 @@ function statusForCode(code: BoardErrorCode): number {
     // state the caller believed in, not a bad request. Retrying it will never succeed.
     case 'ELICITATION_NOT_PENDING':
     case 'CARD_NOT_WAITING':
+    // The stage still holds cards. A conflict with the state the caller believed in, not a
+    // malformed request: the same payload succeeds once the stage is emptied.
+    case 'STAGE_NOT_EMPTY':
       return 409;
     case 'SEPARATION_OF_DUTIES':
     // The caller authenticated, but this run is another agent's: a permanent refusal of an
@@ -86,6 +96,32 @@ function statusForCode(code: BoardErrorCode): number {
  * string because that is what the boards routes have always answered with and
  * the web app already parses.
  */
+/**
+ * Refuse an act this member's role does not reach, or null to proceed.
+ *
+ * `memberships.role` was CHECK-constrained, written once as 'owner', and read by zero queries —
+ * the whole human authorization model recorded and never consulted. This is the consultation.
+ *
+ * Fails closed on a null role: a person whose membership was removed still holds a valid session
+ * cookie naming that tenant, and they are refused rather than demoted to a reader.
+ */
+function refuseByRole(user: UserPrincipal | null, capability: Capability): Response | null {
+  if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+  if (!user.role) return Response.json({ error: 'you are not a member of this workspace' }, { status: 403 });
+  if (!permits(user.role, capability)) {
+    return Response.json({ error: `a ${user.role} may not do that in this workspace` }, { status: 403 });
+  }
+  return null;
+}
+
+/** Would changing or removing this member leave the workspace with no owner at all? */
+async function isLastOwner(db: D1Database, tenantId: string, userId: string): Promise<boolean> {
+  const members = await listMembers(db, tenantId);
+  const target = members.find((m) => m.userId === userId);
+  if (!target || target.role !== 'owner') return false;
+  return (await ownerCount(db, tenantId)) <= 1;
+}
+
 function unexpected(err: unknown): Response {
   const message = (err as { message?: string })?.message ?? 'unexpected error';
   return Response.json({ error: { message } }, { status: 500 });
@@ -149,10 +185,9 @@ export default {
     // never establish the mapping that makes that token resolve. It is human-only or it is
     // unreachable.
     //
-    // Deliberately NOT scoped to owners today. `memberships.role` exists and nothing else in this
-    // file reads it; adding the first role check here would make this route the one place in
-    // kaambaan where membership is not enough, which is a decision about the whole product rather
-    // than about this endpoint. Recorded as a limit rather than settled in passing.
+    // Scoped to owners. The comment this replaces recorded the absence of that check as "a
+    // decision about the whole product rather than about this endpoint" — the decision is now
+    // made, in db/members.ts, and every route reads it from the same place.
     if (path === '/v1/tenant') {
       try {
         const u = await resolveUser(request, env);
@@ -164,6 +199,14 @@ export default {
           return Response.json({ tenant });
         }
         if (request.method !== 'PATCH') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        // Linking a plane is at least as consequential as revoking a credential, so it is the one
+        // act reserved to an owner. The comment this replaces recorded the absence of exactly this
+        // check as "a decision about the whole product rather than about this endpoint" — the
+        // decision is now made, in db/members.ts, and every route reads it from the same place.
+        {
+          const refused = refuseByRole(u, 'own');
+          if (refused) return refused;
+        }
 
         const body = (await request.json()) as { externalId?: string | null };
         if (body.externalId === undefined) {
@@ -204,12 +247,87 @@ export default {
       }
     }
 
+    // /v1/members[/:userId] — who is in this workspace, and what they may do.
+    //
+    // `memberships.role` has been CHECK-constrained to owner/admin/member/viewer since migration
+    // 0001, written exactly once as 'owner' by `ensurePersonalWorkspace`, and read by zero
+    // queries — so a workspace was permanently one person and the four roles described nothing.
+    // These are the routes that make it a real model.
+    //
+    // No mail is sent and none is needed: `users` is keyed on the email GitHub gives at sign-in,
+    // so recording the membership first means the invitee signs in and finds the workspace
+    // waiting (`primaryTenant` orders by `created_at`, so a membership made before their personal
+    // workspace exists is the one they land in).
+    const membersMatch = path.match(/^\/v1\/members(?:\/([^/]+))?$/);
+    if (membersMatch) {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const targetUserId = membersMatch[1];
+
+        if (request.method === 'GET' && !targetUserId) {
+          // Reading the roster is not an administrative act — a member needs to know who else can
+          // see their board, and who to ask when they cannot do something.
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ members: await listMembers(env.DB, u.tenantId) });
+        }
+
+        // Everything below changes who may act in this workspace, which is an owner's decision.
+        const refused = refuseByRole(u, 'own');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !targetUserId) {
+          const body = (await request.json()) as { email?: string; role?: string; name?: string };
+          const email = (body.email ?? '').trim();
+          // Validated here so a typo is a sentence rather than a membership nobody can ever use:
+          // the row is keyed on this address matching what GitHub returns at sign-in.
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            return Response.json({ error: 'a valid email address is required' }, { status: 400 });
+          }
+          const role = asRole(body.role ?? 'member');
+          if (!role) return Response.json({ error: 'role must be one of owner, admin, member, viewer' }, { status: 400 });
+          return Response.json({ member: await addMember(env.DB, u.tenantId, { email, role, name: body.name ?? null }) }, { status: 201 });
+        }
+
+        if (targetUserId && request.method === 'PATCH') {
+          const body = (await request.json()) as { role?: string };
+          const role = asRole(body.role);
+          if (!role) return Response.json({ error: 'role must be one of owner, admin, member, viewer' }, { status: 400 });
+          // A workspace with no owner cannot be administered by anyone, including to appoint a
+          // new one — it is unrecoverable through the product. So the last owner cannot step
+          // down; they appoint a second owner first.
+          if (role !== 'owner' && (await isLastOwner(env.DB, u.tenantId, targetUserId))) {
+            return Response.json({ error: 'this is the workspace\'s only owner — appoint another before changing this' }, { status: 409 });
+          }
+          if (!(await setMemberRole(env.DB, u.tenantId, targetUserId, role))) {
+            return Response.json({ error: 'not a member of this workspace' }, { status: 404 });
+          }
+          return Response.json({ ok: true });
+        }
+
+        if (targetUserId && request.method === 'DELETE') {
+          if (await isLastOwner(env.DB, u.tenantId, targetUserId)) {
+            return Response.json({ error: 'this is the workspace\'s only owner — appoint another before removing this one' }, { status: 409 });
+          }
+          if (!(await removeMember(env.DB, u.tenantId, targetUserId))) {
+            return Response.json({ error: 'not a member of this workspace' }, { status: 404 });
+          }
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     // /v1/agents[/:id[/tokens/:tokenId]] — a workspace's agents + token minting (the "connect an
     // agent" surface) + token revocation, right beside it. The plaintext token is returned ONCE
     // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
     // `findAgentByTokenHash` already refuses anything revoked (catalog.ts), so this write is the
     // whole mechanism.
-    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/tokens\/([^/]+))?)?$/);
+    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/(tokens)(?:\/([^/]+))?)?)?$/);
     if (agentsMatch) {
       // Every route below is inside this, and the whole-branch review is why.
       // The only catch-all in this file wrapped `/v1/boards` alone, so an
@@ -238,7 +356,39 @@ export default {
         if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const agentId = agentsMatch[1];
-        const tokenId = agentsMatch[2];
+        const tokenId = agentsMatch[3];
+        const mintingTokens = agentId && agentsMatch[2] === 'tokens' && !tokenId;
+
+        // POST /v1/agents/:id/tokens — issue a fresh `kbn_` for an agent that already exists.
+        //
+        // Without this, revoking an agent's last token was terminal: tokens were only ever minted
+        // inside `POST /v1/agents`, so "cannot authenticate until reconnected" named a reconnect
+        // that did not exist, and a linked agent — which is created with no `kbn_` at all — could
+        // never be issued one even when it needed a native credential.
+        //
+        // Human-only, exactly like revocation: `u` came from `resolveUser` alone, so an agent can
+        // never mint itself a second credential to outlive one a person revoked
+        // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+        // Everything below the agent list is workspace administration: minting and revoking
+        // credentials, restaffing an agent, deleting one. `member` works the board; managing what
+        // works it is `admin`.
+        if (request.method !== 'GET') {
+          const refused = refuseByRole(u, 'manage');
+          if (refused) return refused;
+        } else {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+        }
+
+        if (mintingTokens) {
+          if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
+          if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
+            return Response.json({ error: 'agent not found' }, { status: 404 });
+          }
+          const minted = await createAgentToken(env.DB, u.tenantId, agentId, AGENT_TOKEN_SCOPES);
+          return Response.json({ token: minted.token, tokenId: minted.id }, { status: 201 });
+        }
+
         if (agentId && tokenId) {
           // Revoking a credential is a HUMAN act, same as minting one: `u` above came ONLY from
           // `resolveUser` (session cookie or dev headers) — never from a `kbn_` bearer or a hub
@@ -268,9 +418,59 @@ export default {
             if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
               return Response.json({ error: 'agent not found' }, { status: 404 });
             }
-            const body = (await request.json()) as { externalId?: string | null };
+            const body = (await request.json()) as {
+              externalId?: string | null;
+              name?: string;
+              capabilities?: string[];
+              iconUrl?: string | null;
+              concurrency?: number;
+            };
+
+            // The agent's OWN properties, which until now could be set exactly once — in the
+            // INSERT inside `createAgent` — and changed nowhere. An agent staffed with the wrong
+            // capabilities could not be restaffed; the only remedy was to delete it and make
+            // another, which for a linked agent discards its principal link too.
+            //
+            // Handled before the externalId branch, and independently of it: linking a principal
+            // and editing an agent are different acts that happen to share a route, and a PATCH
+            // carrying only `capabilities` must not be refused for want of an `externalId`.
+            const patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number } = {};
+            if (body.name !== undefined) {
+              if (typeof body.name !== 'string' || body.name.trim() === '') {
+                return Response.json({ error: 'name must be a non-empty string' }, { status: 400 });
+              }
+              patch.name = body.name.trim();
+            }
+            if (body.capabilities !== undefined) {
+              if (!Array.isArray(body.capabilities) || body.capabilities.some((c) => typeof c !== 'string' || c.trim() === '')) {
+                return Response.json({ error: 'capabilities must be an array of non-empty strings' }, { status: 400 });
+              }
+              // Normalised on the way in so `stageMatches` compares like with like: a stage's
+              // `owner` is a slug, and an operator typing "Code Review" must not produce a
+              // capability that silently matches no stage.
+              patch.capabilities = [...new Set(body.capabilities.map((c) => c.trim().toLowerCase()))];
+            }
+            if (body.iconUrl !== undefined) {
+              if (body.iconUrl !== null && !/^https:\/\//i.test(body.iconUrl)) {
+                // Rendered as an <img> src in the board UI, so the scheme is checked at the write
+                // boundary — the same rule `addReference` applies to a reference url.
+                return Response.json({ error: 'iconUrl must be an https URL, or null to clear it' }, { status: 400 });
+              }
+              patch.iconUrl = body.iconUrl;
+            }
+            if (body.concurrency !== undefined) {
+              if (!Number.isInteger(body.concurrency) || body.concurrency < 1) {
+                return Response.json({ error: 'concurrency must be a whole number of at least 1' }, { status: 400 });
+              }
+              patch.concurrency = body.concurrency;
+            }
+            if (Object.keys(patch).length > 0) await updateAgent(env.DB, u.tenantId, agentId, patch);
+
             if (body.externalId === undefined) {
-              return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
+              // A patch that only touched the agent's own fields is complete. Only a request that
+              // named NOTHING at all is a mistake worth reporting.
+              if (Object.keys(patch).length > 0) return Response.json({ ok: true });
+              return Response.json({ error: 'nothing to change: send name, capabilities, iconUrl, concurrency, or externalId' }, { status: 400 });
             }
             if (body.externalId === null) {
               await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);
@@ -346,7 +546,7 @@ export default {
             );
           }
 
-          const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
+          const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, AGENT_TOKEN_SCOPES);
           return Response.json({ agent: created, token, tokenId }, { status: 201 });
         }
         return Response.json({ error: 'method not allowed' }, { status: 405 });
@@ -391,6 +591,14 @@ export default {
       // that agent — capabilities still come from kaambaan's own agents row, never the claim.
       if (!agent) agent = await resolveHubAgent(request, env);
       if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
+      // Scopes stop being decoration here. Every `kbn_` token has carried a scope set since
+      // migration 0001, the resolver has always returned it, and nothing compared it to the action
+      // being attempted — so a token minted to claim drove every run verb. A recorded permission
+      // nobody checks reads as protection that does not exist (auth/scopes.ts).
+      const needed = requiredScope(rest);
+      if (needed && !scopePermits(agent.scopes, needed)) {
+        return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
+      }
       tenantId = agent.tenantId;
     } else {
       user = await resolveUser(request, env);
@@ -399,6 +607,23 @@ export default {
       // recorded with the card and outlives the token that carried it.
       if (!user) user = await resolveHubUser(request, env);
       if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+      // A viewer reads the board; working it — creating, moving, editing and deleting cards,
+      // resolving gates, answering an agent's question — is `member`, and reworking the board
+      // itself is `admin`. GET is almost the whole read surface, so the method is the right
+      // discriminator rather than a list of paths that would drift from the routes below it.
+      //
+      // Marking a notification read is the exception: it is a POST that changes nothing about the
+      // board, only about what its recipient has already seen. A viewer who was assigned a card
+      // receives notifications for it, and being unable to clear them would leave a badge they
+      // can never dismiss.
+      const needed: Capability =
+        request.method === 'GET' || rest.startsWith('notifications/')
+          ? 'read'
+          : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles'
+            ? 'manage'
+            : 'work';
+      const refusedByRole = refuseByRole(user, needed);
+      if (refusedByRole) return refusedByRole;
       tenantId = user.tenantId;
     }
 
@@ -437,8 +662,32 @@ export default {
         return Response.json(await stub.getState());
       }
 
-      // DELETE /v1/boards/:id — remove the board from the workspace (catalog entry)
+      // PUT /v1/boards/:id/stages — rework the pipeline (docs/03).
+      //
+      // The whole list, not a patch: order is a property of the list rather than of any stage in
+      // it, so a partial update cannot express a reorder. The DO validates and refuses first; the
+      // catalog's `stages_json` is only mirrored after that succeeds, so a rejected change never
+      // leaves the two disagreeing about what the board's pipeline is.
+      if (rest === 'stages' && request.method === 'PUT') {
+        const body = (await request.json()) as { stages?: StageDef[] };
+        const r = await stub.setStages(body.stages ?? []);
+        if (!r.ok) return Response.json({ error: r }, { status: statusForCode(r.code) });
+        await updateBoardStages(env.DB, tenantId, boardId, JSON.stringify(r.value.stages));
+        return Response.json(await stub.getState());
+      }
+
+      // DELETE /v1/boards/:id — remove the board, and everything it held.
+      //
+      // This used to delete the catalog row alone, leaving the Durable Object and all its cards,
+      // runs, activities and references alive: unreachable through any route, undeleted, and
+      // still billing storage. A person who deleted a board had every reason to believe its
+      // contents were gone.
+      //
+      // The DO is emptied FIRST. If that throws, the catalog row survives and the board is still
+      // listed and still reachable — a delete that visibly did not happen, rather than a board
+      // that vanished from the list while its contents quietly stayed.
       if (rest === '' && request.method === 'DELETE') {
+        await stub.destroy();
         await deleteBoard(env.DB, tenantId, boardId);
         return new Response(null, { status: 204 });
       }
@@ -480,7 +729,10 @@ export default {
       // PATCH /v1/boards/:id/cards/:cardId — edit a card · DELETE — remove it
       const cardMatch = rest.match(/^cards\/([^/]+)$/);
       if (cardMatch && request.method === 'PATCH') {
-        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number };
+        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string };
+        if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
+          return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
+        }
         const result = await stub.updateCard(cardMatch[1]!, body);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
@@ -529,6 +781,18 @@ export default {
         return Response.json(result.value);
       }
 
+      // GET /v1/boards/:id/events — the board's own event log (docs/03).
+      //
+      // `BoardDO.getEvents` has existed since the DO did, with no route and no caller: every
+      // state change on a board — created, moved, claimed, blocked, resolved — was appended to
+      // `events` and there was no way to read it back. The only audit trail the product keeps was
+      // unreachable, which is the same as not keeping one.
+      if (rest === 'events' && request.method === 'GET') {
+        const limitParam = Number(url.searchParams.get('limit'));
+        const limit = Number.isInteger(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : 100;
+        return Response.json({ events: await stub.getEvents(limit) });
+      }
+
       // GET /v1/boards/:id/usage — cost/usage rollup (docs/07 §6). `?window=` filters to a recent span.
       if (rest === 'usage' && request.method === 'GET') {
         const window = url.searchParams.get('window');
@@ -538,7 +802,9 @@ export default {
       // GET /v1/boards/:id/notifications — in-app notification feed (docs/07 §7)
       if (rest === 'notifications' && request.method === 'GET') {
         const unreadOnly = url.searchParams.get('unread') === 'true';
-        return Response.json({ notifications: await stub.getNotifications({ unreadOnly }) });
+        // Scoped to the caller: `user_id` was written and never read, so every board notification
+        // reached every member of the workspace.
+        return Response.json({ notifications: await stub.getNotifications({ unreadOnly, userId: user!.userId }) });
       }
 
       // POST /v1/boards/:id/notifications/:seq/read — mark a notification read (docs/07 §7)
@@ -598,7 +864,16 @@ export default {
       // PUT /v1/boards/:id/github — configure GitHub: webhook secret + issue→card trigger (docs/06 §3, docs/05 §6)
       if (rest === 'github' && request.method === 'PUT') {
         const body = (await request.json()) as { secret?: string; issueTrigger?: boolean };
-        const result = await stub.setGithubConfig(body);
+        // Wiring a repository to a board IS the act of authorising automated
+        // dispatch from it, so the grant the operator holds at that moment is
+        // recorded with the configuration. A webhook fires with nobody present;
+        // without this the card it creates carries no authority and can never be
+        // claimed under enforcement.
+        //
+        // Re-sent on every config write, deliberately: the grant is only as good
+        // as the last person who confirmed it, and re-saving the settings is how
+        // an operator refreshes it after their own permissions change.
+        const result = await stub.setGithubConfig({ ...body, triggerGrant: user?.mayDispatch ?? null });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
       }
@@ -611,7 +886,16 @@ export default {
           spec?: JsonValue;
           source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
         };
-        const result = await stub.createCardFromTrigger({ title: body.title, ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_trigger', spec: body.spec, source: body.source });
+        const result = await stub.createCardFromTrigger({
+          title: body.title,
+          ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_trigger',
+          spec: body.spec,
+          // This route DOES have a caller, unlike the webhook — so the grant
+          // comes from them, and the board's standing grant is only the
+          // fallback for when it doesn't.
+          queuedGrant: user?.mayDispatch ?? null,
+          source: body.source,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
       }
@@ -640,7 +924,13 @@ export default {
         const claimResult = await stub.claim({
           agentId: agent!.agentId,
           capabilities: agent!.capabilities ?? payload.capabilities ?? [],
-          maxConcurrency: payload.maxConcurrency,
+          // `agents.concurrency` has existed since migration 0001 and was read by nothing. It is
+          // the operator's ceiling, so an agent may ask for LESS than it (a node that knows it is
+          // busy) but never for more: the request is a preference, the column is the permission.
+          maxConcurrency:
+            payload.maxConcurrency !== undefined && agent!.concurrency !== undefined
+              ? Math.min(payload.maxConcurrency, agent!.concurrency)
+              : (payload.maxConcurrency ?? agent!.concurrency),
           profileKey: payload.profileKey,
           principalId: agent!.externalId,
         });
@@ -765,5 +1055,30 @@ export default {
     } catch (err) {
       return unexpected(err);
     }
+  },
+
+  /**
+   * Drain every board's push delivery queue.
+   *
+   * `POST /v1/boards/:id/push/dispatch` has always existed and nothing ever called it on a
+   * schedule: the queue drained only on a DO alarm or when somebody POSTed by hand, so a delivery
+   * whose alarm was missed sat there indefinitely. A queue with no drain is a queue that loses
+   * things quietly.
+   *
+   * Best-effort per board, and deliberately so: one board whose DO throws must not stop the sweep
+   * for every other board in the deployment.
+   */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        for (const board of await listAllBoards(env.DB)) {
+          try {
+            await boardStub(env, board.tenantId, board.id).dispatchPushDeliveries();
+          } catch {
+            /* one board's failure is not the sweep's */
+          }
+        }
+      })(),
+    );
   },
 } satisfies ExportedHandler<Env>;

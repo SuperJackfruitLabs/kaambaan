@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button';
-  import { renameBoard, setGithubConfig, getProfiles, createProfile, type BoardSnapshot, type Profile } from '$lib/api';
+  import { renameBoard, setGithubConfig, setStages, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
 
   let { open = false, board, onClose, onChanged }: { open?: boolean; board: BoardSnapshot; onClose: () => void; onChanged: () => void } = $props();
 
@@ -13,12 +13,80 @@
   let busy = $state('');
   let seeded = $state(false);
 
+  /**
+   * The pipeline, editable.
+   *
+   * A board's stages were written once at creation and there was no way to change any of them —
+   * one typo in a stage name cost the board and every card on it. Held as a local draft so an
+   * operator can reorder, retitle and retune several stages and save once; the server refuses the
+   * whole payload if any part of it is impossible, so a half-applied pipeline never exists.
+   *
+   * A stage's KEY is identity — cards, runs and gates all carry it — so it is shown and not
+   * editable. Changing a key is adding a stage and removing the old one, which the server's
+   * emptiness rule then makes safe.
+   */
+  let draft = $state<Stage[]>([]);
+  let stagesError = $state<string | null>(null);
+  let newStageName = $state('');
+
+  const cardsPerStage = $derived(
+    board.cards.reduce<Record<string, number>>((acc, c) => ({ ...acc, [c.currentStageKey]: (acc[c.currentStageKey] ?? 0) + 1 }), {}),
+  );
+
+  function slug(v: string): string {
+    return v.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  }
+
+  function addStage(): void {
+    const name = newStageName.trim();
+    if (name === '') return;
+    let key = slug(name) || `stage-${draft.length + 1}`;
+    // A duplicate key is refused by the server; suffixing here means the operator meets a working
+    // stage rather than an error about something they cannot see.
+    let n = 2;
+    while (draft.some((s) => s.key === key)) key = `${slug(name)}-${n++}`;
+    draft = [...draft, { key, name, order: draft.length }];
+    newStageName = '';
+  }
+
+  function removeStage(key: string): void {
+    draft = draft.filter((s) => s.key !== key).map((s, i) => ({ ...s, order: i }));
+  }
+
+  function move(index: number, by: number): void {
+    const to = index + by;
+    if (to < 0 || to >= draft.length) return;
+    const next = [...draft];
+    [next[index], next[to]] = [next[to]!, next[index]!];
+    draft = next.map((s, i) => ({ ...s, order: i }));
+  }
+
+  async function saveStages(): Promise<void> {
+    busy = 'stages';
+    stagesError = null;
+    try {
+      const res = await setStages(board.boardId!, draft);
+      if (!res.ok) {
+        // The server's own sentence names the stage and how many cards are on it — the one fact
+        // the operator needs in order to act.
+        const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        stagesError = body?.error?.message ?? `Saving the pipeline failed (${res.status})`;
+        return;
+      }
+      onChanged();
+    } finally {
+      busy = '';
+    }
+  }
+
   const webhookUrl = $derived(`${location.origin}/v1/boards/${board.boardId}/webhooks/github?tenant=${board.tenantId}`);
 
   $effect(() => {
     if (open && !seeded) {
       nameInput = board.name ?? '';
       issueTrigger = board.github.issueTrigger;
+      draft = board.stages.map((s) => ({ ...s }));
+      stagesError = null;
       void getProfiles(board.boardId!).then((p) => (profiles = p)).catch(() => (profiles = []));
       seeded = true;
     }
@@ -84,6 +152,94 @@
           </div>
         </section>
 
+        <!-- stages -->
+        <section>
+          <div class="eyebrow mb-2">pipeline</div>
+          <p class="text-muted-foreground mb-3 text-xs leading-relaxed">
+            The stages a card moves through. A stage's <span class="mono">key</span> is what every card,
+            run and gate refers to, so it cannot be renamed — add a stage and remove the old one instead.
+            A stage holding cards cannot be removed until they are moved.
+          </p>
+
+          <div class="space-y-2">
+            {#each draft as stage, i (stage.key)}
+              <div class="bg-inset border-border rounded-[8px] border px-2.5 py-2">
+                <div class="flex items-center gap-1.5">
+                  <div class="flex shrink-0 flex-col">
+                    <button onclick={() => move(i, -1)} disabled={i === 0} aria-label="Move {stage.name} earlier" class="text-muted-foreground hover:text-foreground text-[9px] leading-none disabled:opacity-30">▲</button>
+                    <button onclick={() => move(i, 1)} disabled={i === draft.length - 1} aria-label="Move {stage.name} later" class="text-muted-foreground hover:text-foreground text-[9px] leading-none disabled:opacity-30">▼</button>
+                  </div>
+                  <input
+                    bind:value={stage.name}
+                    aria-label="Name of stage {stage.key}"
+                    class="bg-surface border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-sm outline-none"
+                  />
+                  <span class="mono text-muted-foreground shrink-0 text-[10px]">{stage.key}</span>
+                  <button
+                    onclick={() => removeStage(stage.key)}
+                    disabled={(cardsPerStage[stage.key] ?? 0) > 0 || draft.length === 1}
+                    aria-label="Remove stage {stage.name}"
+                    title={(cardsPerStage[stage.key] ?? 0) > 0 ? `Holds ${cardsPerStage[stage.key]} card(s) — move them first` : 'Remove this stage'}
+                    class="text-muted-foreground hover:text-coral shrink-0 disabled:opacity-30"
+                  >
+                    <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                  </button>
+                </div>
+                <div class="mt-1.5 flex flex-wrap items-center gap-2 text-[11px]">
+                  <select
+                    bind:value={stage.ownerKind}
+                    aria-label="Who works stage {stage.name}"
+                    class="bg-surface border-border mono rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                  >
+                    <option value="human">human</option>
+                    <option value="capability">agent</option>
+                  </select>
+                  {#if stage.ownerKind === 'capability'}
+                    <input
+                      bind:value={stage.owner}
+                      placeholder="capability"
+                      aria-label="Capability required for stage {stage.name}"
+                      class="bg-surface border-border mono w-28 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                    />
+                  {/if}
+                  <label class="text-muted-foreground flex items-center gap-1">
+                    <input type="checkbox" checked={stage.gate === 'approval'} onchange={(e) => (stage.gate = e.currentTarget.checked ? 'approval' : 'none')} class="accent-marigold" />
+                    approval gate
+                  </label>
+                  <label class="text-muted-foreground flex items-center gap-1">
+                    wip
+                    <input
+                      type="number"
+                      min="1"
+                      value={stage.wipLimit ?? ''}
+                      onchange={(e) => (stage.wipLimit = e.currentTarget.value === '' ? undefined : Number(e.currentTarget.value))}
+                      placeholder="—"
+                      aria-label="WIP limit for stage {stage.name}"
+                      class="bg-surface border-border mono w-14 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                    />
+                  </label>
+                  {#if (cardsPerStage[stage.key] ?? 0) > 0}
+                    <span class="text-muted-foreground mono ml-auto text-[10px]">{cardsPerStage[stage.key]} card{cardsPerStage[stage.key] === 1 ? '' : 's'}</span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+
+          <div class="mt-2 flex gap-1.5">
+            <input
+              bind:value={newStageName}
+              placeholder="add a stage"
+              onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addStage(); } }}
+              class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+            />
+            <Button size="sm" variant="outline" onclick={addStage} disabled={newStageName.trim() === ''}>Add</Button>
+          </div>
+
+          {#if stagesError}<p class="text-coral mt-2 text-xs leading-relaxed">{stagesError}</p>{/if}
+          <div class="mt-3 flex justify-end"><Button size="sm" onclick={saveStages} disabled={busy === 'stages'}>{busy === 'stages' ? 'Saving…' : 'Save pipeline'}</Button></div>
+        </section>
+
         <!-- github -->
         <section>
           <div class="eyebrow mb-2">github integration</div>
@@ -113,6 +269,24 @@
             <input type="checkbox" bind:checked={issueTrigger} class="accent-marigold" />
             <span>Open a card for each new GitHub issue</span>
           </label>
+          <!--
+            A webhook fires with nobody present, so the authority a trigger-born card carries has
+            to have been recorded here, when the repository was wired. Saying so is the point: a
+            board with the trigger on and no grant produces cards that are refused at claim time,
+            and nothing else in the product notices.
+          -->
+          {#if board.github.triggerGrantCount === null}
+            <p class="text-muted-foreground mt-2 text-xs leading-relaxed">
+              Saving carries your current dispatch authority onto every card this trigger creates.
+              Without it those cards cannot be claimed by any agent.
+            </p>
+          {:else}
+            <p class="text-muted-foreground mt-2 text-xs leading-relaxed">
+              Cards from this trigger may be dispatched to
+              <span class="text-foreground">{board.github.triggerGrantCount}</span>
+              {board.github.triggerGrantCount === 1 ? 'agent' : 'agents'}. Save again to refresh that.
+            </p>
+          {/if}
           <div class="mt-3 flex justify-end"><Button size="sm" variant="outline" onclick={saveGithub} disabled={busy === 'github'}>Save GitHub settings</Button></div>
         </section>
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeClaudeStreamLine } from '../src/adapters/claude-code';
+import { normalizeClaudeStreamLine } from '@kaambaan/agent-sdk';
 
 /**
  * docs/05 §6 / docs/07 §1: an adapter translates a harness's native stream into the normalized

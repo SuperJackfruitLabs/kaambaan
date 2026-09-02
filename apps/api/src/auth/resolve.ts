@@ -9,6 +9,7 @@ import type { Env } from '../env';
 import { readSessionToken, verifySession } from './session';
 import { hashToken } from './agent-token';
 import { findAgentByExternal, findAgentByTokenHash, findTenantByExternal } from '../db/catalog';
+import { roleFor, type Role } from '../db/members';
 import { verifyHubToken } from './hub-jwt';
 
 export interface UserPrincipal {
@@ -22,6 +23,14 @@ export interface UserPrincipal {
    * accompanied this act", which is not the same as an empty grant.
    */
   mayDispatch?: string[];
+  /**
+   * This caller's role in the workspace (`memberships.role`).
+   *
+   * **Null means "not a member here"**, and every gate refuses on it — including reads. A person
+   * whose membership was removed still holds a valid session cookie naming that tenant, and
+   * "not a member" must not resolve to the weakest role that can still see the board.
+   */
+  role: Role | null;
   name?: string;
   login?: string;
   avatarUrl?: string;
@@ -45,6 +54,20 @@ export interface AgentPrincipal {
    * tell "resolved, and there is none" from "not resolved here, look it up yourself".
    */
   externalId?: string | null;
+  /**
+   * The scopes on the `kbn_` token that authenticated this request (`agent_tokens.scopes_json`).
+   *
+   * **Null means "this credential is not a kaambaan token"** — a hub-issued agent token, or a dev
+   * header — not "no scopes". The distinction is load-bearing: `scopePermits` treats null as
+   * unscoped-and-therefore-unrestricted, because a hub token's authority is the hub's and is
+   * checked by the control pair at claim time, not by a scope kaambaan never minted.
+   */
+  scopes?: string[] | null;
+  /**
+   * The ceiling the operator set on how many cards this agent may hold (`agents.concurrency`).
+   * Absent on the paths that never read the catalog row.
+   */
+  concurrency?: number;
 }
 
 function devAuth(env: Env): boolean {
@@ -62,14 +85,36 @@ export async function resolveUser(request: Request, env: Env): Promise<UserPrinc
   if (token && env.SESSION_SECRET) {
     const session = await verifySession(token, env.SESSION_SECRET);
     if (session) {
-      return { userId: session.userId, tenantId: session.tenantId, name: session.name, login: session.login, avatarUrl: session.avatarUrl };
+      return {
+        userId: session.userId,
+        tenantId: session.tenantId,
+        // Read now rather than carried in the cookie: a role change must take effect on the next
+        // request, not when a stateless session happens to be reissued. Removing someone's
+        // membership is a revocation, and a revocation that waits is not one.
+        role: await roleFor(env.DB, session.tenantId, session.userId),
+        name: session.name,
+        login: session.login,
+        avatarUrl: session.avatarUrl,
+      };
     }
   }
   if (devAuth(env)) {
     // Browsers can't set headers on a WebSocket upgrade, so the live feed passes ?tenant= instead.
     const tenantId = request.headers.get('X-Tenant-Id') ?? new URL(request.url).searchParams.get('tenant');
     if (tenantId && tenantId.trim() !== '') {
-      return { userId: request.headers.get('X-User-Id') ?? 'usr_dev', tenantId };
+      const userId = request.headers.get('X-User-Id') ?? 'usr_dev';
+      // Dev headers are already a FULL credential for the tenant by construction (that is why
+      // they are opt-in and absent from wrangler.jsonc), so a workspace with NO members at all —
+      // a bare dev or test tenant, which nothing in dev creates memberships for — grants the top
+      // role rather than refusing everyone.
+      //
+      // But once a workspace HAS members, the dev header must name one of them. Otherwise the
+      // fallback would quietly outrank the roles it is meant to be standing in for, and every
+      // role test would pass by not being applied.
+      const role = await roleFor(env.DB, tenantId, userId);
+      if (role) return { userId, tenantId, role };
+      const populated = await env.DB.prepare(`SELECT 1 FROM memberships WHERE tenant_id = ? LIMIT 1`).bind(tenantId).first();
+      return { userId, tenantId, role: populated ? null : 'owner' };
     }
   }
   return null;
@@ -81,7 +126,14 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
   if (token && token.startsWith('kbn_')) {
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
     return found
-      ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: found.externalId }
+      ? {
+          tenantId: found.tenantId,
+          agentId: found.agentId,
+          capabilities: found.capabilities,
+          externalId: found.externalId,
+          scopes: found.scopes,
+          concurrency: found.concurrency,
+        }
       : null;
   }
   if (devAuth(env)) {
@@ -152,7 +204,16 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
   const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
   if (!tenantId) return null;
 
-  return { userId: claims.sub, tenantId, mayDispatch: claims.mayDispatch ?? [] };
+  // **A hub caller's authority comes from the fleet link, not from a local membership.** Their
+  // `sub` is the hub's id for them and will match no row in `memberships`, and refusing on that
+  // would break the whole cross-domain handoff — the fleet link IS the workspace's decision to
+  // admit them, and it is an owner-level act to make.
+  //
+  // `member` rather than `owner`: the handoff exists so cards can be queued with authority, which
+  // is work. Managing this workspace's agents, its people and its fleet link are decisions for
+  // someone who is actually in it. A hub caller who ALSO holds a local membership keeps it.
+  const local = await roleFor(env.DB, tenantId, claims.sub);
+  return { userId: claims.sub, tenantId, role: local ?? 'member', mayDispatch: claims.mayDispatch ?? [] };
 }
 
 /**

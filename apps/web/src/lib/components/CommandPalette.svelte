@@ -42,8 +42,11 @@
         grp: 'Agents',
         icon: '◉',
         label: agent.name,
-        sub: agent.capabilities.join(', '),
+        sub: agent.capabilities.length > 0 ? agent.capabilities.join(', ') : 'no capabilities',
         act: () => {
+          // Selecting an agent used to close the palette and do nothing. It opens the panel that
+          // manages agents — the only screen where an agent can be acted on at all.
+          app.openAgentsPanel(agent.id);
           close();
         },
       });
@@ -57,6 +60,7 @@
         label: 'Dispatch a card',
         sub: '',
         act: () => {
+          app.requestCompose();
           close();
         },
       },

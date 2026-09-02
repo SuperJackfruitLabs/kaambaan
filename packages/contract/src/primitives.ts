@@ -77,11 +77,11 @@ export const RunOutcome = z.enum([
 ]);
 export type RunOutcome = z.infer<typeof RunOutcome>;
 
-export const AgentStatus = z.enum(['online', 'busy', 'offline']);
-export type AgentStatus = z.infer<typeof AgentStatus>;
+// `AgentStatus` and `ConnectionType` were removed on 2026-09-02 along with the columns they
+// described (migration 0005). Neither was ever written: every agent read 'offline' from the day
+// it was created, including while it held a live lease, and REST is the only transport an agent
+// has ever had. Liveness is knowable from `runs` in the board DO, which is where a claim happens.
 
-export const ConnectionType = z.enum(['mcp', 'rest', 'webhook', 'acp']);
-export type ConnectionType = z.infer<typeof ConnectionType>;
 
 export const ReferenceProvider = z.enum(['github', 'gitlab', 'docs', 'url']);
 export type ReferenceProvider = z.infer<typeof ReferenceProvider>;
