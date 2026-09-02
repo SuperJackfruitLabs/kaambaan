@@ -38,7 +38,7 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
 
 export { BoardDO };
@@ -51,6 +51,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_URL':
     case 'INVALID_DELIVERY':
     case 'INVALID_USAGE':
+    case 'INVALID_STAGES':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -68,6 +69,9 @@ function statusForCode(code: BoardErrorCode): number {
     // state the caller believed in, not a bad request. Retrying it will never succeed.
     case 'ELICITATION_NOT_PENDING':
     case 'CARD_NOT_WAITING':
+    // The stage still holds cards. A conflict with the state the caller believed in, not a
+    // malformed request: the same payload succeeds once the stage is emptied.
+    case 'STAGE_NOT_EMPTY':
       return 409;
     case 'SEPARATION_OF_DUTIES':
     // The caller authenticated, but this run is another agent's: a permanent refusal of an
@@ -516,6 +520,20 @@ export default {
           if (!r.ok) return Response.json({ error: r }, { status: statusForCode(r.code) });
           await renameBoard(env.DB, tenantId, boardId, body.name.trim());
         }
+        return Response.json(await stub.getState());
+      }
+
+      // PUT /v1/boards/:id/stages — rework the pipeline (docs/03).
+      //
+      // The whole list, not a patch: order is a property of the list rather than of any stage in
+      // it, so a partial update cannot express a reorder. The DO validates and refuses first; the
+      // catalog's `stages_json` is only mirrored after that succeeds, so a rejected change never
+      // leaves the two disagreeing about what the board's pipeline is.
+      if (rest === 'stages' && request.method === 'PUT') {
+        const body = (await request.json()) as { stages?: StageDef[] };
+        const r = await stub.setStages(body.stages ?? []);
+        if (!r.ok) return Response.json({ error: r }, { status: statusForCode(r.code) });
+        await updateBoardStages(env.DB, tenantId, boardId, JSON.stringify(r.value.stages));
         return Response.json(await stub.getState());
       }
 

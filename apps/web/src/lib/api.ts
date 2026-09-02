@@ -336,6 +336,18 @@ export function updateCard(boardId: string, cardId: string, patch: { title?: str
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
 }
 
+/**
+ * Rework a board's pipeline.
+ *
+ * The whole list, not a patch: order is a property of the list rather than of any stage in it, so
+ * a partial update cannot express a reorder. Returns the raw response so a caller can show the
+ * server's own refusal — "stage \"todo\" still holds 3 cards" is the useful sentence, and a
+ * generic failure would hide the one fact the operator needs.
+ */
+export function setStages(boardId: string, stages: Stage[]): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/stages`, { method: 'PUT', headers, body: JSON.stringify({ stages }) });
+}
+
 /** Delete a card and everything scoped to it. */
 export function deleteCard(boardId: string, cardId: string): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'DELETE', headers });

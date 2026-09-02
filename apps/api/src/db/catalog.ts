@@ -411,6 +411,18 @@ export async function renameBoard(db: D1Database, tenantId: string, boardId: str
   await db.prepare(`UPDATE boards SET name = ?, updated_at = datetime('now') WHERE tenant_id = ? AND id = ?`).bind(name, tenantId, boardId).run();
 }
 
+/**
+ * Mirror a reworked pipeline into the catalog row.
+ *
+ * `boards.stages_json` is a copy: the Durable Object holds the live definition and every claim
+ * reads it from there. The copy exists so a board can be listed and described without waking its
+ * DO, which means a stale copy is a board that DESCRIBES itself wrongly — hence this writer, and
+ * hence the route calling it only after the DO has accepted the change.
+ */
+export async function updateBoardStages(db: D1Database, tenantId: string, boardId: string, stagesJson: string): Promise<void> {
+  await db.prepare(`UPDATE boards SET stages_json = ?, updated_at = datetime('now') WHERE tenant_id = ? AND id = ?`).bind(stagesJson, tenantId, boardId).run();
+}
+
 /** Remove a board from the catalog (tenant-scoped). The DO's live state is left untouched. */
 export async function deleteBoard(db: D1Database, tenantId: string, boardId: string): Promise<void> {
   await db.prepare(`DELETE FROM boards WHERE tenant_id = ? AND id = ?`).bind(tenantId, boardId).run();

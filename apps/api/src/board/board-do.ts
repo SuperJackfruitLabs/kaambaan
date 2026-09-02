@@ -485,6 +485,8 @@ export type BoardErrorCode =
   | 'NOT_CONFIGURED'
   | 'INVALID_DELIVERY'
   | 'INVALID_USAGE'
+  | 'INVALID_STAGES'
+  | 'STAGE_NOT_EMPTY'
   | 'BUDGET_EXCEEDED';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
@@ -510,6 +512,7 @@ export interface BoardStub {
   updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
+  setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
   getState(): Promise<BoardSnapshot>;
   getEvents(limit?: number): Promise<BoardEvent[]>;
   // Agent contract (docs/04 §3)
@@ -1057,6 +1060,69 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Rename the board (the catalog row is renamed alongside, by the Worker). */
+  /**
+   * Rework the board's pipeline, after it exists.
+   *
+   * Stages were written once — in `init`, and mirrored into the catalog row — and there was no
+   * update route and no method here. Not one field could be changed afterwards: name, order, WIP
+   * limit, approval gate, owner, routing. A mistyped stage name or a WIP limit set one too low
+   * meant recreating the board and losing every card on it.
+   *
+   * **A stage key is identity, not a label.** Cards carry `current_stage_key`, runs carry
+   * `stage_key`, and gates carry it too; renaming a key in place would orphan all three silently.
+   * So every field is editable EXCEPT the key, and changing a key is expressed as adding one
+   * stage and removing another — which the emptiness rule below then makes safe.
+   *
+   * **A stage that still holds cards cannot be removed.** Refusing is the only honest answer: the
+   * alternatives are deleting the operator's work without being asked, or moving it somewhere
+   * this method has no basis for choosing. The caller empties the stage and tries again.
+   *
+   * The whole payload is the new pipeline — a PUT, not a patch — because order is a property of
+   * the list rather than of any stage in it, and a partial update cannot express a reorder.
+   */
+  async setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!Array.isArray(stages) || stages.length === 0) {
+      return { ok: false, code: 'INVALID_STAGES', message: 'a board needs at least one stage' };
+    }
+    for (const s of stages) {
+      if (!s || typeof s.key !== 'string' || s.key.trim() === '') {
+        return { ok: false, code: 'INVALID_STAGES', message: 'every stage needs a key' };
+      }
+      if (typeof s.name !== 'string' || s.name.trim() === '') {
+        return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a name` };
+      }
+      if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
+        return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a WIP limit of at least 1, or none` };
+      }
+    }
+    const keys = stages.map((s) => s.key);
+    const duplicate = keys.find((k, i) => keys.indexOf(k) !== i);
+    if (duplicate) {
+      // Two stages sharing a key is not a pipeline: `stages().find(...)` would resolve every card
+      // in both to whichever came first, and the other would be unreachable.
+      return { ok: false, code: 'INVALID_STAGES', message: `two stages share the key "${duplicate}"` };
+    }
+
+    const kept = new Set(keys);
+    for (const existing of this.stages()) {
+      if (kept.has(existing.key)) continue;
+      const held = this.countInStage(existing.key);
+      if (held > 0) {
+        return {
+          ok: false,
+          code: 'STAGE_NOT_EMPTY',
+          message: `stage "${existing.key}" still holds ${held} card${held === 1 ? '' : 's'} — move them before removing it`,
+        };
+      }
+    }
+
+    const ordered = [...stages].sort((a, b) => a.order - b.order);
+    this.setMeta('stages', JSON.stringify(ordered));
+    this.emit('board.stages_changed', { stages: ordered });
+    return { ok: true, value: { stages: ordered } };
+  }
+
   async setName(name: string): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     this.setMeta('name', name);
