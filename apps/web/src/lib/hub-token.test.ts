@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization } from './hub-token';
+import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus } from './hub-token';
 
 /**
  * Carrying authority from the browser (kaambaan#43, option A).
@@ -123,6 +123,61 @@ describe('hubToken', () => {
     await hubToken();
     await hubToken();
     expect((globalThis.fetch as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('hubStatus', () => {
+  it('reports a hub and a token when the operator has connected', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ token: jwtExpiringIn(300), hubConfigured: true }), { status: 200 })
+      ),
+    );
+
+    const status = await hubStatus();
+    expect(status.configured).toBe(true);
+    expect(status.token).toBeTruthy();
+  });
+
+  it('reports a hub with no token — the state a connect button exists for', async () => {
+    // The distinction the whole field is for. This operator has somewhere to be
+    // sent; the next case does not.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: true }), { status: 200 })),
+    );
+
+    expect(await hubStatus()).toEqual({ configured: true, token: null });
+  });
+
+  it('reports no hub on a standalone kaambaan, so nothing offers to connect', async () => {
+    // A board with no hub is a first-class deployment (migration 0003). It must
+    // render neither button and navigate nowhere, and this is the only signal
+    // that says so — `token: null` alone cannot tell it from "not connected".
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: false }), { status: 200 })),
+    );
+
+    expect(await hubStatus()).toEqual({ configured: false, token: null });
+  });
+
+  it('reports no hub when the field is absent altogether', async () => {
+    // An older Worker that does not send it. Read as "no hub": showing no
+    // button is better than offering a flow that answers 503.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ token: null }), { status: 200 })),
+    );
+
+    expect((await hubStatus()).configured).toBe(false);
+  });
+
+  it('reports no hub rather than throwing when our own back end cannot be reached', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network'); }));
+
+    expect(await hubStatus()).toEqual({ configured: false, token: null });
   });
 });
 

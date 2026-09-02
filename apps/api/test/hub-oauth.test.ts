@@ -291,15 +291,41 @@ describe('GET /hub/token', () => {
       '/hub/token',
     );
     expect(res?.status).toBe(200);
-    expect(await res!.json()).toEqual({ token: 'hub.jwt.value' });
+    expect(await res!.json()).toEqual({ token: 'hub.jwt.value', hubConfigured: true });
   });
 
   it('answers null rather than an error when there is none', async () => {
-    // No token is an ordinary answer, the same way it is in `hubToken()`. A standalone kaambaan,
-    // an operator who never connected and an expired token are one answer, and none is a failure.
+    // No token is an ordinary answer, the same way it is in `hubToken()`. An operator who never
+    // connected and an expired token are one answer, and neither is a failure.
     const res = await handleHubRoute(new Request(`${APP}/hub/token`), envWith(), '/hub/token');
     expect(res?.status).toBe(200);
-    expect(await res!.json()).toEqual({ token: null });
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: true });
+  });
+
+  it('says a standalone deployment has no hub, so nothing offers to connect to one', async () => {
+    // The distinction a null token cannot make on its own: "you have not connected" and "there is
+    // nothing to connect to" look identical from the page, and only one of them should put a
+    // "Connect to AgentPod" button in front of an operator. A button that leads nowhere is worse
+    // than no button — a standalone kaambaan is a first-class deployment (migration 0003), not a
+    // half-configured one.
+    const res = await handleHubRoute(
+      new Request(`${APP}/hub/token`),
+      envWith({ HUB_ISSUER: undefined }),
+      '/hub/token',
+    );
+    expect(res?.status).toBe(200);
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: false });
+  });
+
+  it('says the same for an issuer that is set but is not a URL', async () => {
+    // `hubConfig` already fails closed on an unparseable issuer, and every other route answers
+    // 503 for it. This one must agree, or the UI would offer a connect that cannot start.
+    const res = await handleHubRoute(
+      new Request(`${APP}/hub/token`),
+      envWith({ HUB_ISSUER: 'not a url' }),
+      '/hub/token',
+    );
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: false });
   });
 });
 
@@ -310,7 +336,7 @@ describe('wired into the Worker', () => {
     // the hub's redirect with index.html and drop the code on the floor.
     const res = await SELF.fetch('https://api.test/hub/token');
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ token: null });
+    expect(await res.json()).toEqual({ token: null, hubConfigured: true });
   });
 
   it('serves a real connect through the Worker, with the deployment issuer', async () => {

@@ -69,22 +69,43 @@ function remember(token: string | null | undefined): string | null {
   return token;
 }
 
+/** What our own back end knows about the hub, and about this browser's authority. */
+export interface HubStatus {
+  /**
+   * Whether this deployment has a hub at all.
+   *
+   * The one thing a null token cannot say. An operator who has not connected
+   * and an operator with nowhere to connect *to* both hold no token, and only
+   * the first should ever be offered a button — a standalone kaambaan is a
+   * first-class deployment (migration 0003), not a half-configured one, and a
+   * button that leads nowhere is worse than no button.
+   */
+  configured: boolean;
+  /** A hub token for this operator, or null. Null is an ordinary answer. */
+  token: string | null;
+}
+
 /**
- * The token our own back end holds for this browser, if the operator has
- * connected (`apps/api/src/auth/hub-oauth.ts`).
+ * Ask our own back end for both at once (`apps/api/src/auth/hub-oauth.ts`).
  *
- * Same-origin, so kaambaan's own cookie travels and the hub's never has to. This
- * is the path that actually works from `kaambaan.dev`, which is why it is asked
- * first.
+ * Same-origin, so kaambaan's own cookie travels and the hub's never has to.
+ * This is the path that actually works from `kaambaan.dev`, which is why
+ * `hubToken()` asks it first.
+ *
+ * A missing `hubConfigured` reads as **not** configured. That is the safe
+ * direction on both sides: an older Worker that does not send the field simply
+ * shows no connect button, where the other reading would offer to start a flow
+ * that answers 503.
  */
-async function tokenFromOurBackEnd(): Promise<string | null> {
+export async function hubStatus(): Promise<HubStatus> {
   try {
     const res = await fetch('/hub/token', { credentials: 'same-origin' });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { token?: string | null };
-    return remember(body.token);
+    if (!res.ok) return { configured: false, token: null };
+    const body = (await res.json()) as { token?: string | null; hubConfigured?: boolean };
+    return { configured: body.hubConfigured === true, token: remember(body.token) };
   } catch {
-    return null;
+    // Offline, or a back end that is not there. Neither is an error to show.
+    return { configured: false, token: null };
   }
 }
 
@@ -138,7 +159,7 @@ export async function hubToken(): Promise<string | null> {
 
   inFlight = (async () => {
     try {
-      return (await tokenFromOurBackEnd()) ?? (await tokenFromHubDirectly());
+      return (await hubStatus()).token ?? (await tokenFromHubDirectly());
     } finally {
       inFlight = null;
     }

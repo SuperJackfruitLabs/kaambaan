@@ -3,7 +3,7 @@
  * (sent automatically, same-origin); the `X-Tenant-Id` header is a no-op there and only enables the
  * local dev workspace (when the server runs with DEV_AUTH on).
  */
-import { withAuthority } from './hub-token';
+import { hubToken, withAuthority } from './hub-token';
 
 const TENANT = 'tnt_dev';
 const headers = { 'X-Tenant-Id': TENANT, 'Content-Type': 'application/json' };
@@ -442,31 +442,53 @@ export async function createAgent(
   return (await res.json()) as AgentToken;
 }
 
-/** An agent-kind principal in the suite, as the hub reports it. */
+/**
+ * An agent this operator may dispatch, as the hub reports it.
+ *
+ * Three fields, because three is what the endpoint returns. There is no `kind`
+ * — everything in the list is an agent — and no `suspendedAt`, because a
+ * suspended agent is not in the list at all: the hub filters it, and it has to,
+ * since the answer is "what you may use" rather than an inventory of the fleet.
+ */
 export interface HubPrincipal {
   id: string;
-  kind: string;
   handle: string;
   displayName: string | null;
-  suspendedAt: string | null;
 }
 
 /**
- * The suite's agents, read straight from the hub in the browser.
+ * The agents this operator may dispatch, from the hub.
  *
- * Same posture as `hubToken()`: the operator's own hub session answers, this
- * app is not the issuer, and **null is an ordinary result** — a standalone
- * kaambaan, a hub that is down, an origin the hub does not allow. The caller
- * shows nothing rather than an error, because a kaambaan with no hub is not a
- * broken kaambaan.
+ * **Changed from `GET /api/admin/principals` with `credentials: 'include'`,
+ * which could not work from `kaambaan.dev` and never did.** The hub's session
+ * cookie is `SameSite=Lax` on another registrable domain, so the browser never
+ * attached it; and the hub's admin middleware does not accept a hub-issued
+ * token either, so holding one would not have rescued it. `GET
+ * /api/fleet/dispatchable` is the endpoint built for this question: a Bearer
+ * token, no admin role, and it answers with the agents the token's own
+ * `mayDispatch` names rather than every principal in the fleet.
+ *
+ * **Null is an ordinary result and must stay one** — a standalone kaambaan, an
+ * operator who has not connected, an expired token, a hub that is down. The
+ * caller shows nothing rather than an error, because a kaambaan with no hub is
+ * not a broken kaambaan (migration 0003).
  */
 export async function getHubPrincipals(): Promise<HubPrincipal[] | null> {
+  // Asked first so a board with no authority makes no cross-origin request at
+  // all: with no token there is nothing to send, and the answer is the same.
+  const token = await hubToken();
+  if (!token) return null;
+
   const base = import.meta.env.PUBLIC_HUB_URL ?? 'https://hub.agentpod.dev';
   try {
-    const res = await fetch(`${base}/api/admin/principals`, { credentials: 'include' });
+    // No `credentials`. The Bearer is the whole credential, and asking for the
+    // hub's cookie would be asking for the thing that cannot travel here.
+    const res = await fetch(`${base}/api/fleet/dispatchable`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!res.ok) return null;
-    const body = (await res.json()) as { principals?: HubPrincipal[] };
-    return (body.principals ?? []).filter((p) => p.kind === 'agent');
+    const body = (await res.json()) as { agents?: HubPrincipal[] };
+    return body.agents ?? [];
   } catch {
     return null;
   }

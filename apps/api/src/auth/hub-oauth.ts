@@ -18,8 +18,9 @@
  *                       authorize URL for the page to navigate to.
  *   GET  /hub/callback  the hub's redirect lands here: check `state`, spend the code for a token
  *                       server-to-server, hand it on.
- *   GET  /hub/token     the SPA reads the token it was handed. Same-origin, this Worker's own
- *                       cookie — no hub cookie involved.
+ *   GET  /hub/token     the SPA reads the token it was handed, and learns whether this
+ *                       deployment has a hub at all. Same-origin, this Worker's own cookie — no
+ *                       hub cookie involved.
  *
  * **The verifier is minted here and never leaves this Worker.** The design sketch had the page
  * generate it into `sessionStorage`, which cannot work: the exchange is server-to-server (the hub
@@ -305,9 +306,22 @@ export async function handleHubRoute(
   if (path === '/hub/token') {
     if (request.method !== 'GET') return Response.json({ error: 'method not allowed' }, { status: 405 });
     // `{ token: null }` rather than a 404: no token is an ordinary answer here, exactly as it is
-    // in `hubToken()`. A standalone kaambaan, an operator who never connected, and a token that
-    // expired are all the same answer, and none of them is an error.
-    return Response.json({ token: readCookie(request, TOKEN_COOKIE) });
+    // in `hubToken()`. An operator who never connected and a token that expired are the same
+    // answer, and neither is an error.
+    //
+    // `hubConfigured` is the one thing a null token does NOT say, and the UI needs it. A
+    // standalone kaambaan and an operator who has simply not connected yet both hold no token,
+    // but only one of them should be offered a "Connect to AgentPod" button — the other has
+    // nowhere to be sent, and a button that leads nowhere is worse than no button. This Worker is
+    // the only place that knows, because `HUB_ISSUER` is its environment and not the page's.
+    //
+    // It says whether a hub EXISTS, never anything about it: no issuer URL, no client id. A
+    // deployment's hub is not a secret, but this response is read by script on the page and there
+    // is no reason for it to carry more than the boolean the question needs.
+    return Response.json({
+      token: readCookie(request, TOKEN_COOKIE),
+      hubConfigured: hubConfig(request, env) !== null,
+    });
   }
 
   return null;
