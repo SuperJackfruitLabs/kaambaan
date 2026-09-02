@@ -35,6 +35,7 @@ import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
+import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 
 export { BoardDO };
@@ -102,6 +103,18 @@ export default {
     // Human auth (GitHub OAuth → session): /auth/login · /auth/callback · /auth/me · /auth/logout.
     if (path.startsWith('/auth/')) {
       const res = await handleAuthRoute(request, env, path);
+      if (res) return res;
+    }
+
+    // The hub token handoff: /hub/connect · /hub/callback · /hub/token (auth/hub-oauth.ts).
+    //
+    // Not part of `/auth/*` above, deliberately. Those routes establish who you are HERE — a
+    // kaambaan session, from GitHub. These carry authority from somewhere else: the hub is the
+    // issuer, kaambaan is not, and nothing under this prefix creates or reads a kaambaan session.
+    // The separate prefix is also what `run_worker_first` in wrangler.jsonc names, so the SPA's
+    // index.html fallback cannot shadow a callback the hub redirected a browser to.
+    if (path.startsWith('/hub/')) {
+      const res = await handleHubRoute(request, env, path);
       if (res) return res;
     }
 

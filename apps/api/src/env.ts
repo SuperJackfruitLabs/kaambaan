@@ -23,6 +23,15 @@ export interface Env {
    */
   HUB_ISSUER?: string;
   /**
+   * This plane's key in the hub's OAuth client registry (`HUB_OAUTH_CLIENTS` on the hub), used by
+   * the cross-domain token handoff in `auth/hub-oauth.ts`.
+   *
+   * Optional, defaulting to `kaambaan`, because it is not a credential and confers nothing: the
+   * hub decides whether it knows this client, and one it does not know gets a rendered 400 rather
+   * than a code. Only a deployment registered under another name needs to set it.
+   */
+  HUB_OAUTH_CLIENT_ID?: string;
+  /**
    * When "true", the control pair is enforced: a card is only claimable if its
    * recorded `queued_grant` permits the claiming agent
    * (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4).

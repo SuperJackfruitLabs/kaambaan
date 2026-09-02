@@ -10,6 +10,9 @@ export default defineConfig({
     proxy: {
       '/v1': { target: 'http://localhost:8787', changeOrigin: true, ws: true },
       '/auth': { target: 'http://localhost:8787', changeOrigin: true },
+      // The hub token handoff (apps/api/src/auth/hub-oauth.ts). Same reason as /auth: these are
+      // Worker routes, and the dev server would otherwise answer them with the SPA.
+      '/hub': { target: 'http://localhost:8787', changeOrigin: true },
       '/mcp': { target: 'http://localhost:8787', changeOrigin: true },
       '/health': { target: 'http://localhost:8787', changeOrigin: true },
     },
