@@ -52,6 +52,12 @@
     "not_found_handling": "single-page-application",
     // Run the Worker first for API routes so the SPA fallback never shadows them (a browser
     // navigation to /auth/login must hit the Worker, not get served index.html).
-    "run_worker_first": ["/v1/*", "/auth/*", "/mcp", "/health"]
+    //
+    // `/hub/*` is on this list for a sharper version of the same reason: the hub redirects a
+    // browser to /hub/callback, and without this the assets layer would answer that navigation
+    // with index.html — the code would be dropped on the floor and the operator would land on a
+    // board that looks fine and still has no authority, which is precisely the silent failure
+    // this whole flow exists to end.
+    "run_worker_first": ["/v1/*", "/auth/*", "/hub/*", "/mcp", "/health"]
   }
 }

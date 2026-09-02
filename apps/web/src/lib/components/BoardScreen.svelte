@@ -3,6 +3,8 @@
   import {
     logout,
     createAgent,
+    getHubPrincipals,
+    type HubPrincipal,
     getAgents,
     deleteAgent,
     setAgentPrincipal,
@@ -14,6 +16,7 @@
     type AgentToken,
     type AgentSummary,
   } from '$lib/api';
+  import { beginHubAuthorization, hubStatus } from '$lib/hub-token';
   import { Button } from '$lib/components/ui/button';
   import NewBoardDialog from '$lib/components/NewBoardDialog.svelte';
   import BoardSettings from '$lib/components/BoardSettings.svelte';
@@ -143,6 +146,9 @@
     }
     // The workspace's own fleet link, read alongside the agents it gates.
     await refreshWorkspace().catch(() => {});
+    // Asked when the panel opens rather than on a click, because the answer
+    // decides whether there is anything to click.
+    await refreshHubSection().catch(() => {});
   }
 
   function toggleCap(cap: string): void {
@@ -160,6 +166,95 @@
       error = String(e);
     } finally {
       minting = false;
+    }
+  }
+
+  // ---- adding agents that already exist in the suite -----------------------
+  //
+  // Doing this by hand was four steps per agent: create (which hands back a
+  // `kbn_` secret a linked agent never uses), copy the `agt_` id, go and find
+  // the `prn_` in the other plane, then link. This asks the hub who its agents
+  // are and does the rest.
+  //
+  // Three states, and they are not the same state:
+  //
+  //   no hub at all      → the whole block does not render, and nothing here
+  //                        ever navigates. A kaambaan with no hub is not a
+  //                        broken kaambaan (migration 0003), so it must not be
+  //                        shown a button leading to a hub that is not there.
+  //   hub, no authority  → "Connect to AgentPod", which is the only thing on
+  //                        this screen that leaves the origin, and only ever
+  //                        because someone clicked it.
+  //   hub and authority  → the picker.
+  //
+  // `hubConfigured` has to come from our own back end because `HUB_ISSUER` is
+  // the Worker's environment, not the page's — a null token cannot tell the
+  // first state from the second.
+  let hubConfigured = $state(false);
+  let hubPrincipals = $state<HubPrincipal[] | null>(null);
+  let connecting = $state(false);
+  let picked = $state<string[]>([]);
+  let importCaps = $state<string[]>(['claim']);
+  let importing = $state(false);
+  let importResult = $state<string | null>(null);
+
+  /**
+   * What this deployment's hub will tell us, if it has one.
+   *
+   * `null` principals with a hub configured is not an error to show: an
+   * expired token, a hub that is down and an operator who never connected all
+   * land here, and "Connect to AgentPod" is the right and only next move for
+   * every one of them.
+   */
+  async function refreshHubSection(): Promise<void> {
+    const status = await hubStatus();
+    hubConfigured = status.configured;
+    hubPrincipals = status.token ? await getHubPrincipals() : null;
+  }
+
+  /**
+   * Send the operator to the hub. The one navigation on this screen.
+   *
+   * `beginHubAuthorization` answers `false` — not an error — for a deployment
+   * with no hub, and navigates nowhere in that case. The button is not rendered
+   * then either, so this is belt and braces rather than the only guard.
+   */
+  async function connectToHub(): Promise<void> {
+    connecting = true;
+    if (!(await beginHubAuthorization())) connecting = false;
+  }
+
+  /** Agents with no counterpart here yet — the ones worth offering. */
+  const linkable = $derived(
+    (hubPrincipals ?? []).filter((p) => !agents.some((a) => a.externalId === p.id)),
+  );
+
+  function togglePicked(id: string): void {
+    picked = picked.includes(id) ? picked.filter((x) => x !== id) : [...picked, id];
+  }
+
+  async function addPicked(): Promise<void> {
+    if (picked.length === 0 || importCaps.length === 0) return;
+    importing = true;
+    importResult = null;
+    const failures: string[] = [];
+    try {
+      for (const id of picked) {
+        const p = linkable.find((x) => x.id === id);
+        if (!p) continue;
+        try {
+          // One call each rather than a bulk endpoint: a partial failure then
+          // names the agent it happened to, and the ones that worked stay.
+          await createAgent(p.displayName ?? p.handle, [...importCaps], p.id);
+        } catch (e) {
+          failures.push(`${p.handle}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      agents = await getAgents();
+      picked = [];
+      importResult = failures.length === 0 ? null : failures.join('; ');
+    } finally {
+      importing = false;
     }
   }
 
@@ -528,6 +623,74 @@
               {/each}
             {/if}
           </div>
+
+          <!--
+            Agents that already exist in the suite.
+            Absent entirely when this deployment has no hub — there is nothing
+            to offer and nowhere to send anybody, so the section stays out of
+            the way rather than showing a button that leads nowhere.
+          -->
+          {#if hubConfigured}
+          <div class="border-border mt-5 border-t pt-4">
+            {#if hubPrincipals === null}
+              <button
+                onclick={connectToHub}
+                disabled={connecting}
+                data-testid="connect-hub"
+                class="text-muted-foreground hover:text-foreground text-xs underline"
+              >
+                {connecting ? 'Connecting…' : 'Connect to AgentPod'}
+              </button>
+            {:else if linkable.length === 0}
+              <div class="eyebrow mb-2">from agentpod</div>
+              <p class="text-muted-foreground text-xs">
+                Every agent in the fleet already has one here.
+              </p>
+            {:else}
+              <div class="eyebrow mb-2">from agentpod</div>
+              <div class="flex flex-wrap gap-1.5" data-testid="hub-principal-list">
+                {#each linkable as p (p.id)}
+                  <button
+                    onclick={() => togglePicked(p.id)}
+                    title={p.id}
+                    class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {picked.includes(p.id)
+                      ? 'border-marigold text-marigold'
+                      : 'border-border text-muted-foreground hover:text-foreground'}"
+                  >
+                    {picked.includes(p.id) ? '✓ ' : ''}{p.handle}
+                  </button>
+                {/each}
+              </div>
+              <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">
+                capabilities they can claim:
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                {#each ALL_CAPS as cap (cap)}
+                  <button
+                    onclick={() => (importCaps = importCaps.includes(cap) ? importCaps.filter((c) => c !== cap) : [...importCaps, cap])}
+                    class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {importCaps.includes(cap)
+                      ? 'border-marigold text-marigold'
+                      : 'border-border text-muted-foreground hover:text-foreground'}"
+                  >
+                    {importCaps.includes(cap) ? '✓ ' : ''}{cap}
+                  </button>
+                {/each}
+              </div>
+              {#if importResult}
+                <p class="mt-2 text-xs text-red-400" data-testid="import-failures">{importResult}</p>
+              {/if}
+              <div class="mt-4 flex justify-end">
+                <Button
+                  onclick={addPicked}
+                  disabled={importing || picked.length === 0 || importCaps.length === 0}
+                  data-testid="add-picked-agents"
+                >
+                  {importing ? 'Adding…' : `Add ${picked.length || ''}`.trim()}
+                </Button>
+              </div>
+            {/if}
+          </div>
+          {/if}
 
           <div class="border-border mt-5 border-t pt-4">
             <div class="eyebrow mb-2">new agent</div>
