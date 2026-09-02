@@ -283,9 +283,56 @@ export default {
         }
         if (request.method === 'GET') return Response.json({ agents: await listAgents(env.DB, u.tenantId) });
         if (request.method === 'POST') {
-          const body = (await request.json()) as { name?: string; capabilities?: string[] };
+          const body = (await request.json()) as {
+            name?: string;
+            capabilities?: string[];
+            /**
+             * A suite principal this agent IS, linked as it is created.
+             *
+             * Optional, and its absence is the ordinary case: a standalone
+             * kaambaan has no principals to name, and an agent nobody links is
+             * a complete agent (migration 0003). What it removes is a
+             * four-step chore — create, copy the `agt_` id, go find the `prn_`
+             * in the other plane, PUT the link — and the window between the
+             * create and the link where a failure leaves an agent that exists
+             * and is linked to nobody.
+             */
+            externalId?: string;
+          };
           if (!body.name || body.name.trim() === '') return Response.json({ error: 'name is required' }, { status: 400 });
+
+          const linking = typeof body.externalId === 'string' && body.externalId.trim() !== '';
+          if (linking) {
+            // The same two checks the PUT path makes, made BEFORE anything is
+            // written: a rejected link must leave no agent behind.
+            if (!/^prn_[0-9a-f]{20}$/.test(body.externalId!)) {
+              return Response.json({ error: 'externalId must look like prn_ followed by 20 lowercase hex characters' }, { status: 400 });
+            }
+            const claimedBy = await findAgentByExternal(env.DB, 'org-plane', body.externalId!);
+            if (claimedBy) {
+              return Response.json({ error: `${body.externalId} is already linked to a different agent` }, { status: 409 });
+            }
+          }
+
           const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: body.capabilities ?? [] });
+
+          if (linking) {
+            await setAgentExternalMapping(env.DB, u.tenantId, created.id, {
+              externalId: body.externalId!,
+              externalSource: 'org-plane',
+            });
+            // No `kbn_` token. A linked agent authenticates with hub JWTs
+            // (`resolveHubAgent`), so minting one here would hand back a
+            // long-lived secret the caller must store and never uses — and the
+            // whole point of this path is to stop making the operator handle
+            // credentials they did not ask for. An agent that later needs its
+            // own native credential can still be issued one.
+            return Response.json(
+              { agent: { ...created, externalId: body.externalId, externalSource: 'org-plane' } },
+              { status: 201 },
+            );
+          }
+
           const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
           return Response.json({ agent: created, token, tokenId }, { status: 201 });
         }

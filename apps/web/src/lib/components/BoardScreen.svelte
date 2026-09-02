@@ -3,6 +3,8 @@
   import {
     logout,
     createAgent,
+    getHubPrincipals,
+    type HubPrincipal,
     getAgents,
     deleteAgent,
     setAgentPrincipal,
@@ -160,6 +162,62 @@
       error = String(e);
     } finally {
       minting = false;
+    }
+  }
+
+  // ---- adding agents that already exist in the suite -----------------------
+  //
+  // Doing this by hand was four steps per agent: create (which hands back a
+  // `kbn_` secret a linked agent never uses), copy the `agt_` id, go and find
+  // the `prn_` in the other plane, then link. This asks the hub who its agents
+  // are and does the rest.
+  //
+  // `null` from `getHubPrincipals` is an ordinary answer — no hub, hub down,
+  // an origin it does not allow — and the whole block simply does not render.
+  // A kaambaan with no hub is not a broken kaambaan (migration 0003).
+  let hubPrincipals = $state<HubPrincipal[] | null>(null);
+  let picked = $state<string[]>([]);
+  let importCaps = $state<string[]>(['claim']);
+  let importing = $state(false);
+  let importResult = $state<string | null>(null);
+
+  async function loadHubPrincipals(): Promise<void> {
+    hubPrincipals = await getHubPrincipals();
+  }
+
+  /** Principals with no agent here yet — the ones worth offering. */
+  const linkable = $derived(
+    (hubPrincipals ?? []).filter(
+      (p) => p.suspendedAt === null && !agents.some((a) => a.externalId === p.id),
+    ),
+  );
+
+  function togglePicked(id: string): void {
+    picked = picked.includes(id) ? picked.filter((x) => x !== id) : [...picked, id];
+  }
+
+  async function addPicked(): Promise<void> {
+    if (picked.length === 0 || importCaps.length === 0) return;
+    importing = true;
+    importResult = null;
+    const failures: string[] = [];
+    try {
+      for (const id of picked) {
+        const p = linkable.find((x) => x.id === id);
+        if (!p) continue;
+        try {
+          // One call each rather than a bulk endpoint: a partial failure then
+          // names the agent it happened to, and the ones that worked stay.
+          await createAgent(p.displayName ?? p.handle, [...importCaps], p.id);
+        } catch (e) {
+          failures.push(`${p.handle}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      agents = await getAgents();
+      picked = [];
+      importResult = failures.length === 0 ? null : failures.join('; ');
+    } finally {
+      importing = false;
     }
   }
 
@@ -526,6 +584,70 @@
                   </div>
                 </div>
               {/each}
+            {/if}
+          </div>
+
+          <!--
+            Agents that already exist in the suite. Rendered only once the hub
+            has answered: with no hub there is nothing to offer and the section
+            stays out of the way entirely.
+          -->
+          <div class="border-border mt-5 border-t pt-4">
+            {#if hubPrincipals === null}
+              <button
+                onclick={loadHubPrincipals}
+                data-testid="load-hub-principals"
+                class="text-muted-foreground hover:text-foreground text-xs underline"
+              >
+                Add from AgentPod
+              </button>
+            {:else if linkable.length === 0}
+              <div class="eyebrow mb-2">from agentpod</div>
+              <p class="text-muted-foreground text-xs">
+                Every agent in the fleet already has one here.
+              </p>
+            {:else}
+              <div class="eyebrow mb-2">from agentpod</div>
+              <div class="flex flex-wrap gap-1.5" data-testid="hub-principal-list">
+                {#each linkable as p (p.id)}
+                  <button
+                    onclick={() => togglePicked(p.id)}
+                    title={p.id}
+                    class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {picked.includes(p.id)
+                      ? 'border-marigold text-marigold'
+                      : 'border-border text-muted-foreground hover:text-foreground'}"
+                  >
+                    {picked.includes(p.id) ? '✓ ' : ''}{p.handle}
+                  </button>
+                {/each}
+              </div>
+              <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">
+                capabilities they can claim:
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                {#each ALL_CAPS as cap (cap)}
+                  <button
+                    onclick={() => (importCaps = importCaps.includes(cap) ? importCaps.filter((c) => c !== cap) : [...importCaps, cap])}
+                    class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {importCaps.includes(cap)
+                      ? 'border-marigold text-marigold'
+                      : 'border-border text-muted-foreground hover:text-foreground'}"
+                  >
+                    {importCaps.includes(cap) ? '✓ ' : ''}{cap}
+                  </button>
+                {/each}
+              </div>
+              {#if importResult}
+                <p class="mt-2 text-xs text-red-400" data-testid="import-failures">{importResult}</p>
+              {/if}
+              <div class="mt-4 flex justify-end">
+                <Button
+                  onclick={addPicked}
+                  disabled={importing || picked.length === 0 || importCaps.length === 0}
+                  data-testid="add-picked-agents"
+                >
+                  {importing ? 'Adding…' : `Add ${picked.length || ''}`.trim()}
+                </Button>
+              </div>
             {/if}
           </div>
 

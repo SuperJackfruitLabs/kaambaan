@@ -245,3 +245,82 @@ describe('PATCH /v1/agents/:id — link a suite principal', () => {
     expect(list.agents.find((a) => a.id === agent.id)?.externalId).toBe(sub);
   });
 });
+
+// ─── Creating and linking in one call ────────────────────────────────────────
+//
+// Adding one agent from the suite used to be four steps: POST (which handed
+// back a `kbn_` secret the caller does not want), copy the `agt_` id, go find
+// the `prn_` in the other plane, then PUT the link. This is that in one
+// request — and the failure window in the middle, where a rejected link left
+// an agent that existed and was linked to nobody, is gone with it.
+describe('POST /v1/agents { externalId }', () => {
+  it('creates the agent and links it, and mints no kbn_ token', async () => {
+    const res = await SELF.fetch('https://x/v1/agents', {
+      method: 'POST',
+      headers: dev('t_one'),
+      body: JSON.stringify({ name: 'krishna', capabilities: ['claim'], externalId: 'prn_' + 'a'.repeat(20) }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    const agent = body.agent as Record<string, unknown>;
+    expect(agent.externalId).toBe('prn_' + 'a'.repeat(20));
+    expect(agent.externalSource).toBe('org-plane');
+    // A linked agent authenticates with hub JWTs; a native credential here
+    // would be a secret the operator must store and never uses.
+    expect(body.token).toBeUndefined();
+    expect(body.tokenId).toBeUndefined();
+  });
+
+  it('still mints a token when no principal is named', async () => {
+    const res = await SELF.fetch('https://x/v1/agents', {
+      method: 'POST',
+      headers: dev('t_one'),
+      body: JSON.stringify({ name: 'standalone', capabilities: [] }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(typeof body.token).toBe('string');
+  });
+
+  it('refuses a malformed principal id and creates nothing', async () => {
+    const before = await SELF.fetch('https://x/v1/agents', { headers: dev('t_one') });
+    const countBefore = ((await before.json()) as { agents: unknown[] }).agents.length;
+
+    const res = await SELF.fetch('https://x/v1/agents', {
+      method: 'POST',
+      headers: dev('t_one'),
+      body: JSON.stringify({ name: 'bad', externalId: 'nope' }),
+    });
+    expect(res.status).toBe(400);
+
+    const after = await SELF.fetch('https://x/v1/agents', { headers: dev('t_one') });
+    const countAfter = ((await after.json()) as { agents: unknown[] }).agents.length;
+    // The point of checking before the write: a rejected link leaves no agent.
+    expect(countAfter).toBe(countBefore);
+  });
+
+  it('refuses a principal another agent already claims, and creates nothing', async () => {
+    const prn = 'prn_' + 'b'.repeat(20);
+    const first = await SELF.fetch('https://x/v1/agents', {
+      method: 'POST',
+      headers: dev('t_one'),
+      body: JSON.stringify({ name: 'first', externalId: prn }),
+    });
+    expect(first.status).toBe(201);
+
+    const before = await SELF.fetch('https://x/v1/agents', { headers: dev('t_one') });
+    const countBefore = ((await before.json()) as { agents: unknown[] }).agents.length;
+
+    const second = await SELF.fetch('https://x/v1/agents', {
+      method: 'POST',
+      headers: dev('t_one'),
+      body: JSON.stringify({ name: 'second', externalId: prn }),
+    });
+    expect(second.status).toBe(409);
+
+    const after = await SELF.fetch('https://x/v1/agents', { headers: dev('t_one') });
+    expect(((await after.json()) as { agents: unknown[] }).agents.length).toBe(countBefore);
+  });
+});

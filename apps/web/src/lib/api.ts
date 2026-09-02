@@ -418,11 +418,58 @@ export async function getBoards(): Promise<BoardSummary[]> {
   return ((await res.json()) as { boards: BoardSummary[] }).boards;
 }
 
-/** Register an agent and mint its bearer token (shown once). */
-export async function createAgent(name: string, capabilities: string[]): Promise<AgentToken> {
-  const res = await fetch('/v1/agents', { method: 'POST', headers, body: JSON.stringify({ name, capabilities }) });
-  if (!res.ok) throw new Error(`createAgent failed (${res.status})`);
+/**
+ * Register an agent and mint its bearer token (shown once).
+ *
+ * With `externalId` the agent is created AND linked to that suite principal in
+ * the one call, and **no** `kbn_` token comes back: a linked agent
+ * authenticates with hub JWTs, so minting one would hand over a secret the
+ * operator must store and never uses.
+ */
+export async function createAgent(
+  name: string,
+  capabilities: string[],
+  externalId?: string,
+): Promise<AgentToken> {
+  const body = externalId ? { name, capabilities, externalId } : { name, capabilities };
+  const res = await fetch('/v1/agents', { method: 'POST', headers, body: JSON.stringify(body) });
+  if (!res.ok) {
+    // The Worker's message is the useful one — "already linked to a different
+    // agent" is what an operator needs to read, not a bare status code.
+    const detail = await res.json().catch(() => null) as { error?: string } | null;
+    throw new Error(detail?.error ?? `createAgent failed (${res.status})`);
+  }
   return (await res.json()) as AgentToken;
+}
+
+/** An agent-kind principal in the suite, as the hub reports it. */
+export interface HubPrincipal {
+  id: string;
+  kind: string;
+  handle: string;
+  displayName: string | null;
+  suspendedAt: string | null;
+}
+
+/**
+ * The suite's agents, read straight from the hub in the browser.
+ *
+ * Same posture as `hubToken()`: the operator's own hub session answers, this
+ * app is not the issuer, and **null is an ordinary result** — a standalone
+ * kaambaan, a hub that is down, an origin the hub does not allow. The caller
+ * shows nothing rather than an error, because a kaambaan with no hub is not a
+ * broken kaambaan.
+ */
+export async function getHubPrincipals(): Promise<HubPrincipal[] | null> {
+  const base = import.meta.env.PUBLIC_HUB_URL ?? 'https://hub.agentpod.dev';
+  try {
+    const res = await fetch(`${base}/api/admin/principals`, { credentials: 'include' });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { principals?: HubPrincipal[] };
+    return (body.principals ?? []).filter((p) => p.kind === 'agent');
+  } catch {
+    return null;
+  }
 }
 
 export interface Estimate {
