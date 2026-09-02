@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { capabilityTag } from '@kaambaan/contract';
+
   /**
    * Choose the capabilities an agent claims by.
    *
@@ -19,10 +21,15 @@
 
   let custom = $state('');
 
-  /** Match the server's normalisation, so what is shown is what will be stored. */
-  function normalise(v: string): string {
-    return v.trim().toLowerCase();
-  }
+  /**
+   * The SAME function the server and the stage editor use.
+   *
+   * This used to be a local `trim().toLowerCase()`, which is not what a stage's owner is spelled
+   * with — a stage named "Code Review" carries `code-review`, and this produced `code review`.
+   * Routing is exact string equality, so those never match, and the only symptom is a card that
+   * sits in a lane forever.
+   */
+  const normalise = capabilityTag;
 
   const shown = $derived([...new Set([...options.map(normalise), ...selected.map(normalise)])].filter(Boolean).sort());
 

@@ -42,6 +42,7 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
+import { capabilityTags } from '@kaambaan/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 
 export { BoardDO };
@@ -445,10 +446,11 @@ export default {
               if (!Array.isArray(body.capabilities) || body.capabilities.some((c) => typeof c !== 'string' || c.trim() === '')) {
                 return Response.json({ error: 'capabilities must be an array of non-empty strings' }, { status: 400 });
               }
-              // Normalised on the way in so `stageMatches` compares like with like: a stage's
-              // `owner` is a slug, and an operator typing "Code Review" must not produce a
-              // capability that silently matches no stage.
-              patch.capabilities = [...new Set(body.capabilities.map((c) => c.trim().toLowerCase()))];
+              // Normalised on the way in, with the SAME function that spells a stage's owner
+              // (`capabilityTag`, in the contract). Routing is exact string equality, so an
+              // operator typing "Code Review" must produce `code-review` — what a stage named
+              // "Code Review" carries — and not `code review`, which equals nothing.
+              patch.capabilities = capabilityTags(body.capabilities);
             }
             if (body.iconUrl !== undefined) {
               if (body.iconUrl !== null && !/^https:\/\//i.test(body.iconUrl)) {
@@ -527,7 +529,10 @@ export default {
             }
           }
 
-          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: body.capabilities ?? [] });
+          // Same normalisation as PATCH. This path had none at all, so an agent could be created
+          // with a capability spelled in a way no stage would ever match, and the only way to
+          // discover that was a card that never moved.
+          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: capabilityTags(body.capabilities ?? []) });
 
           if (linking) {
             await setAgentExternalMapping(env.DB, u.tenantId, created.id, {

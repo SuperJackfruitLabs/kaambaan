@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button';
   import { createBoard, BOARD_TEMPLATES, type Stage } from '$lib/api';
+  import { capabilityTag } from '@kaambaan/contract';
 
   let { open = false, onClose, onCreated }: { open?: boolean; onClose: () => void; onCreated: (boardId: string) => void } = $props();
 
@@ -57,9 +58,10 @@
     stages = next;
   }
 
-  function slug(s: string): string {
-    return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  }
+  // The shared spelling, so a template's stage owner and an agent's capability are the same
+  // string. This was a private copy of the same rule; two copies of a rule is one rule and one
+  // bug waiting.
+  const slug = capabilityTag;
 
   const valid = $derived(name.trim() !== '' && stages.length > 0 && stages.every((s) => s.name.trim() !== '' && (s.ownerKind === 'human' || (s.owner || s.name).trim() !== '')));
 
