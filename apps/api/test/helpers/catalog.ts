@@ -12,6 +12,20 @@ const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS boards (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, stages_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
   `CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, icon_url TEXT, capabilities_json TEXT NOT NULL DEFAULT '[]', connection_json TEXT NOT NULL DEFAULT '["rest"]', concurrency INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'offline', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
   `CREATE TABLE IF NOT EXISTS agent_tokens (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, scopes_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT)`,
+  // Mirrors migration 0006, minus `REFERENCES tenants(id)` — the same omission every table above
+  // makes, and for the same reason: the suite drives the API with dev-header tenants that have no
+  // `tenants` row, so a faithful FK here would fail every request rather than test anything.
+  // 0006's own FK and its backfill are exercised against real tenant rows in
+  // test/capabilities-rest.test.ts.
+  `CREATE TABLE IF NOT EXISTS capabilities (
+     id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL,
+     description TEXT, tags_json TEXT NOT NULL DEFAULT '[]', examples_json TEXT NOT NULL DEFAULT '[]',
+     origin TEXT NOT NULL DEFAULT 'declared' CHECK (origin IN ('declared', 'inferred')),
+     created_by TEXT, external_id TEXT, external_source TEXT,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT,
+     UNIQUE (tenant_id, key),
+     CONSTRAINT capabilities_external_pair CHECK ((external_id IS NULL) = (external_source IS NULL))
+   )`,
 ];
 
 /** Strip `--` comment lines and split a migration file into executable statements. */
@@ -31,6 +45,12 @@ async function tableHasColumn(table: string, column: string): Promise<boolean> {
     .bind(table)
     .first<{ sql: string }>();
   return Boolean(row?.sql?.includes(column));
+}
+
+/** Has this table been created yet? Same "storage may persist across beforeAll's" guard. */
+async function tableExists(name: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).bind(name).first();
+  return row !== null;
 }
 
 /** Has this index already been created? Same "storage may persist across beforeAll's" guard. */

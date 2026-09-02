@@ -14,6 +14,11 @@
     revokeAgentToken,
     updateAgent,
     issueAgentToken,
+    getCapabilities,
+    createCapability,
+    updateCapability,
+    deleteCapability,
+    type CapabilityRecord,
     getMembers,
     addMember,
     setMemberRole,
@@ -78,9 +83,57 @@
    * the templates the product ships with. A stage's `owner` slug is the only value
    * `stageMatches` compares against, so it is the only honest source for this list.
    */
-  const boardCaps = $derived(
-    [...new Set((board?.stages ?? []).filter((s) => s.ownerKind === 'capability' && s.owner).map((s) => s.owner!))].sort(),
-  );
+  /**
+   * The workspace's capability registry (migration 0006).
+   *
+   * This was `boardCaps` — derived from one board's stage owners — which made a single board
+   * internally consistent and nothing more. The registry is the whole vocabulary, with how many
+   * agents hold each and how many boards ask for it, so the panel can say which capabilities
+   * match nothing.
+   */
+  let capabilities = $state<CapabilityRecord[]>([]);
+  const orphanCaps = $derived(capabilities.filter((c) => c.boardCount === 0 && c.agentCount > 0));
+  let capError = $state<string | null>(null);
+  let newCapKey = $state('');
+
+  async function refreshCapabilities(): Promise<void> {
+    capabilities = await getCapabilities();
+  }
+
+  async function onAddCapability(): Promise<void> {
+    const key = newCapKey.trim();
+    if (key === '') return;
+    capError = null;
+    const res = await createCapability({ key });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      capError = body?.error ?? `Adding that capability failed (${res.status})`;
+      return;
+    }
+    newCapKey = '';
+    await refreshCapabilities();
+  }
+
+  async function onDescribeCapability(c: CapabilityRecord, description: string): Promise<void> {
+    capError = null;
+    const res = await updateCapability(c.id, { description });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      capError = body?.error ?? `Saving that description failed (${res.status})`;
+    }
+    await refreshCapabilities();
+  }
+
+  async function onDeleteCapability(c: CapabilityRecord): Promise<void> {
+    capError = null;
+    const res = await deleteCapability(c.id);
+    if (!res.ok) {
+      // The server names who still refers to it, which is the one fact needed to act.
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      capError = body?.error ?? `Removing that capability failed (${res.status})`;
+    }
+    await refreshCapabilities();
+  }
   let agentName = $state('');
   let newCaps = $state<string[]>([]);
 
@@ -257,6 +310,7 @@
     // The workspace's own fleet link, read alongside the agents it gates.
     await refreshWorkspace().catch(() => {});
     await refreshMembers().catch(() => {});
+    await refreshCapabilities().catch(() => {});
     // Asked when the panel opens rather than on a click, because the answer
     // decides whether there is anything to click.
     await refreshHubSection().catch(() => {});
@@ -269,6 +323,7 @@
       minted = await createAgent(agentName.trim(), [...newCaps]);
       agentName = '';
       agents = await getAgents();
+      await refreshCapabilities();
     } catch (e) {
       error = String(e);
     } finally {
@@ -497,6 +552,7 @@
         return;
       }
       agents = await getAgents();
+      await refreshCapabilities();
       editingAgentId = null;
     } finally {
       savingEdit = false;
@@ -748,7 +804,7 @@
                       class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1 text-sm outline-none"
                     />
                     <div class="text-muted-foreground mt-2 mb-1 text-[11px]">capabilities it can claim:</div>
-                    <CapabilityPicker bind:selected={editCaps} options={boardCaps} id="edit-caps-{a.id}" />
+                    <CapabilityPicker bind:selected={editCaps} registry={capabilities} id="edit-caps-{a.id}" />
                     <div class="mt-2 flex items-center gap-1.5">
                       <label for="conc-{a.id}" class="text-muted-foreground text-[11px]">cards at once</label>
                       <input
@@ -894,7 +950,7 @@
               <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">
                 capabilities they can claim:
               </div>
-              <CapabilityPicker bind:selected={importCaps} options={boardCaps} id="import-caps" />
+              <CapabilityPicker bind:selected={importCaps} registry={capabilities} id="import-caps" />
               {#if importResult}
                 <p class="mt-2 text-xs text-red-400" data-testid="import-failures">{importResult}</p>
               {/if}
@@ -910,6 +966,66 @@
             {/if}
           </div>
           {/if}
+
+          <!--
+            The capability registry.
+
+            A capability was a free string on both sides of an equality test with nothing defining
+            the set, so five producers each invented a vocabulary and almost nothing matched. This
+            is the vocabulary, with the two counts that make a mismatch visible: an entry held by
+            agents and named by no board stage is an agent that can claim nothing — which is
+            exactly what shipped, thirteen agents carrying a token scope.
+          -->
+          <div class="border-border mt-5 border-t pt-4">
+            <div class="eyebrow mb-2">capabilities</div>
+            {#if orphanCaps.length > 0}
+              <p class="text-coral mb-2 text-xs leading-relaxed">
+                {orphanCaps.map((c) => c.key).join(', ')} — held by agents, asked for by no board stage.
+                An agent holding only these can claim nothing.
+              </p>
+            {/if}
+            <div class="max-h-52 space-y-1.5 overflow-y-auto">
+              {#each capabilities as c (c.id)}
+                <div class="bg-inset border-border rounded-[7px] border px-2.5 py-1.5">
+                  <div class="flex items-center gap-2">
+                    <span class="mono min-w-0 flex-1 truncate text-[11px]">{c.key}</span>
+                    <span class="text-muted-foreground mono shrink-0 text-[10px]" title="{c.agentCount} agent(s) hold this · {c.boardCount} board(s) ask for it">
+                      {c.agentCount}a · <span class={c.boardCount === 0 ? 'text-coral' : ''}>{c.boardCount}b</span>
+                    </span>
+                    {#if c.origin === 'inferred'}
+                      <span class="border-border text-muted-foreground shrink-0 rounded-[4px] border px-1 text-[9px]" title="Nobody defined this — it turned up in use">inferred</span>
+                    {/if}
+                    <button onclick={() => void onDeleteCapability(c)} aria-label="Remove capability {c.key}" class="text-muted-foreground hover:text-coral shrink-0">
+                      <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                    </button>
+                  </div>
+                  <input
+                    value={c.description ?? ''}
+                    onblur={(e) => { const v = e.currentTarget.value; if (v !== (c.description ?? '')) void onDescribeCapability(c, v); }}
+                    placeholder="what does this capability mean?"
+                    aria-label="Description for {c.key}"
+                    class="bg-surface border-border focus:border-marigold mt-1 w-full rounded-[5px] border px-1.5 py-0.5 text-[10px] outline-none"
+                  />
+                </div>
+              {/each}
+              {#if capabilities.length === 0}
+                <p class="text-muted-foreground text-xs leading-relaxed">
+                  Nothing yet. A board stage with an agent owner adds one, or name one below.
+                </p>
+              {/if}
+            </div>
+            <div class="mt-2 flex gap-1.5">
+              <input
+                bind:value={newCapKey}
+                placeholder="add a capability"
+                aria-label="New capability"
+                onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void onAddCapability(); } }}
+                class="bg-inset border-border focus:border-marigold mono min-w-0 flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+              />
+              <Button size="sm" variant="outline" onclick={() => void onAddCapability()} disabled={newCapKey.trim() === ''}>Add</Button>
+            </div>
+            {#if capError}<p class="text-coral mt-1.5 text-xs leading-relaxed">{capError}</p>{/if}
+          </div>
 
           <!--
             People. Beside the agents rather than in a settings page, because both answer the same
@@ -976,7 +1092,7 @@
               class="bg-inset border-border focus:border-marigold w-full rounded-[7px] border px-3 py-2 text-sm outline-none"
             />
             <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">capabilities it can claim:</div>
-            <CapabilityPicker bind:selected={newCaps} options={boardCaps} id="new-caps" />
+            <CapabilityPicker bind:selected={newCaps} registry={capabilities} id="new-caps" />
             <div class="mt-4 flex justify-end">
               <Button onclick={mintAgent} disabled={minting || agentName.trim() === '' || newCaps.length === 0}>{minting ? 'Minting…' : 'Create + mint token'}</Button>
             </div>
