@@ -89,6 +89,7 @@
   let editName = $state('');
   let editCaps = $state<string[]>([]);
   let editConcurrency = $state(1);
+  let editIconUrl = $state('');
   let editError = $state<string | null>(null);
   let savingEdit = $state(false);
 
@@ -467,6 +468,7 @@
     editName = agent.name;
     editCaps = [...agent.capabilities];
     editConcurrency = agent.concurrency ?? 1;
+    editIconUrl = agent.iconUrl ?? '';
     editError = null;
   }
 
@@ -484,6 +486,9 @@
         name: editName.trim(),
         capabilities: [...editCaps],
         concurrency: editConcurrency,
+        // '' clears it. The server takes null for that and refuses anything that is not https,
+        // because this renders as an <img> src on a card tile.
+        iconUrl: editIconUrl.trim() === '' ? null : editIconUrl.trim(),
       });
       if (!res.ok) {
         // The server's own sentence, which names the field that was wrong.
@@ -753,7 +758,13 @@
                         bind:value={editConcurrency}
                         class="bg-surface border-border focus:border-marigold mono w-16 rounded-[6px] border px-2 py-1 text-[11px] outline-none"
                       />
-                      <button onclick={() => void saveEditing()} disabled={savingEdit || editName.trim() === ''} class="mono ml-auto shrink-0 text-[11px] hover:brightness-110 disabled:opacity-40" style="color:var(--marigold)">
+                      <input
+                        bind:value={editIconUrl}
+                        placeholder="https://… avatar"
+                        aria-label="Avatar URL for {a.name}"
+                        class="bg-surface border-border focus:border-marigold mono min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-[10px] outline-none"
+                      />
+                      <button onclick={() => void saveEditing()} disabled={savingEdit || editName.trim() === ''} class="mono shrink-0 text-[11px] hover:brightness-110 disabled:opacity-40" style="color:var(--marigold)">
                         {savingEdit ? 'saving…' : 'save'}
                       </button>
                       <button onclick={cancelEditing} class="text-muted-foreground hover:text-foreground shrink-0 text-[11px]">cancel</button>

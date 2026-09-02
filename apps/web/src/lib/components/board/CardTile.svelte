@@ -84,7 +84,9 @@
     cardCap && cardCap > 0 ? Math.min(100, Math.round((card.costUsd / cardCap) * 100)) : null,
   );
 
-  // Delegate avatar
+  // Delegate avatar. `agents.icon_url` has existed since migration 0001 and was read by nothing;
+  // the coloured initial stays the fallback, which is what most agents will always have.
+  const delegate = $derived(app.agents.find((a) => a.id === card.delegateAgentId) ?? null);
   const avatarColor = $derived(agentColor(card.delegateAgentId));
   const avatarInitial = $derived(
     card.delegateAgentId ? initialOf(card.delegateAgentId).toUpperCase() : null,
@@ -256,11 +258,13 @@
   <!-- meta row: avatar, owner, cost, due -->
   <div class="meta flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
     <!-- delegate avatar -->
-    {#if card.delegateAgentId && avatarInitial}
+    {#if card.delegateAgentId && delegate?.iconUrl}
+      <img src={delegate.iconUrl} alt="" title={delegate.name} class="size-5 shrink-0 rounded-full object-cover" />
+    {:else if card.delegateAgentId && avatarInitial}
       <span
         class="inline-grid size-5 shrink-0 place-items-center rounded-full font-mono text-[9px] font-semibold"
         style="background:{avatarColor}; color: #0f1118"
-        title={card.delegateAgentId}
+        title={delegate?.name ?? card.delegateAgentId}
       >{avatarInitial}</span>
     {:else}
       <span class="eyebrow" style="padding:0">unassigned</span>
