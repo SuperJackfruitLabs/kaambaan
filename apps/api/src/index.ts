@@ -609,10 +609,15 @@ export default {
       if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
       // A viewer reads the board; working it — creating, moving, editing and deleting cards,
       // resolving gates, answering an agent's question — is `member`, and reworking the board
-      // itself is `admin`. GET is the whole read surface here, so the method is the right
+      // itself is `admin`. GET is almost the whole read surface, so the method is the right
       // discriminator rather than a list of paths that would drift from the routes below it.
+      //
+      // Marking a notification read is the exception: it is a POST that changes nothing about the
+      // board, only about what its recipient has already seen. A viewer who was assigned a card
+      // receives notifications for it, and being unable to clear them would leave a badge they
+      // can never dismiss.
       const needed: Capability =
-        request.method === 'GET'
+        request.method === 'GET' || rest.startsWith('notifications/')
           ? 'read'
           : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles'
             ? 'manage'

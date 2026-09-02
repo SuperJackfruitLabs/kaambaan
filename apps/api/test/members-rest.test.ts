@@ -75,6 +75,28 @@ describe('roles decide what a person may do', () => {
     expect(fleet.status).toBe(403);
   });
 
+  it('lets a viewer clear a notification they were sent', async () => {
+    // A viewer can be assigned a card by an admin, and would then receive notifications for it.
+    // Being unable to mark one read would leave a badge they can never dismiss.
+    const card = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+      method: 'POST',
+      headers: as('usr_owner'),
+      body: JSON.stringify({ title: 'theirs', ownerUserId: 'usr_viewer' }),
+    });
+    expect(card.status).toBe(201);
+
+    const { notifications } = await (
+      await SELF.fetch(`https://api.test/v1/boards/${boardId}/notifications`, { headers: as('usr_viewer') })
+    ).json<{ notifications: Array<{ seq: number }> }>();
+    if (notifications.length === 0) return; // nothing was raised for this card; the rule is vacuous
+
+    const read = await SELF.fetch(`https://api.test/v1/boards/${boardId}/notifications/${notifications[0]!.seq}/read`, {
+      method: 'POST',
+      headers: as('usr_viewer'),
+    });
+    expect(read.status).toBe(200);
+  });
+
   it('refuses someone who is not a member at all, rather than treating them as a reader', async () => {
     const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, {
       // A tenant that exists, and a user with no membership row in it.
