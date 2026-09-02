@@ -1,7 +1,23 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button';
-  import { createBoard, BOARD_TEMPLATES, type Stage } from '$lib/api';
+  import { createBoard, getCapabilities, BOARD_TEMPLATES, type Stage, type CapabilityRecord } from '$lib/api';
   import { capabilityTag } from '@kaambaan/contract';
+  import { onMount } from 'svelte';
+
+  /**
+   * The workspace's capability registry, so a lane nobody can work is visible BEFORE the board
+   * exists rather than after.
+   *
+   * This is the check that would have caught the whole mismatch: templates asked for capabilities
+   * no agent held, boards were created with lanes nothing could claim, and the only symptom was a
+   * card that never moved. A stage with no one to work it is a real state — you may be about to
+   * hire — so it warns rather than refuses.
+   */
+  let registry = $state<CapabilityRecord[]>([]);
+  onMount(() => {
+    void getCapabilities().then((c) => (registry = c)).catch(() => (registry = []));
+  });
+
 
   let { open = false, onClose, onCreated }: { open?: boolean; onClose: () => void; onCreated: (boardId: string) => void } = $props();
 
@@ -16,6 +32,16 @@
 
   let name = $state('');
   let stages = $state<DraftStage[]>([]);
+
+  const staffed = $derived(new Set(registry.filter((c) => c.agentCount > 0).map((c) => c.key)));
+  /** Capabilities this pipeline asks for that no agent in the workspace holds. */
+  const unstaffed = $derived([
+    ...new Set(
+      stages
+        .filter((s) => s.ownerKind === 'capability' && s.owner && !staffed.has(capabilityTag(s.owner)))
+        .map((s) => capabilityTag(s.owner)),
+    ),
+  ]);
   let creating = $state(false);
   let error = $state<string | null>(null);
   let seeded = $state(false);
@@ -161,6 +187,19 @@
         <button onclick={addStage} class="text-marigold hover:bg-inset mt-2 flex w-full items-center justify-center gap-1.5 rounded-[7px] border border-dashed border-[var(--line)] px-2 py-2 text-xs">
           <span class="text-sm leading-none">+</span> Add stage
         </button>
+
+        <!--
+          A lane no agent can work. Not an error — you may be about to hire, or to staff an
+          existing agent — but never a surprise. This is the check that would have caught the
+          original mismatch, where a template asked for capabilities nobody held and the only
+          symptom was a card that never moved.
+        -->
+        {#if unstaffed.length > 0}
+          <p class="text-coral mt-3 text-xs leading-relaxed" data-testid="unstaffed-warning">
+            No agent holds {unstaffed.join(', ')}. Those lanes will hold cards nothing can claim
+            until you staff an agent with {unstaffed.length === 1 ? 'it' : 'them'}.
+          </p>
+        {/if}
 
         {#if error}<p class="text-coral mono mt-3 text-xs">{error}</p>{/if}
       </div>

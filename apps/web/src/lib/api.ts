@@ -255,75 +255,70 @@ export interface BoardTemplate {
   stages: Stage[];
 }
 
+/**
+ * Starting pipelines.
+ *
+ * **Rewritten 2026-09-03.** The templates that shipped asked for nine capabilities no agent in
+ * any fleet held — `publish`, `test`, `deploy`, `triage`, `support`, `send`, `extract`,
+ * `transform`, `load` — while the agent-creation UI offered three, of which two overlapped. That
+ * gap is where the capability mismatch began: a board created from a template had lanes nothing
+ * could ever claim, and nothing said so.
+ *
+ * These use a small vocabulary an operator can actually staff, and each names the capabilities it
+ * needs so the mismatch is visible before the board exists rather than after. A stage whose
+ * capability nobody holds is flagged in the dialog — a lane no agent can work is a real state,
+ * not an error, but it should never be a surprise.
+ */
 export const BOARD_TEMPLATES: BoardTemplate[] = [
-  {
-    id: 'agent-pipeline',
-    name: 'Agent pipeline',
-    description: 'A general agent flow: Research → Review (your approval) → Publish.',
-    stages: [
-      { key: 'research', name: 'Research', order: 0, ownerKind: 'capability', owner: 'research' },
-      { key: 'review', name: 'Review', order: 1, ownerKind: 'human', gate: 'approval' },
-      { key: 'publish', name: 'Publish', order: 2, ownerKind: 'capability', owner: 'publish' },
-    ],
-  },
   {
     id: 'software',
     name: 'Software delivery',
-    description: 'Ship code with a review gate: Backlog → Implement → Code review → QA → Deploy.',
+    description: 'Plan, build, check, ship. Needs: planning, code, security.',
     stages: [
-      { key: 'backlog', name: 'Backlog', order: 0, ownerKind: 'human' },
-      { key: 'implement', name: 'Implement', order: 1, ownerKind: 'capability', owner: 'code', wipLimit: 3 },
-      { key: 'code-review', name: 'Code review', order: 2, ownerKind: 'human', gate: 'approval' },
-      { key: 'qa', name: 'QA', order: 3, ownerKind: 'capability', owner: 'test' },
-      { key: 'deploy', name: 'Deploy', order: 4, ownerKind: 'capability', owner: 'deploy' },
-    ],
-  },
-  {
-    id: 'content',
-    name: 'Content production',
-    description: 'Idea to published: Brief → Research → Draft → Edit → Publish.',
-    stages: [
-      { key: 'brief', name: 'Brief', order: 0, ownerKind: 'human' },
-      { key: 'research', name: 'Research', order: 1, ownerKind: 'capability', owner: 'research' },
-      { key: 'draft', name: 'Draft', order: 2, ownerKind: 'capability', owner: 'writing' },
-      { key: 'edit', name: 'Edit', order: 3, ownerKind: 'human', gate: 'approval' },
-      { key: 'publish', name: 'Publish', order: 4, ownerKind: 'capability', owner: 'publish' },
-    ],
-  },
-  {
-    id: 'support',
-    name: 'Support triage',
-    description: 'Resolve tickets with oversight: Inbox → Triage → Draft reply → Approve → Send.',
-    stages: [
-      { key: 'inbox', name: 'Inbox', order: 0, ownerKind: 'human' },
-      { key: 'triage', name: 'Triage', order: 1, ownerKind: 'capability', owner: 'triage' },
-      { key: 'draft-reply', name: 'Draft reply', order: 2, ownerKind: 'capability', owner: 'support' },
-      { key: 'approve', name: 'Approve', order: 3, ownerKind: 'human', gate: 'approval' },
-      { key: 'send', name: 'Send', order: 4, ownerKind: 'capability', owner: 'send' },
+      { key: 'intake', name: 'Intake', order: 0, ownerKind: 'human' },
+      { key: 'plan', name: 'Plan', order: 1, ownerKind: 'capability', owner: 'planning' },
+      { key: 'build', name: 'Build', order: 2, ownerKind: 'capability', owner: 'code', wipLimit: 3 },
+      { key: 'security-review', name: 'Security review', order: 3, ownerKind: 'capability', owner: 'security' },
+      { key: 'sign-off', name: 'Sign-off', order: 4, ownerKind: 'human', gate: 'approval' },
+      { key: 'shipped', name: 'Shipped', order: 5, ownerKind: 'human' },
     ],
   },
   {
     id: 'research-report',
     name: 'Research report',
-    description: 'Question to report: Question → Gather → Analyze → Review → Report.',
+    description: 'Question to written answer. Needs: research, analysis, writing.',
     stages: [
       { key: 'question', name: 'Question', order: 0, ownerKind: 'human' },
       { key: 'gather', name: 'Gather', order: 1, ownerKind: 'capability', owner: 'research' },
-      { key: 'analyze', name: 'Analyze', order: 2, ownerKind: 'capability', owner: 'analysis' },
-      { key: 'review', name: 'Review', order: 3, ownerKind: 'human', gate: 'approval' },
-      { key: 'report', name: 'Report', order: 4, ownerKind: 'capability', owner: 'writing' },
+      { key: 'analyse', name: 'Analyse', order: 2, ownerKind: 'capability', owner: 'analysis' },
+      { key: 'draft', name: 'Draft', order: 3, ownerKind: 'capability', owner: 'writing' },
+      { key: 'review', name: 'Review', order: 4, ownerKind: 'human', gate: 'approval' },
+      { key: 'published', name: 'Published', order: 5, ownerKind: 'human' },
     ],
   },
   {
-    id: 'data',
-    name: 'Data pipeline',
-    description: 'Move + check data: Source → Extract → Transform → Validate → Load.',
+    id: 'security',
+    name: 'Security review',
+    description: 'A finding, fixed and verified. Needs: security, code.',
     stages: [
-      { key: 'source', name: 'Source', order: 0, ownerKind: 'human' },
-      { key: 'extract', name: 'Extract', order: 1, ownerKind: 'capability', owner: 'extract' },
-      { key: 'transform', name: 'Transform', order: 2, ownerKind: 'capability', owner: 'transform' },
-      { key: 'validate', name: 'Validate', order: 3, ownerKind: 'human', gate: 'approval' },
-      { key: 'load', name: 'Load', order: 4, ownerKind: 'capability', owner: 'load' },
+      { key: 'reported', name: 'Reported', order: 0, ownerKind: 'human' },
+      { key: 'assess', name: 'Assess', order: 1, ownerKind: 'capability', owner: 'security' },
+      { key: 'fix', name: 'Fix', order: 2, ownerKind: 'capability', owner: 'code', wipLimit: 2 },
+      { key: 'verify', name: 'Verify', order: 3, ownerKind: 'capability', owner: 'security' },
+      { key: 'sign-off', name: 'Sign-off', order: 4, ownerKind: 'human', gate: 'approval' },
+      { key: 'closed', name: 'Closed', order: 5, ownerKind: 'human' },
+    ],
+  },
+  {
+    id: 'onboarding',
+    name: 'Onboarding',
+    description: 'Bring someone or something up to working order. Needs: onboarding, writing.',
+    stages: [
+      { key: 'arrived', name: 'Arrived', order: 0, ownerKind: 'human' },
+      { key: 'prepare', name: 'Prepare', order: 1, ownerKind: 'capability', owner: 'onboarding' },
+      { key: 'document', name: 'Document', order: 2, ownerKind: 'capability', owner: 'writing' },
+      { key: 'check', name: 'Check', order: 3, ownerKind: 'human', gate: 'approval' },
+      { key: 'ready', name: 'Ready', order: 4, ownerKind: 'human' },
     ],
   },
   {
