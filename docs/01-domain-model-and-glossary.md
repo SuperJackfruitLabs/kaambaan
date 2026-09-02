@@ -227,6 +227,7 @@ Events drive the WebSocket broadcast to UI clients and the webhook dispatch to s
 | **Gate** | Human-approval pause; a Task in `input-required` |
 | **Reference** | First-class external link (GitHub issue/PR, repo, doc) |
 | **AgentCard** | A2A capability/discovery document for an agent |
-| **Capability tag** | A skill string used to route cards to agents |
+| **Capability tag** | The `key` of a Capability — the string a stage and an agent both carry, and the whole of what routing compares |
+| **Capability** | A record in the workspace registry (migration 0006), shaped as an A2A `AgentSkill`: `key`, `name`, `description`, `tags`, `examples`, plus an optional external mapping (an OASF dotted id, say). It gives a routing tag an identity and a definition; it does not enumerate what may exist |
 | **Structured handoff** | The `metadata` an agent passes to the next stage |
 | **Event** | Append-only audit record + realtime/webhook feed item |
