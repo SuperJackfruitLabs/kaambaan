@@ -71,9 +71,17 @@
     return `$${n.toFixed(2)}`;
   }
 
-  // Cost bar width (capped at 100%)
+  /**
+   * Cost against the card's budget cap.
+   *
+   * This used to compute `costUsd / (costUsd * 1.5)` — arithmetic that is 67% for every card with
+   * any cost at all, regardless of budget. It looked like a spend gauge and measured nothing. A
+   * bar is only meaningful against a ceiling, so when there is no cap there is no bar: the figure
+   * alone is the honest reading.
+   */
+  const cardCap = $derived(app.board?.usage.cardUsdCap ?? null);
   const costBarPct = $derived(
-    card.costUsd > 0 ? Math.min(100, Math.round((card.costUsd / (card.costUsd * 1.5 || 1)) * 100)) : 0,
+    cardCap && cardCap > 0 ? Math.min(100, Math.round((card.costUsd / cardCap) * 100)) : null,
   );
 
   // Delegate avatar
@@ -87,9 +95,13 @@
     Array.isArray(card.spec?.labels) ? (card.spec.labels as string[]) : [],
   );
 
-  // Due date from spec
+  // Due date from spec. Overdue is a state worth showing: a date rendered in the same grey as
+  // everything else says when, and never says "and that has passed".
   const due = $derived(
     typeof card.spec?.due === 'string' ? card.spec.due : null,
+  );
+  const overdue = $derived(
+    due !== null && card.state !== 'completed' && new Date(`${due}T23:59:59`).getTime() < Date.now(),
   );
 
   function handleClick() {
@@ -193,7 +205,7 @@
 
     <!-- due -->
     {#if due}
-      <span>· {due}</span>
+      <span class={overdue ? 'text-coral' : ''} title={overdue ? `Due ${due} — overdue` : `Due ${due}`}>· {due}{overdue ? ' ⚠' : ''}</span>
     {/if}
 
     <!-- owner avatar -->
@@ -204,9 +216,9 @@
     >{card.ownerUserId.slice(0, 1).toUpperCase()}</span>
   </div>
 
-  <!-- cost bar -->
-  {#if card.costUsd > 0}
-    <div class="costbar">
+  <!-- cost bar — only where there is a cap for it to be a fraction OF -->
+  {#if card.costUsd > 0 && costBarPct !== null}
+    <div class="costbar" title="{fmtUsd(card.costUsd)} of the {fmtUsd(cardCap!)} card cap">
       <span
         class="costbar-fill {card.overBudget ? 'costbar-fill-over' : ''}"
         style="width:{card.overBudget ? 100 : costBarPct}%"

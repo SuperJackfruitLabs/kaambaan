@@ -40,6 +40,9 @@
   let editDesc = $state('');
   let editLabels = $state('');
   let editAC = $state('');
+  // `spec.due` was rendered on every card tile and no interface could write it: a field that
+  // appeared on the card and that a person could not fill in.
+  let editDue = $state('');
   let savingCard = $state(false);
   let newRefUrl = $state('');
   let localError = $state<string | null>(null);
@@ -98,6 +101,7 @@
     editLabels = existingLabels.join(', ');
     const existingAC = Array.isArray(card.spec?.acceptanceCriteria) ? (card.spec!.acceptanceCriteria as string[]) : [];
     editAC = existingAC.join('\n');
+    editDue = typeof card.spec?.due === 'string' ? card.spec.due : '';
     editing = true;
   }
 
@@ -112,7 +116,11 @@
         description: editDesc,
         labels,
         acceptanceCriteria: ac,
+        // Omitted rather than set to '' when cleared, so "no due date" is the absence the tile
+        // already tests for rather than an empty string that reads as a date.
+        ...(editDue.trim() === '' ? { due: undefined } : { due: editDue.trim() }),
       };
+      if (editDue.trim() === '') delete (spec as Record<string, unknown>).due;
       const res = await updateCard(boardId, cardId, { title: editTitle.trim(), priority: Number(editPriority) || 0, spec });
       if (!res.ok) localError = `Couldn't save the card (${res.status})`;
       editing = false;
@@ -120,6 +128,27 @@
       if (cardId && boardId) void refreshDrawer(cardId, boardId);
     } finally {
       savingCard = false;
+    }
+  }
+
+  /**
+   * Reassign the card.
+   *
+   * A card's owner was fixed to whoever created it — no reassign, no "assign to me", no unassign —
+   * on a board whose whole purpose is handing work between people and agents. Deliberately does
+   * NOT touch `queuedBy`: who is answerable for a card and who authorised its dispatch are
+   * different questions, and the second is what a claim is checked against.
+   */
+  let assigning = $state(false);
+  async function assignToMe(): Promise<void> {
+    if (!boardId || !cardId || !app.user) return;
+    assigning = true;
+    try {
+      const res = await updateCard(boardId, cardId, { ownerUserId: app.user.userId });
+      if (!res.ok) localError = `Couldn't reassign the card (${res.status})`;
+      await app.refresh();
+    } finally {
+      assigning = false;
     }
   }
 
@@ -293,10 +322,19 @@
           <div class="min-w-0 flex-1">
             <div class="eyebrow mb-2">edit card</div>
             <input bind:value={editTitle} placeholder="Title" class="bg-inset border-border focus:border-marigold w-full rounded-[6px] border px-2.5 py-1.5 text-sm outline-none" />
-            <label class="text-muted-foreground mono mt-2 flex items-center gap-1.5 text-[11px]">
-              priority
-              <input type="number" bind:value={editPriority} class="bg-inset border-border focus:border-marigold w-16 rounded-[5px] border px-1.5 py-1 outline-none" />
-            </label>
+            <div class="mt-2 flex flex-wrap items-center gap-3">
+              <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+                priority
+                <input type="number" bind:value={editPriority} class="bg-inset border-border focus:border-marigold w-16 rounded-[5px] border px-1.5 py-1 outline-none" />
+              </label>
+              <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+                due
+                <input type="date" bind:value={editDue} aria-label="Due date" class="bg-inset border-border focus:border-marigold rounded-[5px] border px-1.5 py-1 outline-none" />
+              </label>
+              {#if editDue !== ''}
+                <button onclick={() => (editDue = '')} class="text-muted-foreground hover:text-foreground mono text-[11px]">clear</button>
+              {/if}
+            </div>
             <textarea bind:value={editDesc} rows="3" placeholder="Description / brief for the agent…" class="bg-inset border-border focus:border-marigold mt-2 w-full resize-none rounded-[6px] border px-2.5 py-2 text-xs outline-none"></textarea>
             <label for="edit-labels" class="text-muted-foreground mono mt-3 block text-[11px] uppercase tracking-widest">Labels <span class="normal-case">(comma-separated)</span></label>
             <input
@@ -350,6 +388,13 @@
 
             <!-- owner -->
             <span class="delegate inline-flex items-center gap-1 font-mono text-[11px]" style="color:var(--muted)">owner · {card.ownerUserId}</span>
+            {#if app.user && card.ownerUserId !== app.user.userId}
+              <button
+                onclick={() => void assignToMe()}
+                disabled={assigning}
+                class="text-muted-foreground hover:text-foreground font-mono text-[11px] underline disabled:opacity-40"
+              >{assigning ? 'assigning…' : 'assign to me'}</button>
+            {/if}
 
             <!-- live ephemeral -->
             {#if card.state === 'working'}

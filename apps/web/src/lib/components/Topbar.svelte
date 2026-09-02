@@ -21,6 +21,13 @@
 
   // Dispatch form
   let title = $state('');
+  // The compose form captured a title and nothing else, though the API has always accepted
+  // priority and a spec — so a card could only be created bare and then edited. Collapsed by
+  // default, because the one-line dispatch is the common act and should stay one line.
+  let composeOpen = $state(false);
+  let newPriority = $state(0);
+  let newDue = $state('');
+  let newDescription = $state('');
 
   // Filters (local, synced to store via $effect)
   let filters = $state<CardFilters>({
@@ -94,8 +101,16 @@
     e.preventDefault();
     if (!app.boardId || title.trim() === '') return;
     try {
-      await app.dispatchCard(title.trim());
+      await app.dispatchCard(title.trim(), {
+        priority: Number(newPriority) || 0,
+        description: newDescription,
+        due: newDue,
+      });
       title = '';
+      newPriority = 0;
+      newDue = '';
+      newDescription = '';
+      composeOpen = false;
     } catch (err) {
       error = String(err);
     }
@@ -188,14 +203,45 @@
     </div>
 
     <!-- Dispatch form -->
-    <form class="flex items-center gap-1.5" onsubmit={onAdd}>
+    <form class="relative flex items-center gap-1.5" onsubmit={onAdd}>
       <input
         bind:value={title}
+        data-testid="dispatch-title"
         placeholder="Dispatch a card…"
         aria-label="New card title"
         class="bg-inset border-border focus:border-marigold mono w-44 rounded-[7px] border px-2.5 py-1.5 text-xs outline-none"
       />
+      <button
+        type="button"
+        onclick={() => (composeOpen = !composeOpen)}
+        aria-expanded={composeOpen}
+        aria-label="More card details"
+        title="Priority, due date and description"
+        class="text-muted-foreground hover:text-foreground mono shrink-0 px-1 text-xs"
+      >{composeOpen ? '–' : '+'}</button>
       <Button type="submit" size="sm">Dispatch</Button>
+
+      {#if composeOpen}
+        <div class="bg-surface border-border absolute top-full right-0 z-30 mt-1.5 w-72 rounded-[9px] border p-3 shadow-xl">
+          <div class="flex items-center gap-3">
+            <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+              priority
+              <input type="number" bind:value={newPriority} class="bg-inset border-border focus:border-marigold w-14 rounded-[5px] border px-1.5 py-1 outline-none" />
+            </label>
+            <label class="text-muted-foreground mono flex items-center gap-1.5 text-[11px]">
+              due
+              <input type="date" bind:value={newDue} aria-label="Due date" class="bg-inset border-border focus:border-marigold rounded-[5px] border px-1.5 py-1 outline-none" />
+            </label>
+          </div>
+          <textarea
+            bind:value={newDescription}
+            rows="3"
+            aria-label="Description"
+            placeholder="Brief for the agent…"
+            class="bg-inset border-border focus:border-marigold mt-2 w-full resize-none rounded-[6px] border px-2.5 py-2 text-xs outline-none"
+          ></textarea>
+        </div>
+      {/if}
     </form>
 
     <!-- View toggle -->

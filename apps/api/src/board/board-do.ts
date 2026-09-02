@@ -509,7 +509,7 @@ export interface BoardStub {
     /** What the mover was permitted to dispatch, recorded with the card. */
     queuedGrant?: string[] | null,
   ): Promise<Result<CardView>>;
-  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>>;
+  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
   setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
@@ -1019,8 +1019,16 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: updated };
   }
 
-  /** Edit a card's title / spec / priority (human, docs/07 §4). */
-  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number }): Promise<Result<CardView>> {
+  /**
+   * Edit a card's title / spec / priority / owner (human, docs/07 §4).
+   *
+   * `ownerUserId` is here because a card's owner was fixed to whoever created it, with no
+   * reassign, no "assign to me" and no unassign — on a board whose whole purpose is handing work
+   * between people and agents. It is deliberately NOT `queued_by`: who is answerable for a card
+   * and who authorised its dispatch are different questions, and reassignment must not silently
+   * rewrite the recorded authority a claim is checked against.
+   */
+  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
@@ -1036,6 +1044,10 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
       vals.push(patch.priority);
+    }
+    if (patch.ownerUserId !== undefined) {
+      sets.push('owner_user_id = ?');
+      vals.push(patch.ownerUserId);
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');

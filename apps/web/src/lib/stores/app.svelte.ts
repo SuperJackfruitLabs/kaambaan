@@ -243,10 +243,24 @@ class AppStore {
     }
   }
 
-  async dispatchCard(title: string): Promise<void> {
+  /**
+   * Queue a card.
+   *
+   * `detail` is optional because the one-line dispatch is a real and common act — but the API has
+   * always accepted priority and a spec, and the compose form captured neither, so a card could
+   * only ever be created bare and then edited. Everything the drawer can set, the compose form can
+   * now set at creation.
+   */
+  async dispatchCard(title: string, detail?: { priority?: number; description?: string; due?: string }): Promise<void> {
     if (!this.boardId || title.trim() === '') return;
     try {
-      await createCard(this.boardId, title.trim());
+      const spec: Record<string, unknown> = {};
+      if (detail?.description && detail.description.trim() !== '') spec.description = detail.description.trim();
+      if (detail?.due && detail.due.trim() !== '') spec.due = detail.due.trim();
+      await createCard(this.boardId, title.trim(), {
+        priority: detail?.priority,
+        spec: Object.keys(spec).length > 0 ? spec : undefined,
+      });
       await this.refresh();
     } catch (e) {
       this.error = String(e);

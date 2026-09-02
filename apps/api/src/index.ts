@@ -580,7 +580,10 @@ export default {
       // PATCH /v1/boards/:id/cards/:cardId — edit a card · DELETE — remove it
       const cardMatch = rest.match(/^cards\/([^/]+)$/);
       if (cardMatch && request.method === 'PATCH') {
-        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number };
+        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string };
+        if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
+          return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
+        }
         const result = await stub.updateCard(cardMatch[1]!, body);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });

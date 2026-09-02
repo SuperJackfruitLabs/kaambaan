@@ -322,17 +322,32 @@ export async function getBoard(boardId: string): Promise<BoardSnapshot> {
  * what it permits against the card. Without it the card is queued by nobody with
  * permission, and under enforcement no agent may run it.
  */
-export async function createCard(boardId: string, title: string): Promise<void> {
+export async function createCard(
+  boardId: string,
+  title: string,
+  detail?: { priority?: number; spec?: Record<string, unknown> },
+): Promise<void> {
   const res = await fetch(`/v1/boards/${boardId}/cards`, {
     method: 'POST',
     headers: await withAuthority(headers),
-    body: JSON.stringify({ title }), // owner is the signed-in user, set by the server
+    // Owner is the signed-in user, set by the server. Priority and spec are sent only when given,
+    // so a one-line dispatch produces exactly the request it always did.
+    body: JSON.stringify({ title, ...(detail?.priority !== undefined ? { priority: detail.priority } : {}), ...(detail?.spec ? { spec: detail.spec } : {}) }),
   });
   if (!res.ok) throw new Error(`createCard failed (${res.status})`);
 }
 
-/** Edit a card's title / description (spec) / priority. */
-export function updateCard(boardId: string, cardId: string, patch: { title?: string; spec?: Record<string, unknown>; priority?: number }): Promise<Response> {
+/**
+ * Edit a card's title / description (spec) / priority / owner.
+ *
+ * `ownerUserId` reassigns. It is deliberately not `queuedBy`: who is answerable for a card and
+ * who authorised its dispatch are different questions, and only the second is checked at claim.
+ */
+export function updateCard(
+  boardId: string,
+  cardId: string,
+  patch: { title?: string; spec?: Record<string, unknown>; priority?: number; ownerUserId?: string },
+): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
 }
 
