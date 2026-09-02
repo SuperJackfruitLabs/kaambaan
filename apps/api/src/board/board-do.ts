@@ -3,6 +3,7 @@ import { canTransition, nextState, type GateDecision, type TaskEventType, type T
 import type { Env } from '../env';
 import { newId } from '../ids';
 import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
+import { capabilityTag } from '@kaambaan/contract';
 import { parseElicitationOptions } from './elicitation';
 import { verifyGithubSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
@@ -881,7 +882,11 @@ export class BoardDO extends DurableObject<Env> {
 
   async init(board: BoardInit): Promise<BoardSnapshot> {
     if (!this.getMeta('boardId')) {
-      const stages = [...board.stages].sort((a, b) => a.order - b.order);
+      // Same normalisation as `setStages`: a board created with a mis-spelled capability owner is
+      // a board whose lane no agent can ever claim from.
+      const stages = [...board.stages]
+        .map((s) => (s.ownerKind === 'capability' && s.owner ? { ...s, owner: capabilityTag(s.owner) } : s))
+        .sort((a, b) => a.order - b.order);
       this.setMeta('boardId', board.id);
       this.setMeta('tenantId', board.tenantId);
       this.setMeta('name', board.name);
@@ -1143,7 +1148,13 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
-    const ordered = [...stages].sort((a, b) => a.order - b.order);
+    // A capability owner is normalised with the same function that spells an agent's
+    // capabilities. Routing is `agent.capabilities.includes(stage.owner)` — exact equality — so a
+    // stage whose owner is typed "Code Review" must carry `code-review`, or no agent can ever
+    // claim it and nothing says why.
+    const ordered = [...stages]
+      .map((s) => (s.ownerKind === 'capability' && s.owner ? { ...s, owner: capabilityTag(s.owner) } : s))
+      .sort((a, b) => a.order - b.order);
     this.setMeta('stages', JSON.stringify(ordered));
     this.emit('board.stages_changed', { stages: ordered });
     return { ok: true, value: { stages: ordered } };

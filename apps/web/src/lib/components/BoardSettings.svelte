@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button';
   import { renameBoard, setGithubConfig, setStages, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
+  import { capabilityTag } from '@kaambaan/contract';
 
   let { open = false, board, onClose, onChanged }: { open?: boolean; board: BoardSnapshot; onClose: () => void; onChanged: () => void } = $props();
 
@@ -33,9 +34,9 @@
     board.cards.reduce<Record<string, number>>((acc, c) => ({ ...acc, [c.currentStageKey]: (acc[c.currentStageKey] ?? 0) + 1 }), {}),
   );
 
-  function slug(v: string): string {
-    return v.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  }
+  // The shared spelling — the same one an agent's capabilities are stored with. A stage owner
+  // and a capability are compared by exact equality, so they cannot be spelled by two functions.
+  const slug = capabilityTag;
 
   function addStage(): void {
     const name = newStageName.trim();
@@ -197,8 +198,10 @@
                   {#if stage.ownerKind === 'capability'}
                     <input
                       bind:value={stage.owner}
+                      onblur={() => (stage.owner = stage.owner ? capabilityTag(stage.owner) : stage.owner)}
                       placeholder="capability"
                       aria-label="Capability required for stage {stage.name}"
+                      title="An agent holding this capability claims cards in this stage"
                       class="bg-surface border-border mono w-28 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
                     />
                   {/if}

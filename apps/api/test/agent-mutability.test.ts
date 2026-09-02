@@ -211,3 +211,52 @@ describe('token scopes are compared to the action attempted', () => {
     expect(JSON.parse(row!.scopes_json)).toEqual(['claim', 'run']);
   });
 });
+
+/**
+ * The spelling bug, which is the capability layer's absence showing through.
+ *
+ * Routing is `agent.capabilities.includes(stage.owner)` — exact equality between two free
+ * strings — and three code paths each spelled a capability differently: board templates
+ * slugified (`code-review`), the agent editor lowercased (`code review`), and the create route
+ * normalised nothing. A card in a "Code Review" lane could never be claimed by an agent whose
+ * operator had typed "Code Review", and nothing anywhere said why.
+ */
+describe('a capability is spelled the same everywhere', () => {
+  it('stores a multi-word capability the way a stage owner is stored', async () => {
+    const t = 'tnt_cap_spelling';
+    const { body } = await makeAgent(t, { name: 'S', capabilities: ['Code Review'] });
+    const stored = (await listAgents(t)).find((a) => a.id === body.agent!.id)!;
+    expect(stored.capabilities).toEqual(['code-review']);
+  });
+
+  it('normalises on create as well as on edit — both paths, one spelling', async () => {
+    const t = 'tnt_cap_both';
+    const { body } = await makeAgent(t, { name: 'B', capabilities: ['QA / Test'] });
+    const id = body.agent!.id;
+    expect((await listAgents(t)).find((a) => a.id === id)!.capabilities).toEqual(['qa-test']);
+
+    await patch(t, id, { capabilities: ['  Deploy To Prod '] });
+    expect((await listAgents(t)).find((a) => a.id === id)!.capabilities).toEqual(['deploy-to-prod']);
+  });
+
+  it('lets an agent actually claim the lane its operator meant', async () => {
+    const t = 'tnt_cap_claims';
+    // A board whose stage owner is typed the way a person types it, not pre-slugified.
+    const boardRes = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'CR', stages: [{ key: 'review', name: 'Code Review', order: 0, ownerKind: 'capability', owner: 'Code Review' }] }),
+    });
+    const { boardId } = await boardRes.json<{ boardId: string }>();
+    await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, { method: 'POST', headers: dev(t), body: JSON.stringify({ title: 'x' }) });
+
+    const { body } = await makeAgent(t, { name: 'Reviewer', capabilities: ['Code Review'] });
+    const claim = await SELF.fetch(`https://api.test/v1/boards/${boardId}/claims`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${body.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    // Before both sides shared one spelling this was `false`, silently and forever.
+    expect((await claim.json<{ claimed: boolean }>()).claimed).toBe(true);
+  });
+});

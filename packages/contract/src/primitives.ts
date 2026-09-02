@@ -83,6 +83,39 @@ export type RunOutcome = z.infer<typeof RunOutcome>;
 // has ever had. Liveness is knowable from `runs` in the board DO, which is where a claim happens.
 
 
+/**
+ * The one spelling of a work-capability tag.
+ *
+ * A capability is how kaambaan routes a card to an agent, and the whole of the match is
+ * `agent.capabilities.includes(stage.owner)` — exact string equality between two free strings.
+ * Nothing defines the set, so every place that produces one had invented its own spelling: board
+ * templates slugified a stage name (`code-review`), the agent editor lowercased it
+ * (`code review`), and the create route normalised nothing at all. Three spellings of one word,
+ * compared by equality, matching nothing.
+ *
+ * This is a normaliser, NOT the capability registry the charter's Capabilities layer calls for
+ * (`strategy/2026-08-12-layer-reference.md`, P1/P3, nouns `Capability, Provider`). That registry
+ * would say which capabilities EXIST and what they mean; this only guarantees that two people
+ * typing the same words produce the same tag. It belongs in the contract because it is the one
+ * thing both the Worker and the board UI must agree on, and a normaliser each side implements
+ * separately is the bug it exists to prevent.
+ *
+ * Work capabilities are also NOT AgentPod's station capabilities — `acp`, `fs.read`, `terminal`
+ * are protocol capabilities, and matching a grant on either was rejected as "the same word, two
+ * vocabularies" (charter decisions/2026-08-15-a-grant-names-an-agent-per-plane.md).
+ */
+export function capabilityTag(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/** Normalise a whole set, dropping empties and duplicates, order preserved. */
+export function capabilityTags(raw: string[]): string[] {
+  return [...new Set(raw.map(capabilityTag).filter((c) => c !== ''))];
+}
+
 export const ReferenceProvider = z.enum(['github', 'gitlab', 'docs', 'url']);
 export type ReferenceProvider = z.infer<typeof ReferenceProvider>;
 
