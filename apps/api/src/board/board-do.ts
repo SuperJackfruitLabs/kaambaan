@@ -534,7 +534,7 @@ export interface BoardStub {
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
   getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null }>;
   estimateCardCost(cardId: string): Promise<Result<EstimateView>>;
-  getNotifications(opts?: { unreadOnly?: boolean }): Promise<NotificationView[]>;
+  getNotifications(opts?: { unreadOnly?: boolean; userId?: string }): Promise<NotificationView[]>;
   markNotificationRead(seq: number): Promise<Result<{ ok: true }>>;
   registerPushConfig(input: PushConfigInput): Promise<Result<{ configId: string }>>;
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
@@ -1409,11 +1409,32 @@ export class BoardDO extends DurableObject<Env> {
     return this.computeUsage(since);
   }
 
-  /** In-app notifications for this board, newest first (docs/07 §7). */
-  async getNotifications(opts?: { unreadOnly?: boolean }): Promise<NotificationView[]> {
-    const where = opts?.unreadOnly ? `WHERE read = 0` : '';
+  /**
+   * In-app notifications for this board, newest first (docs/07 §7).
+   *
+   * `notifications.user_id` is written from the card owner and was never used as a filter, so
+   * every board notification was returned to every caller. With one member per workspace that was
+   * invisible; the moment a second person joins it is a disclosure — a notification body names a
+   * card and says what happened to it.
+   *
+   * A null `user_id` is addressed to nobody in particular (work became available, a card was
+   * refused at claim time) and reaches everyone. That is the design, not a gap: those are facts
+   * about the board rather than about a person.
+   *
+   * An omitted `userId` keeps the unfiltered read, for internal callers that have no person to
+   * filter by. Every route passes one.
+   */
+  async getNotifications(opts?: { unreadOnly?: boolean; userId?: string }): Promise<NotificationView[]> {
+    const predicates: string[] = [];
+    const params: unknown[] = [];
+    if (opts?.unreadOnly) predicates.push('read = 0');
+    if (opts?.userId !== undefined) {
+      predicates.push('(user_id IS NULL OR user_id = ?)');
+      params.push(opts.userId);
+    }
+    const where = predicates.length > 0 ? `WHERE ${predicates.join(' AND ')}` : '';
     return this.sql
-      .exec(`SELECT * FROM notifications ${where} ORDER BY seq DESC LIMIT 200`)
+      .exec(`SELECT * FROM notifications ${where} ORDER BY seq DESC LIMIT 200`, ...params)
       .toArray()
       .map((r) => ({
         seq: Number(r.seq),

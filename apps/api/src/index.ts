@@ -14,10 +14,12 @@
  *                   mechanism awaiting "OAuth/magic-link"; real login shipped, and no magic-link was
  *                   ever built.)
  *
- * Token `scopes` ARE enforced on the agent routes (auth/scopes.ts) — `claim` to take a card,
- * `run` to drive one, with `claim` grandfathering `run` for tokens minted before the split.
- * `memberships.role` is still stored and read by nothing; membership in the tenant remains the
- * granularity of human authorization.
+ * Both recorded permissions are now checked, where before neither was:
+ *   - token `scopes` on the agent routes (auth/scopes.ts) — `claim` to take a card, `run` to drive
+ *     one, with `claim` grandfathering `run` for tokens minted before the split.
+ *   - `memberships.role` on every human route (db/members.ts) — viewer reads, member works the
+ *     board, admin manages boards and agents, owner manages people and the fleet link. A caller
+ *     with no membership is refused rather than demoted to a reader.
  */
 import {
   BoardDO,
@@ -40,6 +42,7 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
+import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 
 export { BoardDO };
 
@@ -93,6 +96,32 @@ function statusForCode(code: BoardErrorCode): number {
  * string because that is what the boards routes have always answered with and
  * the web app already parses.
  */
+/**
+ * Refuse an act this member's role does not reach, or null to proceed.
+ *
+ * `memberships.role` was CHECK-constrained, written once as 'owner', and read by zero queries —
+ * the whole human authorization model recorded and never consulted. This is the consultation.
+ *
+ * Fails closed on a null role: a person whose membership was removed still holds a valid session
+ * cookie naming that tenant, and they are refused rather than demoted to a reader.
+ */
+function refuseByRole(user: UserPrincipal | null, capability: Capability): Response | null {
+  if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+  if (!user.role) return Response.json({ error: 'you are not a member of this workspace' }, { status: 403 });
+  if (!permits(user.role, capability)) {
+    return Response.json({ error: `a ${user.role} may not do that in this workspace` }, { status: 403 });
+  }
+  return null;
+}
+
+/** Would changing or removing this member leave the workspace with no owner at all? */
+async function isLastOwner(db: D1Database, tenantId: string, userId: string): Promise<boolean> {
+  const members = await listMembers(db, tenantId);
+  const target = members.find((m) => m.userId === userId);
+  if (!target || target.role !== 'owner') return false;
+  return (await ownerCount(db, tenantId)) <= 1;
+}
+
 function unexpected(err: unknown): Response {
   const message = (err as { message?: string })?.message ?? 'unexpected error';
   return Response.json({ error: { message } }, { status: 500 });
@@ -156,10 +185,9 @@ export default {
     // never establish the mapping that makes that token resolve. It is human-only or it is
     // unreachable.
     //
-    // Deliberately NOT scoped to owners today. `memberships.role` exists and nothing else in this
-    // file reads it; adding the first role check here would make this route the one place in
-    // kaambaan where membership is not enough, which is a decision about the whole product rather
-    // than about this endpoint. Recorded as a limit rather than settled in passing.
+    // Scoped to owners. The comment this replaces recorded the absence of that check as "a
+    // decision about the whole product rather than about this endpoint" — the decision is now
+    // made, in db/members.ts, and every route reads it from the same place.
     if (path === '/v1/tenant') {
       try {
         const u = await resolveUser(request, env);
@@ -171,6 +199,14 @@ export default {
           return Response.json({ tenant });
         }
         if (request.method !== 'PATCH') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        // Linking a plane is at least as consequential as revoking a credential, so it is the one
+        // act reserved to an owner. The comment this replaces recorded the absence of exactly this
+        // check as "a decision about the whole product rather than about this endpoint" — the
+        // decision is now made, in db/members.ts, and every route reads it from the same place.
+        {
+          const refused = refuseByRole(u, 'own');
+          if (refused) return refused;
+        }
 
         const body = (await request.json()) as { externalId?: string | null };
         if (body.externalId === undefined) {
@@ -206,6 +242,81 @@ export default {
         // mapping at all, which is a decision above this endpoint.
         await setTenantExternalMapping(env.DB, u.tenantId, { externalId: body.externalId, externalSource: 'agentpod' });
         return Response.json({ ok: true });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
+    // /v1/members[/:userId] — who is in this workspace, and what they may do.
+    //
+    // `memberships.role` has been CHECK-constrained to owner/admin/member/viewer since migration
+    // 0001, written exactly once as 'owner' by `ensurePersonalWorkspace`, and read by zero
+    // queries — so a workspace was permanently one person and the four roles described nothing.
+    // These are the routes that make it a real model.
+    //
+    // No mail is sent and none is needed: `users` is keyed on the email GitHub gives at sign-in,
+    // so recording the membership first means the invitee signs in and finds the workspace
+    // waiting (`primaryTenant` orders by `created_at`, so a membership made before their personal
+    // workspace exists is the one they land in).
+    const membersMatch = path.match(/^\/v1\/members(?:\/([^/]+))?$/);
+    if (membersMatch) {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const targetUserId = membersMatch[1];
+
+        if (request.method === 'GET' && !targetUserId) {
+          // Reading the roster is not an administrative act — a member needs to know who else can
+          // see their board, and who to ask when they cannot do something.
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ members: await listMembers(env.DB, u.tenantId) });
+        }
+
+        // Everything below changes who may act in this workspace, which is an owner's decision.
+        const refused = refuseByRole(u, 'own');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !targetUserId) {
+          const body = (await request.json()) as { email?: string; role?: string; name?: string };
+          const email = (body.email ?? '').trim();
+          // Validated here so a typo is a sentence rather than a membership nobody can ever use:
+          // the row is keyed on this address matching what GitHub returns at sign-in.
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            return Response.json({ error: 'a valid email address is required' }, { status: 400 });
+          }
+          const role = asRole(body.role ?? 'member');
+          if (!role) return Response.json({ error: 'role must be one of owner, admin, member, viewer' }, { status: 400 });
+          return Response.json({ member: await addMember(env.DB, u.tenantId, { email, role, name: body.name ?? null }) }, { status: 201 });
+        }
+
+        if (targetUserId && request.method === 'PATCH') {
+          const body = (await request.json()) as { role?: string };
+          const role = asRole(body.role);
+          if (!role) return Response.json({ error: 'role must be one of owner, admin, member, viewer' }, { status: 400 });
+          // A workspace with no owner cannot be administered by anyone, including to appoint a
+          // new one — it is unrecoverable through the product. So the last owner cannot step
+          // down; they appoint a second owner first.
+          if (role !== 'owner' && (await isLastOwner(env.DB, u.tenantId, targetUserId))) {
+            return Response.json({ error: 'this is the workspace\'s only owner — appoint another before changing this' }, { status: 409 });
+          }
+          if (!(await setMemberRole(env.DB, u.tenantId, targetUserId, role))) {
+            return Response.json({ error: 'not a member of this workspace' }, { status: 404 });
+          }
+          return Response.json({ ok: true });
+        }
+
+        if (targetUserId && request.method === 'DELETE') {
+          if (await isLastOwner(env.DB, u.tenantId, targetUserId)) {
+            return Response.json({ error: 'this is the workspace\'s only owner — appoint another before removing this one' }, { status: 409 });
+          }
+          if (!(await removeMember(env.DB, u.tenantId, targetUserId))) {
+            return Response.json({ error: 'not a member of this workspace' }, { status: 404 });
+          }
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
       } catch (err) {
         return unexpected(err);
       }
@@ -258,6 +369,17 @@ export default {
         // Human-only, exactly like revocation: `u` came from `resolveUser` alone, so an agent can
         // never mint itself a second credential to outlive one a person revoked
         // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+        // Everything below the agent list is workspace administration: minting and revoking
+        // credentials, restaffing an agent, deleting one. `member` works the board; managing what
+        // works it is `admin`.
+        if (request.method !== 'GET') {
+          const refused = refuseByRole(u, 'manage');
+          if (refused) return refused;
+        } else {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+        }
+
         if (mintingTokens) {
           if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
           if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
@@ -485,6 +607,18 @@ export default {
       // recorded with the card and outlives the token that carried it.
       if (!user) user = await resolveHubUser(request, env);
       if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+      // A viewer reads the board; working it — creating, moving, editing and deleting cards,
+      // resolving gates, answering an agent's question — is `member`, and reworking the board
+      // itself is `admin`. GET is the whole read surface here, so the method is the right
+      // discriminator rather than a list of paths that would drift from the routes below it.
+      const needed: Capability =
+        request.method === 'GET'
+          ? 'read'
+          : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles'
+            ? 'manage'
+            : 'work';
+      const refusedByRole = refuseByRole(user, needed);
+      if (refusedByRole) return refusedByRole;
       tenantId = user.tenantId;
     }
 
@@ -641,7 +775,9 @@ export default {
       // GET /v1/boards/:id/notifications — in-app notification feed (docs/07 §7)
       if (rest === 'notifications' && request.method === 'GET') {
         const unreadOnly = url.searchParams.get('unread') === 'true';
-        return Response.json({ notifications: await stub.getNotifications({ unreadOnly }) });
+        // Scoped to the caller: `user_id` was written and never read, so every board notification
+        // reached every member of the workspace.
+        return Response.json({ notifications: await stub.getNotifications({ unreadOnly, userId: user!.userId }) });
       }
 
       // POST /v1/boards/:id/notifications/:seq/read — mark a notification read (docs/07 §7)

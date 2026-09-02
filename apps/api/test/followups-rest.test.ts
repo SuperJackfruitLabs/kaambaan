@@ -43,10 +43,22 @@ describe('REST — attempts, estimate, notifications (docs/07 §5-7)', () => {
     expect(est.estimatedUsd).toBeCloseTo(0.6, 6);
 
     // Notifications: the failure raised one; unread filter + mark read.
-    const feed = ((await (await SELF.fetch(`${base}/v1/boards/${bid}/notifications?unread=true`, { headers: T })).json()) as { notifications: any[] }).notifications;
+    //
+    // Read AS the card's owner. `notifications.user_id` is written from the card owner and is now
+    // used as a filter — it was written and never read, so every board notification reached every
+    // caller, which one member per workspace made invisible and a second member makes a
+    // disclosure.
+    const asOwner = { ...T, 'X-User-Id': 'usr_owner' };
+    const feed = ((await (await SELF.fetch(`${base}/v1/boards/${bid}/notifications?unread=true`, { headers: asOwner })).json()) as { notifications: any[] }).notifications;
     expect(feed.some((n) => n.kind === 'failed')).toBe(true);
+
+    // And someone else's feed does not carry it.
+    const stranger = ((await (
+      await SELF.fetch(`${base}/v1/boards/${bid}/notifications?unread=true`, { headers: { ...T, 'X-User-Id': 'usr_other' } })
+    ).json()) as { notifications: any[] }).notifications;
+    expect(stranger.some((n) => n.kind === 'failed')).toBe(false);
     const seq = feed[0].seq;
-    const read = await SELF.fetch(`${base}/v1/boards/${bid}/notifications/${seq}/read`, { method: 'POST', headers: T });
+    const read = await SELF.fetch(`${base}/v1/boards/${bid}/notifications/${seq}/read`, { method: 'POST', headers: asOwner });
     expect(read.status).toBe(200);
     const after = ((await (await SELF.fetch(`${base}/v1/boards/${bid}/notifications?unread=true`, { headers: T })).json()) as { notifications: any[] }).notifications;
     expect(after.find((n) => n.seq === seq)).toBeUndefined();

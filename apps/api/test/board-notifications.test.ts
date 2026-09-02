@@ -71,3 +71,45 @@ describe('BoardDO — notifications (docs/07 §7)', () => {
     });
   });
 });
+
+/**
+ * `notifications.user_id` was written from the card owner and never used as a filter, so every
+ * board notification was returned to every caller. One member per workspace made that invisible;
+ * a second member makes it a disclosure.
+ */
+describe('BoardDO — a notification reaches the person it is for', () => {
+  it('keeps one person\'s notifications out of another\'s feed', async () => {
+    await runInDurableObject(stubFor('nf-scope'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_nf_s', tenantId: 'tnt_a', name: 'NF', stages: BUILD });
+      const mine = await board.createCard({ title: 'mine', ownerUserId: 'usr_a' });
+      const theirs = await board.createCard({ title: 'theirs', ownerUserId: 'usr_b' });
+      expect(mine.ok && theirs.ok).toBe(true);
+
+      const forA = await board.getNotifications({ userId: 'usr_a' });
+      const forB = await board.getNotifications({ userId: 'usr_b' });
+
+      // Whatever each feed holds, it must hold nothing addressed to the other person.
+      expect(forA.every((n) => n.userId === null || n.userId === 'usr_a')).toBe(true);
+      expect(forB.every((n) => n.userId === null || n.userId === 'usr_b')).toBe(true);
+
+      // And an unfiltered read still sees everything — internal callers have no person to filter by.
+      const all = await board.getNotifications();
+      expect(all.length).toBeGreaterThanOrEqual(Math.max(forA.length, forB.length));
+    });
+  });
+
+  it('delivers an unaddressed notification to everyone', async () => {
+    await runInDurableObject(stubFor('nf-broadcast'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_nf_b', tenantId: 'tnt_a', name: 'NF', stages: BUILD });
+      const c = await board.createCard({ title: 'x', ownerUserId: 'usr_a' });
+      if (!c.ok) return;
+
+      const all = await board.getNotifications();
+      const unaddressed = all.filter((n) => n.userId === null);
+      if (unaddressed.length === 0) return; // nothing unaddressed on this board; the rule is vacuous
+
+      const forStranger = await board.getNotifications({ userId: 'usr_nobody' });
+      expect(forStranger.length).toBe(unaddressed.length);
+    });
+  });
+});

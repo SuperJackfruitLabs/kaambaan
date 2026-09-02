@@ -14,6 +14,12 @@
     revokeAgentToken,
     updateAgent,
     issueAgentToken,
+    getMembers,
+    addMember,
+    setMemberRole,
+    removeMember,
+    type Member,
+    type Role,
     BOARD_TEMPLATES,
     type AgentToken,
     type AgentSummary,
@@ -88,6 +94,72 @@
 
   // issuing a replacement token, one agent at a time
   let issuingFor = $state<string | null>(null);
+
+  // ---- people ----
+  //
+  // A workspace was permanently one person: `memberships.role` was written once as 'owner' and
+  // read by nothing, and there was no invite, no member list and no role change. This panel is
+  // the whole human authorization model made visible — which matters because it is now enforced,
+  // so a member who cannot do something needs to see who to ask.
+  let members = $state<Member[]>([]);
+  let inviteEmail = $state('');
+  let inviteRole = $state<Role>('member');
+  let membersError = $state<string | null>(null);
+  let membersBusy = $state(false);
+
+  const ROLE_HELP: Record<Role, string> = {
+    viewer: 'reads the board',
+    member: 'works the board — cards, gates, questions',
+    admin: 'also manages boards and agents',
+    owner: 'also manages people and the fleet link',
+  };
+
+  async function refreshMembers(): Promise<void> {
+    members = await getMembers();
+  }
+
+  async function onInvite(): Promise<void> {
+    const email = inviteEmail.trim();
+    if (email === '') return;
+    membersBusy = true;
+    membersError = null;
+    try {
+      const res = await addMember(email, inviteRole);
+      if (!res.ok) {
+        // The server's own sentence — "a valid email address is required" — names the mistake.
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        membersError = body?.error ?? `Inviting failed (${res.status})`;
+        return;
+      }
+      inviteEmail = '';
+      await refreshMembers();
+    } finally {
+      membersBusy = false;
+    }
+  }
+
+  async function onRoleChange(m: Member, role: Role): Promise<void> {
+    membersError = null;
+    const res = await setMemberRole(m.userId, role);
+    if (!res.ok) {
+      // Includes the refusal to leave a workspace with no owner, which is the one an operator
+      // most needs to read rather than guess at.
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      membersError = body?.error ?? `Changing that role failed (${res.status})`;
+    }
+    await refreshMembers();
+  }
+
+  async function onRemoveMember(m: Member): Promise<void> {
+    if (!confirm(`Remove ${m.email} from this workspace? They lose access on their next request.`)) return;
+    membersError = null;
+    const res = await removeMember(m.userId);
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      membersError = body?.error ?? `Removing them failed (${res.status})`;
+    }
+    await refreshMembers();
+  }
   let minted = $state<AgentToken | null>(null);
   let minting = $state(false);
 
@@ -170,6 +242,7 @@
     }
     // The workspace's own fleet link, read alongside the agents it gates.
     await refreshWorkspace().catch(() => {});
+    await refreshMembers().catch(() => {});
     // Asked when the panel opens rather than on a click, because the answer
     // decides whether there is anything to click.
     await refreshHubSection().catch(() => {});
@@ -813,6 +886,62 @@
             {/if}
           </div>
           {/if}
+
+          <!--
+            People. Beside the agents rather than in a settings page, because both answer the same
+            question — who and what may act in this workspace — and a role is now enforced, so a
+            member refused an action needs to see who can grant it.
+          -->
+          <div class="border-border mt-5 border-t pt-4">
+            <div class="eyebrow mb-2">people</div>
+            <div class="space-y-1.5">
+              {#each members as m (m.userId)}
+                <div class="bg-inset border-border flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5">
+                  <span class="min-w-0 flex-1 truncate text-xs" title={m.email}>{m.name ?? m.email}</span>
+                  <select
+                    value={m.role}
+                    onchange={(e) => void onRoleChange(m, e.currentTarget.value as Role)}
+                    aria-label="Role for {m.email}"
+                    title={ROLE_HELP[m.role]}
+                    class="bg-surface border-border mono shrink-0 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                  >
+                    <option value="viewer">viewer</option>
+                    <option value="member">member</option>
+                    <option value="admin">admin</option>
+                    <option value="owner">owner</option>
+                  </select>
+                  <button
+                    onclick={() => void onRemoveMember(m)}
+                    aria-label="Remove {m.email}"
+                    class="text-muted-foreground hover:text-coral shrink-0"
+                  >
+                    <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                  </button>
+                </div>
+              {/each}
+            </div>
+            <div class="mt-2 flex gap-1.5">
+              <input
+                bind:value={inviteEmail}
+                type="email"
+                placeholder="invite by email"
+                aria-label="Email to invite"
+                onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void onInvite(); } }}
+                class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+              />
+              <select bind:value={inviteRole} aria-label="Role for the invitee" class="bg-inset border-border mono shrink-0 rounded-[6px] border px-1.5 text-[10px]">
+                <option value="viewer">viewer</option>
+                <option value="member">member</option>
+                <option value="admin">admin</option>
+                <option value="owner">owner</option>
+              </select>
+              <Button size="sm" variant="outline" onclick={() => void onInvite()} disabled={membersBusy || inviteEmail.trim() === ''}>Invite</Button>
+            </div>
+            <p class="text-muted-foreground mt-1.5 text-[11px] leading-relaxed">
+              {inviteRole}: {ROLE_HELP[inviteRole]}. No email is sent — they sign in with GitHub and find this workspace waiting.
+            </p>
+            {#if membersError}<p class="text-coral mt-1.5 text-xs leading-relaxed">{membersError}</p>{/if}
+          </div>
 
           <div class="border-border mt-5 border-t pt-4">
             <div class="eyebrow mb-2">new agent</div>
