@@ -12,6 +12,8 @@
     setWorkspaceFleet,
     type WorkspaceTenant,
     revokeAgentToken,
+    updateAgent,
+    issueAgentToken,
     BOARD_TEMPLATES,
     type AgentToken,
     type AgentSummary,
@@ -20,6 +22,7 @@
   import { Button } from '$lib/components/ui/button';
   import NewBoardDialog from '$lib/components/NewBoardDialog.svelte';
   import BoardSettings from '$lib/components/BoardSettings.svelte';
+  import CapabilityPicker from '$lib/components/CapabilityPicker.svelte';
   import BoardKanban from '$lib/components/board/BoardKanban.svelte';
   import ListView from '$lib/components/board/ListView.svelte';
   import CardDrawer from '$lib/components/CardDrawer.svelte';
@@ -61,9 +64,30 @@
   // agents manager
   let showConnect = $state(false);
   let agents = $state<AgentSummary[]>([]);
-  const ALL_CAPS = ['research', 'review', 'publish'];
+  /**
+   * The capabilities this board can actually staff.
+   *
+   * Was a hardcoded `['research','review','publish']` while the shipped templates define stages
+   * needing `code`, `test`, `deploy`, `triage` — so an agent could never be staffed to most of
+   * the templates the product ships with. A stage's `owner` slug is the only value
+   * `stageMatches` compares against, so it is the only honest source for this list.
+   */
+  const boardCaps = $derived(
+    [...new Set((board?.stages ?? []).filter((s) => s.ownerKind === 'capability' && s.owner).map((s) => s.owner!))].sort(),
+  );
   let agentName = $state('');
-  let newCaps = $state<string[]>(['research', 'review', 'publish']);
+  let newCaps = $state<string[]>([]);
+
+  // editing an existing agent, one at a time
+  let editingAgentId = $state<string | null>(null);
+  let editName = $state('');
+  let editCaps = $state<string[]>([]);
+  let editConcurrency = $state(1);
+  let editError = $state<string | null>(null);
+  let savingEdit = $state(false);
+
+  // issuing a replacement token, one agent at a time
+  let issuingFor = $state<string | null>(null);
   let minted = $state<AgentToken | null>(null);
   let minting = $state(false);
 
@@ -151,10 +175,6 @@
     await refreshHubSection().catch(() => {});
   }
 
-  function toggleCap(cap: string): void {
-    newCaps = newCaps.includes(cap) ? newCaps.filter((c) => c !== cap) : [...newCaps, cap];
-  }
-
   async function mintAgent(): Promise<void> {
     if (agentName.trim() === '' || newCaps.length === 0) return;
     minting = true;
@@ -194,7 +214,10 @@
   let hubPrincipals = $state<HubPrincipal[] | null>(null);
   let connecting = $state(false);
   let picked = $state<string[]>([]);
-  let importCaps = $state<string[]>(['claim']);
+  // Empty, and the Add button stays disabled until the operator picks. This defaulted to
+  // `['claim']` — a token SCOPE, not a capability — so every agent added through the picker got a
+  // capability no stage has ever named, and could claim nothing at all on any board.
+  let importCaps = $state<string[]>([]);
   let importing = $state(false);
   let importResult = $state<string | null>(null);
 
@@ -258,8 +281,17 @@
     }
   }
 
-  async function onDeleteAgent(id: string): Promise<void> {
-    const res = await deleteAgent(id);
+  async function onDeleteAgent(agent: AgentSummary): Promise<void> {
+    // Hard delete, no archive and no undo — the agent, every token it holds, and its principal
+    // link all go at once. A confirm() names what is lost rather than letting one stray click on
+    // a hover-revealed × do it silently.
+    const loses = [
+      agent.tokenIds.length > 0 ? `${agent.tokenIds.length} active token${agent.tokenIds.length === 1 ? '' : 's'}` : null,
+      agent.externalId ? 'its link to a suite principal' : null,
+    ].filter(Boolean);
+    const detail = loses.length > 0 ? ` This also deletes ${loses.join(' and ')}.` : '';
+    if (!confirm(`Delete ${agent.name}?${detail} This cannot be undone.`)) return;
+    const res = await deleteAgent(agent.id);
     if (res.ok) agents = await getAgents();
   }
 
@@ -337,6 +369,66 @@
   async function unlinkPrincipal(agent: AgentSummary): Promise<void> {
     const res = await setAgentPrincipal(agent.id, null);
     if (res.ok) agents = await getAgents();
+  }
+
+  // ---- edit an agent ----
+  //
+  // Capabilities were fixed at creation until the API grew a writer: the only way to restaff an
+  // agent was to delete it and make another, which for a linked agent discarded its principal
+  // link with it.
+  function startEditing(agent: AgentSummary): void {
+    editingAgentId = agent.id;
+    editName = agent.name;
+    editCaps = [...agent.capabilities];
+    editConcurrency = agent.concurrency ?? 1;
+    editError = null;
+  }
+
+  function cancelEditing(): void {
+    editingAgentId = null;
+    editError = null;
+  }
+
+  async function saveEditing(): Promise<void> {
+    if (!editingAgentId) return;
+    savingEdit = true;
+    editError = null;
+    try {
+      const res = await updateAgent(editingAgentId, {
+        name: editName.trim(),
+        capabilities: [...editCaps],
+        concurrency: editConcurrency,
+      });
+      if (!res.ok) {
+        // The server's own sentence, which names the field that was wrong.
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        editError = body?.error ?? `Saving failed (${res.status})`;
+        return;
+      }
+      agents = await getAgents();
+      editingAgentId = null;
+    } finally {
+      savingEdit = false;
+    }
+  }
+
+  // ---- issue a replacement token ----
+  //
+  // The other half of revocation. The panel has always said a tokenless agent "cannot
+  // authenticate until reconnected"; this is the reconnect.
+  async function onIssueToken(agent: AgentSummary): Promise<void> {
+    issuingFor = agent.id;
+    try {
+      const fresh = await issueAgentToken(agent.id);
+      // Shown through the same one-time reveal the create flow uses, so an operator meets the
+      // "copy it now" warning in exactly one place rather than two that look different.
+      minted = { agent: { id: agent.id, name: agent.name, capabilities: agent.capabilities }, ...fresh };
+      agents = await getAgents();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      issuingFor = null;
+    }
   }
 
   // ---- revoke a token ----
@@ -558,17 +650,48 @@
             {:else}
               {#each agents as a (a.id)}
                 <div class="bg-inset border-border group rounded-[8px] border px-3 py-2">
+                  {#if editingAgentId === a.id}
+                    <input
+                      bind:value={editName}
+                      aria-label="Agent name"
+                      class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1 text-sm outline-none"
+                    />
+                    <div class="text-muted-foreground mt-2 mb-1 text-[11px]">capabilities it can claim:</div>
+                    <CapabilityPicker bind:selected={editCaps} options={boardCaps} id="edit-caps-{a.id}" />
+                    <div class="mt-2 flex items-center gap-1.5">
+                      <label for="conc-{a.id}" class="text-muted-foreground text-[11px]">cards at once</label>
+                      <input
+                        id="conc-{a.id}"
+                        type="number"
+                        min="1"
+                        bind:value={editConcurrency}
+                        class="bg-surface border-border focus:border-marigold mono w-16 rounded-[6px] border px-2 py-1 text-[11px] outline-none"
+                      />
+                      <button onclick={() => void saveEditing()} disabled={savingEdit || editName.trim() === ''} class="mono ml-auto shrink-0 text-[11px] hover:brightness-110 disabled:opacity-40" style="color:var(--marigold)">
+                        {savingEdit ? 'saving…' : 'save'}
+                      </button>
+                      <button onclick={cancelEditing} class="text-muted-foreground hover:text-foreground shrink-0 text-[11px]">cancel</button>
+                    </div>
+                    {#if editError}<p class="text-coral mono mt-1 text-[10px] leading-relaxed">{editError}</p>{/if}
+                  {:else}
                   <div class="flex items-center justify-between gap-2">
                     <div class="min-w-0">
                       <div class="truncate text-sm">{a.name}</div>
-                      <div class="mt-1 flex flex-wrap gap-1">
+                      <div class="mt-1 flex flex-wrap items-center gap-1">
                         {#each a.capabilities as c (c)}<span class="border-border mono text-muted-foreground rounded-[4px] border px-1 py-0.5 text-[10px]">{c}</span>{/each}
+                        {#if a.capabilities.length === 0}
+                          <span class="text-coral text-[10px] leading-relaxed">no capabilities — this agent can claim nothing</span>
+                        {/if}
                       </div>
                     </div>
-                    <button onclick={() => void onDeleteAgent(a.id)} aria-label="Delete agent" title="Delete this agent and every one of its tokens" class="text-muted-foreground hover:text-coral shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
-                      <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
-                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      <button onclick={() => startEditing(a)} aria-label="Edit agent {a.name}" title="Change this agent's name, capabilities and concurrency" class="text-muted-foreground hover:text-foreground text-[11px]">edit</button>
+                      <button onclick={() => void onDeleteAgent(a)} aria-label="Delete agent" title="Delete this agent and every one of its tokens" class="text-muted-foreground hover:text-coral opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
+                        <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                      </button>
+                    </div>
                   </div>
+                  {/if}
 
                   <!-- suite principal: absent is the normal state for a standalone board, and says so -->
                   <div class="border-border/60 mt-2 border-t pt-2">
@@ -601,7 +724,9 @@
                   <!-- tokens: an agent with none cannot authenticate, and that is a real state, not silence -->
                   <div class="mt-2 flex flex-wrap items-center gap-1.5">
                     {#if a.tokenIds.length === 0}
-                      <span class="text-muted-foreground text-[11px] leading-relaxed">no active token — this agent cannot authenticate until reconnected</span>
+                      <span class="text-muted-foreground text-[11px] leading-relaxed">
+                        {a.externalId ? 'no kaambaan token — it authenticates with the tokens agentpod issues' : 'no active token — this agent cannot authenticate'}
+                      </span>
                     {:else}
                       {#each a.tokenIds as t (t)}
                         <span class="border-border mono text-muted-foreground flex items-center gap-1 rounded-[4px] border px-1.5 py-0.5 text-[10px]">
@@ -618,6 +743,14 @@
                         </span>
                       {/each}
                     {/if}
+                    <button
+                      onclick={() => void onIssueToken(a)}
+                      disabled={issuingFor === a.id}
+                      class="mono shrink-0 text-[10px] hover:brightness-110 disabled:opacity-40"
+                      style="color:var(--marigold)"
+                    >
+                      {issuingFor === a.id ? 'issuing…' : '+ token'}
+                    </button>
                   </div>
                 </div>
               {/each}
@@ -664,18 +797,7 @@
               <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">
                 capabilities they can claim:
               </div>
-              <div class="flex flex-wrap gap-1.5">
-                {#each ALL_CAPS as cap (cap)}
-                  <button
-                    onclick={() => (importCaps = importCaps.includes(cap) ? importCaps.filter((c) => c !== cap) : [...importCaps, cap])}
-                    class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {importCaps.includes(cap)
-                      ? 'border-marigold text-marigold'
-                      : 'border-border text-muted-foreground hover:text-foreground'}"
-                  >
-                    {importCaps.includes(cap) ? '✓ ' : ''}{cap}
-                  </button>
-                {/each}
-              </div>
+              <CapabilityPicker bind:selected={importCaps} options={boardCaps} id="import-caps" />
               {#if importResult}
                 <p class="mt-2 text-xs text-red-400" data-testid="import-failures">{importResult}</p>
               {/if}
@@ -701,18 +823,7 @@
               class="bg-inset border-border focus:border-marigold w-full rounded-[7px] border px-3 py-2 text-sm outline-none"
             />
             <div class="text-muted-foreground mt-2.5 mb-1.5 text-xs">capabilities it can claim:</div>
-            <div class="flex flex-wrap gap-1.5">
-              {#each ALL_CAPS as cap (cap)}
-                <button
-                  onclick={() => toggleCap(cap)}
-                  class="mono rounded-[6px] border px-2.5 py-1 text-[11px] transition {newCaps.includes(cap)
-                    ? 'border-marigold text-marigold'
-                    : 'border-border text-muted-foreground hover:text-foreground'}"
-                >
-                  {newCaps.includes(cap) ? '✓ ' : ''}{cap}
-                </button>
-              {/each}
-            </div>
+            <CapabilityPicker bind:selected={newCaps} options={boardCaps} id="new-caps" />
             <div class="mt-4 flex justify-end">
               <Button onclick={mintAgent} disabled={minting || agentName.trim() === '' || newCaps.length === 0}>{minting ? 'Minting…' : 'Create + mint token'}</Button>
             </div>

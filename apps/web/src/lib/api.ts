@@ -35,7 +35,15 @@ export interface AgentSummary {
   /** Its mapped suite principal (`prn_…`), or null — the normal state for a standalone board. */
   externalId: string | null;
   externalSource: string | null;
-  /** Active (non-revoked) token ids. Empty means this agent cannot authenticate right now. */
+  /** An avatar for card tiles, or null — the tile falls back to a coloured initial. */
+  iconUrl: string | null;
+  /** How many cards this agent may hold at once. */
+  concurrency: number;
+  /**
+   * Active (non-revoked) token ids. Empty means this agent cannot authenticate with a `kbn_`
+   * token right now — which for a linked agent is the ordinary state, since it authenticates
+   * with hub-issued tokens instead.
+   */
   tokenIds: string[];
 }
 
@@ -179,7 +187,16 @@ export interface BoardSnapshot {
   elicitations: Elicitation[];
   references: Reference[];
   usage: BoardUsage;
-  github: { issueTrigger: boolean; webhookConfigured: boolean };
+  github: {
+    issueTrigger: boolean;
+    webhookConfigured: boolean;
+    /**
+     * How many principals the board's standing trigger grant names, or null when it has none.
+     * Null with `issueTrigger` on means every card the integration creates will be refused at
+     * claim time — which is worth saying out loud, because nothing else notices.
+     */
+    triggerGrantCount: number | null;
+  };
 }
 
 export interface Profile {
@@ -569,6 +586,38 @@ export function deleteAgent(agentId: string): Promise<Response> {
  */
 export function setAgentPrincipal(agentId: string, externalId: string | null): Promise<Response> {
   return fetch(`/v1/agents/${agentId}`, { method: 'PATCH', headers, body: JSON.stringify({ externalId }) });
+}
+
+/**
+ * Change an agent's own properties after it exists.
+ *
+ * Until the API grew this, `capabilities` was fixed at creation: an agent staffed for the wrong
+ * stages could only be deleted and remade, which for a linked agent threw away its principal link
+ * too. Deliberately separate from {@link setAgentPrincipal} even though both are a PATCH to the
+ * same route — linking an identity and editing a description are different acts, and a caller
+ * should not have to think about one to do the other.
+ */
+export function updateAgent(
+  agentId: string,
+  patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number },
+): Promise<Response> {
+  return fetch(`/v1/agents/${agentId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
+}
+
+/**
+ * Issue a fresh `kbn_` token for an agent that already exists.
+ *
+ * The missing half of revocation: the UI has always said a revoked agent "cannot authenticate
+ * until reconnected", and there was no reconnect — tokens were minted only when an agent was
+ * created. The plaintext comes back exactly once, as it does on create.
+ */
+export async function issueAgentToken(agentId: string): Promise<{ token: string; tokenId: string }> {
+  const res = await fetch(`/v1/agents/${agentId}/tokens`, { method: 'POST', headers });
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(detail?.error ?? `issueAgentToken failed (${res.status})`);
+  }
+  return (await res.json()) as { token: string; tokenId: string };
 }
 
 /** This workspace, and the hub fleet it is linked to (or null for a standalone board). */
