@@ -1,4 +1,4 @@
-import { env, runInDurableObject } from 'cloudflare:test';
+import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import { BoardDO, type BoardInit, type CardView } from '../src/board/board-do';
 
@@ -104,5 +104,38 @@ describe('BoardDO', () => {
       expect(same.ok).toBe(true);
       if (same.ok) expect(same.value.currentStageKey).toBe('backlog');
     });
+  });
+});
+
+/**
+ * `DELETE /v1/boards/:id` removed the catalog row and nothing else, so the Durable Object and
+ * every card, run, gate and reference it held survived — unreachable through any route,
+ * undeleted, and still billing storage. A person who deleted a board had every reason to believe
+ * its contents were gone.
+ */
+describe('deleting a board takes its contents with it', () => {
+  const T = { 'X-Tenant-Id': 'tnt_destroy', 'Content-Type': 'application/json' };
+
+  it('leaves an uninitialised board behind, not a populated one', async () => {
+    const made = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ name: 'D', stages: [{ key: 'todo', name: 'To do', order: 0 }] }),
+    });
+    const { boardId } = await made.json<{ boardId: string }>();
+    await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, { method: 'POST', headers: T, body: JSON.stringify({ title: 'Doomed' }) });
+
+    expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: T })).status).toBe(200);
+
+    const gone = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { method: 'DELETE', headers: T });
+    expect(gone.status).toBe(204);
+
+    // The catalog no longer lists it…
+    const { boards } = await (await SELF.fetch('https://api.test/v1/boards', { headers: T })).json<{ boards: Array<{ id: string }> }>();
+    expect(boards.map((b) => b.id)).not.toContain(boardId);
+
+    // …and the DO behind it holds nothing. Woken by id, it answers as a board that was never made.
+    const after = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: T });
+    expect(after.status).toBe(404);
   });
 });

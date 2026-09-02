@@ -110,6 +110,25 @@
     titleEl?.focus();
   });
 
+  // ---- errors ----
+  let retrying = $state(false);
+
+  async function onRetry(): Promise<void> {
+    retrying = true;
+    try {
+      error = null;
+      await app.retry();
+      if (app.error) error = app.error;
+    } finally {
+      retrying = false;
+    }
+  }
+
+  function dismissError(): void {
+    error = null;
+    app.dismissError();
+  }
+
   // ---- dispatch ----
   async function onAdd(e: SubmitEvent): Promise<void> {
     e.preventDefault();
@@ -133,6 +152,13 @@
   // ---- board switch + board delete ----
   async function onDeleteBoard(id: string): Promise<void> {
     showBoardMenu = false;
+    // One click on a hover-revealed control used to delete a board outright — no confirmation, no
+    // undo, no archive. It now also takes the board's cards and history with it (it always should
+    // have; before, those survived unreachable), which makes saying so first the minimum.
+    const target = app.boards.find((b) => b.id === id);
+    const count = id === app.boardId ? (app.board?.cards.length ?? 0) : null;
+    const cards = count === null ? '' : ` and its ${count} card${count === 1 ? '' : 's'}`;
+    if (!confirm(`Delete "${target?.name ?? 'this board'}"${cards}? Its cards, runs and history go with it. This cannot be undone.`)) return;
     await app.deleteBoard(id);
     if (app.error) error = app.error;
   }
@@ -452,10 +478,20 @@
     </div>
   {/if}
 
-  <!-- Error bar -->
+  <!--
+    Error bar.
+
+    It carried a sentence and nothing else — no retry, no dismiss — so the only way past a failure
+    was to reload the page. An error a person cannot act on is a dead end, and a dead end that
+    stays on screen teaches them to ignore the bar.
+  -->
   {#if error || app.error}
-    <div role="alert" class="border-coral/40 text-coral mono border-t px-4 py-1.5 text-xs" style="background:rgba(255,107,87,.08)">
-      {error ?? app.error}
+    <div role="alert" class="border-coral/40 text-coral mono flex items-center gap-3 border-t px-4 py-1.5 text-xs" style="background:rgba(255,107,87,.08)">
+      <span class="min-w-0 flex-1">{error ?? app.error}</span>
+      <button onclick={() => void onRetry()} disabled={retrying} class="shrink-0 underline underline-offset-2 hover:brightness-125 disabled:opacity-50">
+        {retrying ? 'retrying…' : 'retry'}
+      </button>
+      <button onclick={dismissError} class="shrink-0 underline underline-offset-2 hover:brightness-125">dismiss</button>
     </div>
   {/if}
 </header>

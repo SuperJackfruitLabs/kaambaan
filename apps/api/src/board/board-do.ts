@@ -525,6 +525,7 @@ export interface BoardStub {
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
   setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
+  destroy(): Promise<{ ok: true }>;
   getState(): Promise<BoardSnapshot>;
   getEvents(limit?: number): Promise<BoardEvent[]>;
   // Agent contract (docs/04 §3)
@@ -1157,6 +1158,46 @@ export class BoardDO extends DurableObject<Env> {
 
   async getState(): Promise<BoardSnapshot> {
     return this.snapshot();
+  }
+
+  /**
+   * Erase this board.
+   *
+   * `DELETE /v1/boards/:id` removed the catalog row and nothing else, so the Durable Object and
+   * every card, run, activity, gate, reference and usage record it held survived — unreachable
+   * through any route, undeleted, and still billing storage. A person who deleted a board had
+   * every reason to believe its contents were gone.
+   *
+   * Rows are deleted rather than `storage.deleteAll()`. On a SQLite-backed DO `deleteAll` drops
+   * the tables themselves, and the schema is created in the constructor — so the live instance
+   * would go on serving requests against tables that no longer exist, answering 500 where it
+   * should answer "no such board". Emptying every table leaves `meta` with no `boardId`, which is
+   * precisely how an uninitialised board already reads.
+   *
+   * The alarm goes too: a reclaim scheduled for a board that no longer exists would wake this
+   * object for nothing, on a timer, forever.
+   */
+  async destroy(): Promise<{ ok: true }> {
+    for (const t of [
+      'usage_records',
+      'activities',
+      'runs',
+      'gates',
+      'elicitations',
+      'card_references',
+      'notifications',
+      'push_deliveries',
+      'push_configs',
+      'profiles',
+      'webhook_deliveries',
+      'events',
+      'cards',
+      'meta',
+    ]) {
+      this.sql.exec(`DELETE FROM ${t}`);
+    }
+    await this.ctx.storage.deleteAlarm();
+    return { ok: true };
   }
 
   async getEvents(limit = 100): Promise<BoardEvent[]> {

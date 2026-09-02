@@ -108,10 +108,47 @@
     app.openCard(card.id);
   }
 
+  /**
+   * Moving a card was mouse-only — drag and drop with no keyboard or menu alternative — so the
+   * board's central action was unavailable to keyboard and assistive-technology users.
+   *
+   * `Alt` + arrow rather than a bare arrow: bare arrows are how a keyboard user moves BETWEEN
+   * cards, and stealing them to move the card itself would make the board impossible to read.
+   */
+  const orderedStages = $derived([...(app.board?.stages ?? [])].sort((a, b) => a.order - b.order));
+  const stageIndex = $derived(orderedStages.findIndex((s) => s.key === card.currentStageKey));
+  let moveMenuOpen = $state(false);
+  let moveAnnouncement = $state('');
+
+  async function moveTo(stageKey: string): Promise<void> {
+    const target = orderedStages.find((s) => s.key === stageKey);
+    if (!target || stageKey === card.currentStageKey) return;
+    moveMenuOpen = false;
+    await app.moveCard(card.id, stageKey);
+    // Said out loud, because a keyboard user gets no visual feedback from a card that moved to a
+    // column they cannot see. A refusal (a WIP limit) already lands in the error bar.
+    moveAnnouncement = app.error ? '' : `${card.title} moved to ${target.name}`;
+  }
+
+  function shiftStage(by: number): void {
+    const next = orderedStages[stageIndex + by];
+    if (next) void moveTo(next.key);
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') {
       e.preventDefault();
       app.openCard(card.id);
+      return;
+    }
+    if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault();
+      shiftStage(e.key === 'ArrowRight' ? 1 : -1);
+      return;
+    }
+    if (e.key === 'm' || e.key === 'M') {
+      e.preventDefault();
+      moveMenuOpen = !moveMenuOpen;
     }
   }
 
@@ -134,11 +171,46 @@
   use:cardDraggable={{ cardId: card.id }}
   role="button"
   tabindex="0"
-  aria-label="Open {card.title}"
+  aria-label="{card.title}, in {orderedStages[stageIndex]?.name ?? card.currentStageKey}. Enter to open, M to move, Alt with left or right arrow to move between stages."
   onclick={handleClick}
   onkeydown={handleKeydown}
-  class="tile bg-surface border-border cursor-grab rounded-[10px] border p-3 text-left active:cursor-grabbing {gate ? 'tile-gate' : ''}"
+  class="tile bg-surface border-border group relative cursor-grab rounded-[10px] border p-3 text-left active:cursor-grabbing {gate ? 'tile-gate' : ''}"
 >
+  <!-- What just happened, for a reader who cannot see the column the card landed in. -->
+  <span aria-live="polite" class="sr-only">{moveAnnouncement}</span>
+
+  <!--
+    The menu alternative to dragging. Reachable by keyboard (M, or Tab to the control) and by a
+    pointer that cannot drag — a touch screen, a trackpad the user finds hard to hold.
+  -->
+  <div class="absolute top-2 right-2">
+    <button
+      onclick={(e) => { e.stopPropagation(); moveMenuOpen = !moveMenuOpen; }}
+      aria-label="Move {card.title} to another stage"
+      aria-expanded={moveMenuOpen}
+      title="Move to…"
+      class="text-muted-foreground hover:text-foreground mono px-1 text-[11px] leading-none opacity-0 focus:opacity-100 group-hover:opacity-100"
+      style="opacity:{moveMenuOpen ? 1 : undefined}"
+    >⇄</button>
+    {#if moveMenuOpen}
+      <div
+        role="menu"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); moveMenuOpen = false; } }}
+        class="bg-surface border-border absolute top-full right-0 z-20 mt-1 w-40 rounded-[8px] border py-1 shadow-xl"
+      >
+        {#each orderedStages as s (s.key)}
+          <button
+            role="menuitem"
+            onclick={() => void moveTo(s.key)}
+            disabled={s.key === card.currentStageKey}
+            class="hover:bg-inset block w-full px-2.5 py-1 text-left text-xs disabled:opacity-40"
+          >{s.name}{s.key === card.currentStageKey ? ' · here' : ''}</button>
+        {/each}
+      </div>
+    {/if}
+  </div>
   <!-- row1: priority chip + title + live dot -->
   <div class="row1 mb-2 flex items-start gap-2">
     {#if card.priority > 0}

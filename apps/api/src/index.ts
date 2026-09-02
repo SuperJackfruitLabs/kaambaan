@@ -671,8 +671,18 @@ export default {
         return Response.json(await stub.getState());
       }
 
-      // DELETE /v1/boards/:id — remove the board from the workspace (catalog entry)
+      // DELETE /v1/boards/:id — remove the board, and everything it held.
+      //
+      // This used to delete the catalog row alone, leaving the Durable Object and all its cards,
+      // runs, activities and references alive: unreachable through any route, undeleted, and
+      // still billing storage. A person who deleted a board had every reason to believe its
+      // contents were gone.
+      //
+      // The DO is emptied FIRST. If that throws, the catalog row survives and the board is still
+      // listed and still reachable — a delete that visibly did not happen, rather than a board
+      // that vanished from the list while its contents quietly stayed.
       if (rest === '' && request.method === 'DELETE') {
+        await stub.destroy();
         await deleteBoard(env.DB, tenantId, boardId);
         return new Response(null, { status: 204 });
       }

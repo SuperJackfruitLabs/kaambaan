@@ -109,6 +109,20 @@ class AppStore {
   cmdkOpen = $state(false);
 
   #socket: WebSocket | undefined;
+  /**
+   * Reconnection state for the live feed.
+   *
+   * A dropped WebSocket showed "offline" until the user reloaded the page — no retry, no polling
+   * fallback. A live board that silently stops being live is worse than one that never claimed to
+   * be: the cards on screen keep looking current.
+   *
+   * `#socketGeneration` is what makes a stale timer harmless. Switching boards or disposing
+   * bumps it, so a reconnect scheduled for the previous board finds its generation stale and
+   * returns rather than opening a socket onto a board nobody is looking at.
+   */
+  #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  #reconnectAttempt = 0;
+  #socketGeneration = 0;
 
   // ---- derived reads (methods stay reactive when read in templates) ----
   boardStates(): string[] {
@@ -245,11 +259,48 @@ class AppStore {
     } catch {
       this.agents = [];
     }
-    this.#socket?.close();
-    const sock = openBoardSocket(id, () => this.refresh());
-    sock.addEventListener('open', () => (this.connected = true));
-    sock.addEventListener('close', () => (this.connected = false));
+    this.#connect(id);
+  }
+
+  /**
+   * Open the live feed, and keep it open.
+   *
+   * Backoff is capped at 30s and jittered: every viewer of a board loses the socket at the same
+   * moment when a Worker restarts, and a fixed delay would have them all return in the same
+   * instant.
+   */
+  #connect(boardId: string): void {
+    this.#closeSocket();
+    const generation = this.#socketGeneration;
+    const sock = openBoardSocket(boardId, () => this.refresh());
+    sock.addEventListener('open', () => {
+      if (generation !== this.#socketGeneration) return;
+      this.connected = true;
+      this.#reconnectAttempt = 0;
+    });
+    sock.addEventListener('close', () => {
+      if (generation !== this.#socketGeneration) return;
+      this.connected = false;
+      const delay = Math.min(30_000, 1000 * 2 ** this.#reconnectAttempt) * (0.75 + Math.random() * 0.5);
+      this.#reconnectAttempt += 1;
+      this.#reconnectTimer = setTimeout(() => {
+        if (generation !== this.#socketGeneration) return;
+        // Refresh on the way back: whatever happened while the socket was down did not reach us,
+        // and reconnecting to a live feed with a stale board is the same lie in slower form.
+        void this.refresh();
+        this.#connect(boardId);
+      }, delay);
+    });
     this.#socket = sock;
+  }
+
+  /** Close the socket and cancel any pending reconnect, invalidating both for good measure. */
+  #closeSocket(): void {
+    this.#socketGeneration += 1;
+    if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+    this.#socket?.close();
+    this.#socket = undefined;
   }
 
   async switchBoard(id: string): Promise<void> {
@@ -375,7 +426,26 @@ class AppStore {
     this.cmdkOpen = !this.cmdkOpen;
   }
   dispose(): void {
-    this.#socket?.close();
+    // Through `#closeSocket`, so the pending reconnect goes with it. Closing the socket alone
+    // would leave a timer that reopens one after the component that owned it is gone.
+    this.#closeSocket();
+    this.connected = false;
+  }
+
+  /**
+   * Try again after a failure the operator can see.
+   *
+   * Errors were dead ends: a banner with no retry and no dismiss, so the only way past one was to
+   * reload. This is the retry; `dismissError` is the other half.
+   */
+  async retry(): Promise<void> {
+    this.error = null;
+    await this.refresh();
+    if (this.boardId && !this.connected) this.#connect(this.boardId);
+  }
+
+  dismissError(): void {
+    this.error = null;
   }
 }
 
