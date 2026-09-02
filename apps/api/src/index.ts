@@ -14,8 +14,10 @@
  *                   mechanism awaiting "OAuth/magic-link"; real login shipped, and no magic-link was
  *                   ever built.)
  *
- * `role` and token `scopes` are stored but not enforced anywhere — membership in the tenant is the
- * granularity of human authorization today.
+ * Token `scopes` ARE enforced on the agent routes (auth/scopes.ts) — `claim` to take a card,
+ * `run` to drive one, with `claim` grandfathering `run` for tokens minted before the split.
+ * `memberships.role` is still stored and read by nothing; membership in the tenant remains the
+ * granularity of human authorization.
  */
 import {
   BoardDO,
@@ -36,7 +38,8 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { recordBoard, listBoards, renameBoard, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
 
 export { BoardDO };
 
@@ -209,7 +212,7 @@ export default {
     // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
     // `findAgentByTokenHash` already refuses anything revoked (catalog.ts), so this write is the
     // whole mechanism.
-    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/tokens\/([^/]+))?)?$/);
+    const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/(tokens)(?:\/([^/]+))?)?)?$/);
     if (agentsMatch) {
       // Every route below is inside this, and the whole-branch review is why.
       // The only catch-all in this file wrapped `/v1/boards` alone, so an
@@ -238,7 +241,28 @@ export default {
         if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const agentId = agentsMatch[1];
-        const tokenId = agentsMatch[2];
+        const tokenId = agentsMatch[3];
+        const mintingTokens = agentId && agentsMatch[2] === 'tokens' && !tokenId;
+
+        // POST /v1/agents/:id/tokens — issue a fresh `kbn_` for an agent that already exists.
+        //
+        // Without this, revoking an agent's last token was terminal: tokens were only ever minted
+        // inside `POST /v1/agents`, so "cannot authenticate until reconnected" named a reconnect
+        // that did not exist, and a linked agent — which is created with no `kbn_` at all — could
+        // never be issued one even when it needed a native credential.
+        //
+        // Human-only, exactly like revocation: `u` came from `resolveUser` alone, so an agent can
+        // never mint itself a second credential to outlive one a person revoked
+        // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
+        if (mintingTokens) {
+          if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
+          if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
+            return Response.json({ error: 'agent not found' }, { status: 404 });
+          }
+          const minted = await createAgentToken(env.DB, u.tenantId, agentId, AGENT_TOKEN_SCOPES);
+          return Response.json({ token: minted.token, tokenId: minted.id }, { status: 201 });
+        }
+
         if (agentId && tokenId) {
           // Revoking a credential is a HUMAN act, same as minting one: `u` above came ONLY from
           // `resolveUser` (session cookie or dev headers) — never from a `kbn_` bearer or a hub
@@ -268,9 +292,59 @@ export default {
             if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
               return Response.json({ error: 'agent not found' }, { status: 404 });
             }
-            const body = (await request.json()) as { externalId?: string | null };
+            const body = (await request.json()) as {
+              externalId?: string | null;
+              name?: string;
+              capabilities?: string[];
+              iconUrl?: string | null;
+              concurrency?: number;
+            };
+
+            // The agent's OWN properties, which until now could be set exactly once — in the
+            // INSERT inside `createAgent` — and changed nowhere. An agent staffed with the wrong
+            // capabilities could not be restaffed; the only remedy was to delete it and make
+            // another, which for a linked agent discards its principal link too.
+            //
+            // Handled before the externalId branch, and independently of it: linking a principal
+            // and editing an agent are different acts that happen to share a route, and a PATCH
+            // carrying only `capabilities` must not be refused for want of an `externalId`.
+            const patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number } = {};
+            if (body.name !== undefined) {
+              if (typeof body.name !== 'string' || body.name.trim() === '') {
+                return Response.json({ error: 'name must be a non-empty string' }, { status: 400 });
+              }
+              patch.name = body.name.trim();
+            }
+            if (body.capabilities !== undefined) {
+              if (!Array.isArray(body.capabilities) || body.capabilities.some((c) => typeof c !== 'string' || c.trim() === '')) {
+                return Response.json({ error: 'capabilities must be an array of non-empty strings' }, { status: 400 });
+              }
+              // Normalised on the way in so `stageMatches` compares like with like: a stage's
+              // `owner` is a slug, and an operator typing "Code Review" must not produce a
+              // capability that silently matches no stage.
+              patch.capabilities = [...new Set(body.capabilities.map((c) => c.trim().toLowerCase()))];
+            }
+            if (body.iconUrl !== undefined) {
+              if (body.iconUrl !== null && !/^https:\/\//i.test(body.iconUrl)) {
+                // Rendered as an <img> src in the board UI, so the scheme is checked at the write
+                // boundary — the same rule `addReference` applies to a reference url.
+                return Response.json({ error: 'iconUrl must be an https URL, or null to clear it' }, { status: 400 });
+              }
+              patch.iconUrl = body.iconUrl;
+            }
+            if (body.concurrency !== undefined) {
+              if (!Number.isInteger(body.concurrency) || body.concurrency < 1) {
+                return Response.json({ error: 'concurrency must be a whole number of at least 1' }, { status: 400 });
+              }
+              patch.concurrency = body.concurrency;
+            }
+            if (Object.keys(patch).length > 0) await updateAgent(env.DB, u.tenantId, agentId, patch);
+
             if (body.externalId === undefined) {
-              return Response.json({ error: 'externalId is required (a prn_… string, or null to clear)' }, { status: 400 });
+              // A patch that only touched the agent's own fields is complete. Only a request that
+              // named NOTHING at all is a mistake worth reporting.
+              if (Object.keys(patch).length > 0) return Response.json({ ok: true });
+              return Response.json({ error: 'nothing to change: send name, capabilities, iconUrl, concurrency, or externalId' }, { status: 400 });
             }
             if (body.externalId === null) {
               await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);
@@ -346,7 +420,7 @@ export default {
             );
           }
 
-          const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, ['claim']);
+          const { id: tokenId, token } = await createAgentToken(env.DB, u.tenantId, created.id, AGENT_TOKEN_SCOPES);
           return Response.json({ agent: created, token, tokenId }, { status: 201 });
         }
         return Response.json({ error: 'method not allowed' }, { status: 405 });
@@ -391,6 +465,14 @@ export default {
       // that agent — capabilities still come from kaambaan's own agents row, never the claim.
       if (!agent) agent = await resolveHubAgent(request, env);
       if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
+      // Scopes stop being decoration here. Every `kbn_` token has carried a scope set since
+      // migration 0001, the resolver has always returned it, and nothing compared it to the action
+      // being attempted — so a token minted to claim drove every run verb. A recorded permission
+      // nobody checks reads as protection that does not exist (auth/scopes.ts).
+      const needed = requiredScope(rest);
+      if (needed && !scopePermits(agent.scopes, needed)) {
+        return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
+      }
       tenantId = agent.tenantId;
     } else {
       user = await resolveUser(request, env);
@@ -598,7 +680,16 @@ export default {
       // PUT /v1/boards/:id/github — configure GitHub: webhook secret + issue→card trigger (docs/06 §3, docs/05 §6)
       if (rest === 'github' && request.method === 'PUT') {
         const body = (await request.json()) as { secret?: string; issueTrigger?: boolean };
-        const result = await stub.setGithubConfig(body);
+        // Wiring a repository to a board IS the act of authorising automated
+        // dispatch from it, so the grant the operator holds at that moment is
+        // recorded with the configuration. A webhook fires with nobody present;
+        // without this the card it creates carries no authority and can never be
+        // claimed under enforcement.
+        //
+        // Re-sent on every config write, deliberately: the grant is only as good
+        // as the last person who confirmed it, and re-saving the settings is how
+        // an operator refreshes it after their own permissions change.
+        const result = await stub.setGithubConfig({ ...body, triggerGrant: user?.mayDispatch ?? null });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
       }
@@ -611,7 +702,16 @@ export default {
           spec?: JsonValue;
           source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
         };
-        const result = await stub.createCardFromTrigger({ title: body.title, ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_trigger', spec: body.spec, source: body.source });
+        const result = await stub.createCardFromTrigger({
+          title: body.title,
+          ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_trigger',
+          spec: body.spec,
+          // This route DOES have a caller, unlike the webhook — so the grant
+          // comes from them, and the board's standing grant is only the
+          // fallback for when it doesn't.
+          queuedGrant: user?.mayDispatch ?? null,
+          source: body.source,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
       }
@@ -640,7 +740,13 @@ export default {
         const claimResult = await stub.claim({
           agentId: agent!.agentId,
           capabilities: agent!.capabilities ?? payload.capabilities ?? [],
-          maxConcurrency: payload.maxConcurrency,
+          // `agents.concurrency` has existed since migration 0001 and was read by nothing. It is
+          // the operator's ceiling, so an agent may ask for LESS than it (a node that knows it is
+          // busy) but never for more: the request is a preference, the column is the permission.
+          maxConcurrency:
+            payload.maxConcurrency !== undefined && agent!.concurrency !== undefined
+              ? Math.min(payload.maxConcurrency, agent!.concurrency)
+              : (payload.maxConcurrency ?? agent!.concurrency),
           profileKey: payload.profileKey,
           principalId: agent!.externalId,
         });

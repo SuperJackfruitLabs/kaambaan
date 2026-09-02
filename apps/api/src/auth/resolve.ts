@@ -45,6 +45,20 @@ export interface AgentPrincipal {
    * tell "resolved, and there is none" from "not resolved here, look it up yourself".
    */
   externalId?: string | null;
+  /**
+   * The scopes on the `kbn_` token that authenticated this request (`agent_tokens.scopes_json`).
+   *
+   * **Null means "this credential is not a kaambaan token"** — a hub-issued agent token, or a dev
+   * header — not "no scopes". The distinction is load-bearing: `scopePermits` treats null as
+   * unscoped-and-therefore-unrestricted, because a hub token's authority is the hub's and is
+   * checked by the control pair at claim time, not by a scope kaambaan never minted.
+   */
+  scopes?: string[] | null;
+  /**
+   * The ceiling the operator set on how many cards this agent may hold (`agents.concurrency`).
+   * Absent on the paths that never read the catalog row.
+   */
+  concurrency?: number;
 }
 
 function devAuth(env: Env): boolean {
@@ -81,7 +95,14 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
   if (token && token.startsWith('kbn_')) {
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
     return found
-      ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: found.externalId }
+      ? {
+          tenantId: found.tenantId,
+          agentId: found.agentId,
+          capabilities: found.capabilities,
+          externalId: found.externalId,
+          scopes: found.scopes,
+          concurrency: found.concurrency,
+        }
       : null;
   }
   if (devAuth(env)) {

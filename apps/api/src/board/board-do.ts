@@ -420,7 +420,21 @@ export interface BoardSnapshot {
   elicitations: ElicitationView[];
   references: ReferenceView[];
   usage: BoardUsage;
-  github: { issueTrigger: boolean; webhookConfigured: boolean };
+  github: {
+    issueTrigger: boolean;
+    webhookConfigured: boolean;
+    /**
+     * How many principals the board's standing trigger grant names, or null when
+     * no grant is recorded.
+     *
+     * The count, never the ids: this snapshot is read by every board viewer, and
+     * which agents a particular operator may dispatch is that operator's
+     * business. What a viewer needs to know is whether automation on this board
+     * is authorised at all — because a board wired to a repository with no grant
+     * produces cards no agent can ever claim.
+     */
+    triggerGrantCount: number | null;
+  };
 }
 
 /** Board-level cost rollup + budget state (docs/07 §6). */
@@ -524,11 +538,12 @@ export interface BoardStub {
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
-  setGithubConfig(input: { secret?: string; issueTrigger?: boolean }): Promise<Result<{ ok: true }>>;
+  setGithubConfig(input: { secret?: string; issueTrigger?: boolean; triggerGrant?: string[] | null }): Promise<Result<{ ok: true }>>;
   createCardFromTrigger(input: {
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
+    queuedGrant?: string[] | null;
     source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
   }): Promise<Result<{ card: CardView; reference: ReferenceView | null; referenceError?: string }>>;
   handleGithubWebhook(input: {
@@ -907,9 +922,23 @@ export class BoardDO extends DurableObject<Env> {
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
+    /**
+     * The authority the caller carried, when there was a caller. A live human on
+     * `POST /v1/boards/:id/triggers` has one; a GitHub webhook does not, and
+     * falls back to the board's standing grant below.
+     */
+    queuedGrant?: string[] | null;
     source?: { url: string; provider?: string; sourceType?: string; externalId?: string; title?: string; metadata?: JsonValue };
   }): Promise<Result<{ card: CardView; reference: ReferenceView | null; referenceError?: string }>> {
-    const created = await this.createCard({ title: input.title, ownerUserId: input.ownerUserId, spec: input.spec });
+    const created = await this.createCard({
+      title: input.title,
+      ownerUserId: input.ownerUserId,
+      spec: input.spec,
+      // Without this the automation path produced cards that could never be
+      // claimed under enforcement — created, visible on the board, and parked on
+      // first claim forever, on the one path with no human watching.
+      queuedGrant: input.queuedGrant ?? this.triggerGrant(),
+    });
     if (!created.ok) return { ok: false, code: created.code, message: created.message };
     let reference: ReferenceView | null = null;
     let referenceError: string | undefined;
@@ -1143,13 +1172,54 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Configure GitHub integration: webhook secret + whether opened issues auto-create cards (docs/05 §6). */
-  async setGithubConfig(input: { secret?: string; issueTrigger?: boolean }): Promise<Result<{ ok: true }>> {
+  async setGithubConfig(input: {
+    secret?: string;
+    issueTrigger?: boolean;
+    /** See `triggerGrant()` — the standing authority for cards nobody is present to queue. */
+    triggerGrant?: string[] | null;
+  }): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     }
     if (input.secret !== undefined) this.setMeta('githubWebhookSecret', input.secret);
     if (input.issueTrigger !== undefined) this.setMeta('githubIssueTrigger', input.issueTrigger ? '1' : '0');
+    if (input.triggerGrant !== undefined) this.setTriggerGrant(input.triggerGrant);
     return { ok: true, value: { ok: true } };
+  }
+
+  /**
+   * The authority a card gets when nobody is present to carry one.
+   *
+   * Every other queueing path has a live human on the request, so the grant that
+   * accompanies the act is read off their token. A GitHub webhook has none: the
+   * person who wired the repository to this board is long gone by the time an
+   * issue is opened. That wiring IS the act of authorising automated dispatch,
+   * so the grant is captured then and stored here — the same answer, written
+   * down while it was still askable, which is the whole shape of the control
+   * pair (charter decisions/2026-08-13-ecosystem-identity.md, Decision 4).
+   *
+   * `null` stays an ordinary answer. A standalone board whose operator never
+   * held a hub token records nothing, and under enforcement its trigger-born
+   * cards park in `input-required` and say why — which is the honest outcome,
+   * and is what the audit found happening silently to every such card.
+   */
+  private triggerGrant(): string[] | null {
+    const raw = this.getMeta('triggerGrant');
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as string[]) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private setTriggerGrant(grant: string[] | null): void {
+    // Cleared by deleting the row rather than storing "null": `getMeta` answers
+    // null for an absent key, so an absent row and a cleared grant read the same
+    // — one state, not two that a later reader has to tell apart.
+    if (grant === null) this.sql.exec(`DELETE FROM meta WHERE k = ?`, 'triggerGrant');
+    else this.setMeta('triggerGrant', JSON.stringify(grant));
   }
 
   /**
@@ -2675,7 +2745,11 @@ export class BoardDO extends DurableObject<Env> {
       elicitations: boardId ? this.pendingElicitations() : [],
       references: boardId ? this.allReferences() : [],
       usage: boardId ? this.boardUsage() : { totalCostUsd: 0, estimatedCostUsd: 0, budgetUsd: null, cardUsdCap: null, overBudget: false },
-      github: { issueTrigger: this.getMeta('githubIssueTrigger') === '1', webhookConfigured: this.getMeta('githubWebhookSecret') !== null },
+      github: {
+        issueTrigger: this.getMeta('githubIssueTrigger') === '1',
+        webhookConfigured: this.getMeta('githubWebhookSecret') !== null,
+        triggerGrantCount: this.triggerGrant()?.length ?? null,
+      },
     };
   }
 
