@@ -42,8 +42,17 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
-import { capabilityTags } from '@kaambaan/contract';
+import { capabilityTag, capabilityTags } from '@kaambaan/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
+import {
+  listCapabilities,
+  createCapability,
+  updateCapability,
+  deleteCapability,
+  capabilityById,
+  capabilityUsage,
+  ensureCapabilities,
+} from './db/capabilities';
 
 export { BoardDO };
 
@@ -121,6 +130,24 @@ async function isLastOwner(db: D1Database, tenantId: string, userId: string): Pr
   const target = members.find((m) => m.userId === userId);
   if (!target || target.role !== 'owner') return false;
   return (await ownerCount(db, tenantId)) <= 1;
+}
+
+/**
+ * Register every capability this pipeline names, as `inferred`.
+ *
+ * The declaring half of the registry's asymmetry: a stage naming `code-review` is a workspace
+ * saying it needs code review done, so the capability comes into existence. An agent claiming one
+ * must reference something that already exists (see the `/v1/agents` routes) — because an agent
+ * holding a capability no stage names is the exact failure that matched nothing and said nothing.
+ */
+async function registerStageCapabilities(
+  env: Env,
+  tenantId: string,
+  stages: StageDef[],
+  createdBy: string | null,
+): Promise<void> {
+  const keys = stages.filter((s) => s.ownerKind === 'capability' && s.owner).map((s) => s.owner!);
+  if (keys.length > 0) await ensureCapabilities(env.DB, tenantId, keys, createdBy);
 }
 
 function unexpected(err: unknown): Response {
@@ -323,6 +350,100 @@ export default {
       }
     }
 
+    // /v1/capabilities[/:id] — the capability registry (migration 0006).
+    //
+    // A capability used to be a free string on both sides of an equality test, with nothing
+    // defining the set, so five producers each invented a vocabulary and almost nothing matched.
+    // These routes give a capability an identity and a definition.
+    //
+    // They deliberately do NOT enumerate what may exist: four of the five reference agent
+    // registries (MCP, A2A, Entra, NANDA) decline to define a vocabulary and standardise the
+    // record instead, and a closed list here would be a migration every time somebody adds a
+    // stage. The rows are shaped as A2A `AgentSkill` so a future AgentCard is a projection.
+    const capsMatch = path.match(/^\/v1\/capabilities(?:\/([^/]+))?$/);
+    if (capsMatch) {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const capId = capsMatch[1];
+
+        if (request.method === 'GET' && !capId) {
+          // A read: anyone who can see the board needs to know what its lanes ask for.
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ capabilities: await listCapabilities(env.DB, u.tenantId) });
+        }
+
+        // Defining the workspace's vocabulary is the same class of act as managing its agents.
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !capId) {
+          const body = (await request.json()) as {
+            key?: string;
+            name?: string;
+            description?: string | null;
+            tags?: string[];
+            examples?: string[];
+            externalId?: string | null;
+            externalSource?: string | null;
+          };
+          if (!body.key || capabilityTag(body.key) === '') {
+            return Response.json({ error: 'key is required, and must contain a letter or a digit' }, { status: 400 });
+          }
+          const made = await createCapability(env.DB, u.tenantId, { ...body, key: body.key, createdBy: u.userId });
+          if (!made) {
+            // A collision reads as a sentence rather than a raw UNIQUE failure — and re-declaring
+            // an existing capability is a rename, which `PATCH` does.
+            return Response.json({ error: `${capabilityTag(body.key)} already exists in this workspace` }, { status: 409 });
+          }
+          return Response.json({ capability: made }, { status: 201 });
+        }
+
+        if (capId && request.method === 'PATCH') {
+          const body = (await request.json()) as {
+            name?: string;
+            description?: string | null;
+            tags?: string[];
+            examples?: string[];
+            externalId?: string | null;
+            externalSource?: string | null;
+          };
+          // `key` is absent by design: stages and agents carry it, so renaming it in place would
+          // orphan every one of them silently — the identical reason a stage key cannot be renamed.
+          if ('key' in body) {
+            return Response.json({ error: 'a capability key cannot be renamed — stages and agents refer to it. Create another and restaff.' }, { status: 400 });
+          }
+          if (!(await updateCapability(env.DB, u.tenantId, capId, body))) {
+            return Response.json({ error: 'capability not found, or nothing to change' }, { status: 404 });
+          }
+          return Response.json({ capability: await capabilityById(env.DB, u.tenantId, capId) });
+        }
+
+        if (capId && request.method === 'DELETE') {
+          const cap = await capabilityById(env.DB, u.tenantId, capId);
+          if (!cap) return Response.json({ error: 'capability not found' }, { status: 404 });
+          // Removing one that is still named would silently stop the registry describing the
+          // product: the strings stay on the stage and the agent, matching carries on, and the
+          // list quietly goes wrong. So the refusal names who still refers to it.
+          const used = await capabilityUsage(env.DB, u.tenantId, cap.key);
+          if (used.agents.length > 0 || used.boards.length > 0) {
+            const who = [
+              used.boards.length > 0 ? `boards ${used.boards.join(', ')}` : null,
+              used.agents.length > 0 ? `agents ${used.agents.join(', ')}` : null,
+            ].filter(Boolean).join(' and ');
+            return Response.json({ error: `${cap.key} is still used by ${who}`, usage: used }, { status: 409 });
+          }
+          await deleteCapability(env.DB, u.tenantId, capId);
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     // /v1/agents[/:id[/tokens/:tokenId]] — a workspace's agents + token minting (the "connect an
     // agent" surface) + token revocation, right beside it. The plaintext token is returned ONCE
     // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
@@ -451,6 +572,12 @@ export default {
               // operator typing "Code Review" must produce `code-review` — what a stage named
               // "Code Review" carries — and not `code review`, which equals nothing.
               patch.capabilities = capabilityTags(body.capabilities);
+              // Registered, not refused. Refusing an unknown capability here was the first design
+              // and it was wrong twice over: it dead-ends the first agent in a workspace with no
+              // boards, and it only ever stops the NEXT typo — the agents already holding `claim`
+              // would have sailed through. Recording it instead lets `GET /v1/capabilities` say
+              // "held by 13 agents, named by no stage", which finds the bug retroactively.
+              await ensureCapabilities(env.DB, u.tenantId, patch.capabilities, u.userId);
             }
             if (body.iconUrl !== undefined) {
               if (body.iconUrl !== null && !/^https:\/\//i.test(body.iconUrl)) {
@@ -532,7 +659,9 @@ export default {
           // Same normalisation as PATCH. This path had none at all, so an agent could be created
           // with a capability spelled in a way no stage would ever match, and the only way to
           // discover that was a card that never moved.
-          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: capabilityTags(body.capabilities ?? []) });
+          const wanted = capabilityTags(body.capabilities ?? []);
+          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: wanted });
+          await ensureCapabilities(env.DB, u.tenantId, wanted, u.userId);
 
           if (linking) {
             await setAgentExternalMapping(env.DB, u.tenantId, created.id, {
@@ -640,7 +769,12 @@ export default {
         const body = (await request.json()) as { name: string; stages: StageDef[] };
         const id = newId('brd');
         const snapshot = await boardStub(env, tenantId, id).init({ id, tenantId, name: body.name, stages: body.stages });
-        await recordBoard(env.DB, tenantId, { id, name: body.name, stagesJson: JSON.stringify(body.stages) });
+        await recordBoard(env.DB, tenantId, { id, name: body.name, stagesJson: JSON.stringify(snapshot.stages) });
+        // A stage naming a capability IS the act of declaring the workspace needs that work done,
+        // so it registers the capability. Read from the SNAPSHOT rather than the request, because
+        // the DO normalised the owners on the way in and the registry must record what was
+        // actually stored, not what was asked for.
+        await registerStageCapabilities(env, tenantId, snapshot.stages, user?.userId ?? null);
         return Response.json({ boardId: id, board: snapshot }, { status: 201 });
       }
 
@@ -678,6 +812,7 @@ export default {
         const r = await stub.setStages(body.stages ?? []);
         if (!r.ok) return Response.json({ error: r }, { status: statusForCode(r.code) });
         await updateBoardStages(env.DB, tenantId, boardId, JSON.stringify(r.value.stages));
+        await registerStageCapabilities(env, tenantId, r.value.stages, user?.userId ?? null);
         return Response.json(await stub.getState());
       }
 
