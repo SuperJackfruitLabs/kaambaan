@@ -42,17 +42,33 @@ test.beforeEach(async ({ page, request }) => {
   await page.addInitScript(([key, id]) => window.localStorage.setItem(key, id), [BOARD_KEY, boardId]);
 });
 
-/** Elements whose right edge is past the viewport — the shape of the topbar clipping. */
+/**
+ * Elements that are past the right edge AND cannot be reached by scrolling to them.
+ *
+ * The distinction is the whole finding. The board's lanes extend past the viewport by design —
+ * they live in a horizontal scroller, and paging through them is how a pipeline is read on a
+ * phone. The topbar's controls extended past it inside an ancestor with `overflow: visible`, on a
+ * page that does not scroll sideways, so they were not off-screen-but-reachable; they were gone.
+ *
+ * So: walk up from each offending element and ask whether anything above it scrolls horizontally.
+ */
 async function overflowing(page: Page): Promise<string[]> {
-  return page.evaluate(() =>
-    [...document.querySelectorAll('*')]
+  return page.evaluate(() => {
+    const scrollableAncestor = (el: Element): boolean => {
+      for (let p = el.parentElement; p; p = p.parentElement) {
+        const ox = getComputedStyle(p).overflowX;
+        if ((ox === 'auto' || ox === 'scroll') && p.scrollWidth > p.clientWidth + 1) return true;
+      }
+      return false;
+    };
+    return [...document.querySelectorAll('*')]
       .filter((el) => {
         const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0 && r.right > window.innerWidth + 1;
+        return r.width > 0 && r.height > 0 && r.right > window.innerWidth + 1 && !scrollableAncestor(el);
       })
       .slice(0, 10)
-      .map((el) => `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]}`),
-  );
+      .map((el) => `${el.tagName.toLowerCase()}.${(el.className || '').toString().split(' ')[0]}`);
+  });
 }
 
 /** Interactive targets under the WCAG 2.2 floor. Hidden elements cannot be tapped and are skipped. */

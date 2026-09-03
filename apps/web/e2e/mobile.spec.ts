@@ -41,51 +41,57 @@ test.describe('on a phone', () => {
     );
   });
 
-  test('the rail is out of the way until asked for', async ({ page }) => {
+  test('the rail is out of the way entirely', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Visible on a phone').first()).toBeVisible();
 
-    // The rail is what ate the screen. It must not be on it by default.
-    await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeHidden();
+    // The rail is what ate the screen. Below 900px it is not rendered at all — the bottom bar is
+    // the navigation, so there is exactly one <nav> rather than one hidden behind another.
+    const navs = page.getByRole('navigation', { name: 'Main' });
+    await expect(navs).toHaveCount(1);
+    const box = await navs.boundingBox();
+    expect(box!.width).toBeGreaterThan(300); // the bottom bar spans the screen; the rail was 84px
   });
 
-  test('the menu button reveals it, and the scrim puts it away', async ({ page }) => {
+  test('the board is not pushed off the side by a rail', async ({ page }) => {
     await page.goto('/');
     await expect(page.getByText('Visible on a phone').first()).toBeVisible();
-
-    await page.getByRole('button', { name: 'Navigation' }).click();
-    const rail = page.getByRole('navigation', { name: 'Main navigation' });
-    await expect(rail).toBeVisible();
-
-    // Tapped where the scrim is actually visible. The rail is 208px of a
-    // 390px screen, so the scrim's own centre is underneath it — a
-    // centre-click would land on the rail, which is not what a person does.
-    await expect(page.getByRole('button', { name: 'Close navigation' })).toBeVisible();
-    await page.mouse.click(330, 400);
-    await expect(rail).toBeHidden();
+    const scrolls = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+    expect(scrolls).toBe(false);
   });
 
-  test('choosing a screen closes the rail behind you', async ({ page }) => {
-    // The most common version of this bug: a nav panel that stays open over
-    // the thing you just navigated to.
+  test('the three destinations are on screen, and each one goes somewhere', async ({ page }) => {
+    // Replaces three tests of a hamburger drawer, removed in the 2026-09-03 restructure. The
+    // drawer existed because a 208px rail could not fit beside a 390px board; the fix was not a
+    // better drawer but a bottom bar, so the assertions move to it rather than being deleted.
     await page.goto('/');
-    await page.getByRole('button', { name: 'Navigation' }).click();
-    const rail = page.getByRole('navigation', { name: 'Main navigation' });
-    await expect(rail).toBeVisible();
+    await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
 
-    await rail.getByRole('button', { name: /Triage/i }).click();
-    await expect(rail).toBeHidden();
-    await expect(page.getByText(/Needs You/i).first()).toBeVisible();
+    const nav = page.getByRole('navigation', { name: 'Main' });
+    for (const name of ['Plan', 'Operate', 'Workspace']) {
+      await expect(nav.getByRole('link', { name })).toBeVisible();
+    }
+
+    await nav.getByRole('link', { name: 'Operate' }).click();
+    await expect(page).toHaveURL(/\/operate$/);
+    await expect(page.getByRole('heading', { name: 'Needs you' })).toBeVisible();
+
+    await nav.getByRole('link', { name: 'Workspace' }).click();
+    await expect(page).toHaveURL(/\/workspace\/agents$/);
+
+    await nav.getByRole('link', { name: 'Plan' }).click();
+    await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
   });
 
-  test('escape closes it too', async ({ page }) => {
+  test('every navigation target clears the touch floor', async ({ page }) => {
+    // The audit measured eight controls under 24x24. A bottom bar whose targets are hard to hit
+    // is the same failure wearing a different layout.
     await page.goto('/');
-    await page.getByRole('button', { name: 'Navigation' }).click();
-    const rail = page.getByRole('navigation', { name: 'Main navigation' });
-    await expect(rail).toBeVisible();
-
-    await page.keyboard.press('Escape');
-    await expect(rail).toBeHidden();
+    const nav = page.getByRole('navigation', { name: 'Main' });
+    for (const name of ['Plan', 'Operate', 'Workspace']) {
+      const box = await nav.getByRole('link', { name }).boundingBox();
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
   });
 
   test('the board fits the screen rather than being pushed off it', async ({ page }) => {
@@ -98,18 +104,13 @@ test.describe('on a phone', () => {
 });
 
 test.describe('on a desktop', () => {
-  test('the rail is still simply there', async ({ page, request }) => {
-    // The whole change is a narrow-screen behaviour. If it alters the desktop
-    // layout at all, it has overreached.
-    const id = await board(request, 'Desktop unchanged E2E');
-    await page.addInitScript(
-      ([key, boardId]) => window.localStorage.setItem(key as string, boardId as string),
-      [BOARD_KEY, id],
-    );
+  test('the rail is still simply there, and the bottom bar is not', async ({ page }) => {
     await page.goto('/');
-
-    await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
-    // And no button offering to reveal what is already revealed.
-    await expect(page.getByRole('button', { name: 'Navigation' })).toBeHidden();
+    await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
+    // One navigation at a time: the rail above 900px, the bottom bar below it. Both at once was
+    // the shape of the `max-[900px]:`/`min-[900px]:` bug the restructure was careful to avoid.
+    const links = page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Plan' });
+    await expect(links).toHaveCount(1);
+    await expect(links).toBeVisible();
   });
 });

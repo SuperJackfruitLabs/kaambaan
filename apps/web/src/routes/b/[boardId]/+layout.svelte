@@ -12,6 +12,7 @@
    * gets. A board id in a URL is therefore not an existence oracle.
    */
   import { page } from '$app/state';
+  import { replaceState } from '$app/navigation';
   import { app } from '$lib/stores/app.svelte';
   import BoardHeader from '$lib/components/shell/BoardHeader.svelte';
   import CardDrawer from '$lib/components/CardDrawer.svelte';
@@ -24,6 +25,26 @@
     const id = boardId;
     if (app.authState !== 'ready' || !id || app.boardId === id) return;
     void app.openBoard(id);
+  });
+
+  /**
+   * Keep the address bar honest.
+   *
+   * Without this half a link works when followed and starts lying the moment the reader clicks
+   * anything — which is worse than no routing at all, because the URL now looks authoritative.
+   * It lived in `BoardScreen.svelte` and came back here when that file was retired; the e2e suite
+   * caught its absence, which is the entire reason that assertion exists.
+   *
+   * `replaceState` rather than `goto`: opening a card is not a navigation a reader expects Back to
+   * undo one step at a time. Back should leave the board, not walk through every card they glanced
+   * at.
+   */
+  $effect(() => {
+    if (!app.board) return;
+    const want = app.openCardId ? `/b/${boardId}/c/${app.openCardId}` : `/b/${boardId}`;
+    if (location.pathname !== want && !location.pathname.includes('/operate') && !location.pathname.includes('/settings')) {
+      replaceState(want, {});
+    }
   });
 </script>
 

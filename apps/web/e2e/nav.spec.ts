@@ -23,46 +23,40 @@ test.beforeEach(async ({ page, request }) => {
   );
 });
 
-test('telemetry screen shows spend', async ({ page }) => {
+/**
+ * Triage and Telemetry were rail destinations. Operate absorbed both on 2026-09-03 — along with
+ * the notification bell and the spend pill — which is the move that emptied the topbar. These
+ * assertions follow them rather than being deleted.
+ */
+test('operate shows spend, and its detail view breaks it down', async ({ page }) => {
   await page.goto('/');
-  // wait for the flight-deck shell to render (board columns visible)
   await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
-  // navigate to telemetry via the rail button
-  await page.getByRole('button', { name: /Telemetry/i }).click();
-  // the spend metric heading must be visible (specific text — "Spend" appears in several places)
-  await expect(page.getByText('Spend / budget')).toBeVisible();
+
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Operate' }).click();
+  await expect(page.getByRole('heading', { name: 'Spend' })).toBeVisible();
+  await expect(page.getByText('$0.00')).toBeVisible();
+
+  // By-model and by-card moved to the sub-view; the summary answers "are we fine", and this
+  // answers "where did it go".
+  await page.getByRole('link', { name: 'detail' }).click();
+  await expect(page).toHaveURL(/\/operate\/telemetry$/);
+  await expect(page.getByText(/by agent/i).first()).toBeVisible();
 });
 
-test('telemetry screen shows "By agent" panel', async ({ page }) => {
+test('operate shows what needs you, and says so plainly when nothing does', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: /Telemetry/i }).click();
-  await expect(page.getByText(/By agent/i)).toBeVisible();
+
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Operate' }).click();
+  await expect(page.getByRole('heading', { name: 'Needs you' })).toBeVisible();
+  // A fresh board has no gate, no question and no refusal.
+  await expect(page.getByText('Nothing is waiting on you.')).toBeVisible();
 });
 
-test('telemetry screen shows "By model" panel', async ({ page }) => {
+test('the board log is reachable from the spend detail view', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: /Telemetry/i }).click();
-  await expect(page.getByText(/By model/i)).toBeVisible();
-});
-
-test('triage screen shows "Needs You" heading', async ({ page }) => {
-  await page.goto('/');
-  // wait for the flight-deck shell to render
-  await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
-  // navigate to triage via the rail button
-  await page.getByRole('button', { name: /Triage/i }).click();
-  // the heading must be visible
-  await expect(page.getByRole('heading', { name: /Needs You/i })).toBeVisible();
-});
-
-test('triage screen shows empty-state copy when no gates', async ({ page }) => {
-  await page.goto('/');
-  await expect(page.getByText('Backlog', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: /Triage/i }).click();
-  // heading always visible
-  await expect(page.getByRole('heading', { name: /Needs You/i })).toBeVisible();
-  // with a fresh board (no gated/failed/over-budget cards) the empty state shows
-  await expect(page.getByText(/All clear — nothing needs you\./i)).toBeVisible();
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Operate' }).click();
+  await page.getByRole('link', { name: 'detail' }).click();
+  await expect(page.getByText(/board log/i)).toBeVisible();
 });
