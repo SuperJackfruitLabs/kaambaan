@@ -11,7 +11,6 @@
    */
   import { app } from '$lib/stores/app.svelte';
   import BoardSettings from '$lib/components/BoardSettings.svelte';
-  import { goto } from '$app/navigation';
 </script>
 
 <div class="p-3">
@@ -19,6 +18,6 @@
     <span aria-hidden="true">←</span> Board
   </a>
   {#if app.board}
-    <BoardSettings open={true} board={app.board} onClose={() => goto(`/b/${app.boardId}`)} onChanged={() => void app.refresh()} />
+    <BoardSettings board={app.board} onChanged={() => void app.refresh()} />
   {/if}
 </div>

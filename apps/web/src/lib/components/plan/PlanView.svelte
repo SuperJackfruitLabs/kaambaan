@@ -8,7 +8,7 @@
    */
   import { app } from '$lib/stores/app.svelte';
   import BoardKanban from '$lib/components/board/BoardKanban.svelte';
-  import ListView from '$lib/components/board/ListView.svelte';
+  import ListView from './ListView.svelte';
   import FilterBar from './FilterBar.svelte';
 </script>
 

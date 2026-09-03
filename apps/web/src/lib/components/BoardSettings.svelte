@@ -3,7 +3,7 @@
   import { renameBoard, setGithubConfig, setStages, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
   import { capabilityTag } from '@kaambaan/contract';
 
-  let { open = false, board, onClose, onChanged }: { open?: boolean; board: BoardSnapshot; onClose: () => void; onChanged: () => void } = $props();
+  let { board, onChanged }: { board: BoardSnapshot; onChanged: () => void } = $props();
 
   let nameInput = $state('');
   let githubSecret = $state('');
@@ -83,7 +83,7 @@
   const webhookUrl = $derived(`${location.origin}/v1/boards/${board.boardId}/webhooks/github?tenant=${board.tenantId}`);
 
   $effect(() => {
-    if (open && !seeded) {
+    if (!seeded) {
       nameInput = board.name ?? '';
       issueTrigger = board.github.issueTrigger;
       draft = board.stages.map((s) => ({ ...s }));
@@ -91,7 +91,6 @@
       void getProfiles(board.boardId!).then((p) => (profiles = p)).catch(() => (profiles = []));
       seeded = true;
     }
-    if (!open) seeded = false;
   });
 
   async function saveName(): Promise<void> {
@@ -129,21 +128,11 @@
   }
 </script>
 
-{#if open}
-  <div class="fixed inset-0 z-40 flex items-center justify-center p-4">
-    <button class="absolute inset-0 bg-black/55" onclick={onClose} aria-label="Close" tabindex="-1"></button>
-    <div class="bg-surface border-border drawer-in relative flex max-h-[90vh] w-full max-w-lg flex-col rounded-[12px] border shadow-2xl">
-      <div class="border-border flex items-start justify-between gap-3 border-b p-5">
-        <div>
-          <div class="eyebrow mb-1">board settings</div>
-          <h2 class="wordmark text-lg leading-snug">{board.name}</h2>
-        </div>
-        <button onclick={onClose} aria-label="Close" class="text-muted-foreground hover:text-foreground shrink-0">
-          <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
-        </button>
-      </div>
+<div class="mx-auto max-w-2xl">
+  <div class="eyebrow mb-1">board settings</div>
+  <h1 class="wordmark mb-4 text-lg leading-snug">{board.name}</h1>
 
-      <div class="flex-1 space-y-6 overflow-y-auto p-5">
+  <div class="space-y-6">
         <!-- rename -->
         <section>
           <div class="eyebrow mb-2">name</div>
@@ -313,7 +302,5 @@
             <Button size="sm" variant="outline" onclick={addProfile} disabled={busy === 'profile' || pKey.trim() === ''}>Add</Button>
           </div>
         </section>
-      </div>
-    </div>
   </div>
-{/if}
+</div>
