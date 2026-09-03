@@ -13,12 +13,23 @@
   import { goto } from '$app/navigation';
   import { app } from '$lib/stores/app.svelte';
   import { renameBoard } from '$lib/api';
+  import NewBoardDialog from '$lib/components/NewBoardDialog.svelte';
 
   let open = $state(false);
   let query = $state('');
   let renaming = $state(false);
   let draftName = $state('');
   let menuEl = $state<HTMLDivElement | null>(null);
+  /**
+   * Creating a board.
+   *
+   * It was a button in the topbar, and when that file was deleted the dialog became unreachable —
+   * a workspace could open the boards it already had and never make another. Found by scanning for
+   * components nothing imports, which is the check the parity walk should have started with.
+   *
+   * It belongs here: this menu is where boards are, so it is where a new one comes from.
+   */
+  let creating = $state(false);
 
   const boards = $derived(app.boards);
   const current = $derived(app.board?.name ?? 'Board');
@@ -120,7 +131,19 @@
         {/if}
         <a role="menuitem" href="/b/{app.boardId}/settings" onclick={close} class="hover:bg-inset text-muted-foreground block rounded-[7px] px-2.5 py-1.5 text-xs">Board settings</a>
         <button role="menuitem" onclick={() => void onDelete()} class="hover:bg-inset text-muted-foreground hover:text-coral w-full rounded-[7px] px-2.5 py-1.5 text-left text-xs">Delete this board…</button>
+        <button
+          role="menuitem"
+          onclick={() => { close(); creating = true; }}
+          class="hover:bg-inset border-border mt-1 w-full rounded-[7px] border-t px-2.5 py-2 text-left text-xs"
+          style="color:var(--marigold)"
+        >+ New board</button>
       </div>
     </div>
   {/if}
 </div>
+
+<NewBoardDialog
+  open={creating}
+  onClose={() => (creating = false)}
+  onCreated={(id) => { creating = false; void goto(`/b/${id}`); }}
+/>

@@ -138,6 +138,15 @@ for (const [name, size] of [['a phone', PHONE], ['a desktop', DESKTOP]] as const
       await expect(page.getByRole('heading', { name: /agents/i }).or(page.getByText(/capabilit/i)).first()).toBeVisible();
     });
 
+    test('a second board can be made', async ({ page }) => {
+      // Creating a board was a topbar button. Deleting that file left NewBoardDialog imported by
+      // nothing — a workspace could open the boards it had and never make another. Found by
+      // scanning for unreferenced components, and pinned here so it cannot happen again.
+      await page.goto(`/b/${boardId}`);
+      await page.getByRole('button', { name: /Reachable E2E/ }).first().click();
+      await expect(page.getByRole('menuitem', { name: '+ New board' })).toBeVisible();
+    });
+
     test('every stage is reachable', async ({ page }) => {
       // At 1440px only four of six stages fitted and the fourth was cut through its title. On a
       // phone the lanes were a squeezed desktop layout.
