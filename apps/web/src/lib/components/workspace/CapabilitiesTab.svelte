@@ -7,12 +7,25 @@
    * capability named by a stage and held by nobody is a lane no one can work. Neither is knowable
    * without counting, which is why the counts are the point rather than decoration.
    */
-  import { getCapabilities, createCapability, updateCapability, deleteCapability, type CapabilityRecord } from '$lib/api';
+  import {
+    getCapabilities,
+    createCapability,
+    updateCapability,
+    deleteCapability,
+    addImplication,
+    removeImplication,
+    type CapabilityRecord,
+  } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
 
   let capabilities = $state<CapabilityRecord[]>([]);
   let newKey = $state('');
   let error = $state<string | null>(null);
+  /** Existing keys the one just added looks like. A hint from the server, never a refusal. */
+  let similar = $state<string[]>([]);
+  /** Which capability's "implies" row is open. One at a time; this is a rare act. */
+  let implyingFor = $state<string | null>(null);
+  let implyTo = $state('');
 
   const orphans = $derived(capabilities.filter((c) => c.boardCount === 0 && c.agentCount > 0));
   const unstaffed = $derived(capabilities.filter((c) => c.agentCount === 0 && c.boardCount > 0));
@@ -26,13 +39,38 @@
     const key = newKey.trim();
     if (key === '') return;
     error = null;
+    similar = [];
     const res = await createCapability({ key });
+    const body = (await res.json().catch(() => null)) as { error?: string; similar?: string[] } | null;
     if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
       error = body?.error ?? `Adding failed (${res.status})`;
       return;
     }
+    // Named, not refused: only a person knows whether `cdoe` was a typo for `code` or a word they
+    // meant. Refusing would dead-end a legitimate first move and still miss every existing typo.
+    similar = body?.similar ?? [];
     newKey = '';
+    await refresh();
+  }
+
+  async function imply(from: string): Promise<void> {
+    const to = implyTo.trim();
+    if (to === '') return;
+    error = null;
+    const res = await addImplication(from, to);
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      error = body?.error ?? `Could not record that (${res.status})`;
+      return;
+    }
+    implyTo = '';
+    implyingFor = null;
+    await refresh();
+  }
+
+  async function unimply(from: string, to: string): Promise<void> {
+    error = null;
+    await removeImplication(from, to);
     await refresh();
   }
 
@@ -89,6 +127,42 @@
         aria-label="Description for {c.key}"
         class="bg-inset border-border focus:border-marigold mt-1.5 w-full rounded-[6px] border px-2 py-1 text-[11px]"
       />
+
+      <!--
+        Implication. Routing stays exact string equality; this is how a workspace says one
+        capability is a kind of another without making the match fuzzy. An agent holding this key
+        can claim lanes asking for anything listed here.
+      -->
+      <div class="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <span class="text-muted-foreground mono text-[10px]">implies</span>
+        {#each c.implies ?? [] as to (to)}
+          <span class="bg-inset border-border mono inline-flex items-center gap-1 rounded-[5px] border px-1.5 py-0.5 text-[10px]">
+            {to}
+            <button
+              onclick={() => void unimply(c.key, to)}
+              aria-label="Stop {c.key} implying {to}"
+              class="text-muted-foreground hover:text-coral"
+            >×</button>
+          </span>
+        {/each}
+        {#if implyingFor === c.key}
+          <input
+            bind:value={implyTo}
+            placeholder="capability"
+            aria-label="{c.key} implies"
+            onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void imply(c.key); } }}
+            onblur={() => { if (implyTo.trim() === '') implyingFor = null; }}
+            class="bg-inset border-border focus:border-marigold mono w-28 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+          />
+          <button onclick={() => void imply(c.key)} class="text-marigold mono text-[10px]">add</button>
+        {:else}
+          <button
+            onclick={() => { implyingFor = c.key; implyTo = ''; }}
+            aria-label="Add what {c.key} implies"
+            class="text-muted-foreground hover:text-foreground mono text-[10px]"
+          >+</button>
+        {/if}
+      </div>
     </div>
   {/each}
 
@@ -109,5 +183,13 @@
   />
   <Button variant="outline" onclick={() => void add()} disabled={newKey.trim() === ''}>Add</Button>
 </div>
+
+{#if similar.length > 0}
+  <p class="text-muted-foreground mt-2 text-xs leading-relaxed" data-testid="similar-hint">
+    This workspace already has <b class="mono">{similar.join(', ')}</b>. If one of those is what you
+    meant, remove the new one — routing is exact string equality, so two spellings are two
+    capabilities.
+  </p>
+{/if}
 
 {#if error}<p class="text-coral mt-3 text-xs leading-relaxed">{error}</p>{/if}

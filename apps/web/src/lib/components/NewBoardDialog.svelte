@@ -25,10 +25,20 @@
   interface DraftStage {
     name: string;
     ownerKind: 'capability' | 'human';
+    /**
+     * What an agent must hold. One capability is the ordinary case; a comma-separated list makes
+     * this a requirement SET, and `match` then says whether every member binds or any one does.
+     */
     owner: string;
+    match: 'all' | 'any';
     gate: boolean;
     wipLimit: number | null;
   }
+
+/** The capabilities an owner field names — one, or a comma-separated set. */
+function ownerParts(raw: string): string[] {
+  return [...new Set(raw.split(',').map(capabilityTag).filter((c) => c !== ''))];
+}
 
   let name = $state('');
   let stages = $state<DraftStage[]>([]);
@@ -38,8 +48,9 @@
   const unstaffed = $derived([
     ...new Set(
       stages
-        .filter((s) => s.ownerKind === 'capability' && s.owner && !staffed.has(capabilityTag(s.owner)))
-        .map((s) => capabilityTag(s.owner)),
+        .filter((s) => s.ownerKind === 'capability')
+        .flatMap((s) => ownerParts(s.owner))
+        .filter((c) => !staffed.has(c)),
     ),
   ]);
   let creating = $state(false);
@@ -50,7 +61,8 @@
     return tplStages.map((s) => ({
       name: s.name,
       ownerKind: s.ownerKind ?? 'human',
-      owner: s.owner ?? '',
+      owner: s.requires ? [...(s.requires.all ?? s.requires.any ?? [])].join(', ') : (s.owner ?? ''),
+      match: s.requires?.any ? 'any' : 'all',
       gate: s.gate === 'approval',
       wipLimit: s.wipLimit ?? null,
     }));
@@ -67,11 +79,11 @@
 
   function seedFrom(id: string): void {
     const tpl = BOARD_TEMPLATES.find((t) => t.id === id);
-    stages = tpl ? fromTemplate(tpl.stages) : [{ name: 'To do', ownerKind: 'human', owner: '', gate: false, wipLimit: null }];
+    stages = tpl ? fromTemplate(tpl.stages) : [{ name: 'To do', ownerKind: 'human', owner: '', match: 'all', gate: false, wipLimit: null }];
   }
 
   function addStage(): void {
-    stages = [...stages, { name: '', ownerKind: 'capability', owner: '', gate: false, wipLimit: null }];
+    stages = [...stages, { name: '', ownerKind: 'capability', owner: '', match: 'all', gate: false, wipLimit: null }];
   }
   function removeStage(i: number): void {
     stages = stages.filter((_, idx) => idx !== i);
@@ -98,7 +110,14 @@
       while (used.has(key)) key = `${key}-${i}`;
       used.add(key);
       const stage: Stage = { key, name: s.name.trim(), order: i, ownerKind: s.ownerKind };
-      if (s.ownerKind === 'capability') stage.owner = slug(s.owner) || slug(s.name);
+      if (s.ownerKind === 'capability') {
+        // One capability stays `owner` — the shape every existing board and every consumer
+        // already reads. Only a genuine set becomes `requires`, so nothing is rewritten to a new
+        // shape just for being edited.
+        const parts = ownerParts(s.owner);
+        if (parts.length > 1) stage.requires = s.match === 'any' ? { any: parts } : { all: parts };
+        else stage.owner = parts[0] ?? slug(s.name);
+      }
       if (s.gate) stage.gate = 'approval';
       if (s.wipLimit && s.wipLimit > 0) stage.wipLimit = s.wipLimit;
       return stage;
@@ -169,8 +188,18 @@
                 {#if stage.ownerKind === 'capability'}
                   <label class="text-muted-foreground flex items-center gap-1.5">
                     capability
-                    <input bind:value={stage.owner} placeholder={slug(stage.name) || 'e.g. research'} class="bg-surface border-border focus:border-marigold mono w-28 rounded-[5px] border px-1.5 py-0.5 text-[11px] outline-none" />
+                    <input bind:value={stage.owner} placeholder={slug(stage.name) || 'e.g. research'} class="bg-surface border-border focus:border-marigold mono w-40 rounded-[5px] border px-1.5 py-0.5 text-[11px] outline-none" />
                   </label>
+                  <!--
+                    The all/any choice only exists once a lane names more than one capability;
+                    offering it for a single tag would be a control that decides nothing.
+                  -->
+                  {#if ownerParts(stage.owner).length > 1}
+                    <div class="border-border flex shrink-0 overflow-hidden rounded-[5px] border text-[10px]">
+                      <button onclick={() => (stage.match = 'all')} class="mono px-1.5 py-0.5 {stage.match === 'all' ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground'}" title="An agent must hold every one">all</button>
+                      <button onclick={() => (stage.match = 'any')} class="mono border-border border-l px-1.5 py-0.5 {stage.match === 'any' ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground'}" title="Holding any one is enough">any</button>
+                    </div>
+                  {/if}
                 {:else}
                   <label class="text-muted-foreground flex items-center gap-1.5 select-none">
                     <input type="checkbox" bind:checked={stage.gate} class="accent-coral" /> approval gate
