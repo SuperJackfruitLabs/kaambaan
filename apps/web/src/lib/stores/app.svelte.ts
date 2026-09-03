@@ -32,7 +32,6 @@ import {
 const BOARD_KEY = 'kaambaan.boardId';
 const THEME_KEY = 'kaambaan.theme';
 
-export type Screen = 'board' | 'triage' | 'telemetry';
 export type Theme = 'dark' | 'light';
 export type View = 'board' | 'list';
 export type ListGroupBy = 'stage' | 'state' | 'owner' | 'priority';
@@ -58,25 +57,18 @@ class AppStore {
   connected = $state(false);
 
   /**
-   * Requests the command palette makes of screens it does not own.
+   * The one request the command palette still makes of a component it does not own.
    *
-   * Two palette rows — an Agents row, and "Dispatch a card" — closed the palette and did nothing
-   * at all. They cannot act directly: the agents panel belongs to BoardScreen and the compose
-   * field to Topbar, and the palette is a sibling of both. These are the signals they watch.
+   * Its other two — "open the agents panel" and "go to Triage" — are addresses now, so the palette
+   * navigates instead of signalling. Composing is not an address: it is a sheet over whatever you
+   * are looking at, and only the board header can open it.
    *
-   * A counter rather than a boolean for `composeRequest`, so asking twice in a row is two
-   * requests: a flag that is already true cannot be raised again.
+   * A counter rather than a boolean, so asking twice in a row is two requests: a flag that is
+   * already true cannot be raised again.
    */
-  agentsPanelFor = $state<string | null>(null);
   composeRequest = $state(0);
 
-  openAgentsPanel(agentId?: string): void {
-    this.setScreen('board');
-    this.agentsPanelFor = agentId ?? '';
-  }
-
   requestCompose(): void {
-    this.setScreen('board');
     this.composeRequest += 1;
   }
   error = $state<string | null>(null);
@@ -86,7 +78,6 @@ class AppStore {
   agents = $state<AgentSummary[]>([]);
 
   // navigation + view
-  screen = $state<Screen>('board');
   theme = $state<Theme>('dark');
   view = $state<View>('board');
   listGroupBy = $state<ListGroupBy>('stage');
@@ -105,7 +96,6 @@ class AppStore {
    * Lives here rather than inside `Rail.svelte` because more than the rail
    * closes it: choosing a screen does, and so should anything that navigates.
    */
-  railOpen = $state(false);
   cmdkOpen = $state(false);
 
   #socket: WebSocket | undefined;
@@ -374,11 +364,15 @@ class AppStore {
     }
   }
 
-  async createFirstBoard(): Promise<void> {
+  /** Returns the new board's id so the caller can navigate to it — every screen is a route now. */
+  async createFirstBoard(): Promise<string | null> {
     try {
-      await this.openBoard(await createBoard('My first board', BOARD_TEMPLATES[0]!.stages));
+      const id = await createBoard('My first board', BOARD_TEMPLATES[0]!.stages);
+      await this.openBoard(id);
+      return id;
     } catch (e) {
       this.error = String(e);
+      return null;
     }
   }
 
@@ -387,20 +381,6 @@ class AppStore {
   }
   closeCard(): void {
     this.openCardId = null;
-  }
-  setScreen(s: Screen): void {
-    this.screen = s;
-    // A nav rail that stays open over the thing you just navigated to is the
-    // most common version of this bug, so choosing a screen closes it.
-    this.railOpen = false;
-  }
-
-  toggleRail(): void {
-    this.railOpen = !this.railOpen;
-  }
-
-  closeRail(): void {
-    this.railOpen = false;
   }
   /** Mirror the theme the inline app.html script already applied to <html> into reactive state. */
   initTheme(): void {

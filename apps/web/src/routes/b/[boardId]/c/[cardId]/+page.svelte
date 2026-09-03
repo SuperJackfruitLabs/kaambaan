@@ -1,14 +1,20 @@
 <script lang="ts">
   /**
-   * A card, by address — what a Matrix approval links to.
+   * A card, by address — Plan with its drawer open.
    *
-   * A card id that is not on this board opens the board and clears the
-   * selection rather than erroring. Stale links are the normal case here: a
-   * gate lives in a room forever, and the card it names can be deleted,
-   * archived, or simply finished.
+   * The drawer is rendered by the board layout from `app.openCardId`, so this route's whole job is
+   * to set it. A card the snapshot does not contain leaves it closed rather than opening an empty
+   * drawer, which reads as a broken card instead of a stale link.
    */
   import { page } from '$app/state';
-  import BoardScreen from '$lib/components/BoardScreen.svelte';
+  import { app } from '$lib/stores/app.svelte';
+  import PlanView from '$lib/components/plan/PlanView.svelte';
+
+  $effect(() => {
+    const cardId = page.params.cardId;
+    if (!cardId || !app.board) return;
+    app.openCardId = app.board.cards.some((c) => c.id === cardId) ? cardId : null;
+  });
 </script>
 
-<BoardScreen routeBoardId={page.params.boardId} routeCardId={page.params.cardId} />
+<PlanView />

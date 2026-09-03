@@ -2,6 +2,10 @@
   import { app } from '$lib/stores/app.svelte';
   import { columnDropTarget } from '$lib/dnd';
   import CardTile from './CardTile.svelte';
+  import StageStepper from '$lib/components/plan/StageStepper.svelte';
+
+  /** The lane scroller, so the stepper can observe which lane is on screen and scroll to one. */
+  let scroller = $state<HTMLElement | null>(null);
 
   // local drag-over tracking (no external state needed)
   let overStage = $state<string | null>(null);
@@ -19,31 +23,32 @@
        No own overflow: the full-height screen container (in +page.svelte) is the scroller, so
        horizontal scroll works across the whole viewport height, not just the lanes' height.
        min-h-full makes the board fill the available height (drop targets + scroll region). -->
-  <div class="flex min-h-full items-start px-4 pt-4 pb-6">
+  <StageStepper stages={stages} container={scroller} />
+
+  <!-- Below 900px each lane is the width of the viewport and snaps, so the pipeline is paged
+       rather than squeezed. Above it, lanes sit side by side as before. -->
+  <div
+    bind:this={scroller}
+    class="flex min-h-full items-start overflow-x-auto px-3 pt-3 pb-6 [scroll-snap-type:x_mandatory] min-[900px]:px-4 min-[900px]:pt-4 min-[900px]:[scroll-snap-type:none]"
+  >
     {#each stages as stage, i (stage.key)}
       {@const cards = cardsInStage(stage.key)}
       {@const overLimit = stage.wipLimit !== undefined && cards.length >= stage.wipLimit}
 
       {#if i > 0}
-        <!-- marigold flow arrow between columns -->
-        <div class="flow-arrow px-2.5">
-          <svg
-            class="size-3.5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
+        <!-- The flow arrow, thinner. It used to take ~50px between every pair of 288px lanes,
+             which together put four of six stages on a 1440px screen with the fourth cut through
+             its own title. The waypoint language stays; it just stops costing a sixth of a lane. -->
+        <div class="flow-arrow hidden px-1.5 min-[900px]:block">
+          <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 6l6 6-6 6" />
           </svg>
         </div>
       {/if}
 
       <section
-        class="lane w-72 shrink-0 rounded-[12px] p-2 transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
+        data-lane
+        class="lane w-[calc(100vw-1.5rem)] shrink-0 rounded-[12px] p-2 [scroll-snap-align:center] min-[900px]:w-[264px] min-[900px]:[scroll-snap-align:none] transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
         use:columnDropTarget={{
           stageKey: stage.key,
           onDrop: (cardId) => app.moveCard(cardId, stage.key),
@@ -69,9 +74,10 @@
         <!-- cards -->
         <div class="lane-body mt-1.5 flex min-h-12 flex-col gap-2.5">
           {#if cards.length === 0}
-            <!-- ghost lane: awaiting work -->
-            <div class="eyebrow border-border/60 mx-1 rounded-[8px] border border-dashed px-2 py-4 text-center">
-              awaiting work
+            <!-- One quiet strip. Five full-height AWAITING WORK boxes meant the majority of the
+                 screen was spent saying "empty" five times at full width. -->
+            <div class="eyebrow border-border/60 mx-1 grid h-[34px] place-items-center rounded-[8px] border border-dashed text-center opacity-60">
+              empty
             </div>
           {/if}
           {#each cards as card (card.id)}

@@ -52,6 +52,27 @@
   --coral: #ff6b57;
   --coral-ink: #1c0805;
   --accent-bg: #232838;
+
+  /* ── System tokens ────────────────────────────────────────────────────────────────────
+     Two values that close three findings from the 2026-09-03 UI audit, and that no amount
+     of layout work substitutes for.
+
+     `--focus`: computed `outline-style` was `none` on every button AND every card tile, so
+     a keyboard user could move a card with Alt+arrow — a feature added FOR them — without
+     being able to see which card they were about to move.
+
+     `--tap`: WCAG 2.2 sets 24×24 CSS pixels as the target-size floor. Eight controls were
+     under it, including the two added for accessibility: the move control at 15×11 and the
+     compose expander at 15×16. The pointer query raises it where the pointer is a finger. */
+  --focus: 2px solid var(--marigold);
+  --focus-offset: 2px;
+  --tap: 24px;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --tap: 44px;
+  }
 }
 
 /* Light theme — warm paper ground, indigo-ink text; the signature accents are darkened so they
@@ -69,6 +90,32 @@
   --live: #0e9e86;
   --coral: #d6442b;
   --accent-bg: #efeae0;
+}
+
+/* Deliberately OUTSIDE every layer.
+   
+   Unlayered CSS outranks all layered CSS, including Tailwind's utilities — and that is the
+   point: 23 controls in this app carry `outline-none`, a utility that beat the same rule when
+   it lived in `@layer base`. A focus indicator any component can switch off is how an app ends
+   up with none, which is what the audit measured: computed `outline-style: none` on every
+   button and every card tile.
+   
+   `:focus-visible` rather than `:focus`, so a pointer click does not leave a ring behind it. */
+:focus-visible {
+  outline: var(--focus);
+  outline-offset: var(--focus-offset);
+  border-radius: 6px;
+}
+
+@layer utilities {
+  /* A control that must LOOK small still has to be hittable. Pad the target, never enlarge
+     the glyph — which is why this sets only the minimums and centres the content. */
+  .tap {
+    min-width: var(--tap);
+    min-height: var(--tap);
+    display: inline-grid;
+    place-items: center;
+  }
 }
 
 @layer base {

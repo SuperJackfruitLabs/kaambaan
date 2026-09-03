@@ -1,5 +1,9 @@
 import { test, expect } from '@playwright/test';
 
+// Composing is a sheet now, opened by the header's one primary action. The old inline field plus
+// a 15x16px `+` popover put priority, due date and description behind a control below the WCAG
+// target-size floor; they are first-class fields in the sheet.
+
 const BOARD_KEY = 'kaambaan.boardId';
 const API = 'http://localhost:8787';
 // The app talks to the API as the dev workspace (tnt_dev) when the server runs with DEV_AUTH on.
@@ -31,14 +35,16 @@ test('renders the pipeline columns and connects live', async ({ page }) => {
 
 test('creates a card via the composer', async ({ page }) => {
   await page.goto('/');
-  await page.getByLabel('New card title').fill('Write the launch post');
+  await page.getByRole('button', { name: 'New card' }).click();
+  await page.getByLabel('Card title').fill('Write the launch post');
   await page.getByRole('button', { name: 'Dispatch' }).click();
   await expect(page.getByText('Write the launch post')).toBeVisible();
 });
 
 test('moves a card to another column via drag', async ({ page }) => {
   await page.goto('/');
-  await page.getByLabel('New card title').fill('Draggable task');
+  await page.getByRole('button', { name: 'New card' }).click();
+  await page.getByLabel('Card title').fill('Draggable task');
   await page.getByRole('button', { name: 'Dispatch' }).click();
 
   const card = page.locator('.tile', { hasText: 'Draggable task' });
@@ -62,7 +68,8 @@ test('streams a new card to a second client in real time', async ({ browser }) =
   await b.goto('/');
   await expect(b.getByText('Backlog', { exact: true })).toBeVisible();
 
-  await a.getByLabel('New card title').fill('Realtime card');
+  await a.getByRole('button', { name: 'New card' }).click();
+  await a.getByLabel('Card title').fill('Realtime card');
   await a.getByRole('button', { name: 'Dispatch' }).click();
 
   await expect(b.getByText('Realtime card')).toBeVisible({ timeout: 10_000 });
