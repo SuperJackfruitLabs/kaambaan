@@ -23,6 +23,7 @@ import type { McpAuth } from './tools';
 import type { Env } from '../env';
 import { hashToken } from '../auth/agent-token';
 import { findAgentByTokenHash } from '../db/catalog';
+import { effectiveCapabilities } from '../db/implications';
 
 const PROTECTED_RESOURCE_PATH = '/.well-known/oauth-protected-resource';
 
@@ -35,11 +36,22 @@ export async function resolveMcpAuth(request: Request, env: Env): Promise<McpAut
   const token = match ? match[1]!.trim() : null;
   if (token && token.startsWith('kbn_')) {
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
-    return found
-      ? { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, externalId: found.externalId }
-      : null;
+    if (!found) return null;
+    return {
+      tenantId: found.tenantId,
+      agentId: found.agentId,
+      // Declared → effective, expanded ONCE here so `list_work` and `claim_card` cannot disagree.
+      // An agent told it has work and then refused it would retry forever, and the two tools take
+      // the capability set from the same object precisely so that cannot happen.
+      capabilities: await effectiveCapabilities(env.DB, found.tenantId, found.capabilities),
+      externalId: found.externalId,
+    };
   }
-  if (env.DEV_AUTH === 'true') return resolveBearer(request);
+  if (env.DEV_AUTH === 'true') {
+    const dev = resolveBearer(request);
+    if (!dev) return null;
+    return { ...dev, capabilities: await effectiveCapabilities(env.DB, dev.tenantId, dev.capabilities) };
+  }
   return null;
 }
 

@@ -42,7 +42,7 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
-import { capabilityTag, capabilityTags } from '@kaambaan/contract';
+import { capabilityTag, capabilityTags, stageRequiredCapabilities } from '@kaambaan/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
   listCapabilities,
@@ -52,7 +52,15 @@ import {
   capabilityById,
   capabilityUsage,
   ensureCapabilities,
+  similarKeys,
 } from './db/capabilities';
+import { buildAgentCard } from './db/agent-card';
+import {
+  addImplication,
+  effectiveCapabilities,
+  listImplications,
+  removeImplication,
+} from './db/implications';
 
 export { BoardDO };
 
@@ -146,7 +154,12 @@ async function registerStageCapabilities(
   stages: StageDef[],
   createdBy: string | null,
 ): Promise<void> {
-  const keys = stages.filter((s) => s.ownerKind === 'capability' && s.owner).map((s) => s.owner!);
+  // Every capability a stage mentions, however it mentions it — `owner`, or either arm of
+  // `requires`. Reading only `owner` would leave a set-valued lane's capabilities unregistered,
+  // so they would route correctly and be invisible to the registry that exists to explain them.
+  const keys = stages
+    .filter((s) => s.ownerKind === 'capability')
+    .flatMap((s) => stageRequiredCapabilities(s));
   if (keys.length > 0) await ensureCapabilities(env.DB, tenantId, keys, createdBy);
 }
 
@@ -360,6 +373,60 @@ export default {
     // registries (MCP, A2A, Entra, NANDA) decline to define a vocabulary and standardise the
     // record instead, and a closed list here would be a migration every time somebody adds a
     // stage. The rows are shaped as A2A `AgentSkill` so a future AgentCard is a projection.
+    // /v1/capabilities/implications — what one capability implies about another (migration 0007).
+    //
+    // Matched BEFORE `/v1/capabilities/:id`, or "implications" would be read as a capability id.
+    //
+    // Routing stays exact string equality; this is how a workspace says `code-review` is a kind of
+    // `code` without making the match fuzzy. An agent's DECLARED set is what an operator typed;
+    // its EFFECTIVE set is the closure over these edges, and only the latter is matched at claim.
+    if (path === '/v1/capabilities/implications') {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+
+        if (request.method === 'GET') {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ implications: await listImplications(env.DB, u.tenantId) });
+        }
+
+        // Declaring what a capability means is the same class of act as defining one.
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method === 'POST') {
+          const body = (await request.json()) as { from?: string; to?: string };
+          const res = await addImplication(env.DB, u.tenantId, body.from ?? '', body.to ?? '', u.userId);
+          if (!res.ok) {
+            const message =
+              res.code === 'SELF_IMPLICATION'
+                ? 'a capability already implies itself; an edge to itself says nothing'
+                : 'both from and to are required, and must contain a letter or a digit';
+            return Response.json({ error: message }, { status: 400 });
+          }
+          // Both sides are registered, so an edge cannot name a capability the registry has never
+          // heard of — which would show up later as an effective set nothing can explain.
+          await ensureCapabilities(env.DB, u.tenantId, capabilityTags([body.from!, body.to!]), u.userId);
+          return Response.json({ implications: await listImplications(env.DB, u.tenantId) }, { status: 201 });
+        }
+
+        if (request.method === 'DELETE') {
+          const url = new URL(request.url);
+          const from = url.searchParams.get('from') ?? '';
+          const to = url.searchParams.get('to') ?? '';
+          if (!(await removeImplication(env.DB, u.tenantId, from, to))) {
+            return Response.json({ error: 'no such implication' }, { status: 404 });
+          }
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     const capsMatch = path.match(/^\/v1\/capabilities(?:\/([^/]+))?$/);
     if (capsMatch) {
       try {
@@ -391,13 +458,21 @@ export default {
           if (!body.key || capabilityTag(body.key) === '') {
             return Response.json({ error: 'key is required, and must contain a letter or a digit' }, { status: 400 });
           }
+          // Existing keys that look like the one being created, computed BEFORE the write so the
+          // candidate does not match itself. A hint on the response, never a refusal: only a
+          // person knows whether `cdoe` was a typo for `code` or a word they meant.
+          const existing = (await listCapabilities(env.DB, u.tenantId)).map((c) => c.key);
+          const similar = similarKeys(body.key, existing);
+
           const made = await createCapability(env.DB, u.tenantId, { ...body, key: body.key, createdBy: u.userId });
           if (!made) {
             // A collision reads as a sentence rather than a raw UNIQUE failure — and re-declaring
             // an existing capability is a rename, which `PATCH` does.
             return Response.json({ error: `${capabilityTag(body.key)} already exists in this workspace` }, { status: 409 });
           }
-          return Response.json({ capability: made }, { status: 201 });
+          return Response.json(similar.length > 0 ? { capability: made, similar } : { capability: made }, {
+            status: 201,
+          });
         }
 
         if (capId && request.method === 'PATCH') {
@@ -427,10 +502,13 @@ export default {
           // product: the strings stay on the stage and the agent, matching carries on, and the
           // list quietly goes wrong. So the refusal names who still refers to it.
           const used = await capabilityUsage(env.DB, u.tenantId, cap.key);
-          if (used.agents.length > 0 || used.boards.length > 0) {
+          if (used.agents.length > 0 || used.boards.length > 0 || used.implications.length > 0) {
             const who = [
               used.boards.length > 0 ? `boards ${used.boards.join(', ')}` : null,
               used.agents.length > 0 ? `agents ${used.agents.join(', ')}` : null,
+              // An edge refers to it too. Deleting one end would leave an agent's effective set
+              // containing a capability the registry can no longer explain.
+              used.implications.length > 0 ? `implications ${used.implications.join(', ')}` : null,
             ].filter(Boolean).join(' and ');
             return Response.json({ error: `${cap.key} is still used by ${who}`, usage: used }, { status: 409 });
           }
@@ -449,6 +527,37 @@ export default {
     // on create; thereafter only its hash is stored, and revoking sets `revoked_at` on that row —
     // `findAgentByTokenHash` already refuses anything revoked (catalog.ts), so this write is the
     // whole mechanism.
+    // GET /v1/agents/:id/card — the agent's A2A AgentCard, projected from the registry.
+    //
+    // Matched before the agents block, whose regex ends at `/tokens`. This is what naming
+    // migration 0006's columns after `AgentSkill` was for: the card is a projection of those rows
+    // rather than a translation of them, so nothing is renamed on the way out.
+    const cardMatch = path.match(/^\/v1\/agents\/([^/]+)\/card$/);
+    if (cardMatch) {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        if (request.method !== 'GET') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        const refused = refuseByRole(u, 'read');
+        if (refused) return refused;
+
+        const agents = await listAgents(env.DB, u.tenantId);
+        const found = agents.find((a) => a.id === cardMatch[1]);
+        if (!found) return Response.json({ error: 'no such agent' }, { status: 404 });
+
+        // The card shows the EFFECTIVE set: what this agent can actually be routed for. Showing
+        // only the declared set would publish a card that disagrees with the claim predicate.
+        const effective = await effectiveCapabilities(env.DB, u.tenantId, found.capabilities);
+        const card = buildAgentCard(
+          { name: found.name, capabilities: effective },
+          await listCapabilities(env.DB, u.tenantId),
+        );
+        return Response.json({ card });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     const agentsMatch = path.match(/^\/v1\/agents(?:\/([^/]+)(?:\/(tokens)(?:\/([^/]+))?)?)?$/);
     if (agentsMatch) {
       // Every route below is inside this, and the whole-branch review is why.
@@ -1061,9 +1170,14 @@ export default {
       if (rest === 'claims' && request.method === 'POST') {
         if (!agent!.agentId) return Response.json({ error: 'an agent identity is required to claim' }, { status: 400 });
         const payload = (await request.json()) as { capabilities?: string[]; maxConcurrency?: number; profileKey?: string };
+        // Declared → effective. An agent staffed for `code-review` claims a `code` lane when the
+        // workspace has said one implies the other. The expansion happens HERE, at the Worker
+        // boundary, because the edges live in the catalog and the Durable Object has no D1: the
+        // DO keeps matching a flat set and stays ignorant of where it came from.
+        const declared = agent!.capabilities ?? payload.capabilities ?? [];
         const claimResult = await stub.claim({
           agentId: agent!.agentId,
-          capabilities: agent!.capabilities ?? payload.capabilities ?? [],
+          capabilities: await effectiveCapabilities(env.DB, agent!.tenantId, declared),
           // `agents.concurrency` has existed since migration 0001 and was read by nothing. It is
           // the operator's ceiling, so an agent may ask for LESS than it (a node that knows it is
           // busy) but never for more: the request is a preference, the column is the permission.

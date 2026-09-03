@@ -3,7 +3,7 @@ import { canTransition, nextState, type GateDecision, type TaskEventType, type T
 import type { Env } from '../env';
 import { newId } from '../ids';
 import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
-import { capabilityTag } from '@kaambaan/contract';
+import { capabilityTag, normalizeRequirement, stageCapabilitiesMet } from '@kaambaan/contract';
 import { parseElicitationOptions } from './elicitation';
 import { verifyGithubSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
@@ -96,10 +96,36 @@ export interface StageDef {
   order: number;
   ownerKind?: 'capability' | 'agent' | 'human';
   owner?: string; // a capability tag (ownerKind=capability) or an agentId (ownerKind=agent)
+  /**
+   * A multi-capability requirement for a capability lane: `all` every member, `any` at least one.
+   * Wins over `owner` when present. A sibling field rather than a union on `owner` because
+   * SQLite's `json_each` raises on a scalar, so widening `owner` would break `boardCount` on
+   * every stage that already exists (see `StageRequirement` in @kaambaan/contract).
+   */
+  requires?: { all?: string[]; any?: string[] };
   gate?: 'none' | 'approval';
   wipLimit?: number;
   /** Stage routing strategy (docs/05 §7): `pipeline` (sequential handoff, default) vs `manager`. */
   routing?: 'pipeline' | 'manager';
+}
+
+/**
+ * Canonicalise a stage's routing fields.
+ *
+ * Both write boundaries — `init` and `setStages` — pass every capability a stage mentions through
+ * the one spelling, because routing is exact string equality and a stage typed "Code Review" that
+ * stores `Code Review` is a lane no agent can ever claim, with nothing to say why. A requirement
+ * that normalises to nothing is dropped, so a stray `{}` from an editor falls back to `owner`
+ * rather than becoming a lane nobody can work.
+ */
+function normalizeStageRouting(s: StageDef): StageDef {
+  if (s.ownerKind !== 'capability') return s;
+  const out: StageDef = { ...s };
+  if (s.owner) out.owner = capabilityTag(s.owner);
+  const req = normalizeRequirement(s.requires);
+  if (req) out.requires = req;
+  else delete out.requires;
+  return out;
 }
 
 /** A reusable agent configuration bundle (docs/05 §7). */
@@ -885,7 +911,7 @@ export class BoardDO extends DurableObject<Env> {
       // Same normalisation as `setStages`: a board created with a mis-spelled capability owner is
       // a board whose lane no agent can ever claim from.
       const stages = [...board.stages]
-        .map((s) => (s.ownerKind === 'capability' && s.owner ? { ...s, owner: capabilityTag(s.owner) } : s))
+        .map(normalizeStageRouting)
         .sort((a, b) => a.order - b.order);
       this.setMeta('boardId', board.id);
       this.setMeta('tenantId', board.tenantId);
@@ -1153,7 +1179,7 @@ export class BoardDO extends DurableObject<Env> {
     // stage whose owner is typed "Code Review" must carry `code-review`, or no agent can ever
     // claim it and nothing says why.
     const ordered = [...stages]
-      .map((s) => (s.ownerKind === 'capability' && s.owner ? { ...s, owner: capabilityTag(s.owner) } : s))
+      .map(normalizeStageRouting)
       .sort((a, b) => a.order - b.order);
     this.setMeta('stages', JSON.stringify(ordered));
     this.emit('board.stages_changed', { stages: ordered });
@@ -2545,7 +2571,9 @@ export class BoardDO extends DurableObject<Env> {
 
   private stageMatches(stage: StageDef, agentId: string, capabilities: string[]): boolean {
     if (stage.ownerKind === 'agent') return stage.owner === agentId;
-    if (stage.ownerKind === 'capability') return stage.owner !== undefined && capabilities.includes(stage.owner);
+    // The predicate lives in the contract so the claim path, the `boardCount` diagnostic and the
+    // board editor's unstaffed warning can never disagree about what a stage asks for.
+    if (stage.ownerKind === 'capability') return stageCapabilitiesMet(stage, capabilities);
     return false;
   }
 

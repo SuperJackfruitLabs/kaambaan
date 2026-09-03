@@ -56,6 +56,12 @@ export interface Stage {
   routing?: 'pipeline' | 'manager';
   ownerKind?: 'capability' | 'human';
   owner?: string;
+  /**
+   * A multi-capability requirement: `all` every member, `any` at least one. Wins over `owner`
+   * when present. A sibling of `owner` rather than a widening of it, so a board written before
+   * this existed reads back unchanged.
+   */
+  requires?: { all?: string[]; any?: string[] };
 }
 
 export interface Card {
@@ -737,9 +743,41 @@ export interface CapabilityRecord {
   /** Where it is also known — an OASF dotted id, say. Null is the normal state. */
   externalId: string | null;
   externalSource: string | null;
+  /** A2A `AgentSkill.inputModes`/`outputModes`. Stored and projected, never enforced. */
+  inputModes: string[];
+  outputModes: string[];
+  /** What holding this also implies holding. Absent when it implies nothing. */
+  implies?: string[];
   /** How many agents hold it, and how many boards name it on a stage. */
   agentCount: number;
   boardCount: number;
+}
+
+/** An edge in the workspace's implication graph: holding `from` also means holding `to`. */
+export interface Implication {
+  from: string;
+  to: string;
+}
+
+export async function getImplications(): Promise<Implication[]> {
+  const res = await fetch('/v1/capabilities/implications', { headers });
+  if (!res.ok) return [];
+  return ((await res.json()) as { implications: Implication[] }).implications;
+}
+
+export function addImplication(from: string, to: string): Promise<Response> {
+  return fetch('/v1/capabilities/implications', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ from, to }),
+  });
+}
+
+export function removeImplication(from: string, to: string): Promise<Response> {
+  return fetch(
+    `/v1/capabilities/implications?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+    { method: 'DELETE', headers },
+  );
 }
 
 export async function getCapabilities(): Promise<CapabilityRecord[]> {

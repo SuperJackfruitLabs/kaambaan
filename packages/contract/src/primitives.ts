@@ -152,3 +152,73 @@ export type SyncState = z.infer<typeof SyncState>;
  */
 export const GateDecision = z.enum(['approve', 'request_changes', 'reject']);
 export type GateDecision = z.infer<typeof GateDecision>;
+
+/**
+ * What a stage requires of an agent, when one capability is not enough.
+ *
+ * `all` — the agent must hold every member. `any` — at least one. Both may be present, and both
+ * then bind. This is a **sibling of `owner`, not a widening of it**, and that was decided by a
+ * probe rather than by taste: SQLite's `json_each` returns zero rows over a missing path but
+ * raises `malformed JSON` over a scalar string, so making `owner` a union would break the
+ * `boardCount` subquery on every stage that already exists. An optional key needs no data
+ * migration and cannot break a legacy row.
+ */
+export interface StageRequirement {
+  all?: string[];
+  any?: string[];
+}
+
+/** A stage's routing shape — the part of `StageDef` that decides who may claim. */
+export interface StageRouting {
+  owner?: string;
+  requires?: StageRequirement;
+}
+
+/**
+ * Normalise a requirement to canonical tags, dropping empties and duplicates.
+ *
+ * Returns `null` when it constrains nothing, which is the signal to fall back to `owner`. An
+ * empty `requires` must not mean "no agent may claim" — that would turn a stray `{}` from the
+ * editor into a lane nobody can work, which is the exact failure this whole area exists to end.
+ */
+export function normalizeRequirement(req: StageRequirement | undefined | null): StageRequirement | null {
+  if (!req) return null;
+  const all = capabilityTags(req.all ?? []);
+  const any = capabilityTags(req.any ?? []);
+  if (all.length === 0 && any.length === 0) return null;
+  const out: StageRequirement = {};
+  if (all.length > 0) out.all = all;
+  if (any.length > 0) out.any = any;
+  return out;
+}
+
+/**
+ * Every capability a stage mentions, however it mentions it.
+ *
+ * One function so the claim predicate, the `boardCount` diagnostic and the unstaffed-lane warning
+ * can never disagree about what a stage asks for.
+ */
+export function stageRequiredCapabilities(stage: StageRouting): string[] {
+  const req = normalizeRequirement(stage.requires);
+  if (req) return capabilityTags([...(req.all ?? []), ...(req.any ?? [])]);
+  const owner = stage.owner ? capabilityTag(stage.owner) : '';
+  return owner === '' ? [] : [owner];
+}
+
+/**
+ * Does this capability set satisfy the stage? The whole of routing, for capability lanes.
+ *
+ * Still exact string equality on every member — deliberately. Equality's one great virtue is that
+ * when a card does not move, the diagnosis is a comparison anyone can run by hand; a similarity
+ * score would make that same failure unfalsifiable.
+ */
+export function stageCapabilitiesMet(stage: StageRouting, capabilities: string[]): boolean {
+  const held = new Set(capabilities);
+  const req = normalizeRequirement(stage.requires);
+  if (req) {
+    if (req.all && !req.all.every((c) => held.has(c))) return false;
+    if (req.any && !req.any.some((c) => held.has(c))) return false;
+    return true;
+  }
+  return stage.owner !== undefined && held.has(stage.owner);
+}

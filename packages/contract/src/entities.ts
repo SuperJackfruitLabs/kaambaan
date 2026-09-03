@@ -82,6 +82,13 @@ export const Stage = z.object({
   order: z.number().int().min(0),
   ownerKind: StageOwnerKind,
   owner: z.string().optional(), // capability tag or agentId; absent for human-only stages
+  /**
+   * A multi-capability requirement, when one tag is not enough. Sibling of `owner`, never a
+   * widening of it — see `StageRequirement` in primitives for the SQLite reason.
+   */
+  requires: z
+    .object({ all: z.array(z.string()).optional(), any: z.array(z.string()).optional() })
+    .optional(),
   gate: StageGate.default('none'),
   wipLimit: z.number().int().min(1).optional(),
 });

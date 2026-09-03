@@ -22,9 +22,18 @@ const STATEMENTS = [
      description TEXT, tags_json TEXT NOT NULL DEFAULT '[]', examples_json TEXT NOT NULL DEFAULT '[]',
      origin TEXT NOT NULL DEFAULT 'declared' CHECK (origin IN ('declared', 'inferred')),
      created_by TEXT, external_id TEXT, external_source TEXT,
+     input_modes_json TEXT NOT NULL DEFAULT '[]', output_modes_json TEXT NOT NULL DEFAULT '[]',
      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT,
      UNIQUE (tenant_id, key),
      CONSTRAINT capabilities_external_pair CHECK ((external_id IS NULL) = (external_source IS NULL))
+   )`,
+  // Mirrors migration 0007's additions to `capabilities`. SQLite has no `ADD COLUMN IF NOT
+  // EXISTS`, and this mirror creates the table whole, so the two columns are declared inline
+  // rather than altered in.
+  `CREATE TABLE IF NOT EXISTS capability_implications (
+     tenant_id TEXT NOT NULL, implies_from TEXT NOT NULL, implies_to TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), created_by TEXT,
+     PRIMARY KEY (tenant_id, implies_from, implies_to)
    )`,
 ];
 

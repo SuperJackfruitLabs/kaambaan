@@ -38,6 +38,39 @@
   // and a capability are compared by exact equality, so they cannot be spelled by two functions.
   const slug = capabilityTag;
 
+  /**
+   * A capability lane's requirement, as one editable field.
+   *
+   * One capability stays `owner` — the shape every existing board already carries. A
+   * comma-separated list becomes `requires`, so editing a stage never rewrites it into a new
+   * shape just for having been opened.
+   */
+  function ownerParts(raw: string): string[] {
+    return [...new Set(raw.split(',').map(capabilityTag).filter((c) => c !== ''))];
+  }
+
+  function ownerText(stage: Stage): string {
+    if (stage.requires) return [...(stage.requires.all ?? stage.requires.any ?? [])].join(', ');
+    return stage.owner ?? '';
+  }
+
+  function setOwner(stage: Stage, raw: string): void {
+    const parts = ownerParts(raw);
+    if (parts.length > 1) {
+      const match = stage.requires?.any ? 'any' : 'all';
+      stage.requires = match === 'any' ? { any: parts } : { all: parts };
+      delete stage.owner;
+    } else {
+      delete stage.requires;
+      stage.owner = parts[0] ?? '';
+    }
+  }
+
+  function setMatch(stage: Stage, match: 'all' | 'any'): void {
+    const parts = ownerParts(ownerText(stage));
+    stage.requires = match === 'any' ? { any: parts } : { all: parts };
+  }
+
   function addStage(): void {
     const name = newStageName.trim();
     if (name === '') return;
@@ -186,13 +219,20 @@
                   </select>
                   {#if stage.ownerKind === 'capability'}
                     <input
-                      bind:value={stage.owner}
-                      onblur={() => (stage.owner = stage.owner ? capabilityTag(stage.owner) : stage.owner)}
+                      value={ownerText(stage)}
+                      onblur={(e) => setOwner(stage, e.currentTarget.value)}
                       placeholder="capability"
                       aria-label="Capability required for stage {stage.name}"
-                      title="An agent holding this capability claims cards in this stage"
-                      class="bg-surface border-border mono w-28 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                      title="An agent holding this capability claims cards here. Separate several with commas."
+                      class="bg-surface border-border mono w-40 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
                     />
+                    <!-- Only meaningful once a lane names more than one capability. -->
+                    {#if ownerParts(ownerText(stage)).length > 1}
+                      <div class="border-border flex shrink-0 overflow-hidden rounded-[5px] border text-[10px]">
+                        <button onclick={() => setMatch(stage, 'all')} class="mono px-1.5 py-0.5 {stage.requires?.any ? 'text-muted-foreground' : 'bg-marigold text-primary-foreground'}" title="An agent must hold every one">all</button>
+                        <button onclick={() => setMatch(stage, 'any')} class="mono border-border border-l px-1.5 py-0.5 {stage.requires?.any ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground'}" title="Holding any one is enough">any</button>
+                      </div>
+                    {/if}
                   {/if}
                   <label class="text-muted-foreground flex items-center gap-1">
                     <input type="checkbox" checked={stage.gate === 'approval'} onchange={(e) => (stage.gate = e.currentTarget.checked ? 'approval' : 'none')} class="accent-marigold" />

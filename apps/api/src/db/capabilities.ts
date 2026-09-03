@@ -19,6 +19,7 @@
 import { capabilityTag } from '@kaambaan/contract';
 import { newId } from '../ids';
 import { ExternalMappingError } from './catalog';
+import { listImplications } from './implications';
 
 /**
  * How a capability came to exist, which is the fact the mismatch hid.
@@ -46,6 +47,16 @@ export interface CapabilityRecord {
   externalId: string | null;
   externalSource: string | null;
   /**
+   * A2A `AgentSkill.inputModes` / `outputModes` — the media types this capability takes and
+   * returns. **Stored and projected into an AgentCard, never enforced**: validating a handoff
+   * happens in the board's Durable Object and these rows live in the catalog, and the two do not
+   * meet. Presence of the column is not a guarantee about the data flowing through the lane.
+   */
+  inputModes: string[];
+  outputModes: string[];
+  /** What holding this capability also implies holding. Present only on the list read. */
+  implies?: string[];
+  /**
    * How many agents hold this, and how many boards name it on a stage.
    *
    * Present only on the list read, which is where they are asked for. Zero agents means a lane
@@ -68,11 +79,14 @@ interface Row {
   createdBy: string | null;
   externalId: string | null;
   externalSource: string | null;
+  inputModesJson: string;
+  outputModesJson: string;
 }
 
 const COLUMNS = `id, tenant_id AS tenantId, key, name, description, tags_json AS tagsJson,
                  examples_json AS examplesJson, origin, created_by AS createdBy,
-                 external_id AS externalId, external_source AS externalSource`;
+                 external_id AS externalId, external_source AS externalSource,
+                 input_modes_json AS inputModesJson, output_modes_json AS outputModesJson`;
 
 function toRecord(r: Row): CapabilityRecord {
   return {
@@ -87,6 +101,8 @@ function toRecord(r: Row): CapabilityRecord {
     createdBy: r.createdBy,
     externalId: r.externalId,
     externalSource: r.externalSource,
+    inputModes: JSON.parse(r.inputModesJson) as string[],
+    outputModes: JSON.parse(r.outputModesJson) as string[],
   };
 }
 
@@ -100,6 +116,15 @@ function toRecord(r: Row): CapabilityRecord {
  *
  * Correlated subqueries rather than joins: an agent holding three capabilities must not multiply
  * this list into three rows.
+ *
+ * `boardCount` counts a stage that names the capability **any way a stage can** — as `owner`, or
+ * as a member of either arm of `requires`. Missing that second case is not a cosmetic bug: a
+ * capability required only by a set-valued lane would count zero boards and be reported as an
+ * orphan, by the very diagnostic built to find the original mismatch.
+ *
+ * `json_each` over the `$.requires.*` paths is safe on legacy rows precisely because they are
+ * ABSENT there — `json_each` returns no rows for a missing path, but raises `malformed JSON` for
+ * a scalar. That asymmetry is why `requires` is a sibling of `owner` rather than a union with it.
  */
 export async function listCapabilities(db: D1Database, tenantId: string): Promise<CapabilityRecord[]> {
   const { results } = await db
@@ -108,14 +133,38 @@ export async function listCapabilities(db: D1Database, tenantId: string): Promis
               (SELECT COUNT(*) FROM agents a WHERE a.tenant_id = c.tenant_id
                  AND EXISTS (SELECT 1 FROM json_each(a.capabilities_json) WHERE value = c.key)) AS agentCount,
               (SELECT COUNT(*) FROM boards b WHERE b.tenant_id = c.tenant_id
-                 AND EXISTS (SELECT 1 FROM json_each(b.stages_json)
-                             WHERE json_extract(value, '$.ownerKind') = 'capability'
-                               AND json_extract(value, '$.owner') = c.key)) AS boardCount
+                 AND EXISTS (SELECT 1 FROM json_each(b.stages_json) st
+                             WHERE json_extract(st.value, '$.ownerKind') = 'capability'
+                               AND ( json_extract(st.value, '$.owner') = c.key
+                                  OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.all'))
+                                             WHERE value = c.key)
+                                  OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.any'))
+                                             WHERE value = c.key) ))) AS boardCount
        FROM capabilities c WHERE c.tenant_id = ? ORDER BY c.key ASC`,
     )
     .bind(tenantId)
     .all<Row & { agentCount: number; boardCount: number }>();
-  return results.map((r) => ({ ...toRecord(r), agentCount: Number(r.agentCount), boardCount: Number(r.boardCount) }));
+  // Edges are attached here rather than fetched per row: one small indexed read for the whole
+  // list, and the panel needs them to show DECLARED beside EFFECTIVE. A view that counts holders
+  // one way and displays them the other is a diagnostic that lies.
+  const edges = await listImplications(db, tenantId);
+  const impliesBy = new Map<string, string[]>();
+  for (const e of edges) {
+    const list = impliesBy.get(e.from);
+    if (list) list.push(e.to);
+    else impliesBy.set(e.from, [e.to]);
+  }
+
+  return results.map((r) => {
+    const rec: CapabilityRecord = {
+      ...toRecord(r),
+      agentCount: Number(r.agentCount),
+      boardCount: Number(r.boardCount),
+    };
+    const implies = impliesBy.get(rec.key);
+    if (implies) rec.implies = implies;
+    return rec;
+  });
 }
 
 /** Which of these keys this workspace has never heard of. Empty means every one is known. */
@@ -246,6 +295,8 @@ export async function createCapability(
     createdBy: input.createdBy ?? null,
     externalId: input.externalId ?? null,
     externalSource: input.externalSource ?? null,
+    inputModes: [],
+    outputModes: [],
   };
 }
 
@@ -324,7 +375,7 @@ export async function capabilityUsage(
   db: D1Database,
   tenantId: string,
   key: string,
-): Promise<{ agents: string[]; boards: string[] }> {
+): Promise<{ agents: string[]; boards: string[]; implications: string[] }> {
   const { results: agents } = await db
     .prepare(
       `SELECT name FROM agents
@@ -332,21 +383,81 @@ export async function capabilityUsage(
     )
     .bind(tenantId, key)
     .all<{ name: string }>();
+  // The board predicate must match `boardCount`'s exactly: a capability required only by a
+  // set-valued lane is still required by that board, and reading `$.owner` alone would report it
+  // unused and let an operator delete a capability a lane depends on.
   const { results: boards } = await db
     .prepare(
       `SELECT name FROM boards
-       WHERE tenant_id = ? AND EXISTS (
-         SELECT 1 FROM json_each(stages_json)
-         WHERE json_extract(value, '$.ownerKind') = 'capability' AND json_extract(value, '$.owner') = ?
+       WHERE tenant_id = ?1 AND EXISTS (
+         SELECT 1 FROM json_each(stages_json) st
+         WHERE json_extract(st.value, '$.ownerKind') = 'capability'
+           AND ( json_extract(st.value, '$.owner') = ?2
+              OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.all')) WHERE value = ?2)
+              OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.any')) WHERE value = ?2) )
        )`,
     )
     .bind(tenantId, key)
     .all<{ name: string }>();
-  return { agents: agents.map((a) => a.name), boards: boards.map((b) => b.name) };
+  // An edge refers to a capability just as surely as an agent does. Without this, deleting one
+  // end of `code-review implies code` leaves an edge pointing at nothing, and an agent's
+  // effective set would silently contain a capability the registry cannot explain.
+  const { results: implications } = await db
+    .prepare(
+      `SELECT implies_from || ' → ' || implies_to AS edge FROM capability_implications
+       WHERE tenant_id = ?1 AND (implies_from = ?2 OR implies_to = ?2) ORDER BY edge`,
+    )
+    .bind(tenantId, key)
+    .all<{ edge: string }>();
+  return {
+    agents: agents.map((a) => a.name),
+    boards: boards.map((b) => b.name),
+    implications: implications.map((i) => i.edge),
+  };
 }
 
 /** Remove a capability. The caller checks `capabilityUsage` first. */
 export async function deleteCapability(db: D1Database, tenantId: string, id: string): Promise<boolean> {
   const res = await db.prepare(`DELETE FROM capabilities WHERE tenant_id = ? AND id = ?`).bind(tenantId, id).run();
   return (res.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * Existing keys that look like this one — an operator about to create a near-duplicate.
+ *
+ * A **hint, never a refusal**, for the same reason the declare/reference rule was reversed in
+ * #56: refusing dead-ends a legitimate first move, and it only ever catches the NEXT typo while
+ * leaving every existing one in place. `code` and `cdoe` are both plausible; only a person knows
+ * which was meant.
+ *
+ * Two cheap signals, no model and no embedding: an edit distance of at most two, or one key
+ * containing the other. Deliberately not semantic — a similarity score on this path would make
+ * "why did nothing match?" unanswerable, which is the failure this whole area exists to end.
+ */
+export function similarKeys(candidate: string, existing: string[]): string[] {
+  const c = capabilityTag(candidate);
+  if (c === '') return [];
+  return existing
+    .filter((k) => k !== c)
+    .filter((k) => (k.includes(c) || c.includes(k) ? true : editDistance(c, k) <= 2))
+    .sort();
+}
+
+/** Levenshtein, iterative two-row. Keys are short, and this runs once per capability written. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > 2) return 3; // early out: cannot be within the threshold
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    for (let j = 1; j <= b.length; j++) {
+      curr[j] = Math.min(
+        prev[j]! + 1,
+        curr[j - 1]! + 1,
+        prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = curr;
+  }
+  return prev[b.length]!;
 }
