@@ -82,3 +82,46 @@ describe('a capability named only by a requirement set', () => {
     expect(list.find((c) => c.key === 'Code Review')).toBeUndefined();
   });
 });
+
+describe('deleting a capability something still refers to', () => {
+  it('is refused when only a requirement set names it', async () => {
+    const t = 'tnt_del_req';
+    await makeBoard(t, [
+      { key: 'intake', name: 'Intake', order: 0, ownerKind: 'human' },
+      { key: 'audit', name: 'Audit', order: 1, ownerKind: 'capability', requires: { all: ['code', 'security'] } },
+    ]);
+    const list = await caps(t);
+    const security = list.find((c) => c.key === 'security')!;
+
+    // `capabilityUsage` read `$.owner` alone, exactly as `boardCount` did. A capability required
+    // only by a set-valued lane would have reported no users and been deleted out from under a
+    // board that depends on it — the strings stay on the stage, matching carries on, and the
+    // registry quietly stops describing the product.
+    const res = await SELF.fetch(`https://api.test/v1/capabilities/${security.id}`, {
+      method: 'DELETE',
+      headers: T(t),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json<{ error: string }>()).error).toContain('still used by');
+  });
+
+  it('is refused when only an implication names it', async () => {
+    const t = 'tnt_del_imp';
+    await SELF.fetch('https://api.test/v1/capabilities/implications', {
+      method: 'POST',
+      headers: T(t),
+      body: JSON.stringify({ from: 'code-review', to: 'code' }),
+    });
+    const list = await caps(t);
+    const code = list.find((c) => c.key === 'code')!;
+
+    // An edge refers to a capability as surely as an agent does. Deleting one end would leave an
+    // agent's EFFECTIVE set holding a capability the registry can no longer explain.
+    const res = await SELF.fetch(`https://api.test/v1/capabilities/${code.id}`, {
+      method: 'DELETE',
+      headers: T(t),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json<{ error: string }>()).error).toContain('code-review → code');
+  });
+});
