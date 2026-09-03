@@ -25,25 +25,18 @@
       {@const overLimit = stage.wipLimit !== undefined && cards.length >= stage.wipLimit}
 
       {#if i > 0}
-        <!-- marigold flow arrow between columns -->
-        <div class="flow-arrow px-2.5">
-          <svg
-            class="size-3.5"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
+        <!-- The flow arrow, thinner. It used to take ~50px between every pair of 288px lanes,
+             which together put four of six stages on a 1440px screen with the fourth cut through
+             its own title. The waypoint language stays; it just stops costing a sixth of a lane. -->
+        <div class="flow-arrow px-1.5">
+          <svg class="size-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 6l6 6-6 6" />
           </svg>
         </div>
       {/if}
 
       <section
-        class="lane w-72 shrink-0 rounded-[12px] p-2 transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
+        class="lane w-[264px] shrink-0 rounded-[12px] p-2 transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
         use:columnDropTarget={{
           stageKey: stage.key,
           onDrop: (cardId) => app.moveCard(cardId, stage.key),
@@ -69,9 +62,10 @@
         <!-- cards -->
         <div class="lane-body mt-1.5 flex min-h-12 flex-col gap-2.5">
           {#if cards.length === 0}
-            <!-- ghost lane: awaiting work -->
-            <div class="eyebrow border-border/60 mx-1 rounded-[8px] border border-dashed px-2 py-4 text-center">
-              awaiting work
+            <!-- One quiet strip. Five full-height AWAITING WORK boxes meant the majority of the
+                 screen was spent saying "empty" five times at full width. -->
+            <div class="eyebrow border-border/60 mx-1 grid h-[34px] place-items-center rounded-[8px] border border-dashed text-center opacity-60">
+              empty
             </div>
           {/if}
           {#each cards as card (card.id)}

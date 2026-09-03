@@ -1,5 +1,6 @@
 <script lang="ts">
   import { app } from '$lib/stores/app.svelte';
+  import { goto } from '$app/navigation';
   import { tick } from 'svelte';
 
   // ---- state ----
@@ -29,8 +30,9 @@
         label: card.title,
         sub: `#${shortId}`,
         act: () => {
-          app.setScreen('board');
-          app.openCard(card.id);
+          // A card is an address. Navigating rather than setting state means the palette produces
+          // a link the reader could have pasted.
+          void goto(`/b/${app.boardId}/c/${card.id}`);
           close();
         },
       });
@@ -44,9 +46,9 @@
         label: agent.name,
         sub: agent.capabilities.length > 0 ? agent.capabilities.join(', ') : 'no capabilities',
         act: () => {
-          // Selecting an agent used to close the palette and do nothing. It opens the panel that
-          // manages agents — the only screen where an agent can be acted on at all.
-          app.openAgentsPanel(agent.id);
+          // Selecting an agent used to close the palette and do nothing at all. Agents live at an
+          // address now, so this navigates rather than signalling a component to open a modal.
+          void goto('/workspace/agents');
           close();
         },
       });
@@ -67,20 +69,20 @@
       {
         grp: 'Actions',
         icon: '⊞',
-        label: 'Open Triage',
-        sub: '',
+        label: 'Operate',
+        sub: 'what needs you, what is running, what it cost',
         act: () => {
-          app.setScreen('triage');
+          void goto(`/b/${app.boardId}/operate`);
           close();
         },
       },
       {
         grp: 'Actions',
         icon: '◴',
-        label: 'View Telemetry',
-        sub: '',
+        label: 'Spend detail',
+        sub: 'by model, by card, and the board log',
         act: () => {
-          app.setScreen('telemetry');
+          void goto(`/b/${app.boardId}/operate/telemetry`);
           close();
         },
       },

@@ -18,12 +18,14 @@
   const refs = $derived(app.referencesForCard(card.id));
   const firstRef = $derived(refs[0] ?? null);
 
-  // Priority chip class
-  function priClass(p: number): string {
-    if (p === 1) return 'pri-chip pri-chip-1';
-    if (p === 2) return 'pri-chip pri-chip-2';
-    return 'pri-chip pri-chip-3';
-  }
+  /**
+   * Priority as a 3px left edge stripe rather than a chip.
+   *
+   * A chip competes with the title for the first thing the eye lands on; a stripe is readable
+   * straight down a column without being read at all. Absent priority renders nothing, rather
+   * than a third chip saying "P3".
+   */
+  const priColour = $derived(card.priority === 1 ? 'var(--coral)' : card.priority === 2 ? 'var(--marigold)' : null);
 
   // Reference chip helpers (ported from page.svelte)
   const SUB_STATE_LABELS: Record<string, string> = {
@@ -191,7 +193,7 @@
       aria-label="Move {card.title} to another stage"
       aria-expanded={moveMenuOpen}
       title="Move to…"
-      class="text-muted-foreground hover:text-foreground mono px-1 text-[11px] leading-none opacity-0 focus:opacity-100 group-hover:opacity-100"
+      class="text-muted-foreground hover:text-foreground tap mono rounded-[6px] text-[11px] leading-none opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
       style="opacity:{moveMenuOpen ? 1 : undefined}"
     >⇄</button>
     {#if moveMenuOpen}
@@ -213,11 +215,13 @@
       </div>
     {/if}
   </div>
-  <!-- row1: priority chip + title + live dot -->
+  {#if priColour}
+    <span class="absolute top-0 bottom-0 left-0 w-[3px]" style="background:{priColour}" aria-hidden="true"></span>
+    <span class="sr-only">Priority {card.priority}</span>
+  {/if}
+
+  <!-- row1: title + live dot -->
   <div class="row1 mb-2 flex items-start gap-2">
-    {#if card.priority > 0}
-      <span class={priClass(card.priority)}>P{card.priority}</span>
-    {/if}
     <span class="flex-1 text-[13.5px] font-medium leading-snug">{card.title}</span>
     {#if card.state === 'working'}
       <span class="live-dot mt-1 shrink-0" title="Agent working"></span>
@@ -258,6 +262,14 @@
   <!-- meta row: avatar, owner, cost, due -->
   <div class="meta flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
     <!-- delegate avatar -->
+    <!--
+      One avatar slot, for the agent doing the work, and nothing at all when nobody is.
+
+      There used to be two: this one, and a second showing the owner's initial — almost always the
+      same letter on every card. Beside them, the word UNASSIGNED in capitals, which made the
+      absence of an agent the most repeated and loudest thing on the board. The board's default
+      state is that nobody has picked a card up; it should be its quietest.
+    -->
     {#if card.delegateAgentId && delegate?.iconUrl}
       <img src={delegate.iconUrl} alt="" title={delegate.name} class="size-5 shrink-0 rounded-full object-cover" />
     {:else if card.delegateAgentId && avatarInitial}
@@ -267,7 +279,7 @@
         title={delegate?.name ?? card.delegateAgentId}
       >{avatarInitial}</span>
     {:else}
-      <span class="eyebrow" style="padding:0">unassigned</span>
+      <span class="text-muted-foreground" aria-hidden="true">—</span>
     {/if}
 
     <span class="spacer ml-auto"></span>
@@ -284,12 +296,6 @@
       <span class={overdue ? 'text-coral' : ''} title={overdue ? `Due ${due} — overdue` : `Due ${due}`}>· {due}{overdue ? ' ⚠' : ''}</span>
     {/if}
 
-    <!-- owner avatar -->
-    <span
-      class="inline-grid size-5 shrink-0 place-items-center rounded-full font-mono text-[9px] font-semibold"
-      style="background:var(--inset); color:var(--muted)"
-      title={card.ownerUserId}
-    >{card.ownerUserId.slice(0, 1).toUpperCase()}</span>
   </div>
 
   <!-- cost bar — only where there is a cap for it to be a fraction OF -->
