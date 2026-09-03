@@ -42,7 +42,7 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
-import { capabilityTag, capabilityTags } from '@kaambaan/contract';
+import { capabilityTag, capabilityTags, stageRequiredCapabilities } from '@kaambaan/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
   listCapabilities,
@@ -146,7 +146,12 @@ async function registerStageCapabilities(
   stages: StageDef[],
   createdBy: string | null,
 ): Promise<void> {
-  const keys = stages.filter((s) => s.ownerKind === 'capability' && s.owner).map((s) => s.owner!);
+  // Every capability a stage mentions, however it mentions it — `owner`, or either arm of
+  // `requires`. Reading only `owner` would leave a set-valued lane's capabilities unregistered,
+  // so they would route correctly and be invisible to the registry that exists to explain them.
+  const keys = stages
+    .filter((s) => s.ownerKind === 'capability')
+    .flatMap((s) => stageRequiredCapabilities(s));
   if (keys.length > 0) await ensureCapabilities(env.DB, tenantId, keys, createdBy);
 }
 

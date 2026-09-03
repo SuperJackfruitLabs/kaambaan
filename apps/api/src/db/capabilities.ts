@@ -100,6 +100,15 @@ function toRecord(r: Row): CapabilityRecord {
  *
  * Correlated subqueries rather than joins: an agent holding three capabilities must not multiply
  * this list into three rows.
+ *
+ * `boardCount` counts a stage that names the capability **any way a stage can** — as `owner`, or
+ * as a member of either arm of `requires`. Missing that second case is not a cosmetic bug: a
+ * capability required only by a set-valued lane would count zero boards and be reported as an
+ * orphan, by the very diagnostic built to find the original mismatch.
+ *
+ * `json_each` over the `$.requires.*` paths is safe on legacy rows precisely because they are
+ * ABSENT there — `json_each` returns no rows for a missing path, but raises `malformed JSON` for
+ * a scalar. That asymmetry is why `requires` is a sibling of `owner` rather than a union with it.
  */
 export async function listCapabilities(db: D1Database, tenantId: string): Promise<CapabilityRecord[]> {
   const { results } = await db
@@ -108,9 +117,13 @@ export async function listCapabilities(db: D1Database, tenantId: string): Promis
               (SELECT COUNT(*) FROM agents a WHERE a.tenant_id = c.tenant_id
                  AND EXISTS (SELECT 1 FROM json_each(a.capabilities_json) WHERE value = c.key)) AS agentCount,
               (SELECT COUNT(*) FROM boards b WHERE b.tenant_id = c.tenant_id
-                 AND EXISTS (SELECT 1 FROM json_each(b.stages_json)
-                             WHERE json_extract(value, '$.ownerKind') = 'capability'
-                               AND json_extract(value, '$.owner') = c.key)) AS boardCount
+                 AND EXISTS (SELECT 1 FROM json_each(b.stages_json) st
+                             WHERE json_extract(st.value, '$.ownerKind') = 'capability'
+                               AND ( json_extract(st.value, '$.owner') = c.key
+                                  OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.all'))
+                                             WHERE value = c.key)
+                                  OR EXISTS (SELECT 1 FROM json_each(json_extract(st.value, '$.requires.any'))
+                                             WHERE value = c.key) ))) AS boardCount
        FROM capabilities c WHERE c.tenant_id = ? ORDER BY c.key ASC`,
     )
     .bind(tenantId)
