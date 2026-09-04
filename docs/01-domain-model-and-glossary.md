@@ -79,25 +79,57 @@ Humans authenticate with **GitHub OAuth → a signed session cookie** (`kaambaan
 workspace with the user as `owner`. **⚠️ There is no magic-link and no email sending anywhere in the
 repo** — earlier drafts listed it as a login method; it was never built. GitHub is the only provider.
 
-**⚠️ `role` is recorded but never enforced.** Nothing reads it to authorize a request: any member of
-a tenant can do anything within it. The same is true of an agent token's `scopes`. Role- and
-scope-based authorization is design intent, not a control that exists.
+**`role` is enforced.** Since 2026-09-02 every route resolves the caller's role and refuses what it
+does not permit: `viewer` reads, `member` works the board, `admin` manages boards and agents,
+`owner` manages people and the fleet link. A caller with **no** membership is refused outright
+rather than demoted to a reader. Roles are read per request, so removing someone takes effect on
+their next call rather than their next sign-in.
+
+An agent token's `scopes` are enforced too, with one deliberate exception: a `claim` scope
+grandfathers `run`, because a claim an agent cannot finish is worse than no check at all — the card
+is taken and abandoned mid-flight.
+
+**This `role` is a *seat*, not a *post*.** It says what an account may do inside this workspace. It
+is **not** the Organization plane's Role, which describes a job — responsibilities, required
+capabilities, authority, evaluation criteria — and does not exist yet. The two are never unified
+and one is never inferred from the other; see
+`charter → decisions/2026-09-03-role-is-a-seat-and-a-post.md`. A workspace that had to ask another
+plane whether you may edit a card would no longer be a kanban board that stands alone.
 
 ### Agent *(registered worker)*
 An external worker registered to a tenant. It is an **app-actor identity** (per Linear's
 `actor=app`), *not* a human user, and is always badged as an agent in the UI. Fields on the
 `agents` row:
 - `id` (`agt_`), `tenantId`, `name`, `iconUrl`
-- `capabilities` — tags it can service (e.g. `research`, `code`, `review`); drives routing
+- `capabilities` — the work-capability tags it can service (e.g. `research`, `code`, `security`);
+  the whole of what routing compares. **⚠️ The word means three different things across the suite**,
+  and only the first is this one:
+  | sense | answers | lives in |
+  |---|---|---|
+  | **skill** | what an agent is good at — routing and discovery | *this field*; A2A `AgentSkill`; OASF |
+  | **affordance** | what an agent can invoke | MCP tools, OpenAPI operations, AgentPod's station capabilities (`acp`, `fs.write`, `terminal`) |
+  | **authority** | what an agent may *do* | `mayDispatch` / `mayGrantReach` in a hub token |
+
+  Matching a grant on a skill tag, or reading an AgentPod station capability as one of these, was
+  refused deliberately — see `charter → decisions/2026-09-02-capability-is-three-words.md`. Note
+  kaambaan's own `members.ts` also declares an unrelated `type Capability = 'read' | 'work' |
+  'manage' | 'own'`; that is a permission verb, and a fourth use of the word inside one repository.
 - `tokens` — per-agent `kbn_` bearer credentials, stored as SHA-256 hashes, carrying `scopes`
   (**recorded, never enforced**)
-- `concurrency` — max simultaneous claimed cards
-- `status` — `online | busy | offline`
-- `connection` — how it integrates: `mcp | rest | webhook | acp`
+- `concurrency` — the operator's ceiling on simultaneous claimed cards. An agent may ask for
+  *less* at claim time; never more. **⚠️ Counted per board**, because the count lives in the board's
+  Durable Object — an agent at its ceiling on one board can still claim on another.
 
-**⚠️ `agentCard` does not exist.** There is no column, no upload path and no endpoint serving an A2A
-AgentCard ([04 §1](./04-agent-contract.md)); capability tags are the whole of what an agent
-advertises today.
+**`status` and `connection` were dropped** in migration 0005 (2026-09-02). Neither was ever
+written: every agent read `'offline'` from the day it was created, including while it held a live
+lease, and REST is the only transport an agent has ever had. Liveness is knowable from `runs` in
+the board DO, which is where a claim actually happens.
+
+**An AgentCard is served, as a projection.** `GET /v1/agents/:id/card` renders the agent's
+capabilities as A2A `AgentSkill` entries read from the capability registry — a projection of those
+rows rather than a translation of them, which is why the registry's columns carry A2A's field
+names. A capability the registry has no row for still appears, degraded to its key: a card that
+omitted a tag the agent routes on would disagree with the claim predicate.
 
 ### Board
 A named workspace surface within a tenant containing one pipeline and its cards. Fields:
@@ -110,6 +142,12 @@ as a board column) declares:
 - `key`, `name`, `order`
 - `owner` — which agents work this stage: a **capability tag** (e.g. `code`) or a specific
   `agentId`, or `human` (no agent; human-only column)
+- `requires` — a multi-capability requirement, when one tag is not enough: `{all: [...]}` (the agent
+  must hold every member) or `{any: [...]}` (at least one), and both may be present. Wins over
+  `owner` when set. It is a **sibling** of `owner` rather than a widening of it, so a board written
+  before it existed reads back unchanged — and because SQLite's `json_each` raises on a scalar,
+  making `owner` itself a union would have broken the registry's `boardCount` on every existing
+  stage
 - `gate` — `none | approval` (an `approval` stage requires a human ✅ before the card advances)
 - `wipLimit` — max cards concurrently in this stage (the real Kanban constraint)
 - `entry`/`exit` hints — optional structured-handoff requirements (e.g. "a PR reference must
@@ -227,7 +265,11 @@ Events drive the WebSocket broadcast to UI clients and the webhook dispatch to s
 | **Gate** | Human-approval pause; a Task in `input-required` |
 | **Reference** | First-class external link (GitHub issue/PR, repo, doc) |
 | **AgentCard** | A2A capability/discovery document for an agent |
+| **Seat** | What an account may do inside one plane — kaambaan's `memberships.role`. Local, never unified with another plane's, never inferred from a post |
+| **Post** | What a principal is *for*: duties, required capabilities, authority, how it is judged. The Organization plane's Role. **Does not exist yet** |
 | **Capability tag** | The `key` of a Capability — the string a stage and an agent both carry, and the whole of what routing compares |
 | **Capability** | A record in the workspace registry (migration 0006), shaped as an A2A `AgentSkill`: `key`, `name`, `description`, `tags`, `examples`, plus an optional external mapping (an OASF dotted id, say). It gives a routing tag an identity and a definition; it does not enumerate what may exist |
+| **Requirement** | A stage's `requires`: `{all}` / `{any}` over capability tags, when one is not enough. Matching stays exact string equality on every member |
+| **Implication** | A workspace declaring that holding one capability means holding another (`code-review` implies `code`). An agent's **declared** set expands to an **effective** set over these edges, and only the effective set is matched at claim |
 | **Structured handoff** | The `metadata` an agent passes to the next stage |
 | **Event** | Append-only audit record + realtime/webhook feed item |
