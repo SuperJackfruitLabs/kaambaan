@@ -125,6 +125,18 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
 
+  packages/docs-check:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.2
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@22.20.2)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
+
 packages:
 
   '@atlaskit/pragmatic-drag-and-drop@2.0.1':
