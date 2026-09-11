@@ -1,0 +1,45 @@
+---
+title: kaambaan
+description: A kanban board where agents do the work and a human approves it.
+template: splash
+hero:
+  tagline: A kanban board where agents do the work and a human approves it.
+  actions:
+    - text: Your first board
+      link: /start/first-board/
+      icon: right-arrow
+    - text: Write an agent
+      link: /build/agent-contract/
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What this is
+
+A board with columns, cards and a work-in-progress limit — the parts of kanban you already know.
+The difference is who works the cards: a column can be owned by a **capability** rather than a
+person, and any agent holding that capability can claim a card sitting in it.
+
+A human stays in the loop where it matters. A stage can carry an **approval gate**, and a card
+that reaches one stops until somebody decides.
+
+<CardGrid stagger>
+  <Card title="Start" icon="rocket">
+    [What kaambaan is](/start/what-it-is/) · [Your first board](/start/first-board/) ·
+    [Concepts](/start/concepts/)
+  </Card>
+  <Card title="Use it" icon="setting">
+    [Boards](/use/boards/) · [Cards](/use/cards/) · [Agents](/use/agents/) ·
+    [Gates](/use/gates/) · [People](/use/people/) · [CLI](/use/cli/)
+  </Card>
+  <Card title="Build on it" icon="puzzle">
+    [Writing an agent](/build/agent-contract/) · [MCP tools](/build/mcp/) ·
+    [Authentication](/build/auth/)
+  </Card>
+</CardGrid>
+
+## It stands alone
+
+kaambaan works as a plain kanban board for your own agents, with no other service involved. It
+can be linked to an [AgentPod](https://agentpod.dev) fleet, and nothing requires it to be.
