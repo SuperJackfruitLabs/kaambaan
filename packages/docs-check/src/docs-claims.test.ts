@@ -16,6 +16,30 @@ const read = (rel: string) => readFileSync(join(REPO, rel), 'utf8');
 const allDocs = () => docFiles.map((f) => ({ file: f, text: readFileSync(join(DOCS, f), 'utf8') }));
 
 /**
+ * The PUBLISHED pages, held to the same standard as the internal ones.
+ *
+ * Publishing doubles the surface that can go stale. If only the internal docs are checked, the
+ * fraction of documentation anything verifies HALVES the day the site goes live — and the
+ * published pages are the ones strangers read.
+ *
+ * `apps/landing` in AgentPod is the warning, recorded in its own README: both of its two outbound
+ * links were 404s, because they were "ordinary links with no test behind them".
+ */
+const SITE = join(REPO, 'docs-site/src/content/docs');
+
+function publishedPages(dir = SITE, prefix = ''): Array<{ file: string; text: string }> {
+  const out: Array<{ file: string; text: string }> = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...publishedPages(join(dir, entry.name), rel));
+    else if (entry.name.endsWith('.md') || entry.name.endsWith('.mdx'))
+      out.push({ file: rel, text: readFileSync(join(dir, entry.name), 'utf8') });
+  }
+  return out;
+}
+
+
+/**
  * Names matching the tool pattern that are NOT tools, each with why.
  *
  * The same shape as agentpod's `NOT_OUR_ENV_VARS`, and for the same reason: without it, this
@@ -39,7 +63,13 @@ describe('the MCP tools the docs name', () => {
 
   
 const named = (): string[] =>
-    [...new Set(allDocs().flatMap(({ text }) => [...text.matchAll(/\bkaambaan_[a-z_]+\b/g)].map((m) => m[0])))].sort();
+    [
+      ...new Set(
+        [...allDocs(), ...publishedPages()].flatMap(({ text }) =>
+          [...text.matchAll(/\bkaambaan_[a-z_]+\b/g)].map((m) => m[0]),
+        ),
+      ),
+    ].sort();
 
   it('finds tools at all — a guard on the guard', () => {
     // An empty scan passes both assertions below for free, and a regex is exactly the thing that
@@ -111,5 +141,35 @@ describe('internal links in the docs', () => {
       if (!slugs.includes(anchor)) broken.push(`${from} → ${target} (no such heading)`);
     }
     expect(broken).toEqual([]);
+  });
+});
+
+describe('the published site', () => {
+  it('has pages at all — a guard on the guard', () => {
+    expect(publishedPages().length).toBeGreaterThan(5);
+  });
+
+  it('every internal link resolves to a page that exists', () => {
+    // Starlight routes by slug, so `/use/gates/` is `use/gates.md`. A link to a page nobody wrote
+    // renders as a 404 for a stranger, which is the audience least able to recover from one.
+    const slugs = new Set(publishedPages().map((p) => p.file.replace(/\.mdx?$/, '')));
+    const broken: string[] = [];
+    for (const { file, text } of publishedPages()) {
+      for (const m of text.matchAll(/\]\(\/([a-z0-9/-]*)\/?\)/g)) {
+        const slug = m[1]!.replace(/\/$/, '');
+        if (slug === '') continue; // the site root
+        if (!slugs.has(slug) && !slugs.has(`${slug}/index`)) broken.push(`${file} → /${slug}/`);
+      }
+    }
+    expect(broken).toEqual([]);
+  });
+
+  it('every page declares a title and a description', () => {
+    // The description is the search result and the social card. A page published without one is
+    // published without the line that decides whether anybody opens it.
+    const missing = publishedPages()
+      .filter(({ text }) => !/^title:/m.test(text) || !/^description:/m.test(text))
+      .map(({ file }) => file);
+    expect(missing).toEqual([]);
   });
 });
