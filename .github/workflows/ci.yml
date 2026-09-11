@@ -59,3 +59,41 @@ jobs:
       # the Worker with real auth (DEV_AUTH off).
       - run: pnpm --filter @kaambaan/api db:migrate
       - run: pnpm --filter @kaambaan/api run deploy
+
+  # The published documentation site, to Cloudflare Pages at docs.kaambaan.dev.
+  #
+  # Separate from `deploy` on purpose. The docs site shares no dependency tree with the
+  # Worker — it is npm, at the repo root, outside the pnpm workspace, for reasons set out
+  # in docs-site/README.md — and a docs typo should not be able to hold up a Worker deploy
+  # or vice versa.
+  #
+  # Gated on `test` only, not on `e2e`: the docs site is a static build with no runtime to
+  # exercise, and its claims are checked by packages/docs-check inside `test`.
+  #
+  # Needs the same CLOUDFLARE_API_TOKEN secret, with Pages: Edit added to its scope, and a
+  # Pages project named `kaambaan-docs`. See docs-site/README.md for the one-time setup.
+  deploy-docs:
+    needs: [test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-docs
+      cancel-in-progress: false
+    environment:
+      name: docs
+      url: https://docs.kaambaan.dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # npm, not pnpm, and scoped to docs-site: this project is deliberately not a
+      # workspace member.
+      - run: npm ci
+        working-directory: docs-site
+      - run: npm run build
+        working-directory: docs-site
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: pages deploy docs-site/dist --project-name=kaambaan-docs --branch=main
