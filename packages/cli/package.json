@@ -1,0 +1,21 @@
+{
+  "name": "@kaambaan/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "kbn": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kaambaan/contract": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
