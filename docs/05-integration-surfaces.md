@@ -93,7 +93,7 @@ that flow in the present tense. None of it was ever built.
 | `kaambaan_post_activity` | `runId`, `leaseEpoch`, `type`, `body?`, `parameter?`, `signal?`, `usage?` | `POST …/runs/:runId/activities` |
 | `kaambaan_submit_for_review` | `runId`, `leaseEpoch`, `output?` | `POST …/runs/:runId/`**`submit`** *(the verb is `submit`, not `submit_for_review`)* |
 | `kaambaan_complete` | `runId`, `leaseEpoch`, `handoff?` | `POST …/runs/:runId/complete` |
-| `kaambaan_block` / `_fail` | `runId`, `leaseEpoch`, `reason` *(required, non-empty)* | `POST …/runs/:runId/{block,fail}` *(REST defaults `reason` to `''`)* |
+| `kaambaan_block` / `kaambaan_fail` | `runId`, `leaseEpoch`, `reason` *(required, non-empty)* | `POST …/runs/:runId/{block,fail}` *(REST defaults `reason` to `''`)* |
 | `kaambaan_release` | `runId`, `leaseEpoch`, `reason?` | `POST …/runs/:runId/release` *(REST drops `reason`)* |
 
 `{tenant, agentId, capabilities}` always come from the token, never from tool arguments.
