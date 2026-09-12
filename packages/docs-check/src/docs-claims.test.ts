@@ -150,9 +150,16 @@ describe('the published site', () => {
   });
 
   it('no published page links to the agentpod.dev apex', () => {
-    // The apex resolves but serves nothing over HTTPS — a reader clicking it gets a
-    // connection failure, not a 404. Eight pages linked there until a crawl of the live
-    // site caught it; `docs.agentpod.dev` is the live destination and the right one.
+    // Eight pages linked to the apex until a crawl of the live site caught it. At the time
+    // it served nothing over HTTPS, so a reader clicking "AgentPod" got a connection
+    // failure — not even a 404.
+    //
+    // That is no longer true: agentpod.dev moved to Cloudflare on 2026-09-12 and now serves
+    // the product's landing page. The guard stays, on the weaker but still good ground that
+    // a reader following a product name from inside documentation wants that product's
+    // DOCUMENTATION, not its marketing page. If someone decides the marketing page is the
+    // better destination, delete this test rather than work around it — the original reason
+    // has expired and only the editorial one remains.
     //
     // Checked statically, on the host, rather than by fetching: a test that makes network
     // calls fails on a train, and a flaky test in CI teaches people to re-run rather than
