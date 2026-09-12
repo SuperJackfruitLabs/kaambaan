@@ -149,6 +149,20 @@ describe('the published site', () => {
     expect(publishedPages().length).toBeGreaterThan(5);
   });
 
+  it('no published page links to the agentpod.dev apex', () => {
+    // The apex resolves but serves nothing over HTTPS — a reader clicking it gets a
+    // connection failure, not a 404. Eight pages linked there until a crawl of the live
+    // site caught it; `docs.agentpod.dev` is the live destination and the right one.
+    //
+    // Checked statically, on the host, rather than by fetching: a test that makes network
+    // calls fails on a train, and a flaky test in CI teaches people to re-run rather than
+    // to look.
+    const offenders = publishedPages().flatMap(({ file, text }) =>
+      [...text.matchAll(/https:\/\/agentpod\.dev(?![a-z0-9.-])/g)].map(() => file)
+    );
+    expect(offenders, 'link to https://docs.agentpod.dev instead').toEqual([]);
+  });
+
   it('every internal link resolves to a page that exists', () => {
     // Starlight routes by slug, so `/use/gates/` is `use/gates.md`. A link to a page nobody wrote
     // renders as a 404 for a stranger, which is the audience least able to recover from one.

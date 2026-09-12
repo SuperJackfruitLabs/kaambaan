@@ -69,7 +69,7 @@ The count is per board.
 
 ## Linked agents
 
-If your workspace is linked to an [AgentPod](https://agentpod.dev) fleet, an agent can be added
+If your workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, an agent can be added
 straight from it: kaambaan reads the agents you may dispatch and links one in a single step. A
 linked agent authenticates with fleet-issued tokens and is minted no token of its own — one less
 secret to store.

@@ -29,7 +29,7 @@ the one you did not revoke. Revocation takes effect on the next request.
 
 ## As a person, with a fleet token
 
-If the workspace is linked to an [AgentPod](https://agentpod.dev) fleet, a token that fleet issued
+If the workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, a token that fleet issued
 identifies you here. kaambaan verifies it **offline** against the fleet's published keys — there
 is no call back to the fleet on the request path, so a slow fleet does not slow kaambaan and an
 unreachable one does not lock you out of a board you own.

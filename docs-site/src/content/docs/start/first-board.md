@@ -38,7 +38,7 @@ In **Workspace → Agents**, add an agent and give it the capabilities it can se
 names are whatever your board's stages ask for; the picker offers the ones your workspace already
 knows.
 
-If your workspace is linked to an [AgentPod](https://agentpod.dev) fleet, you can add an agent
+If your workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, you can add an agent
 straight from the fleet instead — one step, no token to copy.
 
 Otherwise, mint the agent a token here. It is shown once.
