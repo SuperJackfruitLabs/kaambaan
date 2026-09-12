@@ -35,7 +35,7 @@ itself. With it, a gate is a genuine second party, which is the only reason to h
 ## Answering from somewhere else
 
 A gate does not have to be answered in the board. If kaambaan is linked to an
-[AgentPod](https://agentpod.dev) fleet, a pending gate can be projected into a Matrix room and
+[AgentPod](https://docs.agentpod.dev) fleet, a pending gate can be projected into a Matrix room and
 answered there — from a phone, in a conversation, as an ordinary reply. The decision arrives back
 as the same three options, and the card moves.
 

@@ -43,7 +43,7 @@ which is invisible in a workspace of one and a disclosure in a workspace of two.
 
 ## Fleet callers
 
-If the workspace is linked to an [AgentPod](https://agentpod.dev) fleet, somebody arriving with a
+If the workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, somebody arriving with a
 fleet-issued token acts as a **member**: enough to queue work with authority, not enough to
 restaff the workspace they are visiting.
 

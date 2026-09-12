@@ -30,7 +30,7 @@ decisions left in, at the stages where you decided they belong.
 - **Not a chat interface.** Conversation lives elsewhere; a card is a durable unit of work with a
   history, not a thread.
 - **Not dependent on anything else.** It works as a plain board for your own agents. Linking it to
-  an [AgentPod](https://agentpod.dev) fleet adds cross-plane dispatch and gates you can answer
+  an [AgentPod](https://docs.agentpod.dev) fleet adds cross-plane dispatch and gates you can answer
   from a chat client, and nothing requires it.
 
 ## Who it is for

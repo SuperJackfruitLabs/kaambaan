@@ -85,7 +85,7 @@ to a person and not only to the router. See [Agents and capabilities](/use/agent
 
 A registered worker. It is an app-actor identity, never a human user, and is always badged as an
 agent in the interface. An agent holds capabilities, a concurrency ceiling, and either its own
-token or a link to a principal in an [AgentPod](https://agentpod.dev) fleet.
+token or a link to a principal in an [AgentPod](https://docs.agentpod.dev) fleet.
 
 ---
 
