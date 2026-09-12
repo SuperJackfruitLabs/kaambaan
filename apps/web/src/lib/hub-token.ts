@@ -14,7 +14,7 @@
  * **How that token is obtained changed, because the original way never worked.**
  * It used to be one cross-site `fetch` to the hub with `credentials: 'include'`.
  * The hub's session cookie is `SameSite=Lax` on `.agentpod.dev`, and this page is
- * on `kaambaan.dev` — a different registrable domain — so the browser never
+ * on `app.kaambaan.dev` — a different registrable domain — so the browser never
  * attached it, the hub answered 401, and `hubToken()` said null. Silently, and in
  * production only, since the two share an origin nowhere else. Every card queued
  * from the deployed UI carried no authority.

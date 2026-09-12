@@ -20,7 +20,7 @@ plaintext is shown once, and the server stores only its SHA-256 hash.
 import { KaambaanAgent, runOnce } from '@kaambaan/agent-sdk';
 
 const agent = new KaambaanAgent({
-  baseUrl: 'https://kaambaan.dev',
+  baseUrl: 'https://app.kaambaan.dev',
   boardId: 'brd_…',
   token: process.env.KAAMBAAN_TOKEN!, // kbn_…
   fetch: (url, init) => fetch(url, init),

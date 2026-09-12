@@ -16,7 +16,8 @@ secret:
   *Settings → Secrets and variables → Actions*.
 
 So the day-to-day flow is: open a PR → tests run → merge → it builds, migrates, and ships to
-kaambaan.dev automatically. The manual steps below are only for first-time setup or one-off deploys.
+app.kaambaan.dev automatically — `kaambaan.dev` is a separate static site, see
+`14-splitting-app-and-marketing-hosts.md`. The manual steps below are only for first-time setup or one-off deploys.
 
 ## Prerequisites (you)
 

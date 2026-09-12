@@ -8,7 +8,7 @@ human approval gates. The board is the control plane; agents bring their own run
 
 ## Status
 
-Deployed at [kaambaan.dev](https://kaambaan.dev). P0→P14 have shipped (tagged
+The app is at [app.kaambaan.dev](https://app.kaambaan.dev); [kaambaan.dev](https://kaambaan.dev) is the public page. P0→P14 have shipped (tagged
 [v0.0.1 "First Flight"](./CHANGELOG.md)); [docs/10-roadmap.md](./docs/10-roadmap.md) records the
 phases and [docs/13](./docs/13-linear-parity-program.md) plans what comes after.
 

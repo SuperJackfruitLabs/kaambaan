@@ -57,7 +57,7 @@ export type Fetcher = (
 ) => Promise<HttpResponse>;
 
 export interface AgentConfig {
-  /** Origin of the Kaambaan deployment, e.g. `https://kaambaan.dev`. */
+  /** Origin of the Kaambaan deployment, e.g. `https://app.kaambaan.dev`. */
   baseUrl: string;
   /** The board this agent works. */
   boardId: string;

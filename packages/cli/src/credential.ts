@@ -25,7 +25,7 @@ export const ENV_TOKEN = "KAAMBAAN_TOKEN";
 export const ENV_HUB_TOKEN = "AGENTPOD_TOKEN";
 export const ENV_BASE = "KAAMBAAN_URL";
 
-export const DEFAULT_BASE = "https://kaambaan.dev";
+export const DEFAULT_BASE = "https://app.kaambaan.dev";
 
 export interface Credential {
   token: string;

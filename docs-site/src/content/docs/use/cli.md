@@ -27,7 +27,7 @@ KAAMBAAN_TOKEN=… kbn boards
 |---|---|
 | `KAAMBAAN_TOKEN` | a token, used before anything else |
 | `AGENTPOD_TOKEN` | the fleet token — what kaambaan actually accepts |
-| `KAAMBAAN_URL` | the deployment to talk to. Defaults to `https://kaambaan.dev`. |
+| `KAAMBAAN_URL` | the deployment to talk to. Defaults to `https://app.kaambaan.dev`. |
 
 ## The verbs
 
