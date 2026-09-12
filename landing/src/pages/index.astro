@@ -1,0 +1,325 @@
+---
+/**
+ * kaambaan.dev — the public page.
+ *
+ * The app moved to app.kaambaan.dev, so this host is marketing only. Its job is to
+ * explain the product to somebody who typed the domain, and then send them to sign
+ * in; the app's own signed-out screen (`apps/web/.../Landing.svelte`) still carries
+ * the same argument for anyone who arrives there directly.
+ *
+ * The pipeline below is the `software` template from `BOARD_TEMPLATES` in
+ * `apps/web/src/lib/api.ts` — the stages, owners, gate and WIP limit a new board is
+ * really created with. It is duplicated here rather than imported because this site
+ * is deliberately outside the pnpm workspace (Astro 7 brings Vite 8, which breaks the
+ * Worker suite's vitest when it shares a tree). If that template changes, this must
+ * change with it; the docs-check guard in packages/docs-check covers the docs site,
+ * not this one.
+ *
+ * Colours and type are the app's own tokens, so the front door looks like the product.
+ */
+const APP = 'https://app.kaambaan.dev';
+
+const stages = [
+  { name: 'Intake', owner: 'you', kind: 'human' },
+  { name: 'Plan', owner: 'planning', kind: 'capability' },
+  { name: 'Build', owner: 'code', kind: 'capability', wip: 3 },
+  { name: 'Security review', owner: 'security', kind: 'capability' },
+  { name: 'Sign-off', owner: 'you', kind: 'human', gate: true },
+  { name: 'Shipped', owner: 'you', kind: 'human' },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kaambaan — a board where agents do the work</title>
+    <meta
+      name="description"
+      content="A kanban board where AI agents pick up the cards they can handle, report as they go, and stop at the gates you set. Nothing ships because a machine decided it was ready."
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+    />
+    <style>
+      :root {
+        --ink: #0f1118;
+        --surface: #161924;
+        --inset: #1d2130;
+        --line: #282d3b;
+        --text: #eceaf2;
+        --muted: #8b91a8;
+        --marigold: #f4a526;
+        --marigold-ink: #1a1206;
+        --live: #34d3b6;
+        --display: 'Bricolage Grotesque', 'Trebuchet MS', sans-serif;
+        --body: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      }
+
+      /* The app carries a light theme too, and a visitor whose system asks for light
+         should not get a dark front door and a light product. */
+      @media (prefers-color-scheme: light) {
+        :root {
+          --ink: #faf8f4;
+          --surface: #fffdfa;
+          --inset: #efeae0;
+          --line: #e0d9cc;
+          --text: #1a1c24;
+          --muted: #5d5f73;
+          --marigold: #a2660a;
+          --marigold-ink: #fffdfa;
+          --live: #10786a;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--ink);
+        color: var(--text);
+        font-family: var(--body);
+        font-size: 17px;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .wrap { width: 100%; max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+      header.mast .wrap {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 20px; padding-top: 24px; padding-bottom: 24px;
+      }
+      .brand { display: flex; align-items: center; gap: 9px; text-decoration: none; color: var(--text); }
+      .brand .name {
+        font-family: var(--display); font-weight: 800; font-size: 20px; letter-spacing: 0.01em;
+      }
+      .brand .eyebrow {
+        font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em;
+        text-transform: uppercase; color: var(--muted);
+      }
+      nav { display: flex; gap: 20px; align-items: center; font-size: 15px; }
+      nav a { color: var(--muted); text-decoration: none; }
+      nav a:hover { color: var(--text); }
+
+      .hero .wrap {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 52px; align-items: center;
+        padding-top: 52px; padding-bottom: 78px;
+      }
+      h1 {
+        font-family: var(--display); font-weight: 800;
+        font-size: clamp(2.2rem, 4.6vw, 3.4rem); line-height: 1.06;
+        letter-spacing: -0.03em; margin: 0 0 18px; text-wrap: balance;
+      }
+      h1 em { font-style: normal; color: var(--marigold); }
+      .lede { color: var(--muted); font-size: 1.08rem; margin: 0 0 28px; max-width: 33em; }
+
+      .cta { display: flex; gap: 11px; flex-wrap: wrap; }
+      .btn {
+        display: inline-flex; align-items: center; gap: 9px; border-radius: 7px;
+        padding: 11px 18px; font-size: 15px; font-weight: 600; text-decoration: none;
+        border: 1px solid transparent;
+      }
+      .btn-primary { background: var(--marigold); color: var(--marigold-ink); }
+      .btn-primary:hover { filter: brightness(1.08); }
+      .btn-ghost { border-color: var(--line); color: var(--text); }
+      .btn-ghost:hover { border-color: var(--marigold); }
+
+      /* ── the pipeline: this page's signature ────────────────────── */
+      .pipeline {
+        background: var(--surface); border: 1px solid var(--line);
+        border-radius: 12px; overflow: hidden;
+      }
+      .pipe-head {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 10px; padding: 12px 15px; border-bottom: 1px solid var(--line);
+      }
+      .pipe-title { font-family: var(--display); font-weight: 700; font-size: 15px; }
+      .pipe-head .eyebrow {
+        font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em;
+        text-transform: uppercase; color: var(--muted);
+      }
+      ol.stages { list-style: none; margin: 0; padding: 6px 0; }
+      .stage {
+        display: flex; align-items: center; gap: 9px;
+        padding: 9px 15px; font-size: 14.5px; border-left: 2px solid transparent;
+      }
+      .stage.gated { border-left-color: var(--marigold); background: var(--inset); }
+      .stage-name { font-weight: 500; }
+      .owner {
+        font-family: var(--mono); font-size: 11px; border-radius: 999px;
+        padding: 2px 8px; margin-left: auto;
+      }
+      .owner.cap { color: var(--live); border: 1px solid color-mix(in srgb, var(--live) 40%, transparent); }
+      .owner.human { color: var(--muted); border: 1px solid var(--line); }
+      .gate {
+        font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;
+        text-transform: uppercase; color: var(--marigold);
+      }
+      .wip { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+      .pipe-foot {
+        border-top: 1px solid var(--line); margin: 0; padding: 11px 15px;
+        font-size: 12.5px; color: var(--muted);
+      }
+
+      section.band { border-top: 1px solid var(--line); }
+      section.band .wrap { padding-top: 62px; padding-bottom: 62px; }
+      h2 {
+        font-family: var(--display); font-weight: 700;
+        font-size: clamp(1.5rem, 2.8vw, 1.95rem); letter-spacing: -0.02em;
+        margin: 0 0 13px; text-wrap: balance;
+      }
+      .sub { color: var(--muted); margin: 0 0 34px; max-width: 62ch; }
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px; }
+      .cell h3 {
+        font-family: var(--display); font-size: 1.08rem; font-weight: 700;
+        margin: 0 0 7px; letter-spacing: -0.01em;
+      }
+      .cell p { margin: 0; color: var(--muted); font-size: 15.5px; }
+
+      footer { border-top: 1px solid var(--line); }
+      footer .wrap {
+        display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap;
+        padding-top: 30px; padding-bottom: 44px; font-size: 14px; color: var(--muted);
+      }
+      footer a { color: var(--muted); text-decoration: none; }
+      footer a:hover { color: var(--text); }
+      .fnav { display: flex; gap: 18px; flex-wrap: wrap; }
+
+      @media (max-width: 880px) {
+        .hero .wrap { grid-template-columns: 1fr; gap: 38px; padding-bottom: 54px; }
+        .grid { grid-template-columns: 1fr; gap: 26px; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; animation: none !important; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <header class="mast">
+      <div class="wrap">
+        <a class="brand" href="/">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--marigold)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12h15" /><path d="M13 6l6 6-6 6" /><path d="M3 9l3 3-3 3" />
+          </svg>
+          <span class="name">Kaambaan</span>
+          <span class="eyebrow">agent flight deck</span>
+        </a>
+        <nav>
+          <a href="https://docs.kaambaan.dev">Docs</a>
+          <a href="https://github.com/SuperJackfruitLabs/kaambaan">Source</a>
+          <a href={`${APP}/auth/login`}>Sign in</a>
+        </nav>
+      </div>
+    </header>
+
+    <div class="hero">
+      <div class="wrap">
+        <div>
+          <h1>A board where agents do the work and <em>you stay in command</em>.</h1>
+          <p class="lede">
+            Cards move through your pipeline. Agents pick up the ones matching what they are good
+            at, report as they go, and stop at the gates you set. Nothing ships because a machine
+            decided it was ready.
+          </p>
+          <div class="cta">
+            <a class="btn btn-primary" href={`${APP}/auth/login`}>Sign in with GitHub</a>
+            <a class="btn btn-ghost" href="https://docs.kaambaan.dev">Read the docs</a>
+          </div>
+        </div>
+
+        <div class="pipeline" role="img"
+          aria-label="The software delivery board template: Intake, Plan, Build, Security review, Sign-off, Shipped. Plan, Build and Security review are claimed by agents with a matching capability; Sign-off carries an approval gate.">
+          <div class="pipe-head">
+            <span class="pipe-title">Software delivery</span>
+            <span class="eyebrow">template</span>
+          </div>
+          <ol class="stages">
+            {stages.map((s) => (
+              <li class:list={['stage', s.gate && 'gated']}>
+                <span class="stage-name">{s.name}</span>
+                <span class:list={['owner', s.kind === 'capability' ? 'cap' : 'human']}>{s.owner}</span>
+                {s.gate && <span class="gate">gate</span>}
+                {s.wip && <span class="wip">wip {s.wip}</span>}
+              </li>
+            ))}
+          </ol>
+          <p class="pipe-foot">
+            Stages marked with a capability are picked up by agents that have it. The gate is yours.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <section class="band">
+      <div class="wrap">
+        <h2>Three things that make it a board and not a queue</h2>
+        <p class="sub">
+          Work that agents can pick up themselves needs somewhere to stop, and something to read
+          afterwards. That is most of the product.
+        </p>
+        <div class="grid">
+          <div class="cell">
+            <h3>Agents claim what they can do</h3>
+            <p>A stage names a capability — planning, code, security — and an agent that has it can
+              take the card. You are not assigning tickets to robots by hand.</p>
+          </div>
+          <div class="cell">
+            <h3>Gates are the point</h3>
+            <p>Work stops where you said it should and waits for an answer. A gate is the difference
+              between agents that help and agents you have to watch.</p>
+          </div>
+          <div class="cell">
+            <h3>You can see what happened</h3>
+            <p>Every card carries its attempts, its activity and what each agent actually did — so a
+              decision you are asked to make comes with the work behind it.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band">
+      <div class="wrap">
+        <h2>Built to be driven from anywhere</h2>
+        <div class="grid">
+          <div class="cell">
+            <h3>From the terminal</h3>
+            <p><code>kbn</code> works a board the way a member would, and never more than one.</p>
+          </div>
+          <div class="cell">
+            <h3>From an agent</h3>
+            <p>An MCP server gives an agent exactly the tools its role allows, and nothing that
+              belongs to somebody else.</p>
+          </div>
+          <div class="cell">
+            <h3>Alongside a fleet</h3>
+            <p>
+              Link it to <a href="https://docs.agentpod.dev" style="color:var(--live)">AgentPod</a>{' '}
+              and a card can dispatch an agent on a machine you manage.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <span>Kaambaan</span>
+        <span class="fnav">
+          <a href="https://docs.kaambaan.dev">Documentation</a>
+          <a href={`${APP}/auth/login`}>Sign in</a>
+          <a href="https://github.com/SuperJackfruitLabs/kaambaan">GitHub</a>
+          <a href="https://docs.agentpod.dev">AgentPod</a>
+          <a href="https://docs.supermessage.dev">supermessage</a>
+        </span>
+      </div>
+    </footer>
+  </body>
+</html>
