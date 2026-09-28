@@ -20,6 +20,8 @@ export interface TenantRecord {
   name: string;
   externalId: string | null;
   externalSource: string | null;
+  /** This workspace's Forgejo host, bare — no scheme, no path. NULL when it runs no forge. */
+  forgeHost: string | null;
 }
 
 /** Where a tenant is also known, outside superpipeline. */
@@ -106,6 +108,10 @@ export async function ensurePersonalWorkspace(db: D1Database, userId: string, di
     name: `${displayName}'s workspace`,
     externalId: null,
     externalSource: null,
+    // A new workspace runs no forge. Every self-hosted URL stays a generic `url` reference until
+    // somebody says otherwise, which is the safe default: not recognising a link is recoverable,
+    // labelling somebody else's server as this tenant's repository is not.
+    forgeHost: null,
   };
   await db.prepare(`INSERT INTO tenants (id, slug, name) VALUES (?, ?, ?)`).bind(tenant.id, tenant.slug, tenant.name).run();
   await db.prepare(`INSERT INTO memberships (id, tenant_id, user_id, role) VALUES (?, ?, ?, 'owner')`).bind(newId('mbr'), id, userId).run();
@@ -115,7 +121,8 @@ export async function ensurePersonalWorkspace(db: D1Database, userId: string, di
 export async function primaryTenant(db: D1Database, userId: string): Promise<TenantRecord | null> {
   return db
     .prepare(
-      `SELECT t.id, t.slug, t.name, t.external_id AS externalId, t.external_source AS externalSource
+      `SELECT t.id, t.slug, t.name, t.external_id AS externalId, t.external_source AS externalSource,
+              t.forge_host AS forgeHost
        FROM tenants t JOIN memberships m ON m.tenant_id = t.id WHERE m.user_id = ? ORDER BY m.created_at ASC LIMIT 1`,
     )
     .bind(userId)
@@ -133,11 +140,41 @@ export async function primaryTenant(db: D1Database, userId: string): Promise<Ten
 export async function tenantById(db: D1Database, tenantId: string): Promise<TenantRecord | null> {
   return db
     .prepare(
-      `SELECT id, slug, name, external_id AS externalId, external_source AS externalSource
+      `SELECT id, slug, name, external_id AS externalId, external_source AS externalSource,
+              forge_host AS forgeHost
        FROM tenants WHERE id = ?`,
     )
     .bind(tenantId)
     .first<TenantRecord>();
+}
+
+/**
+ * Record (or clear, with `null`) which host is this workspace's forge.
+ *
+ * A HOST, not a URL. It is compared against a parsed URL's `hostname`, so a scheme or a trailing
+ * path would simply never match and the setting would look configured while doing nothing —
+ * which is worse than an error, because nothing reports it. The normalisation here is the
+ * same one recognition applies, so what is stored is what will be compared.
+ */
+export async function setTenantForgeHost(db: D1Database, tenantId: string, host: string | null): Promise<void> {
+  let value: string | null = null;
+  if (host !== null) {
+    const trimmed = host.trim();
+    // Accept what a person is likely to paste — `https://forge.example/` — and store the host.
+    // Refusing it would be defensible; quietly storing it would not.
+    let parsed = trimmed;
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        parsed = new URL(trimmed).hostname;
+      } catch {
+        throw new Error(`not a host: ${host}`);
+      }
+    }
+    parsed = parsed.replace(/\/.*$/, '').toLowerCase().replace(/^www\./, '');
+    if (!parsed || parsed.includes(' ')) throw new Error(`not a host: ${host}`);
+    value = parsed;
+  }
+  await db.prepare(`UPDATE tenants SET forge_host = ?, updated_at = datetime('now') WHERE id = ?`).bind(value, tenantId).run();
 }
 
 /**

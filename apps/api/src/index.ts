@@ -41,7 +41,7 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, tenantById } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
@@ -250,7 +250,25 @@ export default {
           if (refused) return refused;
         }
 
-        const body = (await request.json()) as { externalId?: string | null };
+        const body = (await request.json()) as { externalId?: string | null; forgeHost?: string | null };
+
+        // Where this workspace's forge lives. Separate from the external mapping above and
+        // accepted on the same PATCH: both are facts the workspace states about the outside
+        // world, and neither is worth a route of its own.
+        if (body.forgeHost !== undefined) {
+          try {
+            await setTenantForgeHost(env.DB, u.tenantId, body.forgeHost);
+          } catch {
+            return Response.json(
+              { error: 'forgeHost must be a host — `forge.example.com`, not a URL with a path' },
+              { status: 400 },
+            );
+          }
+          // A PATCH carrying only the host is complete; one carrying both falls through to the
+          // mapping below, so neither field is silently ignored because the other was present.
+          if (body.externalId === undefined) return Response.json({ ok: true });
+        }
+
         if (body.externalId === undefined) {
           return Response.json({ error: 'externalId is required (a fleet_… string, or null to unlink)' }, { status: 400 });
         }
@@ -1100,7 +1118,13 @@ export default {
           metadata?: Record<string, unknown>;
           addedBy?: 'agent' | 'user';
         };
-        const result = await stub.addReference(resolveReferenceInput({ cardId: refMatch[1]!, ...body }));
+        // The tenant's forge host is read here rather than held in the DO: it is a workspace
+        // fact, and a board that cached it would keep enriching against a host the workspace had
+        // already changed.
+        const refTenant = await tenantById(env.DB, tenantId);
+        const result = await stub.addReference(
+          resolveReferenceInput({ cardId: refMatch[1]!, ...body }, refTenant?.forgeHost ?? null),
+        );
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ reference: result.value });
       }

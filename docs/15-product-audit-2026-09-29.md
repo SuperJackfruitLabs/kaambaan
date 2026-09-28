@@ -37,7 +37,7 @@ reference with no `externalId`, so it cannot be deduped, enriched, or synced, an
 tell a forge PR from a link to a blog post.
 
 The integration is GitHub-shaped end to end: `PUT /v1/boards/:id/github`,
-`POST /v1/boards/:id/webhooks/github`, and `apps/api/src/references/github-url.ts`.
+`POST /v1/boards/:id/webhooks/github`, and `apps/api/src/references/reference-url.ts`.
 
 ### 2. The contract is not a boundary
 

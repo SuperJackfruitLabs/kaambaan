@@ -1,0 +1,20 @@
+-- Where this workspace's forge lives.
+--
+-- GitHub can be recognised from a constant because there is one github.com. A Forgejo instance is
+-- at whatever host its operator chose, so recognition has to be told — and telling it is a
+-- per-workspace fact, because one superpipeline deployment serves many tenants and each may run
+-- its own forge or none.
+--
+-- NULL is the normal, complete state: a workspace with no forge never sets it, and every
+-- self-hosted URL stays a generic `url` reference. That default matters more than it looks. The
+-- alternative to configuration is guessing, and a guess here relabels an unrelated link as the
+-- tenant's own repository — a wrong enrichment is harder to notice than a missing one.
+--
+-- A host, never a URL: no scheme, no path, no port. It is compared against a parsed URL's
+-- hostname, and storing "https://forge.example/" would simply never match anything.
+--
+-- Singular, deliberately. An organisation runs one forge; a column that accepted a list would
+-- raise a question nothing else answers — which of them is canonical when two recognise the same
+-- repository. If a second one is ever needed, that question has to be answered first, and a
+-- migration is the cheap part of it.
+ALTER TABLE tenants ADD COLUMN forge_host TEXT;
