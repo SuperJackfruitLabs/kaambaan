@@ -116,7 +116,15 @@ export function capabilityTags(raw: string[]): string[] {
   return [...new Set(raw.map(capabilityTag).filter((c) => c !== ''))];
 }
 
-export const ReferenceProvider = z.enum(['github', 'gitlab', 'docs', 'url']);
+/**
+ * Where a reference lives.
+ *
+ * `forge` is a SELF-HOSTED Forgejo instance, which is why it is one value rather than one per
+ * host: the tenant's `forge_host` says which server, and this says what kind of thing it is.
+ * Added 2026-09-29 — until then the charter's primary git host had no name in this enum and every
+ * forge link was stored as a generic `url`, undedupable and unenrichable.
+ */
+export const ReferenceProvider = z.enum(['github', 'gitlab', 'forge', 'docs', 'url']);
 export type ReferenceProvider = z.infer<typeof ReferenceProvider>;
 
 export const ReferenceSourceType = z.enum([

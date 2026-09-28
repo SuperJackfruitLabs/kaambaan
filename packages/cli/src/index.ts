@@ -54,6 +54,7 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                queue a card, with this token as its grant
   supi templates               the starting pipelines --template accepts
 
+  supi forge [<host>|none]     this workspace's forge host, shown or set
   supi agents                  the workspace's agents and what they declare
   supi capabilities            the capability registry, with each one's origin
   supi implications            what one capability implies about another
@@ -437,6 +438,29 @@ async function main(argv: string[]): Promise<void> {
       }
       if (priorityArg) body.priority = Number(priorityArg);
       out(await api(`/v1/boards/${pos[0]}/cards`, { method: "POST", body: JSON.stringify(body) }));
+      return;
+    }
+
+    /**
+     * Where this workspace's forge is, so references from it are recognised.
+     *
+     * GitHub needs no configuration — there is one github.com. A Forgejo instance is at whatever
+     * host its operator chose, so recognition has to be told, and until it is, every link to the
+     * workspace's own repositories is stored as a generic `url`: no durable id, nothing to dedupe
+     * against, nothing a webhook could ever match.
+     */
+    case "forge": {
+      if (!pos[0]) {
+        const t = (await api("/v1/tenant")) as { tenant?: { forgeHost?: string | null } };
+        const host = t.tenant?.forgeHost ?? null;
+        out({ forgeHost: host }, () =>
+          host ? `forge  ${host}` : "No forge configured. `supi forge <host>` sets one.",
+        );
+        return;
+      }
+      const host = pos[0] === "none" ? null : pos[0];
+      await api("/v1/tenant", { method: "PATCH", body: JSON.stringify({ forgeHost: host }) });
+      out({ forgeHost: host }, () => (host ? `forge  ${host}` : "Forge cleared."));
       return;
     }
 
