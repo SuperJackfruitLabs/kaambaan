@@ -48,6 +48,8 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                create a board; --template defaults to \`simple\`
   supi set-stages <boardId> <file|->
                                replace a board's pipeline
+  supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name ...]
+                               change ONE stage, leaving the others alone
   supi create-card <boardId> <title> [--spec <file|->] [--priority <n>]
                                queue a card, with this token as its grant
   supi templates               the starting pipelines --template accepts
@@ -189,6 +191,15 @@ function stagesFromTemplate(id: string): BoardTemplateStage[] {
  * wrong *kind* of thing — a board snapshot, a card list, an error page saved by mistake — where
  * the server's own message would be about fields the person never typed.
  */
+/** A file's text, or stdin for `-`. Unlike `stagesFromFile` the content is prose, not JSON. */
+function readText(path: string): string {
+  try {
+    return (path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8")).trim();
+  } catch {
+    fail(`Could not read ${path === "-" ? "stdin" : path}.`);
+  }
+}
+
 async function stagesFromFile(path: string): Promise<BoardTemplateStage[]> {
   let raw: string;
   try {
@@ -366,6 +377,47 @@ async function main(argv: string[]): Promise<void> {
         method: "PUT",
         body: JSON.stringify({ stages: await stagesFromFile(pos[1]) }),
       }));
+      return;
+    }
+
+    /**
+     * One stage, without holding the rest of the pipeline.
+     *
+     * `set-stages` replaces every stage, so setting one rule meant reading them all, editing a
+     * JSON file by hand and putting them all back — four times in one afternoon on one board, and
+     * every one of those writes would have discarded a concurrent edit to a stage it never
+     * touched.
+     *
+     * `--instructions` reads a FILE or stdin rather than taking a string, because a stage rule is
+     * paragraphs with line breaks and shell quoting mangles those in ways that are invisible
+     * until an agent reads them.
+     */
+    case "set-stage": {
+      if (!pos[0] || !pos[1]) {
+        fail(
+          "usage: supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name <name>]",
+          "  [--gate none|approval] [--wip <n>] [--owner <capability>] [--clear-instructions]",
+        );
+      }
+      const patch: Record<string, unknown> = {};
+      const instructionsArg = flag(rest, "--instructions");
+      if (instructionsArg) patch.instructions = readText(instructionsArg);
+      // Explicit, and its own flag: `--instructions ""` cannot mean "remove" when an empty rule
+      // is refused, and a flag that deletes something should have to be typed.
+      if (rest.includes("--clear-instructions")) patch.instructions = null;
+      const nameArg = flag(rest, "--name");
+      if (nameArg) patch.name = nameArg;
+      const gateArg = flag(rest, "--gate");
+      if (gateArg) patch.gate = gateArg;
+      const ownerArg = flag(rest, "--owner");
+      if (ownerArg) patch.owner = ownerArg;
+      const wipArg = flag(rest, "--wip");
+      if (wipArg) patch.wipLimit = wipArg === "none" ? null : Number(wipArg);
+
+      if (Object.keys(patch).length === 0) {
+        fail("Nothing to change.", "  supi set-stage <boardId> <stageKey> --instructions <file|->");
+      }
+      out(await api(`/v1/boards/${pos[0]}/stages/${pos[1]}`, { method: "PATCH", body: JSON.stringify(patch) }));
       return;
     }
 

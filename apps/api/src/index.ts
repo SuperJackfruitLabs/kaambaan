@@ -24,6 +24,7 @@
 import {
   BoardDO,
   type StageDef,
+  type StagePatch,
   type BoardSnapshot,
   type BoardErrorCode,
   type AgentActivityType,
@@ -969,6 +970,39 @@ export default {
           await renameBoard(env.DB, tenantId, boardId, body.name.trim());
         }
         return Response.json(await stub.getState());
+      }
+
+      // PATCH /v1/boards/:id/stages/:stageKey — change ONE stage (docs/15 §5)
+      //
+      // Beside the whole-pipeline PUT rather than replacing it: reordering and adding stages are
+      // statements about the pipeline and stay there. This is for the fields that belong to one
+      // stage, where a full replace would discard a concurrent edit to a stage nobody touched.
+      const stageMatch = rest.match(/^stages\/([^/]+)$/);
+      if (stageMatch && request.method === 'PATCH') {
+        const body = (await request.json().catch(() => null)) as StagePatch | null;
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return Response.json({ error: 'a stage patch must be a JSON object' }, { status: 400 });
+        }
+        // Named rather than ignored. A caller sending `key` means to rename the stage, and
+        // silently dropping it would report success for a change that did not happen.
+        for (const forbidden of ['key', 'order'] as const) {
+          if (forbidden in body) {
+            return Response.json(
+              { error: `\`${forbidden}\` is not patchable — use PUT /stages, where its effect on the other stages is visible` },
+              { status: 400 },
+            );
+          }
+        }
+        const result = await stub.updateStage(stageMatch[1]!, body);
+        if (!result.ok) {
+          // `UNKNOWN_STAGE` is a 400 in the shared mapping, which is right where the stage is in
+          // the BODY — `move` asking for a lane that does not exist is a bad request. Here it is a
+          // path segment, and a path naming nothing is a 404: that is how a caller tells a typo in
+          // the URL from a bad payload without reading the message.
+          const status = result.code === 'UNKNOWN_STAGE' ? 404 : statusForCode(result.code);
+          return Response.json({ error: result }, { status });
+        }
+        return Response.json(result.value);
       }
 
       // PUT /v1/boards/:id/stages — rework the pipeline (docs/03).

@@ -200,3 +200,128 @@ describe('BoardDO — a stage carries its own instructions', () => {
     });
   });
 });
+
+/**
+ * Patching ONE stage.
+ *
+ * `setStages` replaces the pipeline, so changing one field meant reading every stage, mutating
+ * one, and writing them all back — four times in one afternoon while configuring one board, and
+ * every one of those writes would have discarded a concurrent edit to a stage it never touched.
+ */
+describe('BoardDO — one stage can be changed without rewriting the pipeline', () => {
+  const RULE = 'Push to the PRIMARY remote, never to GitHub directly.';
+
+  it('changes only the named stage, and only the fields given', async () => {
+    await runInDurableObject(stubFor('st-patch'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_sp', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const r = await board.updateStage('doing', { instructions: RULE });
+      expect(r.ok).toBe(true);
+
+      const stages = (await board.getState()).stages;
+      const doing = stages.find((s) => s.key === 'doing')!;
+      expect(doing.instructions).toBe(RULE);
+      // The fields not named are untouched — a patch that silently dropped `owner` would
+      // unstaff a lane, and nothing on the board would say why it stopped being claimed.
+      expect(doing.owner).toBe('research');
+      expect(doing.name).toBe('Doing');
+      expect(stages.map((s) => s.key)).toEqual(['todo', 'doing', 'done']);
+      expect(stages.find((s) => s.key === 'todo')!.instructions).toBeUndefined();
+    });
+  });
+
+  it('refuses a stage that is not on the board, rather than creating one', async () => {
+    await runInDurableObject(stubFor('st-patch-missing'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_spm', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const r = await board.updateStage('nope', { instructions: RULE });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('UNKNOWN_STAGE');
+    });
+  });
+
+  it('holds a patched rule to the same limits a replaced one meets', async () => {
+    // The validation lives in one place for both writes. Two copies drift, and the copy that
+    // drifts is the one nobody is looking at.
+    await runInDurableObject(stubFor('st-patch-limits'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_spl', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const long = await board.updateStage('doing', { instructions: 'x'.repeat(4001) });
+      expect(long.ok).toBe(false);
+      const blank = await board.updateStage('doing', { instructions: '   ' });
+      expect(blank.ok).toBe(false);
+    });
+  });
+
+  it('clears a rule when asked with null, which is not the same as omitting it', async () => {
+    await runInDurableObject(stubFor('st-patch-clear'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_spc', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      await board.updateStage('doing', { instructions: RULE });
+      await board.updateStage('doing', { name: 'In progress' });
+      expect((await board.getState()).stages.find((s) => s.key === 'doing')!.instructions).toBe(RULE);
+
+      await board.updateStage('doing', { instructions: null });
+      expect((await board.getState()).stages.find((s) => s.key === 'doing')!.instructions).toBeUndefined();
+    });
+  });
+
+  it('normalises a capability owner the way the whole-pipeline write does', async () => {
+    await runInDurableObject(stubFor('st-patch-norm'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_spn', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      await board.updateStage('doing', { owner: 'Code Review' });
+      expect((await board.getState()).stages.find((s) => s.key === 'doing')!.owner).toBe('code-review');
+    });
+  });
+});
+
+describe('PATCH /v1/boards/:id/stages/:stageKey', () => {
+  const dev = { 'X-Tenant-Id': 'tnt_patch', 'Content-Type': 'application/json' };
+
+  async function board(): Promise<string> {
+    const res = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST',
+      headers: dev,
+      body: JSON.stringify({ name: 'P', stages: PIPE }),
+    });
+    return ((await res.json()) as { boardId: string }).boardId;
+  }
+
+  it('sets a stage rule without the caller holding the rest of the pipeline', async () => {
+    const id = await board();
+    const res = await SELF.fetch(`https://api.test/v1/boards/${id}/stages/doing`, {
+      method: 'PATCH',
+      headers: dev,
+      body: JSON.stringify({ instructions: 'Push to the PRIMARY remote.' }),
+    });
+    expect(res.status).toBe(200);
+
+    const state = (await (await SELF.fetch(`https://api.test/v1/boards/${id}`, { headers: dev })).json()) as {
+      stages: Array<{ key: string; instructions?: string; owner?: string }>;
+    };
+    expect(state.stages.find((s) => s.key === 'doing')!.instructions).toBe('Push to the PRIMARY remote.');
+    expect(state.stages.find((s) => s.key === 'doing')!.owner).toBe('research');
+    expect(state.stages.map((s) => s.key)).toEqual(['todo', 'doing', 'done']);
+  });
+
+  it('refuses `key` and `order` by name rather than ignoring them', async () => {
+    // Dropping them silently would answer 200 for a rename that did not happen, which is the
+    // worst of the three options: the caller believes the board changed.
+    const id = await board();
+    for (const body of [{ key: 'renamed' }, { order: 0 }]) {
+      const res = await SELF.fetch(`https://api.test/v1/boards/${id}/stages/doing`, {
+        method: 'PATCH',
+        headers: dev,
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toMatch(/not patchable/);
+    }
+  });
+
+  it('answers 404 for a stage the board does not have', async () => {
+    const id = await board();
+    const res = await SELF.fetch(`https://api.test/v1/boards/${id}/stages/absent`, {
+      method: 'PATCH',
+      headers: dev,
+      body: JSON.stringify({ name: 'X' }),
+    });
+    expect(res.status).toBe(404);
+  });
+});

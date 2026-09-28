@@ -9,7 +9,7 @@
  * Needed because `--flag value` and a bare `--flag` cannot be told apart without knowing the flag:
  * the token after `--json` is a positional, the token after `--spec` is not.
  */
-const VALUELESS = new Set(["--json"]);
+const VALUELESS = new Set(["--json", "--clear-instructions"]);
 
 /** A flag's value, in either spelling: `--name value` or `--name=value`. */
 export function flag(args: string[], name: string): string | null {

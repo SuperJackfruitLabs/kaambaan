@@ -95,7 +95,52 @@ const DEFAULT_GATE_OPTIONS: GateOption[] = [
  * `@superpipeline/contract`. A rule is a few lines an agent reads every time; past this it is
  * a document, and a document belongs in a card reference where it can be read once.
  */
+/**
+ * A change to ONE stage. Absent means "leave it"; `null` on `instructions` means "remove it".
+ *
+ * `key` and `order` are deliberately not patchable. A key is the stage's identity — every card
+ * refers to it — and reordering one stage is a statement about all of them, so both remain
+ * whole-pipeline work where their consequences are visible.
+ */
+export interface StagePatch {
+  name?: string;
+  owner?: string;
+  ownerKind?: 'capability' | 'agent' | 'human';
+  requires?: { all?: string[]; any?: string[] } | null;
+  gate?: 'none' | 'approval';
+  wipLimit?: number | null;
+  instructions?: string | null;
+}
+
 export const STAGE_INSTRUCTIONS_MAX = 4000;
+
+/**
+ * What is wrong with one stage's own fields, or null.
+ *
+ * Shared by `setStages` (which replaces the pipeline) and `updateStage` (which patches one), so a
+ * rule a patch accepts is a rule a replace would accept too. Two copies of this drift, and the
+ * copy that drifts is the one nobody is looking at.
+ *
+ * Checked HERE rather than only in `@superpipeline/contract` because the routes cast rather than
+ * parse: a cap enforced only in the schema is a cap nothing enforces.
+ */
+export function stageFieldError(s: Pick<StageDef, 'key' | 'wipLimit' | 'instructions'>): string | null {
+  if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
+    return `stage "${s.key}" needs a WIP limit of at least 1, or none`;
+  }
+  if (s.instructions !== undefined) {
+    // Blank is refused: AgentPod gives instructions their own heading, and a heading with nothing
+    // under it reads to an agent as "there was nothing to do here", which is a different claim
+    // from "this was not provided".
+    if (typeof s.instructions !== 'string' || s.instructions.trim() === '') {
+      return `stage "${s.key}" has empty instructions — leave them out instead`;
+    }
+    if (s.instructions.length > STAGE_INSTRUCTIONS_MAX) {
+      return `stage "${s.key}" has ${s.instructions.length} characters of instructions; the limit is ${STAGE_INSTRUCTIONS_MAX}. A rule this long is a document, and belongs in a reference.`;
+    }
+  }
+  return null;
+}
 
 export interface StageDef {
   key: string;
@@ -567,6 +612,7 @@ export interface BoardStub {
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
   setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
+  updateStage(stageKey: string, patch: StagePatch): Promise<Result<{ stage: StageDef }>>;
   destroy(): Promise<{ ok: true }>;
   getState(): Promise<BoardSnapshot>;
   getEvents(limit?: number): Promise<BoardEvent[]>;
@@ -1164,26 +1210,8 @@ export class BoardDO extends DurableObject<Env> {
       if (typeof s.name !== 'string' || s.name.trim() === '') {
         return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a name` };
       }
-      if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
-        return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a WIP limit of at least 1, or none` };
-      }
-      // Checked HERE rather than only in `@superpipeline/contract`, because the route casts
-      // (`body.stages as StageDef[]`) instead of parsing: a cap enforced only in the schema is
-      // a cap nothing enforces. Blank is refused too — the renderer gives instructions their
-      // own heading, and a heading with nothing under it reads to an agent as "there was
-      // nothing to do here", which is a different claim from "this was not provided".
-      if (s.instructions !== undefined) {
-        if (typeof s.instructions !== 'string' || s.instructions.trim() === '') {
-          return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" has empty instructions — leave them out instead` };
-        }
-        if (s.instructions.length > STAGE_INSTRUCTIONS_MAX) {
-          return {
-            ok: false,
-            code: 'INVALID_STAGES',
-            message: `stage "${s.key}" has ${s.instructions.length} characters of instructions; the limit is ${STAGE_INSTRUCTIONS_MAX}. A rule this long is a document, and belongs in a reference.`,
-          };
-        }
-      }
+      const invalid = stageFieldError(s);
+      if (invalid) return { ok: false, code: 'INVALID_STAGES', message: invalid };
     }
     const keys = stages.map((s) => s.key);
     const duplicate = keys.find((k, i) => keys.indexOf(k) !== i);
@@ -1216,6 +1244,61 @@ export class BoardDO extends DurableObject<Env> {
     this.setMeta('stages', JSON.stringify(ordered));
     this.emit('board.stages_changed', { stages: ordered });
     return { ok: true, value: { stages: ordered } };
+  }
+
+  /**
+   * Change one stage without rewriting the pipeline.
+   *
+   * `setStages` replaces every stage, so adjusting one field meant reading them all, mutating
+   * one, and writing them all back — which discards any concurrent edit to a stage the caller
+   * never touched. This writes the one stage named and leaves its neighbours exactly as found.
+   *
+   * Validation is the same function the whole-pipeline write uses, so a rule accepted here is a
+   * rule that would survive a replace.
+   */
+  async updateStage(stageKey: string, patch: StagePatch): Promise<Result<{ stage: StageDef }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const stages = this.stages();
+    const index = stages.findIndex((s) => s.key === stageKey);
+    if (index === -1) {
+      // Named rather than created. A patch that invents a stage puts a lane on the board that no
+      // card can reach and nothing asked for, and a typo is the likeliest way to get here.
+      return { ok: false, code: 'UNKNOWN_STAGE', message: `unknown stage: ${stageKey}` };
+    }
+
+    const next: StageDef = { ...stages[index]! };
+    if (patch.name !== undefined) {
+      if (typeof patch.name !== 'string' || patch.name.trim() === '') {
+        return { ok: false, code: 'INVALID_STAGES', message: `stage "${stageKey}" needs a name` };
+      }
+      next.name = patch.name;
+    }
+    if (patch.ownerKind !== undefined) next.ownerKind = patch.ownerKind;
+    if (patch.owner !== undefined) next.owner = patch.owner;
+    if (patch.gate !== undefined) next.gate = patch.gate;
+    // `null` is the removal. `undefined` cannot be, because it is what an absent field already
+    // means — a caller sending JSON has no other way to say "take this off".
+    if (patch.requires !== undefined) {
+      if (patch.requires === null) delete next.requires;
+      else next.requires = patch.requires;
+    }
+    if (patch.wipLimit !== undefined) {
+      if (patch.wipLimit === null) delete next.wipLimit;
+      else next.wipLimit = patch.wipLimit;
+    }
+    if (patch.instructions !== undefined) {
+      if (patch.instructions === null) delete next.instructions;
+      else next.instructions = patch.instructions;
+    }
+
+    const invalid = stageFieldError(next);
+    if (invalid) return { ok: false, code: 'INVALID_STAGES', message: invalid };
+
+    const normalized = normalizeStageRouting(next);
+    const ordered = stages.map((s, i) => (i === index ? normalized : s));
+    this.setMeta('stages', JSON.stringify(ordered));
+    this.emit('board.stages_changed', { stages: ordered });
+    return { ok: true, value: { stage: normalized } };
   }
 
   async setName(name: string): Promise<Result<{ ok: true }>> {
