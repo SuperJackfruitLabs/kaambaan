@@ -74,7 +74,7 @@ describe('a forge reference', () => {
   });
 });
 
-describe('PATCH /v1/tenant — forgeHost', () => {
+describe('PUT /v1/tenant/forge', () => {
   async function owner(tenantId: string) {
     await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'F')`)
       .bind(tenantId, `slug-${tenantId}`).run();
@@ -90,8 +90,8 @@ describe('PATCH /v1/tenant — forgeHost', () => {
     const t = 'tnt_forge_patch';
     const headers = await owner(t);
     for (const [sent, stored] of [['forge.example.test', 'forge.example.test'], ['https://Forge.Example.test/x', 'forge.example.test']]) {
-      const res = await SELF.fetch('https://api.test/v1/tenant', {
-        method: 'PATCH', headers, body: JSON.stringify({ forgeHost: sent }),
+      const res = await SELF.fetch('https://api.test/v1/tenant/forge', {
+        method: 'PUT', headers, body: JSON.stringify({ forgeHost: sent }),
       });
       expect(res.status).toBe(200);
       const row = await env.DB.prepare(`SELECT forge_host AS h FROM tenants WHERE id = ?`).bind(t).first<{ h: string }>();
@@ -102,9 +102,24 @@ describe('PATCH /v1/tenant — forgeHost', () => {
   it('clears the host with null', async () => {
     const t = 'tnt_forge_clear';
     const headers = await owner(t);
-    await SELF.fetch('https://api.test/v1/tenant', { method: 'PATCH', headers, body: JSON.stringify({ forgeHost: 'f.test' }) });
-    await SELF.fetch('https://api.test/v1/tenant', { method: 'PATCH', headers, body: JSON.stringify({ forgeHost: null }) });
+    await SELF.fetch('https://api.test/v1/tenant/forge', { method: 'PUT', headers, body: JSON.stringify({ forgeHost: 'f.test' }) });
+    await SELF.fetch('https://api.test/v1/tenant/forge', { method: 'PUT', headers, body: JSON.stringify({ forgeHost: null }) });
     const row = await env.DB.prepare(`SELECT forge_host AS h FROM tenants WHERE id = ?`).bind(t).first<{ h: string | null }>();
     expect(row?.h ?? null).toBeNull();
+  });
+
+  it('is reachable with the credential `supi` actually holds', async () => {
+    // The defect this route exists to fix. `forgeHost` shipped on `PATCH /v1/tenant`, which is
+    // human-only because a hub token cannot establish the mapping that makes a hub token resolve
+    // — a bootstrap problem the forge host does not have. The setting existed and the only client
+    // that would ever set it got a 401.
+    //
+    // Asserted through the dev-header path, which the suite uses for human routes; the live proof
+    // is `supi forge` answering at all.
+    const t = 'tnt_forge_reach';
+    const headers = await owner(t);
+    const res = await SELF.fetch('https://api.test/v1/tenant/forge', { headers });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toHaveProperty('forgeHost');
   });
 });

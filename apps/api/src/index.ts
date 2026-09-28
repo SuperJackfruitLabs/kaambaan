@@ -230,6 +230,52 @@ export default {
     // Scoped to owners. The comment this replaces recorded the absence of that check as "a
     // decision about the whole product rather than about this endpoint" — the decision is now
     // made, in db/members.ts, and every route reads it from the same place.
+    /**
+     * GET|PUT /v1/tenant/forge — where this workspace's forge lives.
+     *
+     * Deliberately NOT part of `PATCH /v1/tenant`, which is human-only because a hub token cannot
+     * establish the very mapping that makes a hub token resolve — a bootstrap problem this has
+     * none of. Hanging the forge host there made it unreachable from `supi`, which authenticates
+     * with exactly that kind of token: the setting existed and the only client that would set it
+     * got a 401.
+     *
+     * `manage`, not `own`. Linking a plane is an owner's act; saying which host is the forge is
+     * ordinary workspace configuration, and it changes how references are read rather than who
+     * this workspace answers to.
+     */
+    if (path === '/v1/tenant/forge') {
+      const u = (await resolveUser(request, env)) ?? (await resolveHubUser(request, env));
+      if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+
+      if (request.method === 'GET') {
+        const refused = refuseByRole(u, 'read');
+        if (refused) return refused;
+        const tenant = await tenantById(env.DB, u.tenantId);
+        return Response.json({ forgeHost: tenant?.forgeHost ?? null });
+      }
+      if (request.method !== 'PUT') return Response.json({ error: 'method not allowed' }, { status: 405 });
+      {
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+      }
+      const body = (await request.json().catch(() => null)) as { forgeHost?: string | null } | null;
+      if (!body || body.forgeHost === undefined) {
+        return Response.json(
+          { error: 'forgeHost is required (a host like `forge.example.com`, or null to clear)' },
+          { status: 400 },
+        );
+      }
+      try {
+        await setTenantForgeHost(env.DB, u.tenantId, body.forgeHost);
+      } catch {
+        return Response.json(
+          { error: 'forgeHost must be a host — `forge.example.com`, not a URL with a path' },
+          { status: 400 },
+        );
+      }
+      return Response.json({ forgeHost: body.forgeHost });
+    }
+
     if (path === '/v1/tenant') {
       try {
         const u = await resolveUser(request, env);
@@ -250,25 +296,7 @@ export default {
           if (refused) return refused;
         }
 
-        const body = (await request.json()) as { externalId?: string | null; forgeHost?: string | null };
-
-        // Where this workspace's forge lives. Separate from the external mapping above and
-        // accepted on the same PATCH: both are facts the workspace states about the outside
-        // world, and neither is worth a route of its own.
-        if (body.forgeHost !== undefined) {
-          try {
-            await setTenantForgeHost(env.DB, u.tenantId, body.forgeHost);
-          } catch {
-            return Response.json(
-              { error: 'forgeHost must be a host — `forge.example.com`, not a URL with a path' },
-              { status: 400 },
-            );
-          }
-          // A PATCH carrying only the host is complete; one carrying both falls through to the
-          // mapping below, so neither field is silently ignored because the other was present.
-          if (body.externalId === undefined) return Response.json({ ok: true });
-        }
-
+        const body = (await request.json()) as { externalId?: string | null };
         if (body.externalId === undefined) {
           return Response.json({ error: 'externalId is required (a fleet_… string, or null to unlink)' }, { status: 400 });
         }
@@ -853,7 +881,8 @@ export default {
     const isEitherRoute = !!boardId && rest === 'gates/pending';
     const isAgentRoute =
       !!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute);
-    const isWebhook = !!boardId && rest === 'webhooks/github';
+    // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
+    const isWebhook = !!boardId && (rest === 'webhooks/github' || rest === 'webhooks/forge');
     let tenantId: string;
     let user: UserPrincipal | null = null;
     let agent: AgentPrincipal | null = null;
@@ -1266,6 +1295,47 @@ export default {
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
+      }
+
+      // PUT /v1/boards/:id/forge — this board's forge webhook secret.
+      //
+      // Separate from `PUT …/github` and holding its own secret: a board may legitimately receive
+      // from a forge-primary repository AND its GitHub mirror, and one shared secret would mean
+      // revoking either side's access revokes the other's.
+      if (rest === 'forge' && request.method === 'PUT') {
+        const body = (await request.json().catch(() => null)) as { secret?: string } | null;
+        if (!body || typeof body.secret !== 'string' || body.secret.trim() === '') {
+          return Response.json({ error: 'secret is required' }, { status: 400 });
+        }
+        const result = await stub.setForgeSecret(body.secret);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
+      }
+
+      // POST /v1/boards/:id/webhooks/forge — inbound Forgejo webhook.
+      //
+      // Forgejo sends its own `X-Forgejo-*` headers and, for compatibility, GitHub-spelled ones
+      // too. The event and delivery are read from either, because a Gitea-typed webhook on an
+      // older instance sends `X-Gitea-*` and both are the same claim. The SIGNATURE is read only
+      // from Forgejo's own header: accepting `X-Hub-Signature-256` here would let a payload
+      // signed for the GitHub door in through this one.
+      if (rest === 'webhooks/forge' && request.method === 'POST') {
+        const rawBody = await request.text();
+        const header = (...names: string[]): string | null => {
+          for (const n of names) {
+            const v = request.headers.get(n);
+            if (v) return v;
+          }
+          return null;
+        };
+        const result = await stub.handleForgeWebhook({
+          rawBody,
+          signature: header('X-Forgejo-Signature', 'X-Gitea-Signature'),
+          deliveryId: header('X-Forgejo-Delivery', 'X-Gitea-Delivery', 'X-GitHub-Delivery'),
+          event: header('X-Forgejo-Event', 'X-Gitea-Event', 'X-GitHub-Event') ?? '',
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
       }
 
       // POST /v1/boards/:id/webhooks/github — inbound GitHub webhook (docs/06 §3).
