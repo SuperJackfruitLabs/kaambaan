@@ -25,6 +25,7 @@
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, expired, inspect, resolveCredential, ENV_TOKEN } from "./credential.ts";
+import { renderBoards, renderBoard, renderGates, renderLog } from "./render.ts";
 import { flag, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 
@@ -37,6 +38,11 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
   supi move <boardId> <cardId> <stageKey>
                                move a card to another stage
   supi gates <boardId>         approval gates waiting on a human
+  supi approve <boardId> <gateId> [--comment "why"]
+  supi reject <boardId> <gateId> [--comment "why"]
+  supi request-changes <boardId> <gateId> --comment "what to change"
+                               decide a gate without leaving the terminal
+  supi log <boardId> <cardId>  what an agent did on a card, and its handoff
 
   supi create-board <name> [--template <id>] [--stages <file|->]
                                create a board; --template defaults to \`simple\`
@@ -53,7 +59,8 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
   supi update [--check]        replace this binary with the newest release
   supi version                 print this binary's version
 
-  --json                       machine-stable output, on any command
+  --json                       machine-stable output, on any command (the default is
+                               readable; a shape with no renderer prints JSON either way)
 
 Credential: $${ENV_TOKEN}, else $AGENTPOD_TOKEN, else the token \`fleet login\` writes.
 Expired file tokens renew through the device credential from fleet login.
@@ -137,7 +144,29 @@ async function api(path: string, init: RequestInit = {}): Promise<unknown> {
   }
 }
 
-const out = (value: unknown) => process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+/**
+ * Set once from the argv in `main`, read by `out`.
+ *
+ * A module-level flag rather than a parameter threaded through every case: the alternative is
+ * passing `json` to twenty call sites, where forgetting one produces a command that silently
+ * ignores `--json` — the exact defect this change exists to fix.
+ */
+let wantJson = false;
+
+/**
+ * Print a response: readable by default, JSON on request.
+ *
+ * A shape with no renderer still prints JSON, so adding a command never waits on a formatter
+ * being written for it. That fallback is why this could change the default without auditing
+ * every verb first.
+ */
+const out = (value: unknown, human?: (v: unknown) => string) => {
+  if (!wantJson && human) {
+    process.stdout.write(human(value) + "\n");
+    return;
+  }
+  process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+};
 
 /** A named template's stages, or a refusal that lists the ones that exist. */
 function stagesFromTemplate(id: string): BoardTemplateStage[] {
@@ -193,6 +222,7 @@ async function stagesFromFile(path: string): Promise<BoardTemplateStage[]> {
 async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
   const json = wantsJson(rest);
+  wantJson = json;
   // Flags and the values they consume removed — see `positionals`; the old filter kept the value.
   const pos = positionals(rest);
 
@@ -244,12 +274,12 @@ async function main(argv: string[]): Promise<void> {
     }
 
     case "boards":
-      out(await api("/v1/boards"));
+      out(await api("/v1/boards"), renderBoards);
       return;
 
     case "board": {
       if (!pos[0]) fail("usage: supi board <boardId>");
-      out(await api(`/v1/boards/${pos[0]}`));
+      out(await api(`/v1/boards/${pos[0]}`), renderBoard);
       return;
     }
 
@@ -272,7 +302,52 @@ async function main(argv: string[]): Promise<void> {
 
     case "gates": {
       if (!pos[0]) fail("usage: supi gates <boardId>");
-      out(await api(`/v1/boards/${pos[0]}/gates/pending`));
+      out(await api(`/v1/boards/${pos[0]}/gates/pending`), renderGates);
+      return;
+    }
+
+    /**
+     * Deciding a gate, from the place the work is already being watched.
+     *
+     * `gates` could list what was waiting and nothing could answer it: the resolve route existed
+     * with no verb in front of it, so a human at a terminal had to open the web app or a phone to
+     * say yes to work they were already looking at.
+     *
+     * Three verbs rather than `supi gate <id> <decision>` because the decision is the point of the
+     * command and belongs where it can be read: `supi reject` mistyped is a usage error, while
+     * `supi gate … reject` mistyped is a different decision.
+     */
+    case "approve":
+    case "reject":
+    case "request-changes": {
+      if (!pos[0] || !pos[1]) fail(`usage: supi ${cmd} <boardId> <gateId> [--comment "why"]`);
+      const comment = flag(rest, "--comment") ?? undefined;
+      // `request_changes` returns the card for rework, and the feedback IS the rework instruction —
+      // superpipeline merges it into the handoff the next run reads. Sending one without a comment
+      // re-queues the work with nothing said about what was wrong.
+      if (cmd === "request-changes" && !comment) {
+        fail("request-changes needs a reason.", '  supi request-changes <boardId> <gateId> --comment "what to change"');
+      }
+      const decision = cmd === "request-changes" ? "request_changes" : cmd;
+      out(
+        await api(`/v1/boards/${pos[0]}/gates/${pos[1]}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ decision, ...(comment ? { comment } : {}) }),
+        }),
+      );
+      return;
+    }
+
+    /**
+     * What an agent actually did on a card.
+     *
+     * `GET /cards/:cardId/activities` has always returned the transcript, the handoff and the
+     * card's gates, and nothing put it in reach: reading one meant a hand-built curl with a token
+     * lifted out of the credential file.
+     */
+    case "log": {
+      if (!pos[0] || !pos[1]) fail("usage: supi log <boardId> <cardId>");
+      out(await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/activities`), renderLog);
       return;
     }
 
