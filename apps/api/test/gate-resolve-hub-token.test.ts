@@ -118,6 +118,29 @@ async function openGate(name: string): Promise<{ boardId: string; gateId: string
   return { boardId, gateId: gate!.id };
 }
 
+describe('listing pending gates with a hub token', () => {
+  it('answers the human whose decision is being waited on', async () => {
+    // `gates/pending` was reclassified as an AGENT route so agentpod's bridge could sweep it
+    // without minting an assertion for a person who was not there. Agent routes refuse people,
+    // so the widening for the service narrowed it for everyone else: `supi gates <boardId>` — a
+    // command the CLI advertises — answered 401 for every human token, and the only way to see
+    // what was waiting on you was a phone or the web app.
+    //
+    // A read that, in the words of the comment justifying that change, "names nobody and carries
+    // no authority" is strictly safer in the hands of the person who must decide than in the
+    // hands of the service that only relays the decision.
+    await withIssuer(async () => {
+      const { boardId } = await openGate('GH-list');
+      const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/pending`, {
+        headers: { Authorization: `Bearer ${await hubToken()}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json<{ gates: Array<Record<string, unknown>> }>();
+      expect(body.gates).toHaveLength(1);
+    });
+  });
+});
+
 describe('resolving a gate with a hub token', () => {
   it('records the token holder as the decider, not the bridge', async () => {
     await withIssuer(async () => {

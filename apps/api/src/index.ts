@@ -826,8 +826,14 @@ export default {
     // an assertion for a human on a timer so it could use the human-routed
     // board snapshot, which would make "a service may speak as a person" a
     // background job rather than the carrying of an answer that person gave.
+    // `gates/pending` is readable by EITHER an agent or a human. It was widened to agents for
+    // the bridge (above); classifying it as agent-only then refused the people whose decisions
+    // it lists, because agent routes reject human credentials. `supi gates <boardId>` answered
+    // 401 for every human token as a result. Whoever must make the decision has at least as much
+    // business reading this as the service that relays it.
+    const isEitherRoute = !!boardId && rest === 'gates/pending';
     const isAgentRoute =
-      !!boardId && (rest === 'claims' || rest.startsWith('runs/') || rest === 'gates/pending');
+      !!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute);
     const isWebhook = !!boardId && rest === 'webhooks/github';
     let tenantId: string;
     let user: UserPrincipal | null = null;
@@ -843,16 +849,25 @@ export default {
       // short-lived hub token whose sub is an agent principal, and superpipeline must accept it as
       // that agent — capabilities still come from superpipeline's own agents row, never the claim.
       if (!agent) agent = await resolveHubAgent(request, env);
-      if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
-      // Scopes stop being decoration here. Every `spa_` token has carried a scope set since
-      // migration 0001, the resolver has always returned it, and nothing compared it to the action
-      // being attempted — so a token minted to claim drove every run verb. A recorded permission
-      // nobody checks reads as protection that does not exist (auth/scopes.ts).
-      const needed = requiredScope(rest);
-      if (needed && !scopePermits(agent.scopes, needed)) {
-        return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
+      // A route open to both resolves as a human when no agent credential was offered, and falls
+      // through to the human branch's own 401 rather than reporting "a valid agent token is
+      // required" to a person who holds no agent token and needs none.
+      if (!agent && isEitherRoute) {
+        user = (await resolveUser(request, env)) ?? (await resolveHubUser(request, env));
+        if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        tenantId = user.tenantId;
+      } else {
+        if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
+        // Scopes stop being decoration here. Every `spa_` token has carried a scope set since
+        // migration 0001, the resolver has always returned it, and nothing compared it to the action
+        // being attempted — so a token minted to claim drove every run verb. A recorded permission
+        // nobody checks reads as protection that does not exist (auth/scopes.ts).
+        const needed = requiredScope(rest);
+        if (needed && !scopePermits(agent.scopes, needed)) {
+          return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
+        }
+        tenantId = agent.tenantId;
       }
-      tenantId = agent.tenantId;
     } else {
       user = await resolveUser(request, env);
       // A hub-issued token is accepted on the human routes too, because the
