@@ -90,6 +90,13 @@ const DEFAULT_GATE_OPTIONS: GateOption[] = [
 ];
 
 /** A pipeline stage (board column). `ownerKind`/`owner` drive agent claim routing (docs/01, docs/04). */
+/**
+ * The longest a stage's standing rule may be, matching `Stage.instructions` in
+ * `@superpipeline/contract`. A rule is a few lines an agent reads every time; past this it is
+ * a document, and a document belongs in a card reference where it can be read once.
+ */
+export const STAGE_INSTRUCTIONS_MAX = 4000;
+
 export interface StageDef {
   key: string;
   name: string;
@@ -105,6 +112,14 @@ export interface StageDef {
   requires?: { all?: string[]; any?: string[] };
   gate?: 'none' | 'approval';
   wipLimit?: number;
+  /**
+   * The stage's standing rule, handed to the agent in its prompt. A stage's, never a card's:
+   * it governs every card that reaches the stage and every agent that can claim it.
+   *
+   * It reached agents before this line existed, because `setStages` stores whatever it is
+   * given and `stages()` parses it straight back. Declared so that stays true on purpose.
+   */
+  instructions?: string;
   /** Stage routing strategy (docs/05 §7): `pipeline` (sequential handoff, default) vs `manager`. */
   routing?: 'pipeline' | 'manager';
 }
@@ -1151,6 +1166,23 @@ export class BoardDO extends DurableObject<Env> {
       }
       if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
         return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" needs a WIP limit of at least 1, or none` };
+      }
+      // Checked HERE rather than only in `@superpipeline/contract`, because the route casts
+      // (`body.stages as StageDef[]`) instead of parsing: a cap enforced only in the schema is
+      // a cap nothing enforces. Blank is refused too — the renderer gives instructions their
+      // own heading, and a heading with nothing under it reads to an agent as "there was
+      // nothing to do here", which is a different claim from "this was not provided".
+      if (s.instructions !== undefined) {
+        if (typeof s.instructions !== 'string' || s.instructions.trim() === '') {
+          return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}" has empty instructions — leave them out instead` };
+        }
+        if (s.instructions.length > STAGE_INSTRUCTIONS_MAX) {
+          return {
+            ok: false,
+            code: 'INVALID_STAGES',
+            message: `stage "${s.key}" has ${s.instructions.length} characters of instructions; the limit is ${STAGE_INSTRUCTIONS_MAX}. A rule this long is a document, and belongs in a reference.`,
+          };
+        }
       }
     }
     const keys = stages.map((s) => s.key);

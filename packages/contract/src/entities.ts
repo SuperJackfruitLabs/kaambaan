@@ -89,6 +89,19 @@ export const Stage = z.object({
   requires: z
     .object({ all: z.array(z.string()).optional(), any: z.array(z.string()).optional() })
     .optional(),
+  /**
+   * The stage's standing rule for every card that reaches it, handed to the agent as part of
+   * its prompt (AgentPod renders it as its own section, `card-prompt/2`).
+   *
+   * A stage's rule, never a card's task. The Press board's `publish` stage needs to say "push
+   * to the repository's primary remote" for every card and every agent that can claim it —
+   * and with nowhere to say it, the rule lived in whoever wrote the card. The card that did
+   * not repeat it left a post committed to a station while the board reported it published.
+   *
+   * Capped rather than unbounded: this is a rule, and something long enough to need scrolling
+   * is a document that belongs in a reference.
+   */
+  instructions: z.string().min(1).max(4000).optional(),
   gate: StageGate.default('none'),
   wipLimit: z.number().int().min(1).optional(),
 });

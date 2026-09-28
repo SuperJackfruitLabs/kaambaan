@@ -141,3 +141,62 @@ describe('REST — PUT /v1/boards/:id/stages', () => {
     expect(JSON.parse(row!.stages_json)).toHaveLength(3);
   });
 });
+
+/**
+ * A stage's standing rule (docs/05) — the text handed to every agent that claims a card there.
+ *
+ * It reached agents before the field was declared, because `setStages` stores what it is given
+ * and `stages()` parses it straight back. These pin the parts that were never true by accident:
+ * that it survives a rework, and that the length cap in the contract is enforced where the write
+ * happens rather than only where a client happens to validate.
+ */
+describe('BoardDO — a stage carries its own instructions', () => {
+  const RULE = "Push to the repository's PRIMARY remote, never to GitHub directly.";
+
+  it('keeps a stage rule across a rework, and only on the stage that has one', async () => {
+    await runInDurableObject(stubFor('st-instructions'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_sti', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const r = await board.setStages([
+        { key: 'todo', name: 'To do', order: 0 },
+        { key: 'doing', name: 'Doing', order: 1, ownerKind: 'capability', owner: 'code', instructions: RULE },
+        { key: 'done', name: 'Done', order: 2 },
+      ]);
+      expect(r.ok).toBe(true);
+
+      const stages = (await board.getState()).stages;
+      expect(stages.find((s) => s.key === 'doing')!.instructions).toBe(RULE);
+      // A rule belongs to one stage. Leaking onto its neighbours would govern work it
+      // was never written for, which is worse than not being carried at all.
+      expect(stages.find((s) => s.key === 'todo')!.instructions).toBeUndefined();
+      expect(stages.find((s) => s.key === 'done')!.instructions).toBeUndefined();
+    });
+  });
+
+  it('refuses a rule too long to be one', async () => {
+    await runInDurableObject(stubFor('st-instructions-long'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_stl', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const r = await board.setStages([
+        { key: 'todo', name: 'To do', order: 0 },
+        { key: 'doing', name: 'Doing', order: 1, instructions: 'x'.repeat(4001) },
+        { key: 'done', name: 'Done', order: 2 },
+      ]);
+      // The cap lives in the contract, but the route casts rather than parses — so a cap
+      // enforced only there is a cap nothing enforces.
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('INVALID_STAGES');
+    });
+  });
+
+  it('refuses an empty rule rather than storing a heading with nothing under it', async () => {
+    await runInDurableObject(stubFor('st-instructions-blank'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_stb', tenantId: 'tnt_a', name: 'S', stages: PIPE });
+      const r = await board.setStages([
+        { key: 'todo', name: 'To do', order: 0 },
+        { key: 'doing', name: 'Doing', order: 1, instructions: '   ' },
+        { key: 'done', name: 'Done', order: 2 },
+      ]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('INVALID_STAGES');
+    });
+  });
+});
