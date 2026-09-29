@@ -88,6 +88,7 @@ that flow in the present tense. None of it was ever built.
 | `superpipeline_list_work` | *(none — no `boardId` either)* | **none** — MCP-only; `GET /v1/boards` is human-auth and has no `readyForYou` |
 | `superpipeline_claim_card` | `maxConcurrency?` | `POST /v1/boards/:id/claims` *(REST also takes `profileKey`)* |
 | `superpipeline_get_card` | `cardId` | **none** — there is no `GET …/cards/:cardId` |
+| `superpipeline_get_run` | `runId` | `GET …/runs/:runId` *(the run context — lease epoch, card, stage, prior handoff)* |
 | `superpipeline_add_reference` | `cardId`, `url`, `provider?`, `sourceType?`, … | `PUT …/cards/:cardId/references` *(human-auth — MCP is the only agent path)* |
 | `superpipeline_heartbeat` | `runId`, `leaseEpoch` | `POST …/runs/:runId/heartbeat` |
 | `superpipeline_post_activity` | `runId`, `leaseEpoch`, `type`, `body?`, `parameter?`, `signal?`, `usage?` | `POST …/runs/:runId/activities` |
@@ -97,6 +98,13 @@ that flow in the present tense. None of it was ever built.
 | `superpipeline_release` | `runId`, `leaseEpoch`, `reason?` | `POST …/runs/:runId/release` *(REST drops `reason`)* |
 
 `{tenant, agentId, capabilities}` always come from the token, never from tool arguments.
+
+`superpipeline_get_run` exists so an agent can learn its own `leaseEpoch`. Every run verb takes
+that epoch as an argument — fencing works only when the caller supplies it, since deriving it
+server-side would let a superseded holder act — and AgentPod's prompt corpus forbids putting one in
+a rendered prompt (*"no rendered prompt leaks a credential, a lease epoch or an AgentPod id"*,
+because a prompt crosses into a harness process and can be echoed into a transcript). So the agent
+asks rather than being told.
 
 > **⚠️ The one asymmetry that matters: MCP cannot read a run.** `GET /v1/boards/:id/runs/:runId` has
 > **no MCP tool**, so an MCP-only agent cannot re-read its run — and therefore **cannot collect an
