@@ -1243,9 +1243,16 @@ export class BoardDO extends DurableObject<Env> {
     }
 
     // A capability owner is normalised with the same function that spells an agent's
-    // capabilities. Routing is `agent.capabilities.includes(stage.owner)` — exact equality — so a
-    // stage whose owner is typed "Code Review" must carry `code-review`, or no agent can ever
-    // claim it and nothing says why.
+    // capabilities, because matching is exact string equality — a stage whose owner is typed
+    // "Code Review" must carry `code-review`, or no agent can ever claim it and nothing says why.
+    //
+    // WHAT is matched is `stageCapabilitiesMet` (@superpipeline/contract): a stage's `requires`
+    // when it has one — `all` every member, `any` at least one — and `owner` only when it does
+    // not. This comment used to say routing was `agent.capabilities.includes(stage.owner)`, full
+    // stop, which stopped being true when requirements shipped on 2026-09-03 and was still here
+    // three weeks later. It sits where somebody asking "how does routing work" reads, so it was
+    // believed over the code, and issue #88 was filed against behaviour that already worked.
+    // `test/claim-honours-requires.test.ts` pins the real answer at the claim boundary.
     const ordered = [...stages]
       .map(normalizeStageRouting)
       .sort((a, b) => a.order - b.order);
