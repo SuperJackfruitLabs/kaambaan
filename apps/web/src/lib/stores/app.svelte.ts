@@ -16,6 +16,7 @@ import {
   createCard,
   moveCard,
   openBoardSocket,
+  setUnauthorizedHandler,
   type BoardFeedEvent,
   deleteBoard,
   BOARD_TEMPLATES,
@@ -186,6 +187,20 @@ class AppStore {
    */
   async init(preferred?: { boardId?: string | null; cardId?: string | null }): Promise<void> {
     this.initTheme();
+    /**
+     * A 401 anywhere means the session this tab is holding is gone, whatever it decided at boot.
+     *
+     * Without this the app decides `authState` once and never revisits it, so an expired session
+     * presents as a board that stopped updating and buttons that do nothing — the failure is
+     * total and says nothing, which is the worst shape a failure can have. The socket is closed
+     * too: reconnecting a dead session forever would keep the board looking merely offline.
+     */
+    setUnauthorizedHandler(() => {
+      if (this.authState === 'signed-out') return;
+      this.authState = 'signed-out';
+      this.user = null;
+      this.#closeSocket();
+    });
     try {
       this.user = await getMe();
       if (!this.user) {

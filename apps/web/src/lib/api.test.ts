@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, BOARD_TEMPLATES } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -308,5 +308,51 @@ describe('issueAgentToken', () => {
     const [, init] = fetchSpy.mock.calls[0]!;
     expect(JSON.parse(init?.body as string)).toEqual({ scopes: ['run'] });
     expect(minted.scopes).toEqual(['run']);
+  });
+});
+
+describe('an expired session is noticed, rather than presenting as a dead board', () => {
+  beforeEach(() => setUnauthorizedHandler(() => {}));
+
+  it('a 401 on the board read fires the handler', async () => {
+    // `authState` is decided once at init and never revisited, so without this a session that
+    // expires while a tab is open leaves the app certain it is signed in while every request
+    // fails — a board that stopped updating and buttons that do nothing, saying nothing.
+    let fired = 0;
+    setUnauthorizedHandler(() => { fired++; });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+
+    await expect(getBoard('brd_1')).rejects.toThrow();
+    expect(fired).toBe(1);
+  });
+
+  it('a 401 on a gate decision fires it too — that is the click a person actually makes', async () => {
+    let fired = 0;
+    setUnauthorizedHandler(() => { fired++; });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+
+    const res = await resolveGate('brd_1', 'gate_1', 'reject');
+    expect(res.status).toBe(401);
+    expect(fired).toBe(1);
+  });
+
+  it('an ordinary refusal is not mistaken for a lost session', async () => {
+    // 409 GATE_NOT_PENDING is a real answer about the gate, not about who you are.
+    let fired = 0;
+    setUnauthorizedHandler(() => { fired++; });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: { message: 'gate is already resolved' } }), { status: 409 })));
+
+    const res = await resolveGate('brd_1', 'gate_1', 'reject');
+    expect(res.status).toBe(409);
+    expect(fired).toBe(0);
+  });
+
+  it('a success fires nothing', async () => {
+    let fired = 0;
+    setUnauthorizedHandler(() => { fired++; });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ card: {} }), { status: 200 })));
+
+    await resolveGate('brd_1', 'gate_1', 'approve');
+    expect(fired).toBe(0);
   });
 });

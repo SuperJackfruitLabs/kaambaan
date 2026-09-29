@@ -7,6 +7,30 @@ import type { AgentScope } from '@superpipeline/contract';
 import { hubToken, withAuthority } from './hub-token';
 
 const TENANT = 'tnt_dev';
+
+/**
+ * What to do when the server says the session is gone.
+ *
+ * `authState` is decided once, at `init()`, and never revisited — so a session that expires while
+ * a tab is open leaves the app certain it is signed in while every request 401s. What a person
+ * sees then is a board that has stopped updating and buttons that do nothing, with no statement
+ * anywhere that they are signed out. A gate rejected from another client, a card that will not
+ * move, a live feed that never reconnects: all the same silence.
+ *
+ * Registered by the store, called from the reads that run on a timer and the writes a person
+ * clicks — enough that an expired session is noticed within one refresh rather than never.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(fn: () => void): void {
+  onUnauthorized = fn;
+}
+
+/** Pass every response through this. Returns it untouched, so it can wrap a call in place. */
+export function noteAuth(res: Response): Response {
+  if (res.status === 401) onUnauthorized?.();
+  return res;
+}
 const headers = { 'X-Tenant-Id': TENANT, 'Content-Type': 'application/json' };
 
 export interface User {
@@ -271,7 +295,7 @@ export async function createBoard(name: string, stages: Stage[]): Promise<string
 }
 
 export async function getBoard(boardId: string): Promise<BoardSnapshot> {
-  const res = await fetch(`/v1/boards/${boardId}`, { headers });
+  const res = noteAuth(await fetch(`/v1/boards/${boardId}`, { headers }));
   if (!res.ok) throw new Error(`getBoard failed (${res.status})`);
   return (await res.json()) as BoardSnapshot;
 }
@@ -381,7 +405,7 @@ export async function getAttempts(boardId: string, cardId: string): Promise<Atte
 
 /** A card's session-replay timeline + carried handoff (docs/07 §4). */
 export async function getCardActivities(boardId: string, cardId: string): Promise<CardActivities> {
-  const res = await fetch(`/v1/boards/${boardId}/cards/${cardId}/activities`, { headers });
+  const res = noteAuth(await fetch(`/v1/boards/${boardId}/cards/${cardId}/activities`, { headers }));
   if (!res.ok) throw new Error(`getCardActivities failed (${res.status})`);
   return (await res.json()) as CardActivities;
 }
@@ -408,7 +432,7 @@ export function resolveGate(
     method: 'POST',
     headers,
     body: JSON.stringify({ decision, comment }),
-  });
+  }).then(noteAuth);
 }
 
 /**
