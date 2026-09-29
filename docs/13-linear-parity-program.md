@@ -71,6 +71,33 @@ status; the question is whether it's a **second axis** or a **projection**.
   explicit human status *override* that is itself a logged activity (so derivation
   + override are both visible). Resolve in **P19**.
 
+## 1a. Verification pass — 29 September 2026
+
+**Every row below was checked against the code on this date.** Eleven were wrong, all of them
+understating what exists; one of them — RBAC — described enforced access control as decorative.
+
+That matters beyond the tidying. A planner reading this document would have scheduled work that
+was already done, and `packages/docs-check` cannot catch it: it verifies names, paths and anchors,
+not claims. This is the same failure mode as the routing comment that produced issue #88 — a
+document in the place somebody looks, believed over the code it describes.
+
+Shipped without the map noticing: **the command palette**, **light/dark theming**, **RBAC
+enforcement**, labels on tiles, the Needs-You triage queue, outbound push notifications, and the
+board event log's route and UI.
+
+Overstated in the other direction, and now marked `~` rather than ✓: **due dates** exist but live
+in the opaque `spec`, so nothing filters or sorts by them; **search** is the palette over a loaded
+board, not a server-side workspace search; **guest access** is the `viewer` role and nothing finer.
+
+Confirmed still absent, with the false positives cleared away: sub-issues, card-to-card relations
+(the `relation` hits are the capability graph), comments, @mentions and reactions (all hits were
+the verb "mentions"), saved views, calendar and timeline, the Team container, automation rules,
+projects and milestones, cycles (the `cycle` hits are graph cycles in `implications.ts`),
+initiatives, importers, SSO/SAML/SCIM, native mobile, and local-first sync.
+
+**Re-run this pass before quoting a parity percentage.** The map is a plan; it is only evidence on
+the day somebody checks it.
+
 ## 2. The Linear surface → Superpipeline map
 
 Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked non-goal.
@@ -79,16 +106,16 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 |---|---|---|---|---|
 | **Card depth** | Sub-issues + progress rollup | ✗ | 🟡 (sub-card pipeline semantics — see P15) | P15 |
 | | Relations (blocks/blocked-by/related/duplicate) | ✗ (only *external* refs) | ✅ | P15 |
-| | Labels + label groups | field exists, no UI | ✅ | P15 |
-| | Due dates / target dates | ✗ | ✅ | P15 |
+| | Labels + label groups | ✓ rendered as pills on every tile; no label-group model | ✅ | P15 |
+| | Due dates / target dates | ~ editable, but stored in the opaque `spec`, so nothing can filter or sort by it | ✅ | P15 |
 | | Estimates (points) | cost estimate only | 🟡 (points vs $/tokens) | P15 |
 | | Custom fields | opaque `spec` JSON | ✅ | P15 |
 | **Collaboration** | Comments (threaded, markdown) | agent activity only | 🔴→✅ (as `comment` activity) | P16 |
 | | @mentions, reactions, emoji | ✗ | ✅ | P16 |
-| | Notifications: inbox / email / Slack / push | in-app only | ✅ | P16 |
-| **Navigation** | Command palette (Cmd+K) | ✗ | ✅ (Linear's signature) | P17 |
-| | Full-text search | ✗ | ✅ | P17 |
-| | Keyboard-first everything | Esc only | ✅ | P17 |
+| | Notifications: inbox / email / Slack / push | ✓ in-app **and** outbound push configs, signed deliveries, dead-lettering | ✅ | P16 |
+| **Navigation** | Command palette (Cmd+K) | **✓ shipped** (`CommandPalette.svelte`, 4 e2e) | ✅ | **done** |
+| | Full-text search | ~ the palette searches the loaded board; nothing searches a workspace server-side | ✅ | P17 |
+| | Keyboard-first everything | ✓ Esc, ⌘K, `M` to move, Alt+← / Alt+→ across stages | ✅ | P17 |
 | **Views** | Saved / shared / custom views, favorites | ephemeral filters | ✅ | P18 |
 | | Filter / group / sort on every field | partial | ✅ | P18 |
 | | Board, List | ✓ | — | done |
@@ -96,7 +123,7 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 | | Timeline / Gantt | ✗ | 🔴 (low agent fit) | P23 |
 | **Team & flow** | Teams | Boards only | 🟡 (D1) | P19 |
 | | Customizable workflow states | pipeline stages | 🟡 (D2) | P19 |
-| | Triage inbox | gates ≈ triage | 🟡 (generalize gates) | P19 |
+| | Triage inbox | ✓ "Needs You" queue (gate, question, over-budget, failed) on Operate | 🟡 (generalize) | P19 |
 | | Issue/card + project templates | board templates | ✅ | P20 |
 | | Automation / workflow rules | ✗ | ✅ (also routes agents) | P20 |
 | **Planning** | Projects + milestones + updates + docs | ✗ | 🟡 | P21 |
@@ -108,13 +135,13 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 | | Slack two-way + Asks (message→card) | ✗ | ✅ (= an inbound trigger, [05](./05-integration-surfaces.md)) | P25 |
 | | Importers (Jira/Asana/GitHub/CSV) | ✗ | ✅ | P26 |
 | | Customer requests | ✗ | 🟡 | P26 |
-| **Enterprise** | RBAC enforcement | roles in DB, unenforced | ✅ | P27 |
-| | Audit log | activity log ≈ audit | 🟡 (formalize) | P27 |
-| | Guest / limited access | ✗ | ✅ | P27 |
+| **Enterprise** | RBAC enforcement | **✓ enforced** — `refuseByRole` at 14 route checks (read/work/manage/own) | ✅ | **done** |
+| | Audit log | ✓ board event log has a route and a UI; not yet a formalised audit surface | 🟡 (formalize) | P27 |
+| | Guest / limited access | ~ a `viewer` role exists and is enforced; no guest scoping below it | ✅ | P27 |
 | | SSO / SAML / SCIM | OAuth + tokens | ✅ | P28 |
 | **Platform** | Mobile apps (iOS/Android) | responsive web | 🟡 (XL) | P29 |
 | | Local-first sync engine (offline, instant) | DO + WebSocket | 🔴 (the moat-copy question) | P30 |
-| | Dark/light theming | dark only | ✅ | P30 |
+| | Dark/light theming | **✓ shipped** (light theme + `prefers-color-scheme`, 2 e2e) | ✅ | **done** |
 
 ## 3. Phased delivery (P15+)
 
