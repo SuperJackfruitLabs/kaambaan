@@ -1144,8 +1144,23 @@ export default {
         return Response.json({ card: result.value });
       }
 
-      // PATCH /v1/boards/:id/cards/:cardId — edit a card · DELETE — remove it
+      // GET /v1/boards/:id/cards/:cardId — one card · PATCH — edit it · DELETE — remove it
       const cardMatch = rest.match(/^cards\/([^/]+)$/);
+      /**
+       * The read arm did not exist until #90, so `supi card` — which has requested exactly this
+       * path since it was written — answered 405 on every invocation, for every board and every
+       * card, while `supi --help` advertised it as "one card in full". The subroutes below
+       * (`/attempts`, `/activities`, `/estimate`) all serve GET; the card itself was the one
+       * thing under this prefix nobody could read, and the absence was routed around by filtering
+       * the whole board snapshot client-side.
+       *
+       * Bodied as `{ card }`, which is what PATCH already answers with, so one client parses both.
+       */
+      if (cardMatch && request.method === 'GET') {
+        const result = await stub.getCardView(cardMatch[1]!);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ card: result.value });
+      }
       if (cardMatch && request.method === 'PATCH') {
         const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string };
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
