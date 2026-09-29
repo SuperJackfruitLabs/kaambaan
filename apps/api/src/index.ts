@@ -43,7 +43,7 @@ import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
 import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
-import { capabilityTag, capabilityTags, stageRequiredCapabilities } from '@superpipeline/contract';
+import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
   listCapabilities,
@@ -1147,6 +1147,20 @@ export default {
           metadata?: Record<string, unknown>;
           addedBy?: 'agent' | 'user';
         };
+        // Parsed, not cast. `ReferenceProvider` documented a constraint nothing imposed — the
+        // routes cast request bodies — so `provider: "web"` reached a live card on 2026-09-28.
+        // Checked HERE and nowhere else on this path, because this is the only door a caller
+        // supplies a provider through.
+        //
+        // A WRITE rule only: rows written before this exists are read back untouched, and a read
+        // that threw on them would turn a tightening into an outage.
+        if (body.provider !== undefined && !isKnownProvider(String(body.provider))) {
+          return Response.json(
+            { error: `unknown reference provider: ${String(body.provider)}. Known: ${providerKeys().join(', ')}` },
+            { status: 400 },
+          );
+        }
+
         // The tenant's forge host is read here rather than held in the DO: it is a workspace
         // fact, and a board that cached it would keep enriching against a host the workspace had
         // already changed.
