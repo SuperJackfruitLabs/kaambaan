@@ -5,6 +5,7 @@ import { newId } from '../ids';
 import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
 import { capabilityTag, normalizeRequirement, stageCapabilitiesMet } from '@superpipeline/contract';
 import { parseElicitationOptions } from './elicitation';
+import { evaluateCompletion, type CompletionRequirement } from '@superpipeline/contract';
 import { verifyGithubSignature, verifyForgeSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
 import { mapForgeEvent } from '../references/forge-events';
@@ -158,6 +159,12 @@ export interface StageDef {
   requires?: { all?: string[]; any?: string[] };
   gate?: 'none' | 'approval';
   wipLimit?: number;
+  /**
+   * What a run must produce here before the board believes it finished
+   * (`evaluateCompletion` in @superpipeline/contract). Absent means "anything", which is how
+   * every stage behaved before this existed.
+   */
+  completion?: CompletionRequirement;
   /**
    * The stage's standing rule, handed to the agent in its prompt. A stage's, never a card's:
    * it governs every card that reaches the stage and every agent that can claim it.
@@ -340,6 +347,8 @@ export interface AttemptView {
   costUsd: number;
   model: string | null;
   profileKey: string | null;
+  /** The completion verdict, when the stage asked for something. Null when it asked for nothing. */
+  completion: Record<string, unknown> | null;
 }
 
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
@@ -838,6 +847,19 @@ export class BoardDO extends DurableObject<Env> {
     // An attempt pins the profile it ran under (docs/05 §7) — added as a guarded migration.
     try {
       this.sql.exec(`ALTER TABLE runs ADD COLUMN profile_key TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * The completion verdict, so a trace can say WHY a run ended as it did.
+     *
+     * Without it the receipt could only report `completed` or `blocked` and had to guess at the
+     * rest — which is how a published trace came to record a publish run that had refused. It also
+     * carries `override` and `unchecked`, because a waived check and an unverifiable one are both
+     * things a reader must be able to see.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE runs ADD COLUMN completion TEXT`);
     } catch {
       // column already exists
     }
@@ -2053,6 +2075,15 @@ export class BoardDO extends DurableObject<Env> {
           costUsd: cost,
           model: modelRow ? (modelRow.model as string) : null,
           profileKey: (r.profile_key as string | null) ?? null,
+          /**
+           * Why this run ended as it did, when a stage asked for something.
+           *
+           * Carried so a reader does not have to infer intent from an outcome. A published
+           * receipt once recorded `publish · completed` for a run that had refused, and the only
+           * fix available was a prose caveat explaining that a repeated stage usually means the
+           * earlier one did nothing. This is that caveat replaced by the fact.
+           */
+          completion: r.completion ? (JSON.parse(r.completion as string) as Record<string, unknown>) : null,
         };
       });
   }
@@ -2273,10 +2304,70 @@ export class BoardDO extends DurableObject<Env> {
     this.cancelElicitationsForRun(input.runId);
 
     const card = this.mustGetCard(cardId);
+
+    /**
+     * Completion is earned, not announced.
+     *
+     * This method wrote `outcome = 'completed'` and advanced the card unconditionally, so an agent
+     * calling `complete` was the sole author of the claim that its stage was done — and on the
+     * Press board that claim was false twice, once over a commit sitting unpushed on a station and
+     * once for a run that had explicitly refused to publish.
+     *
+     * A card may override its stage (D3). The override REPLACES rather than merges: a card saying
+     * `{}` means "this card's stage rule does not apply here", and a merge would make that
+     * impossible to say. It is recorded on the run, because routing around a check is a legitimate
+     * act and a silent one is not.
+     */
+    const stage = this.stages().find((st) => st.key === card.currentStageKey);
+    const cardOverride = (card.spec as { completion?: CompletionRequirement } | null | undefined)?.completion;
+    const requirement = cardOverride ?? stage?.completion;
+
+    if (requirement) {
+      const verdict = evaluateCompletion(requirement, {
+        handoff: input.handoff,
+        references: this.sql
+          .exec(`SELECT provider, source_type AS sourceType FROM card_references WHERE card_id = ?`, cardId)
+          .toArray()
+          .map((r) => ({ provider: r.provider as string, sourceType: r.sourceType as string })),
+      });
+      this.recordRunCompletion(input.runId, { ...verdict, override: cardOverride !== undefined });
+
+      if (!verdict.met) {
+        // Blocked, not failed (D1): the agent asserted something untrue, and a retry loop would
+        // burn budget re-asserting it. A person should see this.
+        this.sql.exec(`UPDATE runs SET outcome = 'blocked' WHERE id = ?`, input.runId);
+        this.sql.exec(
+          `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
+          now,
+          cardId,
+        );
+        const reason = `this stage was not finished: ${verdict.reason}`;
+        this.emit('card.blocked', { cardId, reason });
+        // On the card's own replay, as an `error`: a refusal a reader has to reconstruct from
+        // run outcomes is a refusal most readers will miss.
+        this.sql.exec(
+          `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
+           VALUES (?, ?, 'error', 0, ?, NULL, ?, ?)`,
+          input.runId,
+          cardId,
+          reason,
+          JSON.stringify({ parameter: requirement, result: verdict, signal: null }),
+          now,
+        );
+        await this.scheduleReclaim();
+        return { ok: true, value: this.mustGetCard(cardId) };
+      }
+    }
+
     const handoffJson = input.handoff !== undefined ? JSON.stringify(input.handoff) : null;
     this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
+  }
+
+  /** The verdict, on the run, so the trace and the receipt can read it rather than infer it. */
+  private recordRunCompletion(runId: string, verdict: Record<string, unknown>): void {
+    this.sql.exec(`UPDATE runs SET completion = ? WHERE id = ?`, JSON.stringify(verdict), runId);
   }
 
   /** Submit a gated, agent-worked stage for human approval (docs/04, docs/08 §6). */

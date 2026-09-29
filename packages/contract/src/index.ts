@@ -6,3 +6,4 @@ export * from './entities';
 export * from './verbs';
 export * from './templates';
 export * from './providers';
+export * from './completion';
