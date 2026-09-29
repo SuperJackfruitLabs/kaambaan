@@ -823,12 +823,43 @@ export function revokeAgentToken(agentId: string, tokenId: string): Promise<Resp
   return fetch(`/v1/agents/${agentId}/tokens/${tokenId}`, { method: 'DELETE', headers });
 }
 
-/** Subscribe to the board's live event feed; `onEvent` fires on every server message. */
-export function openBoardSocket(boardId: string, onEvent: () => void): WebSocket {
+/**
+ * One message from the board's live feed.
+ *
+ * The DO sends a `snapshot` on connect and an `event` for everything after — including one per
+ * activity (`emit('activity', { runId, cardId, activityType })` in `postActivity`). `cardId` is
+ * the part that matters to a subscriber watching one card: without it every listener has to
+ * refetch on every event or none at all.
+ */
+export interface BoardFeedEvent {
+  seq: number;
+  type: string;
+  payload: { cardId?: string; runId?: string; [k: string]: unknown };
+  ts: string;
+}
+
+/**
+ * Subscribe to the board's live event feed.
+ *
+ * `onEvent` receives the parsed event, or `null` for the opening snapshot and for anything that
+ * will not parse. It used to receive nothing at all — `() => onEvent()` discarded the message —
+ * so no subscriber could tell WHICH card had changed, and the only listener refetched the whole
+ * board on every event while the open card's own activity list refreshed on nothing. A run posted
+ * 67 activities, every one of them delivered here, and the card drawer showed none of them.
+ */
+export function openBoardSocket(boardId: string, onEvent: (event: BoardFeedEvent | null) => void): WebSocket {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/v1/boards/${boardId}/ws?tenant=${TENANT}`);
-  ws.addEventListener('message', () => {
-    onEvent();
+  ws.addEventListener('message', (e) => {
+    let parsed: BoardFeedEvent | null = null;
+    try {
+      const msg = JSON.parse(String(e.data)) as { kind?: string; event?: BoardFeedEvent };
+      if (msg.kind === 'event' && msg.event) parsed = msg.event;
+    } catch {
+      // A message we cannot read is still a message: the board changed, so the caller should
+      // still refresh. It simply learns nothing about what changed.
+    }
+    onEvent(parsed);
   });
   return ws;
 }

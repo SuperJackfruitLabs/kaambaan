@@ -81,3 +81,26 @@ export function groupActivities(activities: Activity[], attempts: Attempt[]): Ac
 export function defaultOpen(groups: ActivityGroup[], index: number): boolean {
   return groups.length <= 1 || index === groups.length - 1;
 }
+
+/**
+ * Which rows of a run to render, given the reader's tool-call preference.
+ *
+ * The preference is "narrative only", and it earns its place: a real run posted 67 activities of
+ * which none were narrative — hermes streams tool calls and says nothing in prose. Filtering that
+ * to narrative leaves an empty panel under a heading that says "67 events", which reads as
+ * *nothing happened* when a great deal did. The panel knew it, too: it printed "Nothing but tool
+ * calls in this run" and still showed none of them.
+ *
+ * So a run with no narrative shows its tool calls. The default is unchanged for every run that
+ * has something to say; what changes is that the degenerate case stops hiding its only content.
+ */
+export function visibleActivities<T>(
+  activities: T[],
+  isNarrativeRow: (a: T) => boolean,
+  showToolCalls: boolean,
+): { rows: T[]; shownBecauseNoNarrative: boolean } {
+  if (showToolCalls) return { rows: activities, shownBecauseNoNarrative: false };
+  const narrative = activities.filter(isNarrativeRow);
+  if (narrative.length > 0) return { rows: narrative, shownBecauseNoNarrative: false };
+  return { rows: activities, shownBecauseNoNarrative: activities.length > 0 };
+}

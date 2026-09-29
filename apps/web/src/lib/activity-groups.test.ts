@@ -9,7 +9,7 @@
  * These hold the grouping to using the data that was already on the wire.
  */
 import { describe, it, expect } from 'vitest';
-import { groupActivities, isNarrative } from './activity-groups';
+import { groupActivities, isNarrative, visibleActivities } from './activity-groups';
 import type { Activity, Attempt } from './api';
 
 const act = (seq: number, runId: string, type = 'action', extra: Partial<Activity> = {}): Activity => ({
@@ -94,5 +94,36 @@ describe('isNarrative', () => {
 
   it('drops the tool calls, which are 361 of 366 rows on a real card', () => {
     expect(isNarrative(act(5, 'r', 'action'))).toBe(false);
+  });
+});
+
+describe('visibleActivities — the run that is all tool calls', () => {
+  const narrative = (a: { kind: string }) => a.kind === 'say';
+
+  it('shows tool calls when there is no narrative to show instead', () => {
+    // The live case: 67 activities, none narrative. The old behaviour rendered an empty panel
+    // beneath a heading reading "67 events".
+    const all = [{ kind: 'tool' }, { kind: 'tool' }, { kind: 'tool' }];
+    const { rows, shownBecauseNoNarrative } = visibleActivities(all, narrative, false);
+    expect(rows).toHaveLength(3);
+    expect(shownBecauseNoNarrative).toBe(true);
+  });
+
+  it('still filters when the run has something to say', () => {
+    const all = [{ kind: 'tool' }, { kind: 'say' }, { kind: 'tool' }];
+    const { rows, shownBecauseNoNarrative } = visibleActivities(all, narrative, false);
+    expect(rows).toEqual([{ kind: 'say' }]);
+    expect(shownBecauseNoNarrative).toBe(false);
+  });
+
+  it('shows everything when the reader asked for everything', () => {
+    const all = [{ kind: 'tool' }, { kind: 'say' }];
+    expect(visibleActivities(all, narrative, true).rows).toHaveLength(2);
+  });
+
+  it('an empty run is empty, and does not claim it was hiding anything', () => {
+    const { rows, shownBecauseNoNarrative } = visibleActivities([], narrative, false);
+    expect(rows).toEqual([]);
+    expect(shownBecauseNoNarrative).toBe(false);
   });
 });
