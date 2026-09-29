@@ -16,6 +16,7 @@ describe('MCP tools — registration', () => {
       'superpipeline_complete',
       'superpipeline_fail',
       'superpipeline_get_card',
+      'superpipeline_get_run',
       'superpipeline_heartbeat',
       'superpipeline_list_work',
       'superpipeline_post_activity',
