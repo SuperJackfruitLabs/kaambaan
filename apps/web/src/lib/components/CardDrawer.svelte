@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { groupActivities, isNarrative, defaultOpen } from '$lib/activity-groups';
   import { app } from '$lib/stores/app.svelte';
   import {
     getCardActivities,
@@ -30,9 +31,19 @@
 
   // ---- local async state ----
   let cardDetail = $state<CardActivities | null>(null);
+  /**
+   * Tool calls are hidden by default.
+   *
+   * On the card that prompted this, 361 of 366 rows were tool calls and 5 carried anything the
+   * agent said. Showing everything by default buries the 1.4% that tells the story inside the
+   * 98.6% that does not.
+   */
+  let showToolCalls = $state(false);
   /** Gates that have been decided — the pending one is rendered by its own control above. */
   const decidedGates = $derived((cardDetail?.gates ?? []).filter((g) => g.status !== 'pending'));
   let drawerAttempts = $state<Attempt[]>([]);
+  const activityGroups = $derived(groupActivities(cardDetail?.activities ?? [], drawerAttempts ?? []));
+
   let cardEstimate = $state<Estimate | null>(null);
 
   // ---- edit state ----
@@ -573,21 +584,102 @@
           {#if !cardDetail || cardDetail.activities.length === 0}
             <p class="text-muted-foreground text-xs">No recorded activity yet — this card hasn't been worked.</p>
           {:else}
-            <div class="stream flex flex-col gap-0.5">
-              {#each cardDetail.activities as a (a.seq)}
-                {@const m = activityMarker(a.type)}
-                <div class="act {m.cssClass} grid rounded-[6px] px-1.5 py-1.5 text-[12.5px] items-start" style="grid-template-columns:18px 1fr auto;gap:9px">
-                  <span class="act-icon text-[12px] text-center pt-px">{m.glyph}</span>
-                  <div class="act-body min-w-0">
-                    <span class="act-k font-mono text-[9.5px] uppercase tracking-wider mr-1.5" style="color:var(--muted)">{a.type}</span>
-                    {#if a.action}
-                      <span class="font-mono text-[11px]" style="color:var(--marigold)">{a.action}</span>
-                      {#if a.parameter}<span class="text-muted-foreground font-mono text-[11px]"> {JSON.stringify(a.parameter).slice(0, 140)}</span>{/if}
+            <div class="mb-1.5 flex items-center gap-2">
+              <button
+                onclick={() => (showToolCalls = !showToolCalls)}
+                aria-pressed={showToolCalls}
+                class="mono border-border hover:bg-accent rounded-[6px] border px-1.5 py-0.5 text-[10px]"
+                style="min-height:var(--tap)"
+              >{showToolCalls ? 'hide tool calls' : 'show tool calls'}</button>
+              <span class="text-muted-foreground mono text-[10px]">
+                {activityGroups.length} run{activityGroups.length === 1 ? '' : 's'}
+              </span>
+            </div>
+
+            <!--
+              One `<details>` per run, and per expandable row.
+
+              Native disclosure rather than a click handler on a div: it is keyboard-operable and
+              announced as expandable for free, and the previous stream had a `▸` glyph that LOOKED
+              expandable and was decorative — a UI that promises a detail it does not have.
+            -->
+            <div class="stream flex flex-col gap-1.5">
+              {#each activityGroups as g, gi (g.runId)}
+                {@const rows = showToolCalls ? g.activities : g.activities.filter(isNarrative)}
+                <details open={defaultOpen(activityGroups, gi)} class="border-border rounded-[7px] border">
+                  <summary
+                    class="mono flex cursor-pointer items-center gap-2 px-2 py-1.5 text-[11px]"
+                    style="min-height:var(--tap)"
+                  >
+                    <!--
+                      The run id when the stage is unknown. The attempts fetch can fail or lag,
+                      and five groups all reading "unassigned run" are indistinguishable — which
+                      is the flat list this change replaces, in miniature.
+                    -->
+                    <span style="color:var(--marigold)">{g.stageKey ?? `run ${g.runId.slice(-6)}`}</span>
+                    {#if g.agentId}<span class="text-muted-foreground truncate">{g.agentId}</span>{/if}
+                    {#if g.outcome}
+                      <span style="color:{g.outcome === 'completed' ? 'var(--live)' : 'var(--coral)'}">{g.outcome}</span>
                     {/if}
-                    {#if a.body}<div class="mt-0.5 text-xs leading-relaxed {a.type === 'error' || a.type === 'elicitation' ? 'text-coral' : 'text-foreground/90'}">{a.body}</div>{/if}
+                    <span class="text-muted-foreground ml-auto whitespace-nowrap text-[10px]">
+                      {g.counts.total} event{g.counts.total === 1 ? '' : 's'}{g.counts.error > 0 ? ` · ${g.counts.error} error` : ''}
+                    </span>
+                  </summary>
+
+                  <div class="flex flex-col gap-0.5 px-1.5 pb-1.5">
+                    {#if rows.length === 0}
+                      <p class="text-muted-foreground px-1.5 py-1 text-[11px]">
+                        Nothing but tool calls in this run — use “show tool calls”.
+                      </p>
+                    {/if}
+                    {#each rows as a (a.seq)}
+                      {@const m = activityMarker(a.type)}
+                      {@const detail = a.parameter !== null || a.result !== null}
+                      {#if detail}
+                        <details class="act {m.cssClass} rounded-[6px]">
+                          <summary class="grid cursor-pointer px-1.5 py-1.5 text-[12.5px] items-start" style="grid-template-columns:18px 1fr auto;gap:9px;min-height:var(--tap)">
+                            <span class="act-icon text-[12px] text-center pt-px">{m.glyph}</span>
+                            <div class="act-body min-w-0" style="overflow-wrap:anywhere">
+                              <span class="act-k font-mono text-[9.5px] uppercase tracking-wider mr-1.5" style="color:var(--muted)">{a.type}</span>
+                              {#if a.action}<span class="font-mono text-[11px]" style="color:var(--marigold)">{a.action}</span>{/if}
+                              {#if a.body}<div class="mt-0.5 text-xs leading-relaxed {a.type === 'error' || a.type === 'elicitation' ? 'text-coral' : 'text-foreground/90'}">{a.body}</div>{/if}
+                            </div>
+                            <span class="act-ts text-muted-foreground font-mono text-[10px] whitespace-nowrap pt-px">{fmtTime(a.ts)}</span>
+                          </summary>
+                          <!--
+                            `result` was populated on 153 of this card's 366 activities and rendered
+                            nowhere at all, and `parameter` was truncated at 140 characters with no
+                            way to see the rest. Both were already on the wire.
+                          -->
+                          <div class="space-y-1 px-2 pb-2 pl-[27px]">
+                            {#if a.parameter !== null}
+                              <div>
+                                <div class="mono text-[9.5px] uppercase tracking-wider" style="color:var(--muted)">parameter</div>
+                                <pre class="bg-inset mt-0.5 overflow-x-auto rounded-[5px] px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap" style="overflow-wrap:anywhere">{JSON.stringify(a.parameter, null, 2)}</pre>
+                              </div>
+                            {/if}
+                            {#if a.result !== null}
+                              <div>
+                                <div class="mono text-[9.5px] uppercase tracking-wider" style="color:var(--muted)">result</div>
+                                <pre class="bg-inset mt-0.5 overflow-x-auto rounded-[5px] px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap" style="overflow-wrap:anywhere">{typeof a.result === 'string' ? a.result : JSON.stringify(a.result, null, 2)}</pre>
+                              </div>
+                            {/if}
+                          </div>
+                        </details>
+                      {:else}
+                        <div class="act {m.cssClass} grid rounded-[6px] px-1.5 py-1.5 text-[12.5px] items-start" style="grid-template-columns:18px 1fr auto;gap:9px">
+                          <span class="act-icon text-[12px] text-center pt-px">{m.glyph}</span>
+                          <div class="act-body min-w-0" style="overflow-wrap:anywhere">
+                            <span class="act-k font-mono text-[9.5px] uppercase tracking-wider mr-1.5" style="color:var(--muted)">{a.type}</span>
+                            {#if a.action}<span class="font-mono text-[11px]" style="color:var(--marigold)">{a.action}</span>{/if}
+                            {#if a.body}<div class="mt-0.5 text-xs leading-relaxed {a.type === 'error' || a.type === 'elicitation' ? 'text-coral' : 'text-foreground/90'}">{a.body}</div>{/if}
+                          </div>
+                          <span class="act-ts text-muted-foreground font-mono text-[10px] whitespace-nowrap pt-px">{fmtTime(a.ts)}</span>
+                        </div>
+                      {/if}
+                    {/each}
                   </div>
-                  <span class="act-ts text-muted-foreground font-mono text-[10px] whitespace-nowrap pt-px">{fmtTime(a.ts)}</span>
-                </div>
+                </details>
               {/each}
             </div>
             {#if card.state === 'working'}
