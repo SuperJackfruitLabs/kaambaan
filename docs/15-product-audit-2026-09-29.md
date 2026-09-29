@@ -154,8 +154,14 @@ Gitea- and GitHub-shaped and much of the existing handler is reusable.
    constant, which is a different shape from what is there now.
 3. **`PUT /v1/boards/:id/forge` and `POST /v1/boards/:id/webhooks/forge`**, reusing the HMAC
    verification and delivery-deduplication path.
-4. **Teach references that a forge pull request and its GitHub mirror are the same work.** Without
-   this, every mirrored repository produces duplicate references for one change.
+4. **Stop a forge reference and a GitHub one colliding.** This entry was written the wrong way
+   round and is corrected here rather than quietly reworded: it said a forge pull request and its
+   GitHub mirror are *the same work* and would produce duplicates. They are not. A push mirror
+   mirrors git refs, **not** pull requests, so forge PR #7 and GitHub PR #7 on a mirrored
+   repository are different objects that happen to share an id — and `externalId` is `owner/repo#n`
+   for both, matched with no provider filter. The risk was never duplication; it was a delivery
+   from one provider writing its state onto the other's reference. Fixed by qualifying every
+   matcher with the provider.
 
 ## Recommended sequence
 
