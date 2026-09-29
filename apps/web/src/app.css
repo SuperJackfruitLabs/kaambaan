@@ -231,6 +231,49 @@
     border: 1px solid var(--line);
   }
 
+  /*
+     The tile's title is its single primary control, stretched over the whole tile.
+
+     The tile used to be `role="button"` around a real button and, sometimes, a link — a role that
+     cannot legally contain interactive descendants, so assistive technology was told the tile was
+     one control and handed three. This keeps the whole-tile click target that made the board
+     pleasant to use while leaving exactly one button in the accessibility tree for it.
+
+     The focus ring belongs on the TILE rather than the text, because the text is what is stretched
+     and a ring around it would frame a few words in the middle of a card the user is actually
+     selecting. */
+  .tile-open::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+  }
+  /*
+     Everything else interactive on the tile sits ABOVE that stretched layer.
+
+     Declared once, for every control, rather than remembered per element: the first version of
+     this lifted the move button and the reference chip by hand and covered the gate's Approve —
+     so a human could see the button and not press it, which the e2e suite caught and a reader
+     would have called the board broken. A control added to the tile tomorrow is covered by this
+     rule without anybody recalling it exists. */
+  .tile :is(button, a, select, input, textarea, [role='group'], [role='menu']):not(.tile-open) {
+    position: relative;
+    z-index: 1;
+  }
+  .tile-open:focus-visible {
+    outline: none;
+  }
+  .tile:has(.tile-open:focus-visible) {
+    outline: var(--focus);
+    outline-offset: var(--focus-offset);
+  }
+
+  /* The stage strip continues past the right edge on a phone; its scrollbar is hidden, so the
+     fade is the only thing that says so. */
+  .stage-strip {
+    mask-image: linear-gradient(to right, black calc(100% - 28px), transparent 100%);
+  }
+
   /* reference chip on the tile */
   .refchip {
     display: inline-flex;

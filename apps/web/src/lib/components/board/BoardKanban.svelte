@@ -46,7 +46,13 @@
         </div>
       {/if}
 
+      <!--
+        A NAMED region. An unnamed `<section>` has no role at all, so eight columns arrived in the
+        accessibility tree as eight anonymous `generic` boxes — a board with nothing to navigate
+        by, neither heading nor landmark.
+      -->
       <section
+        aria-labelledby="lane-{stage.key}"
         data-lane
         class="lane w-[calc(100vw-1.5rem)] shrink-0 rounded-[12px] p-2 [scroll-snap-align:center] min-[900px]:w-[264px] min-[900px]:[scroll-snap-align:none] transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
         use:columnDropTarget={{
@@ -57,7 +63,7 @@
       >
         <!-- waypoint header -->
         <div class="lane-head flex h-[30px] items-center gap-2 px-1.5">
-          <span class="wordmark text-[13px] tracking-wide">{stage.name}</span>
+          <h2 id="lane-{stage.key}" class="wordmark text-[13px] font-normal tracking-wide">{stage.name}</h2>
           <span class="mono text-xs {overLimit ? 'text-coral' : 'text-muted-foreground'}">
             {cards.length}{#if stage.wipLimit !== undefined}/{stage.wipLimit}{/if}
           </span>

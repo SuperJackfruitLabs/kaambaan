@@ -9,7 +9,7 @@
    */
   import { app } from '$lib/stores/app.svelte';
   import {
-    getWorkspace, setWorkspaceFleet, getHubPrincipals, getAgents, getCapabilities, createAgent,
+    getWorkspace, setWorkspaceFleet, getForgeHost, setForgeHost, getHubPrincipals, getAgents, getCapabilities, createAgent,
     type WorkspaceTenant, type HubPrincipal, type AgentSummary, type CapabilityRecord,
   } from '$lib/api';
   import { beginHubAuthorization, hubStatus } from '$lib/hub-token';
@@ -98,7 +98,65 @@
       importing = false;
     }
   }
+
+  /**
+   * The forge host.
+   *
+   * Recognition has to be TOLD which host is a forge — there is one github.com, and a Forgejo
+   * instance is wherever its operator put it. Until this is set, every link to the workspace's
+   * own repositories is stored as a generic `url`: no durable id, nothing to dedupe against and
+   * nothing a webhook could ever match.
+   */
+  let forgeHost = $state<string | null>(null);
+  let editingForge = $state(false);
+  let forgeInput = $state('');
+  let forgeError = $state<string | null>(null);
+
+  $effect(() => {
+    void getForgeHost().then((h) => (forgeHost = h));
+  });
+
+  async function saveForge(): Promise<void> {
+    forgeError = null;
+    const next = forgeInput.trim();
+    const res = await setForgeHost(next === '' ? null : next);
+    if (!res.ok) {
+      forgeError = next === '' ? `Could not clear the forge (${res.status}).` : 'That is a host, not a URL — `forge.example.com`.';
+      return;
+    }
+    forgeHost = await getForgeHost();
+    editingForge = false;
+  }
 </script>
+
+<section class="bg-surface border-border mb-2 rounded-[10px] border px-3 py-2.5">
+  <div class="eyebrow mb-1.5">forge</div>
+  {#if editingForge}
+    <div class="flex flex-wrap items-center gap-2">
+      <input
+        bind:value={forgeInput}
+        placeholder="forge.example.com  (empty to clear)"
+        aria-label="Forge host"
+        class="bg-inset border-border focus:border-marigold mono min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-[11px]"
+      />
+      <button onclick={() => void saveForge()} class="mono text-[11px]" style="color:var(--marigold);min-height:var(--tap)">save</button>
+      <button onclick={() => (editingForge = false)} class="text-muted-foreground mono text-[11px]" style="min-height:var(--tap)">cancel</button>
+    </div>
+    {#if forgeError}<p class="text-coral mt-1 text-[11px]">{forgeError}</p>{/if}
+  {:else if forgeHost}
+    <div class="mono flex items-center gap-2 text-[11px]">
+      <span class="truncate">{forgeHost}</span>
+      <button onclick={() => { editingForge = true; forgeInput = forgeHost ?? ''; }} class="text-muted-foreground hover:text-foreground ml-auto" style="min-height:var(--tap)">change</button>
+    </div>
+  {:else}
+    <div class="flex flex-wrap items-center gap-2">
+      <p class="text-muted-foreground min-w-0 flex-1 text-[11px] leading-relaxed">
+        No forge set — links to your own repositories are stored as plain URLs, with nothing a webhook can match.
+      </p>
+      <button onclick={() => { editingForge = true; forgeInput = ''; }} class="mono text-[11px]" style="color:var(--marigold);min-height:var(--tap)">set</button>
+    </div>
+  {/if}
+</section>
 
 <section class="bg-surface border-border rounded-[10px] border px-3 py-2.5">
   <div class="eyebrow mb-1.5">agentpod fleet</div>

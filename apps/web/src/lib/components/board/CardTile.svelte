@@ -171,14 +171,21 @@
   }
 </script>
 
+<!--
+  The tile is a CONTAINER, not a button.
+
+  It used to be `role="button"` wrapping a real `<button>` (move) and, when the card carried a
+  reference, an `<a>`. An element with a button role may not contain interactive descendants:
+  the role is a promise the markup cannot keep, and assistive technology may not expose the
+  controls inside it at all.
+
+  The whole-tile click survives, because the title button below is stretched over the tile with
+  a pseudo-element. Everything else that is interactive sits above it on the z-axis, so the
+  reference chip and the move control keep behaving exactly as they did.
+-->
 <div
   use:cardDraggable={{ cardId: card.id }}
-  role="button"
-  tabindex="0"
-  aria-label="{card.title}, in {orderedStages[stageIndex]?.name ?? card.currentStageKey}. Enter to open, M to move, Alt with left or right arrow to move between stages."
-  onclick={handleClick}
-  onkeydown={handleKeydown}
-  class="tile bg-surface border-border group relative cursor-grab rounded-[10px] border p-3 text-left active:cursor-grabbing {gate ? 'tile-gate' : ''}"
+  class="tile bg-surface border-border group relative rounded-[10px] border p-3 text-left cursor-grab active:cursor-grabbing {gate ? 'tile-gate' : ''}"
 >
   <!-- What just happened, for a reader who cannot see the column the card landed in. -->
   <span aria-live="polite" class="sr-only">{moveAnnouncement}</span>
@@ -187,7 +194,7 @@
     The menu alternative to dragging. Reachable by keyboard (M, or Tab to the control) and by a
     pointer that cannot drag — a touch screen, a trackpad the user finds hard to hold.
   -->
-  <div class="absolute top-2 right-2">
+  <div class="absolute top-2 right-2 z-10">
     <button
       onclick={(e) => { e.stopPropagation(); moveMenuOpen = !moveMenuOpen; }}
       aria-label="Move {card.title} to another stage"
@@ -222,7 +229,15 @@
 
   <!-- row1: title + live dot -->
   <div class="row1 mb-2 flex items-start gap-2">
-    <span class="flex-1 text-[13.5px] font-medium leading-snug">{card.title}</span>
+    <button
+      type="button"
+      onclick={handleClick}
+      onkeydown={handleKeydown}
+      aria-label="{card.title}, in {orderedStages[stageIndex]?.name ?? card.currentStageKey}. Enter to open, M to move, Alt with left or right arrow to move between stages."
+      data-stretch-target
+      data-card-open={card.id}
+      class="tile-open flex-1 text-left text-[13.5px] font-medium leading-snug"
+    >{card.title}</button>
     {#if card.state === 'working'}
       <span class="live-dot mt-1 shrink-0" title="Agent working"></span>
     {/if}

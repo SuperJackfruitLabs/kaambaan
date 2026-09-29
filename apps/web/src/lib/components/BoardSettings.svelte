@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button';
-  import { renameBoard, setGithubConfig, setStages, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
+  import { renameBoard, setGithubConfig, setStages, patchStage, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
   import { capabilityTag } from '@superpipeline/contract';
 
   let { board, onChanged }: { board: BoardSnapshot; onChanged: () => void } = $props();
@@ -93,6 +93,27 @@
     const next = [...draft];
     [next[index], next[to]] = [next[to]!, next[index]!];
     draft = next.map((s, i) => ({ ...s, order: i }));
+  }
+
+  /**
+   * One stage's rule, saved on its own.
+   *
+   * A whole-pipeline PUT would carry every other stage back as this form last read it, discarding
+   * anything changed in between — which for a field this long is exactly when it happens.
+   */
+  let ruleSaved = $state<string | null>(null);
+  async function saveRule(stage: Stage, text: string): Promise<void> {
+    const next = text.trim();
+    if (next === (stage.instructions ?? '')) return;
+    const res = await patchStage(board.boardId!, stage.key, { instructions: next === '' ? null : next });
+    if (!res.ok) {
+      stagesError = `Could not save the rule for ${stage.name} (${res.status}).`;
+      return;
+    }
+    stage.instructions = next === '' ? undefined : next;
+    ruleSaved = stage.key;
+    setTimeout(() => (ruleSaved = ruleSaved === stage.key ? null : ruleSaved), 1600);
+    onChanged();
   }
 
   async function saveStages(): Promise<void> {
@@ -238,6 +259,35 @@
                     <input type="checkbox" checked={stage.gate === 'approval'} onchange={(e) => (stage.gate = e.currentTarget.checked ? 'approval' : 'none')} class="accent-marigold" />
                     approval gate
                   </label>
+                </div>
+
+                <!--
+                  The stage's standing rule.
+
+                  It shipped to the API and to every agent's prompt and appeared in NO user
+                  interface at all: the only way to set one was to hand-build a whole pipeline
+                  JSON and PUT it. A rule that governs every run on a lane should be visible on
+                  the lane.
+
+                  Saved on blur with a per-stage PATCH rather than with the pipeline below,
+                  because it is prose — long enough that holding it hostage to a whole-board save
+                  is how an edit gets lost.
+                -->
+                <div class="mt-1.5">
+                  <label class="text-muted-foreground mono block text-[10px]" for="rule-{stage.key}">
+                    standing rule for this stage
+                  </label>
+                  <textarea
+                    id="rule-{stage.key}"
+                    rows="2"
+                    value={stage.instructions ?? ''}
+                    onblur={(e) => void saveRule(stage, e.currentTarget.value)}
+                    placeholder="What every agent that claims a card here should know — pushed to its prompt."
+                    class="bg-surface border-border focus:border-marigold mt-0.5 w-full resize-y rounded-[5px] border px-1.5 py-1 text-[11px] outline-none"
+                  ></textarea>
+                  {#if ruleSaved === stage.key}
+                    <span class="mono text-[10px]" style="color:var(--live)">saved</span>
+                  {/if}
                   <label class="text-muted-foreground flex items-center gap-1">
                     wip
                     <input
