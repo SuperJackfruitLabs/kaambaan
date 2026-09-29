@@ -305,7 +305,16 @@
   // agent avatar
   const delegateId = $derived(card?.delegateAgentId ?? null);
   const delegateColor = $derived(agentColor(delegateId));
-  const delegateInitial = $derived(initialOf(delegateId));
+  /**
+   * The agent's NAME, then its initial from that name.
+   *
+   * Both used to be taken from the raw `agt_…`, so the drawer header read
+   * `agt_267d3618110a419b · delegate` with an avatar lettered "A" — the `a` of `agt_`, the same
+   * letter for every agent on the board. The owner standing next to it has always been resolved
+   * through `displayPrincipal`; this was the one site the naming work missed.
+   */
+  const delegateName = $derived(displayAgent(delegateId, app.agents));
+  const delegateInitial = $derived(initialOf(delegateName));
 
   // state pill
   function statePillClass(state: string): string {
@@ -488,7 +497,7 @@
             {#if delegateId}
               <span class="delegate inline-flex items-center gap-1.5 font-mono text-[11px]" style="color:var(--muted)">
                 <span class="inline-flex size-[18px] items-center justify-center rounded-full text-[9px] font-semibold shrink-0" style="background:{delegateColor};color:#0f1118">{delegateInitial}</span>
-                <span>{delegateId} · delegate</span>
+                <span title={delegateId}>{delegateName} · delegate</span>
               </span>
             {/if}
 
