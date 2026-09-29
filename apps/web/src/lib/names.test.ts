@@ -9,6 +9,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { displayAgent, displayPrincipal, shortId } from './names';
+import { initialOf } from './components/agentColor';
+import type { AgentSummary } from './api';
 
 const AGENTS = [
   { id: 'agt_2613e473e3934509', name: 'research-ray', capabilities: ['research'] },
@@ -65,5 +67,27 @@ describe('shortId', () => {
   it('leaves something already short alone', () => {
     expect(shortId('agt_1')).toBe('agt_1');
     expect(shortId('')).toBe('');
+  });
+});
+
+describe('initialOf, given what the card drawer used to pass it', () => {
+  it('letters an avatar from the NAME, so two agents do not share one letter', () => {
+    // The drawer header took its initial from the raw `agt_…`, so every agent on the board got
+    // an avatar lettered "A" — the `a` of `agt_`. The fix is to resolve the name first; this
+    // pins the difference that makes.
+    const agents = [
+      { id: 'agt_267d3618110a419b', name: 'coder-kai' },
+      { id: 'agt_9f1c2b3a4d5e6f70', name: 'writer-quill' },
+    ] as AgentSummary[];
+
+    expect(initialOf(displayAgent('agt_267d3618110a419b', agents))).toBe('C');
+    expect(initialOf(displayAgent('agt_9f1c2b3a4d5e6f70', agents))).toBe('W');
+    // The bug, stated: both of these were the same letter.
+    expect(initialOf('agt_267d3618110a419b')).toBe(initialOf('agt_9f1c2b3a4d5e6f70'));
+  });
+
+  it('an agent the board does not know falls back to a short id, not to nothing', () => {
+    expect(displayAgent('agt_267d3618110a419b', [])).toBe(shortId('agt_267d3618110a419b'));
+    expect(initialOf(displayAgent('agt_267d3618110a419b', []))).not.toBe('');
   });
 });
