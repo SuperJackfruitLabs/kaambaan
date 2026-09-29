@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { displayAgent, displayPrincipal } from '$lib/names';
   import { onDestroy } from 'svelte';
   import { groupActivities, isNarrative, defaultOpen } from '$lib/activity-groups';
   import { app } from '$lib/stores/app.svelte';
@@ -492,7 +493,7 @@
             {/if}
 
             <!-- owner -->
-            <span class="delegate inline-flex items-center gap-1 font-mono text-[11px]" style="color:var(--muted)">owner · {card.ownerUserId}</span>
+            <span class="delegate inline-flex items-center gap-1 font-mono text-[11px]" style="color:var(--muted)" title={card.ownerUserId}>owner · {displayPrincipal(card.ownerUserId, app.members)}</span>
             {#if app.user && card.ownerUserId !== app.user.userId}
               <button
                 onclick={() => void assignToMe()}
@@ -534,7 +535,7 @@
                 <span class="wordmark font-semibold text-sm" style="color:var(--coral)">
                   ⚑ {elicitation.signal === 'auth' ? 'awaiting your sign-in' : 'awaiting your answer'}
                 </span>
-                <span class="eyebrow ml-auto">{elicitation.agentId} is waiting</span>
+                <span class="eyebrow ml-auto" title={elicitation.agentId}>{displayAgent(elicitation.agentId, app.agents)} is waiting</span>
               </div>
               <p class="mb-3 text-[13px] leading-relaxed whitespace-pre-wrap">{elicitation.question}</p>
 
@@ -709,7 +710,9 @@
                       is the flat list this change replaces, in miniature.
                     -->
                     <span style="color:var(--marigold)">{g.stageKey ?? `run ${g.runId.slice(-6)}`}</span>
-                    {#if g.agentId}<span class="text-muted-foreground truncate">{g.agentId}</span>{/if}
+                    {#if g.agentId}
+                      <span class="text-muted-foreground truncate" title={g.agentId}>{displayAgent(g.agentId, app.agents)}</span>
+                    {/if}
                     {#if g.outcome}
                       <span style="color:{g.outcome === 'completed' ? 'var(--live)' : 'var(--coral)'}">{g.outcome}</span>
                     {/if}
@@ -801,7 +804,9 @@
                     <span class="mono">{g.stageKey}</span>
                     {#if g.decidedBy}
                       <span class="text-muted-foreground">by</span>
-                      <span class="mono truncate">{g.decidedBy}</span>
+                      <!-- A gate decided through AgentPod records a `prn_…` whose directory is in
+                           another product, so it shortens rather than resolves. -->
+                      <span class="mono truncate" title={g.decidedBy}>{displayPrincipal(g.decidedBy, app.members)}</span>
                     {/if}
                   </div>
                   {#if g.comment}
@@ -852,7 +857,7 @@
             <div class="space-y-1.5">
               {#each drawerAttempts as a, i (a.runId)}
                 <div class="bg-inset border-border mono flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
-                  <span class="text-muted-foreground truncate">{i + 1} · {a.agentId}{a.profileKey ? ` · ${a.profileKey}` : a.model ? ` · ${a.model}` : ''}</span>
+                  <span class="text-muted-foreground truncate" title={a.agentId}>{i + 1} · {displayAgent(a.agentId, app.agents)}{a.profileKey ? ` · ${a.profileKey}` : a.model ? ` · ${a.model}` : ''}</span>
                   <span class="shrink-0">{fmtUsd(a.costUsd)}{a.outcome ? ` · ${a.outcome}` : ''}</span>
                 </div>
               {/each}

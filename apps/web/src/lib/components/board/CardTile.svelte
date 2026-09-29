@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { displayAgent } from '$lib/names';
   import type { Card, Reference } from '$lib/api';
   import { resolveGate, type GateDecision } from '$lib/api';
   import { app } from '$lib/stores/app.svelte';
@@ -330,7 +331,7 @@
         size="sm"
         variant="outline"
         onclick={(e: MouseEvent) => { e.stopPropagation(); app.openCard(card.id); }}
-      >⚑ Answer {question.agentId}</Button>
+      >⚑ Answer {displayAgent(question.agentId, app.agents)}</Button>
     </div>
   {/if}
 

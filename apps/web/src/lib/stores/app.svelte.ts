@@ -27,6 +27,8 @@ import {
   type Notification,
   type User,
   type AgentSummary,
+  getMembers,
+  type Member,
 } from '$lib/api';
 
 const BOARD_KEY = 'superpipeline.boardId';
@@ -76,6 +78,12 @@ class AppStore {
   // collaboration data
   notifications = $state<Notification[]>([]);
   agents = $state<AgentSummary[]>([]);
+  /**
+   * The workspace's people, held for the same reason the agents are: so an id can be shown as a
+   * name. A card's owner and a gate's decider are user ids, and printing one at a person is the
+   * same complaint as printing an agent id.
+   */
+  members = $state<Member[]>([]);
 
   // navigation + view
   theme = $state<Theme>('dark');
@@ -244,11 +252,11 @@ class AppStore {
     localStorage.setItem(BOARD_KEY, id);
     await this.refresh();
     await this.loadBoards();
-    try {
-      this.agents = await getAgents();
-    } catch {
-      this.agents = [];
-    }
+    // Both are best-effort and independent: a workspace where one read is refused should still
+    // resolve the other rather than fall back to ids for everything.
+    const [agents, members] = await Promise.allSettled([getAgents(), getMembers()]);
+    this.agents = agents.status === 'fulfilled' ? agents.value : [];
+    this.members = members.status === 'fulfilled' ? members.value : [];
     this.#connect(id);
   }
 

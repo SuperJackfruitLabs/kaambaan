@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { displayAgent } from '$lib/names';
   /**
    * Spend, and the caps that bound it.
    *
@@ -85,7 +86,7 @@
         <div class="mt-3 grid gap-1.5">
           {#each usage.byAgent.slice(0, 5) as row (row.agentId)}
             <div class="mono grid grid-cols-[7rem_1fr_3.4rem] items-center gap-2 text-[11px]">
-              <span class="truncate">{app.agents.find((a) => a.id === row.agentId)?.name ?? row.agentId}</span>
+              <span class="truncate" title={row.agentId}>{displayAgent(row.agentId, app.agents)}</span>
               <span class="bg-inset h-[4px] overflow-hidden rounded-full"><i class="bg-marigold block h-full" style="width:{Math.round((row.costUsd / maxAgent) * 100)}%"></i></span>
               <span class="text-muted-foreground text-right">{usd(row.costUsd)}</span>
             </div>
