@@ -11,7 +11,7 @@
   import { app } from '$lib/stores/app.svelte';
   import {
     getAgents, getCapabilities, createAgent, updateAgent, deleteAgent,
-    issueAgentToken, revokeAgentToken, setAgentPrincipal,
+    issueAgentToken, revokeAgentToken, setAgentPrincipal, type AgentScope,
     type AgentSummary, type AgentToken, type CapabilityRecord,
   } from '$lib/api';
   import CapabilityPicker from '$lib/components/CapabilityPicker.svelte';
@@ -32,7 +32,7 @@
   let newName = $state('');
   let newCaps = $state<string[]>([]);
   let minting = $state(false);
-  let minted = $state<AgentToken | { agent: { id: string; name: string; capabilities: string[] }; token: string; tokenId: string } | null>(null);
+  let minted = $state<AgentToken | { agent: { id: string; name: string; capabilities: string[] }; token: string; tokenId: string; scopes?: AgentScope[] } | null>(null);
 
   const anyUnlinked = $derived(agents.some((a) => !a.externalId));
 
@@ -83,10 +83,21 @@
     if ((await deleteAgent(a.id)).ok) await refresh();
   }
 
-  async function onIssue(a: AgentSummary): Promise<void> {
+  /**
+   * Mint a credential for an agent that already exists.
+   *
+   * `scopes` narrows it. A run-only token drives the card the agent already holds and cannot
+   * claim another, which is what makes it safe to hand to a harness — the agent spends it itself,
+   * through MCP, inside its own session. The full token stays the one the orchestrator uses to
+   * claim on the agent's behalf.
+   */
+  async function onIssue(a: AgentSummary, scopes?: AgentScope[]): Promise<void> {
     error = null;
     try {
-      minted = { agent: { id: a.id, name: a.name, capabilities: a.capabilities }, ...(await issueAgentToken(a.id)) };
+      minted = {
+        agent: { id: a.id, name: a.name, capabilities: a.capabilities },
+        ...(await issueAgentToken(a.id, scopes)),
+      };
       await refresh();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -122,7 +133,11 @@
 {#if minted}
   <div class="border-marigold/40 bg-inset mb-4 rounded-[10px] border p-3.5">
     <p class="text-sm leading-relaxed">
-      <span class="font-medium">{minted.agent.name}</span>'s token —
+      <span class="font-medium">{minted.agent.name}</span>'s
+      {#if 'scopes' in minted && minted.scopes && !minted.scopes.includes('claim')}
+        <span class="mono">{minted.scopes.join(' + ')}</span>-only
+      {/if}
+      token —
       <span class="text-coral">copy it now, it won't be shown again.</span>
     </p>
     <div class="bg-surface border-border mono mt-2.5 flex items-center justify-between gap-2 rounded-[7px] border px-3 py-2 text-xs">
@@ -179,6 +194,7 @@
           <div class="border-border mt-2 flex flex-wrap items-center gap-2 border-t pt-2">
             <button onclick={() => startEdit(a)} class="border-border hover:border-marigold rounded-[7px] border px-2.5 text-[11px]" style="min-height:var(--tap)">Edit</button>
             <button onclick={() => void onIssue(a)} class="border-border hover:border-marigold rounded-[7px] border px-2.5 text-[11px]" style="min-height:var(--tap)">Issue a token</button>
+            <button onclick={() => void onIssue(a, ['run'])} title="Drives a card it already holds; cannot claim another. For a harness that reports for itself over MCP." class="border-border hover:border-marigold rounded-[7px] border px-2.5 text-[11px]" style="min-height:var(--tap)">Issue a run-only token</button>
             {#if a.externalId}
               <button onclick={() => void onUnlink(a)} class="border-border hover:border-marigold rounded-[7px] border px-2.5 text-[11px]" style="min-height:var(--tap)">Unlink principal</button>
             {/if}

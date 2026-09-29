@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, revokeAgentToken, getAgents, getHubPrincipals, BOARD_TEMPLATES } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, BOARD_TEMPLATES } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -274,5 +274,39 @@ describe('board templates ask only for capabilities a workspace can staff', () =
       const keys = t.stages.map((s) => s.key);
       expect(new Set(keys).size).toBe(keys.length);
     }
+  });
+});
+
+describe('issueAgentToken', () => {
+  it('mints the full credential by default — the body stays empty, as it always was', async () => {
+    const fetchSpy = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify({ token: 'spa_x', tokenId: 'tok_1' }), { status: 201 }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await issueAgentToken('agt_1');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/agents/agt_1/tokens');
+    expect(init?.method).toBe('POST');
+    expect(init?.body).toBeUndefined();
+  });
+
+  it('asks for a narrower credential when given scopes', async () => {
+    // A `run`-only token can finish the card it holds and cannot claim another. It is what a
+    // harness driving the board through MCP should carry, and minting is a human act — an agent
+    // cannot narrow, or widen, its own.
+    const fetchSpy = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(JSON.stringify({ token: 'spa_x', tokenId: 'tok_1', scopes: ['run'] }), { status: 201 }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const minted = await issueAgentToken('agt_1', ['run']);
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({ scopes: ['run'] });
+    expect(minted.scopes).toEqual(['run']);
   });
 });

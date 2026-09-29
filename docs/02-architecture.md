@@ -52,8 +52,10 @@ A single Worker that:
   validation ([05 §2](./05-integration-surfaces.md)).
 - **Authorizes**: pins the tenant, which is always derived from the credential and never from a
   client-supplied value, and compares the authenticated agent against `run.agentId` on run verbs.
-  **⚠️ Membership `role` and token `scopes` are stored but never checked** — that authorization
-  layer is design intent, not a control that exists.
+  Membership `role` and token `scopes` are both compared: `role` per request in `db/members.ts`,
+  and `scopes` by `auth/scopes.ts` — `claim` for `POST …/claims`, `run` for the run verbs and the
+  MCP tools that wrap them, with `claim` grandfathering `run` so tokens minted before the check
+  existed still finish the cards they take.
 - **Routes** to the correct **Board Durable Object** (by `boardId → DO id`) and to the MCP
   endpoint. The DO trusts the Worker's authorization decision — it never re-authenticates.
 

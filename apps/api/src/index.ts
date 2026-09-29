@@ -42,7 +42,7 @@ import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, res
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
-import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits, type AgentScope } from './auth/scopes';
+import { AGENT_TOKEN_SCOPES, isAgentScope, requiredScope, scopePermits, type AgentScope } from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
@@ -691,7 +691,7 @@ export default {
             if (
               !Array.isArray(asked) ||
               asked.length === 0 ||
-              !asked.every((x): x is AgentScope => typeof x === 'string' && (AGENT_TOKEN_SCOPES as string[]).includes(x))
+              !asked.every(isAgentScope)
             ) {
               return Response.json(
                 { error: `scopes must be a non-empty subset of ${AGENT_TOKEN_SCOPES.join(', ')}` },
