@@ -52,8 +52,15 @@ So: a registry rather than an enum. Each provider brings a host pattern, a recog
 registry is the one place a new provider is added, and the write boundary parses against it, which
 closes the `"web"` hole as a side effect rather than as a separate fix.
 
-The registry ships with what exists (`github`, `gitlab`, `forge`) plus the generic `url`. `docs` is
-removed: it is in the enum, produced by no recogniser and consumed by nothing.
+The registry ships with what exists (`github`, `gitlab`, `forge`) plus the generic `url` — and
+`docs`, which this spec first said to remove. That was half wrong, and the test suite caught it
+during slice 0: `docs` is produced by no recogniser **and deliberately declared by callers**, which
+are different things. Any host can serve a document, so no host identifies one; naming `docs` is a
+claim about a link's role rather than about where it lives.
+
+That distinction is in the registry as `declarable`, and it is the shape **Drive, Notion and
+Figma** take *before* anybody writes them a recogniser — a better first step than leaving them as
+generic `url`, and one that costs nothing.
 
 ### 1 — Stage completion requirements
 
