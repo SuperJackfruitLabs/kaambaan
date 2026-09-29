@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { providerKeys } from './providers';
 
 /**
  * Canonical task states — mirrors the A2A `TaskState` machine (see docs/03-card-lifecycle.md).
@@ -124,7 +125,15 @@ export function capabilityTags(raw: string[]): string[] {
  * Added 2026-09-29 — until then the charter's primary git host had no name in this enum and every
  * forge link was stored as a generic `url`, undedupable and unenrichable.
  */
-export const ReferenceProvider = z.enum(['github', 'gitlab', 'forge', 'docs', 'url']);
+/**
+ * Built from the registry rather than written beside it.
+ *
+ * This was a hand-maintained enum that nothing parsed, so it drifted in both directions at once:
+ * it named `docs`, which no recogniser produced and nothing consumed, and it did not name Drive,
+ * Notion, Figma or Sentry, which an operator references in earnest. Deriving it means a provider
+ * is added in exactly one place — `providers.ts` — and this can no longer disagree with it.
+ */
+export const ReferenceProvider = z.enum(providerKeys() as [string, ...string[]]);
 export type ReferenceProvider = z.infer<typeof ReferenceProvider>;
 
 export const ReferenceSourceType = z.enum([

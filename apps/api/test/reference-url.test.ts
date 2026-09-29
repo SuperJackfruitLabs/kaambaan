@@ -122,3 +122,32 @@ describe('recognizeReference on a configured forge', () => {
     });
   });
 });
+
+/**
+ * URL-level behaviour, pinned where the real parser runs.
+ *
+ * The contract package holds the rules and takes an already-parsed host, because it compiles with
+ * no DOM and no Node types. The parse lives here — and the host comparison it feeds is a security
+ * boundary, so these exist to prove the platform's parser is doing that job rather than a regex.
+ */
+describe('recognizeReference parses before it matches', () => {
+  it('is not fooled by userinfo naming the forge', () => {
+    // `https://evil.com@forge.example.test/` has hostname `forge.example.test` — the userinfo is
+    // `evil.com` and belongs to nobody. The inverse is the dangerous one and is the point of this
+    // test: a hand-rolled split on `//` and `/` reads the host as `evil.com` in one direction and
+    // as the operator's forge in the other. A real parser is not confused either way.
+    expect(
+      recognizeReference('https://forge.example.test@evil.test/org/repo/pulls/1', 'forge.example.test'),
+    ).toMatchObject({ provider: 'url' });
+  });
+
+  it('ignores a port and a query when matching the host', () => {
+    expect(
+      recognizeReference('https://forge.example.test/org/repo/pulls/1?tab=files', 'forge.example.test'),
+    ).toMatchObject({ provider: 'forge', externalId: 'org/repo#1' });
+  });
+
+  it('answers generic for something that is not a url at all', () => {
+    expect(recognizeReference('not a url at all')).toEqual({ provider: 'url', sourceType: 'url' });
+  });
+});

@@ -5,3 +5,4 @@ export * from './activity';
 export * from './entities';
 export * from './verbs';
 export * from './templates';
+export * from './providers';
