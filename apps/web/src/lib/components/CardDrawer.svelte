@@ -23,7 +23,25 @@
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
   const card = $derived(cardId ? app.cardById(cardId) : undefined);
-  const gate = $derived(cardId ? app.gateForCard(cardId) : undefined);
+  let cardDetail = $state<CardActivities | null>(null);
+  /**
+   * The gate this card is waiting on, preferring the card's OWN fetch over the board snapshot.
+   *
+   * The drawer had two sources of truth for one fact: the pending gate came from the board
+   * snapshot, the decided ones from `cardDetail`. When those disagree — a gate resolved from
+   * another client, a snapshot that has not caught up — the panel offers Approve and Reject for a
+   * decision already made, and the server rightly refuses.
+   *
+   * One source, and it is the card's own record, which carries decided gates too: a gate resolved
+   * anywhere drops out of here as soon as the drawer refetches, which since this branch happens on
+   * the live feed. The snapshot stays as the fallback for the moment before the first fetch lands,
+   * so a freshly opened drawer is not briefly gateless.
+   */
+  const gate = $derived(
+    cardId
+      ? (cardDetail?.gates?.find((g) => g.status === 'pending') ?? (cardDetail ? undefined : app.gateForCard(cardId)))
+      : undefined,
+  );
   const elicitation = $derived(cardId ? app.elicitationForCard(cardId) : undefined);
   const refs = $derived(cardId ? app.referencesForCard(cardId) : []);
   const boardId = $derived(app.boardId);
@@ -32,7 +50,6 @@
   );
 
   // ---- local async state ----
-  let cardDetail = $state<CardActivities | null>(null);
   /**
    * Tool calls are hidden by default.
    *
@@ -61,6 +78,8 @@
   let savingCard = $state(false);
   let newRefUrl = $state('');
   let localError = $state<string | null>(null);
+  /** A refusal from the gate, rendered in the gate panel rather than at the top of the drawer. */
+  let gateError = $state<string | null>(null);
 
   // ---- elicitation (agent question) state ----
   let answerText = $state('');
@@ -85,6 +104,7 @@
     if (id && boardId) {
       answerText = '';
       gateComment = '';
+      gateError = null;
       activeInteractiveOption = null;
       editing = false;
       newRefUrl = '';
@@ -242,10 +262,24 @@
     const res = await resolveGate(boardId, gate.id, decision, comment);
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
-      localError = body?.error?.message ?? `Resolve failed (${res.status})`;
-      await app.refresh();
+      /**
+       * Beside the button, and carrying the status.
+       *
+       * A reject on a live gate was reported as the button doing nothing at all. Whatever the
+       * server answered, the reader never saw it: `localError` renders at the top of the drawer,
+       * sixty lines above the gate panel and off-screen on any card with a real spec. The status
+       * code is included because the message alone did not distinguish the candidates — a refused
+       * decision, an expired session and a gate decided elsewhere are three different problems
+       * with three different remedies.
+       */
+      gateError = body?.error?.message
+        ? `${body.error.message} (${res.status})`
+        : `Couldn't record that decision (${res.status})`;
+      // Whatever refused us knows something this tab does not; the card's own record settles it.
+      await Promise.all([app.refresh(), refreshDrawer(cardId!, boardId)]);
       return;
     }
+    gateError = null;
     localError = null;
     await app.refresh();
     app.closeCard();
@@ -644,6 +678,18 @@
               <div class="gh mb-2.5 flex items-center gap-2">
                 <span class="wordmark font-semibold text-sm" style="color:var(--coral)">⚑ awaiting your review</span>
               </div>
+
+              {#if gateError}
+                <p role="alert" class="border-coral/40 text-coral mono mb-2.5 rounded-[7px] border px-3 py-2 text-xs" style="background:rgba(255,107,87,.12)">
+                  {gateError}
+                </p>
+              {/if}
+
+              {#if gateError}
+                <p role="alert" class="border-coral/40 text-coral mono mb-2.5 rounded-[7px] border px-3 py-2 text-xs" style="background:rgba(255,107,87,.12)">
+                  {gateError}
+                </p>
+              {/if}
 
               <!-- gate action buttons — driven by effectiveOptions -->
               <div class="triad flex gap-2 flex-wrap">
