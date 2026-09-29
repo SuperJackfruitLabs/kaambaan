@@ -325,3 +325,69 @@ describe('PATCH /v1/boards/:id/stages/:stageKey', () => {
     expect(res.status).toBe(404);
   });
 });
+
+/**
+ * A completion requirement is settable one stage at a time.
+ *
+ * Slice 1 shipped the check and no way to configure it but rewriting the whole pipeline — which is
+ * the problem the per-stage PATCH exists to solve, repeated for the newer field. A feature only
+ * reachable by `set-stages` is a feature most boards will not get.
+ */
+describe('PATCH /v1/boards/:id/stages/:stageKey — completion', () => {
+  const dev = { 'X-Tenant-Id': 'tnt_patch_completion', 'Content-Type': 'application/json' };
+
+  async function board(): Promise<string> {
+    const res = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST',
+      headers: dev,
+      body: JSON.stringify({ name: 'PC', stages: PIPE }),
+    });
+    return ((await res.json()) as { boardId: string }).boardId;
+  }
+
+  const patch = (id: string, body: unknown) =>
+    SELF.fetch(`https://api.test/v1/boards/${id}/stages/doing`, {
+      method: 'PATCH',
+      headers: dev,
+      body: JSON.stringify(body),
+    });
+
+  const stageOf = async (id: string) =>
+    ((await (await SELF.fetch(`https://api.test/v1/boards/${id}`, { headers: dev })).json()) as {
+      stages: Array<{ key: string; completion?: unknown; owner?: string }>;
+    }).stages.find((s) => s.key === 'doing')!;
+
+  it('sets a requirement without disturbing the stage or its neighbours', async () => {
+    const id = await board();
+    const res = await patch(id, { completion: { handoff: ['url', 'commit'] } });
+    expect(res.status).toBe(200);
+
+    const doing = await stageOf(id);
+    expect(doing.completion).toMatchObject({ handoff: ['url', 'commit'] });
+    expect(doing.owner).toBe('research');
+  });
+
+  it('clears it with null, which is not the same as leaving it alone', async () => {
+    const id = await board();
+    await patch(id, { completion: { handoff: ['url'] } });
+    await patch(id, { name: 'Doing' });
+    expect((await stageOf(id)).completion).toMatchObject({ handoff: ['url'] });
+
+    await patch(id, { completion: null });
+    expect((await stageOf(id)).completion).toBeUndefined();
+  });
+
+  it('refuses a requirement that is not an object', async () => {
+    const id = await board();
+    expect((await patch(id, { completion: 'url please' })).status).toBe(400);
+    expect((await patch(id, { completion: ['url'] })).status).toBe(400);
+  });
+
+  it('refuses arms that are the wrong shape, rather than storing a rule nothing can evaluate', async () => {
+    // A `handoff` of `"url"` instead of `["url"]` would be silently unsatisfiable: the evaluator
+    // reads it as a list, finds none, and blocks every run on the stage forever.
+    const id = await board();
+    expect((await patch(id, { completion: { handoff: 'url' } })).status).toBe(400);
+    expect((await patch(id, { completion: { reference: 'forge' } })).status).toBe(400);
+  });
+});
