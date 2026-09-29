@@ -1,7 +1,7 @@
 <script lang="ts">
   import { displayAgent, displayPrincipal } from '$lib/names';
   import { onDestroy } from 'svelte';
-  import { groupActivities, isNarrative, defaultOpen } from '$lib/activity-groups';
+  import { groupActivities, isNarrative, defaultOpen, visibleActivities } from '$lib/activity-groups';
   import { app } from '$lib/stores/app.svelte';
   import {
     getCardActivities,
@@ -66,6 +66,14 @@
   let answerText = $state('');
   let answering = $state(false);
 
+  /**
+   * How long a burst of feed events is allowed to collapse into one refetch.
+   *
+   * A second is well under the interval at which a person perceives a list as stale, and well
+   * over the gap between two tool calls in a fast run.
+   */
+  const FEED_COALESCE_MS = 1000;
+
   // ---- gate state ----
   // which option is interactive (request_changes) — shows comment textarea
   let activeInteractiveOption = $state<string | null>(null);
@@ -100,6 +108,43 @@
       /* best-effort */
     }
   }
+
+  /**
+   * Follow the live feed for THIS card.
+   *
+   * The effect above runs when the open card changes, which is not when the open card's activity
+   * changes. An agent working a card posts one activity per tool call — a real run posted 67 —
+   * and every one of them arrives on the board socket; none of them reached this panel, so a
+   * person watching a card work saw an empty list until the card moved stage and remounted the
+   * drawer. That is what this fixes.
+   *
+   * Filtered on `payload.cardId` so a busy neighbour costs nothing, and coalesced, because a
+   * chatty run would otherwise mean three fetches per tool call. The trailing call matters more
+   * than the leading one: the last event in a burst is the one whose data we want.
+   */
+  let feedTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const id = cardId;
+    const bid = boardId;
+    if (!id || !bid) return;
+
+    const stop = app.onFeed((event) => {
+      // Events that name another card are not ours. Events that name none — a board rename, a
+      // stage change — could still move this card, so they are taken.
+      if (event.payload?.cardId && event.payload.cardId !== id) return;
+      if (feedTimer !== undefined) return;
+      feedTimer = setTimeout(() => {
+        feedTimer = undefined;
+        void refreshDrawer(id, bid);
+      }, FEED_COALESCE_MS);
+    });
+
+    return () => {
+      stop();
+      if (feedTimer !== undefined) clearTimeout(feedTimer);
+      feedTimer = undefined;
+    };
+  });
 
   // ---- close ----
   function close(): void {
@@ -707,7 +752,8 @@
             -->
             <div class="stream flex flex-col gap-1.5">
               {#each activityGroups as g, gi (g.runId)}
-                {@const rows = showToolCalls ? g.activities : g.activities.filter(isNarrative)}
+                {@const view = visibleActivities(g.activities, isNarrative, showToolCalls)}
+                {@const rows = view.rows}
                 <details open={defaultOpen(activityGroups, gi)} class="border-border rounded-[7px] border">
                   <summary
                     class="mono flex cursor-pointer items-center gap-2 px-2 py-1.5 text-[11px]"
@@ -731,10 +777,18 @@
                   </summary>
 
                   <div class="flex flex-col gap-0.5 px-1.5 pb-1.5">
-                    {#if rows.length === 0}
+                    {#if view.shownBecauseNoNarrative}
+                      <!--
+                        Said once, quietly, rather than hiding the run: the reader's preference is
+                        narrative-only, and this run has none, so what follows is its tool calls.
+                        The alternative — what this replaces — was an empty panel under a heading
+                        reading "67 events".
+                      -->
                       <p class="text-muted-foreground px-1.5 py-1 text-[11px]">
-                        Nothing but tool calls in this run — use “show tool calls”.
+                        This run said nothing in prose; its tool calls are below.
                       </p>
+                    {:else if rows.length === 0}
+                      <p class="text-muted-foreground px-1.5 py-1 text-[11px]">No activity recorded for this run.</p>
                     {/if}
                     {#each rows as a (a.seq)}
                       {@const m = activityMarker(a.type)}

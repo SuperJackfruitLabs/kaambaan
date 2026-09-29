@@ -16,6 +16,7 @@ import {
   createCard,
   moveCard,
   openBoardSocket,
+  type BoardFeedEvent,
   deleteBoard,
   BOARD_TEMPLATES,
   type BoardSnapshot,
@@ -120,6 +121,7 @@ class AppStore {
    */
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   #reconnectAttempt = 0;
+  #feedListeners = new Set<(event: BoardFeedEvent) => void>();
   #socketGeneration = 0;
 
   // ---- derived reads (methods stay reactive when read in templates) ----
@@ -270,7 +272,12 @@ class AppStore {
   #connect(boardId: string): void {
     this.#closeSocket();
     const generation = this.#socketGeneration;
-    const sock = openBoardSocket(boardId, () => this.refresh());
+    const sock = openBoardSocket(boardId, (event) => {
+      void this.refresh();
+      // Fan the event out to whoever is watching one card. The board snapshot that `refresh`
+      // reloads does not carry activities, so without this the open card learns nothing.
+      if (event) for (const fn of this.#feedListeners) fn(event);
+    });
     sock.addEventListener('open', () => {
       if (generation !== this.#socketGeneration) return;
       this.connected = true;
@@ -290,6 +297,23 @@ class AppStore {
       }, delay);
     });
     this.#socket = sock;
+  }
+
+  /**
+   * Subscribers to the live feed, for things the board snapshot does not carry.
+   *
+   * The card drawer is the reason this exists: its activity list is a separate fetch, and it used
+   * to refresh only when the open card CHANGED — so a run could post sixty-seven activities, every
+   * one of them arriving on this socket, and the panel a person was watching showed none of them
+   * until the card moved stage and remounted the drawer.
+   *
+   * Returns its own unsubscribe. A `Set` rather than a single callback because two components may
+   * legitimately watch at once, and a second one silently replacing the first is the kind of bug
+   * that only shows up when someone opens two panels.
+   */
+  onFeed(fn: (event: BoardFeedEvent) => void): () => void {
+    this.#feedListeners.add(fn);
+    return () => this.#feedListeners.delete(fn);
   }
 
   /** Close the socket and cancel any pending reconnect, invalidating both for good measure. */
