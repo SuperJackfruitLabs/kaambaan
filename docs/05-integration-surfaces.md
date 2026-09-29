@@ -89,6 +89,7 @@ that flow in the present tense. None of it was ever built.
 | `superpipeline_claim_card` | `maxConcurrency?` | `POST /v1/boards/:id/claims` *(REST also takes `profileKey`)* |
 | `superpipeline_get_card` | `cardId` | `GET …/cards/:cardId` *(human-auth; added for `supi card`, which had requested it since before it existed)* |
 | `superpipeline_get_run` | `runId` | `GET …/runs/:runId` *(the run context — lease epoch, card, stage, prior handoff)* |
+| *(no tool)* | — | `GET …/gates/:gateId` *(one gate with its decision; agent-or-human, like `gates/pending`)* |
 | `superpipeline_add_reference` | `cardId`, `url`, `provider?`, `sourceType?`, … | `PUT …/cards/:cardId/references` *(human-auth — MCP is the only agent path)* |
 | `superpipeline_heartbeat` | `runId`, `leaseEpoch` | `POST …/runs/:runId/heartbeat` |
 | `superpipeline_post_activity` | `runId`, `leaseEpoch`, `type`, `body?`, `parameter?`, `signal?`, `usage?` | `POST …/runs/:runId/activities` |

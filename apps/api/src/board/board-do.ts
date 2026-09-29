@@ -675,6 +675,8 @@ export interface BoardStub {
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
+  /** One gate, including how it was decided. See `getGate`. */
+  getGate(gateId: string): Promise<Result<GateView>>;
   getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }>;
   getEvents(limit?: number): Promise<BoardEvent[]>;
   estimateCardCost(cardId: string): Promise<Result<EstimateView>>;
@@ -2029,6 +2031,21 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** A card's session replay: its durable activity waterfall + the handoff carried into it (docs/07 §4). */
+  /**
+   * One gate, including how it was decided.
+   *
+   * Gates were readable two ways and neither served the caller that needed this. `gates/pending`
+   * answers only what is still waiting; the board snapshot is a human route. So a hub that had
+   * posted a gate into a chat room had no way to learn it had since been decided on the web, or
+   * what the decision was — and that room went on offering Approve and Reject for a decision
+   * already made, with no expiry (agentpod: the sweep that settles those).
+   */
+  async getGate(gateId: string): Promise<Result<GateView>> {
+    const row = this.getGateRow(gateId);
+    if (!row) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${gateId}` };
+    return { ok: true, value: this.rowToGate(row) };
+  }
+
   async getCardActivities(cardId: string): Promise<{ activities: ActivityView[]; handoff: JsonValue | null; gates: GateView[] }> {
     const activities = this.sql
       .exec(`SELECT * FROM activities WHERE card_id = ? AND ephemeral = 0 ORDER BY seq ASC`, cardId)
@@ -2935,19 +2952,24 @@ export class BoardDO extends DurableObject<Env> {
     return this.sql
       .exec(`SELECT * FROM gates WHERE card_id = ? ORDER BY created_at ASC`, cardId)
       .toArray()
-      .map((r) => ({
-        id: r.id as string,
-        cardId: r.card_id as string,
-        stageKey: r.stage_key as string,
-        status: r.status as 'pending' | 'resolved',
-        decision: (r.decision as string | null) ?? null,
-        options: JSON.parse(r.options_json as string) as GateOption[],
-        producedBy: r.produced_by as string,
-        createdAt: r.created_at as string,
-        decidedBy: (r.decided_by as string | null) ?? null,
-        comment: (r.comment as string | null) ?? null,
-        resolvedAt: (r.resolved_at as string | null) ?? null,
-      }));
+      .map((r) => this.rowToGate(r as Row));
+  }
+
+  /** One gate row as a `GateView`. Shared, so one gate and a card's gates cannot disagree. */
+  private rowToGate(r: Row): GateView {
+    return {
+      id: r.id as string,
+      cardId: r.card_id as string,
+      stageKey: r.stage_key as string,
+      status: r.status as 'pending' | 'resolved',
+      decision: (r.decision as string | null) ?? null,
+      options: JSON.parse(r.options_json as string) as GateOption[],
+      producedBy: r.produced_by as string,
+      createdAt: r.created_at as string,
+      decidedBy: (r.decided_by as string | null) ?? null,
+      comment: (r.comment as string | null) ?? null,
+      resolvedAt: (r.resolved_at as string | null) ?? null,
+    };
   }
 
   private stageMatches(stage: StageDef, agentId: string, capabilities: string[]): boolean {
