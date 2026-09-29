@@ -451,15 +451,15 @@ async function main(argv: string[]): Promise<void> {
      */
     case "forge": {
       if (!pos[0]) {
-        const t = (await api("/v1/tenant")) as { tenant?: { forgeHost?: string | null } };
-        const host = t.tenant?.forgeHost ?? null;
+        const t = (await api("/v1/tenant/forge")) as { forgeHost?: string | null };
+        const host = t.forgeHost ?? null;
         out({ forgeHost: host }, () =>
           host ? `forge  ${host}` : "No forge configured. `supi forge <host>` sets one.",
         );
         return;
       }
       const host = pos[0] === "none" ? null : pos[0];
-      await api("/v1/tenant", { method: "PATCH", body: JSON.stringify({ forgeHost: host }) });
+      await api("/v1/tenant/forge", { method: "PUT", body: JSON.stringify({ forgeHost: host }) });
       out({ forgeHost: host }, () => (host ? `forge  ${host}` : "Forge cleared."));
       return;
     }

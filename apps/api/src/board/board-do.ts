@@ -5,8 +5,9 @@ import { newId } from '../ids';
 import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
 import { capabilityTag, normalizeRequirement, stageCapabilitiesMet } from '@superpipeline/contract';
 import { parseElicitationOptions } from './elicitation';
-import { verifyGithubSignature } from '../references/github-signature';
+import { verifyGithubSignature, verifyForgeSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
+import { mapForgeEvent } from '../references/forge-events';
 import { estimateCostUsd } from '../metering/pricing';
 import { parseWindowMs } from '../metering/window';
 import { signAndSend, type PushSender } from '../push/deliver';
@@ -643,6 +644,13 @@ export interface BoardStub {
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
+  setForgeSecret(secret: string): Promise<Result<{ configured: true }>>;
+  handleForgeWebhook(input: {
+    rawBody: string;
+    signature: string | null;
+    deliveryId: string | null;
+    event: string;
+  }): Promise<Result<{ deduped: boolean; matched: number; modeled: boolean }>>;
   setGithubConfig(input: { secret?: string; issueTrigger?: boolean; triggerGrant?: string[] | null }): Promise<Result<{ ok: true }>>;
   createCardFromTrigger(input: {
     title: string;
@@ -1447,6 +1455,84 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /** Store/rotate this board's GitHub webhook secret (docs/06 §3, §6). */
+  async setForgeSecret(secret: string): Promise<Result<{ configured: true }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    // Its own secret, never the GitHub one. A board may legitimately receive from both — a repo
+    // that is forge-primary and mirrored — and one shared secret would mean revoking either
+    // side's access revokes the other's.
+    this.setMeta('forgeWebhookSecret', secret);
+    return { ok: true, value: { configured: true } };
+  }
+
+  /**
+   * An inbound Forgejo webhook.
+   *
+   * Deliberately parallel to `handleGithubWebhook` and deliberately not shared with it. The
+   * dedupe table, the fail-closed delivery check and the reference update are identical; the
+   * signature spelling and the event vocabulary are not, and those are exactly the parts that
+   * fail silently when assumed (Forgejo sends `synchronized`, GitHub `synchronize`).
+   *
+   * Deliveries share one table with GitHub's on purpose: a delivery id is a delivery id, and a
+   * board receiving from a forge-primary repository AND its GitHub mirror should not process the
+   * same underlying change twice because the two arrived by different doors.
+   */
+  async handleForgeWebhook(input: {
+    rawBody: string;
+    signature: string | null;
+    deliveryId: string | null;
+    event: string;
+  }): Promise<Result<{ deduped: boolean; matched: number; modeled: boolean }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    const secret = this.getMeta('forgeWebhookSecret');
+    if (!secret) {
+      return { ok: false, code: 'NOT_CONFIGURED', message: 'no forge webhook secret configured for this board' };
+    }
+    if (!(await verifyForgeSignature(secret, input.rawBody, input.signature))) {
+      return { ok: false, code: 'INVALID_SIGNATURE', message: 'invalid X-Forgejo-Signature' };
+    }
+    // Fail closed, for the reason the GitHub path gives: a missing delivery id would silently
+    // disable replay protection. Recorded only after the signature verifies, so an unverified
+    // request can never poison the table.
+    if (!input.deliveryId) {
+      return { ok: false, code: 'INVALID_DELIVERY', message: 'missing X-Forgejo-Delivery' };
+    }
+    const seen = this.sql.exec(`SELECT 1 FROM webhook_deliveries WHERE delivery_id = ?`, input.deliveryId).toArray()[0];
+    if (seen) return { ok: true, value: { deduped: true, matched: 0, modeled: false } };
+    this.sql.exec(`INSERT INTO webhook_deliveries (delivery_id, received_at) VALUES (?, ?)`, input.deliveryId, this.now());
+
+    let payload: unknown;
+    try {
+      const raw = input.rawBody;
+      const jsonText = raw.startsWith('payload=') ? (new URLSearchParams(raw).get('payload') ?? raw) : raw;
+      payload = JSON.parse(jsonText);
+    } catch {
+      return { ok: true, value: { deduped: false, matched: 0, modeled: false } };
+    }
+
+    const mapped = mapForgeEvent(input.event, payload);
+    if (!mapped) return { ok: true, value: { deduped: false, matched: 0, modeled: false } };
+
+    const now = this.now();
+    const rows = this.sql.exec(`SELECT * FROM card_references WHERE external_id = ?`, mapped.externalId).toArray();
+    for (const row of rows) {
+      const current = (row.metadata_json ? JSON.parse(row.metadata_json as string) : {}) as Record<string, unknown>;
+      const merged = { ...current, ...mapped.metadata, subState: mapped.subState };
+      this.sql.exec(
+        `UPDATE card_references SET metadata_json = ?, sync_state = 'synced', last_synced_at = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify(merged),
+        now,
+        now,
+        row.id as string,
+      );
+      this.emit('reference.updated', { reference: this.mustGetReference(row.id as string) });
+    }
+    return { ok: true, value: { deduped: false, matched: rows.length, modeled: true } };
+  }
+
   async setGithubSecret(secret: string): Promise<Result<{ configured: true }>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
