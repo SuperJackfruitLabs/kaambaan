@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { displayAgent } from '$lib/names';
   /**
    * Attention as an object, not a bell.
    *
@@ -28,7 +29,7 @@
       const gate = app.gateForCard(c.id);
       const ask = app.elicitationForCard(c.id);
       if (gate) out.push({ id: `g:${gate.id}`, kind: 'gate', title: c.title, detail: `${gate.stageKey} · waiting on you`, cardId: c.id });
-      else if (ask) out.push({ id: `e:${ask.id}`, kind: 'asked', title: c.title, detail: `${ask.agentId} asked a question`, cardId: c.id });
+      else if (ask) out.push({ id: `e:${ask.id}`, kind: 'asked', title: c.title, detail: `${displayAgent(ask.agentId, app.agents)} asked a question`, cardId: c.id });
       else if (c.state === 'failed') out.push({ id: `f:${c.id}`, kind: 'failed', title: c.title, detail: 'the run failed', cardId: c.id });
       else if (c.state === 'input-required')
         // The control-pair refusal: the card was queued without authority, or the agent that could
