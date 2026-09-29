@@ -42,7 +42,7 @@ import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, res
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
-import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits } from './auth/scopes';
+import { AGENT_TOKEN_SCOPES, requiredScope, scopePermits, type AgentScope } from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
@@ -673,8 +673,35 @@ export default {
           if (!(await agentBelongsToTenant(env.DB, u.tenantId, agentId))) {
             return Response.json({ error: 'agent not found' }, { status: 404 });
           }
-          const minted = await createAgentToken(env.DB, u.tenantId, agentId, AGENT_TOKEN_SCOPES);
-          return Response.json({ token: minted.token, tokenId: minted.id }, { status: 201 });
+          /**
+           * A caller may ask for less than the default, and never for more than exists.
+           *
+           * Both mint sites passed `AGENT_TOKEN_SCOPES` unconditionally, so there was no way to
+           * issue a credential that can finish the card it holds and cannot ask for another. That
+           * narrowing is what makes direct MCP access for an agent defensible: AgentPod's prompt
+           * contract objects that a harness driving the board itself "would keep a lease open past
+           * the card it was claimed for", and a run-only token is the answer to it.
+           *
+           * Absent means the default, so every existing caller is unaffected.
+           */
+          const mintBody = (await request.json().catch(() => ({}))) as { scopes?: unknown };
+          let scopes: AgentScope[] = AGENT_TOKEN_SCOPES;
+          if (mintBody.scopes !== undefined) {
+            const asked = mintBody.scopes;
+            if (
+              !Array.isArray(asked) ||
+              asked.length === 0 ||
+              !asked.every((x): x is AgentScope => typeof x === 'string' && (AGENT_TOKEN_SCOPES as string[]).includes(x))
+            ) {
+              return Response.json(
+                { error: `scopes must be a non-empty subset of ${AGENT_TOKEN_SCOPES.join(', ')}` },
+                { status: 400 },
+              );
+            }
+            scopes = [...new Set(asked)];
+          }
+          const minted = await createAgentToken(env.DB, u.tenantId, agentId, scopes);
+          return Response.json({ token: minted.token, tokenId: minted.id, scopes }, { status: 201 });
         }
 
         if (agentId && tokenId) {

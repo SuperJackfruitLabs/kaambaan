@@ -12,6 +12,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { BoardStub, Result, JsonValue, AgentActivityType } from '../board/board-do';
 import { resolveReferenceInput } from '../references/resolve';
+import { scopePermits, type AgentScope } from '../auth/scopes';
 
 /** The principal resolved from the bearer token (the OAuth Resource Server side, docs/05 §2). */
 export interface McpAuth {
@@ -19,12 +20,41 @@ export interface McpAuth {
   agentId: string;
   capabilities: string[];
   /**
+   * The token's scope set, or `null` for a credential that did not come from `agent_tokens`.
+   * `null` means unscoped rather than unpermitted — see `scopePermits`.
+   */
+  scopes?: string[] | null;
+  /**
    * The agent's mapped suite principal id (`agents.external_id`), already known from the same
    * catalog row the `spa_` token resolved against. Absent when this auth path never looked it up
    * (the dev bearer) — see `AgentPrincipal.externalId` in `auth/resolve.ts`, which this mirrors.
    */
   externalId?: string | null;
 }
+
+/**
+ * Which scope each tool needs — the MCP mirror of `requiredScope` for REST paths.
+ *
+ * A table rather than a check inside each handler, following the rule AgentPod's own MCP states:
+ * *the principal decides the tool set, once, at registration; an agent is not offered a tool it
+ * must not call.* A check inside a handler is a check that one handler out of eleven can be
+ * written without, and the route audit's whole finding was that guards bolted on beside an id are
+ * the thing that gets forgotten.
+ *
+ * Reads are unscoped, for the reason `requiredScope` gives about `gates/pending`: they name nobody
+ * and carry no authority.
+ */
+const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
+  superpipeline_claim_card: 'claim',
+  superpipeline_heartbeat: 'run',
+  superpipeline_post_activity: 'run',
+  superpipeline_submit_for_review: 'run',
+  superpipeline_complete: 'run',
+  superpipeline_block: 'run',
+  superpipeline_release: 'run',
+  superpipeline_fail: 'run',
+  superpipeline_add_reference: 'run',
+};
 
 export interface ToolDeps {
   auth: McpAuth;
@@ -49,7 +79,27 @@ const json = z.record(z.string(), z.unknown());
 export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): void {
   const { auth } = deps;
 
-  server.registerTool(
+  /**
+   * Registration, gated by the token's scopes.
+   *
+   * Every `registerTool` below goes through this, so a tool the caller's scopes do not permit is
+   * never offered — it does not appear in `tools/list` and cannot be called. Gating at
+   * registration rather than inside each handler is the rule AgentPod's own MCP server states and
+   * the reason it gives: a check inside a handler is a check that one handler out of eleven can be
+   * written without.
+   *
+   * `auth.scopes` of `null` is an unscoped credential (the dev bearer), not an unpermitted one —
+   * `scopePermits` draws that distinction and `auth/resolve.ts` calls it load-bearing.
+   */
+  const register: typeof server.registerTool = ((name: string, ...rest: unknown[]) => {
+    const needed = TOOL_SCOPE[name];
+    if (needed && !scopePermits(auth.scopes ?? null, needed)) return undefined;
+    return (server.registerTool as (...a: unknown[]) => unknown)(name, ...rest);
+    // The cast is here because `registerTool` is generic over its input schema and this wrapper is
+    // deliberately indifferent to it; the alternative is repeating the generic at eleven call sites.
+  }) as typeof server.registerTool;
+
+  register(
     'superpipeline_list_work',
     {
       description:
@@ -72,7 +122,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     },
   );
 
-  server.registerTool(
+  register(
     'superpipeline_claim_card',
     {
       description:
@@ -92,7 +142,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     },
   );
 
-  server.registerTool(
+  register(
     'superpipeline_get_card',
     {
       description: 'Read a card by id (title, current stage, state).',
@@ -105,7 +155,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     },
   );
 
-  server.registerTool(
+  register(
     'superpipeline_add_reference',
     {
       description:
@@ -132,7 +182,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       ),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_heartbeat',
     {
       description: 'Renew your lease on an active run so it is not reclaimed (docs/08).',
@@ -143,7 +193,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       fromResult(await deps.boardStub(boardId).heartbeat({ runId, leaseEpoch, agentId: auth.agentId })),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_post_activity',
     {
       description: 'Stream a typed activity (thought/action/response/elicitation/error) onto the run.',
@@ -187,7 +237,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       ),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_submit_for_review',
     {
       description: 'Submit your work at a gated stage for human review (opens an approval gate).',
@@ -198,7 +248,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       fromResult(await deps.boardStub(boardId).submitForReview({ runId, leaseEpoch, agentId: auth.agentId, output: output as JsonValue })),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_complete',
     {
       description: 'Finish your run successfully; the card advances to the next stage carrying your handoff.',
@@ -209,7 +259,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       fromResult(await deps.boardStub(boardId).complete({ runId, leaseEpoch, agentId: auth.agentId, handoff: handoff as JsonValue })),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_block',
     {
       description: 'Mark the run blocked on an external dependency; releases the lease.',
@@ -220,7 +270,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       fromResult(await deps.boardStub(boardId).block({ runId, leaseEpoch, agentId: auth.agentId, reason })),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_release',
     {
       description: 'Voluntarily give the card back to the queue without failing it.',
@@ -231,7 +281,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       fromResult(await deps.boardStub(boardId).release({ runId, leaseEpoch, agentId: auth.agentId, reason })),
   );
 
-  server.registerTool(
+  register(
     'superpipeline_fail',
     {
       description: 'Fail the run (counts toward the circuit breaker); the card returns to the queue or trips.',
