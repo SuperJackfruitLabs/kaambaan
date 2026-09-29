@@ -1517,7 +1517,14 @@ export class BoardDO extends DurableObject<Env> {
     if (!mapped) return { ok: true, value: { deduped: false, matched: 0, modeled: false } };
 
     const now = this.now();
-    const rows = this.sql.exec(`SELECT * FROM card_references WHERE external_id = ?`, mapped.externalId).toArray();
+    // Matched by provider AS WELL AS external_id. `externalId` is `owner/repo#n` for GitHub and
+    // for forge alike, and a push mirror mirrors git refs — not pull requests — so a forge PR #7
+    // and a GitHub PR #7 on a mirrored repository are DIFFERENT objects sharing an id. Without the
+    // provider, a delivery from one writes its state onto the other's reference: a wrong
+    // enrichment, which is harder to notice than a missing one.
+    const rows = this.sql
+      .exec(`SELECT * FROM card_references WHERE external_id = ? AND provider = 'forge'`, mapped.externalId)
+      .toArray();
     for (const row of rows) {
       const current = (row.metadata_json ? JSON.parse(row.metadata_json as string) : {}) as Record<string, unknown>;
       const merged = { ...current, ...mapped.metadata, subState: mapped.subState };
@@ -1645,7 +1652,11 @@ export class BoardDO extends DurableObject<Env> {
         const externalId = `${fullName.toLowerCase()}#${issue.number}`;
         // Idempotency: don't create a second card if one already references this issue (a redelivery
         // with a fresh delivery-id, or a re-opened issue, would otherwise duplicate).
-        const exists = this.sql.exec(`SELECT 1 FROM card_references WHERE external_id = ? LIMIT 1`, externalId).toArray()[0];
+        // Provider-qualified for the same reason the matchers are: a forge issue #12 must not
+        // suppress the card a GitHub issue #12 should have created.
+        const exists = this.sql
+          .exec(`SELECT 1 FROM card_references WHERE external_id = ? AND provider = 'github' LIMIT 1`, externalId)
+          .toArray()[0];
         if (!exists) {
           await this.createCardFromTrigger({
             title: (issue.title as string) ?? `Issue #${issue.number}`,
@@ -1660,7 +1671,14 @@ export class BoardDO extends DurableObject<Env> {
     if (!mapped) return { ok: true, value: { deduped: false, matched: 0, modeled: false } };
 
     const now = this.now();
-    const rows = this.sql.exec(`SELECT * FROM card_references WHERE external_id = ?`, mapped.externalId).toArray();
+    // Matched by provider AS WELL AS external_id. `externalId` is `owner/repo#n` for GitHub and
+    // for forge alike, and a push mirror mirrors git refs — not pull requests — so a forge PR #7
+    // and a GitHub PR #7 on a mirrored repository are DIFFERENT objects sharing an id. Without the
+    // provider, a delivery from one writes its state onto the other's reference: a wrong
+    // enrichment, which is harder to notice than a missing one.
+    const rows = this.sql
+      .exec(`SELECT * FROM card_references WHERE external_id = ? AND provider = 'github'`, mapped.externalId)
+      .toArray();
     for (const row of rows) {
       const current = (row.metadata_json ? JSON.parse(row.metadata_json as string) : {}) as Record<string, unknown>;
       const merged = { ...current, ...mapped.metadata, subState: mapped.subState };

@@ -100,3 +100,118 @@ describe('POST /v1/boards/:id/webhooks/forge', () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
   });
 });
+
+/**
+ * Two providers, one id space.
+ *
+ * `externalId` is `owner/repo#n` for GitHub and for forge alike, and the matcher reads it alone.
+ * A push mirror mirrors git refs — NOT pull requests — so a forge PR #7 and a GitHub PR #7 on a
+ * mirrored repository are DIFFERENT objects that happen to share an id.
+ *
+ * docs/15 called this a dedupe problem. It is the opposite: nothing needs collapsing, and two
+ * unrelated things must stop being treated as one. A forge delivery writing its state onto a
+ * GitHub pull request's reference is a wrong enrichment, which is the failure the audit's own
+ * reasoning says is harder to notice than a missing one.
+ */
+describe('a forge delivery and a GitHub reference that share an id', () => {
+  it('does not write forge state onto the GitHub pull request', async () => {
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'MX')`)
+      .bind('tnt_mirror', 'slug-tnt-mirror').run();
+    const h = { 'X-Tenant-Id': 'tnt_mirror', 'Content-Type': 'application/json' };
+
+    const b = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST', headers: h,
+      body: JSON.stringify({ name: 'MX', stages: [{ key: 'todo', name: 'To do', order: 0 }] }),
+    });
+    const { boardId } = (await b.json()) as { boardId: string };
+    const c = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+      method: 'POST', headers: h, body: JSON.stringify({ title: 'Mirrored' }),
+    });
+    const { card } = (await c.json()) as { card: { id: string } };
+
+    // A reference to the GITHUB pull request #7 of the mirrored repository.
+    const ref = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards/${card.id}/references`, {
+      method: 'PUT', headers: h, body: JSON.stringify({ url: 'https://github.com/org/repo/pull/7' }),
+    });
+    const { reference } = (await ref.json()) as { reference: { id: string; provider: string; externalId: string } };
+    expect(reference.provider).toBe('github');
+    expect(reference.externalId).toBe('org/repo#7');
+
+    await SELF.fetch(`https://api.test/v1/boards/${boardId}/forge`, {
+      method: 'PUT', headers: h, body: JSON.stringify({ secret: SECRET }),
+    });
+
+    // A forge delivery for ITS pull request #7 — a different pull request, same id.
+    const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/webhooks/forge?tenant=tnt_mirror`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forgejo-Signature': await hmacHex(SECRET, payload),
+        'X-Forgejo-Delivery': crypto.randomUUID(),
+        'X-Forgejo-Event': 'pull_request',
+      },
+      body: payload,
+    });
+    expect(res.status).toBe(200);
+    // Modelled, and matching nothing: there is no forge reference on this board.
+    expect(await res.json()).toMatchObject({ matched: 0, modeled: true });
+
+    const after = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: h });
+    const state = (await after.json()) as { references?: Array<{ id: string; provider: string; metadata?: Record<string, unknown> }> };
+    const github = (state.references ?? []).find((r) => r.id === reference.id);
+    expect(github?.metadata?.subState, 'a forge event must not set a GitHub reference’s sub-state').toBeUndefined();
+  });
+
+  it('and the same holds in the other direction', async () => {
+    // Asserted both ways on purpose. A fix applied to one matcher and not the other would pass
+    // the test above while leaving the collision live in the direction nobody checked.
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'MY')`)
+      .bind('tnt_mirror2', 'slug-tnt-mirror2').run();
+    const h = { 'X-Tenant-Id': 'tnt_mirror2', 'Content-Type': 'application/json' };
+    await env.DB.prepare(`UPDATE tenants SET forge_host = 'forge.example.test' WHERE id = 'tnt_mirror2'`).run();
+
+    const b = await SELF.fetch('https://api.test/v1/boards', {
+      method: 'POST', headers: h,
+      body: JSON.stringify({ name: 'MY', stages: [{ key: 'todo', name: 'To do', order: 0 }] }),
+    });
+    const { boardId } = (await b.json()) as { boardId: string };
+    const c = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+      method: 'POST', headers: h, body: JSON.stringify({ title: 'Mirrored' }),
+    });
+    const { card } = (await c.json()) as { card: { id: string } };
+
+    // A reference to the FORGE pull request #7.
+    const ref = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards/${card.id}/references`, {
+      method: 'PUT', headers: h, body: JSON.stringify({ url: 'https://forge.example.test/org/repo/pulls/7' }),
+    });
+    const { reference } = (await ref.json()) as { reference: { id: string; provider: string } };
+    expect(reference.provider).toBe('forge');
+
+    // A GitHub delivery for ITS pull request #7.
+    const ghBody = JSON.stringify({
+      action: 'closed',
+      repository: { full_name: 'org/repo', default_branch: 'main' },
+      pull_request: { number: 7, state: 'closed', merged: true, html_url: 'https://github.com/org/repo/pull/7', base: { ref: 'main' }, head: { ref: 'f' } },
+    });
+    await SELF.fetch(`https://api.test/v1/boards/${boardId}/github`, {
+      method: 'PUT', headers: h, body: JSON.stringify({ secret: SECRET }),
+    });
+    const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/webhooks/github?tenant=tnt_mirror2`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hub-Signature-256': `sha256=${await hmacHex(SECRET, ghBody)}`,
+        'X-GitHub-Delivery': crypto.randomUUID(),
+        'X-GitHub-Event': 'pull_request',
+      },
+      body: ghBody,
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ matched: 0 });
+
+    const after = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: h });
+    const state = (await after.json()) as { references?: Array<{ id: string; metadata?: Record<string, unknown> }> };
+    const forgeRef = (state.references ?? []).find((r) => r.id === reference.id);
+    expect(forgeRef?.metadata?.subState, 'a GitHub event must not mark a forge PR merged').toBeUndefined();
+  });
+});
