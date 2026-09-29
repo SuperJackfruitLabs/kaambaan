@@ -1,3 +1,4 @@
+import type { AgentScope } from '@superpipeline/contract';
 /**
  * Thin client for the Superpipeline API (apps/api). The deployed app authenticates with a session cookie
  * (sent automatically, same-origin); the `X-Tenant-Id` header is a no-op there and only enables the
@@ -258,6 +259,9 @@ export interface Profile {
  */
 export { DEFAULT_STAGES, BOARD_TEMPLATES, boardTemplate } from '@superpipeline/contract';
 export type { BoardTemplate, BoardTemplateStage } from '@superpipeline/contract';
+
+/** The scope vocabulary a mint may narrow to. See `issueAgentToken`. */
+export { AGENT_TOKEN_SCOPES, type AgentScope } from '@superpipeline/contract';
 
 export async function createBoard(name: string, stages: Stage[]): Promise<string> {
   const res = await fetch('/v1/boards', { method: 'POST', headers, body: JSON.stringify({ name, stages }) });
@@ -621,14 +625,27 @@ export function updateAgent(
  * The missing half of revocation: the UI has always said a revoked agent "cannot authenticate
  * until reconnected", and there was no reconnect — tokens were minted only when an agent was
  * created. The plaintext comes back exactly once, as it does on create.
+ *
+ * `scopes` narrows it. A `run`-only credential can drive the card it already holds and cannot
+ * claim another — which is what makes it safe to hand to a harness, where the agent itself
+ * spends it through MCP. Narrowing is a human act here by design: an agent cannot mint for
+ * itself at all, so it can neither narrow nor widen what it was given.
  */
-export async function issueAgentToken(agentId: string): Promise<{ token: string; tokenId: string }> {
-  const res = await fetch(`/v1/agents/${agentId}/tokens`, { method: 'POST', headers });
+export async function issueAgentToken(
+  agentId: string,
+  scopes?: AgentScope[],
+): Promise<{ token: string; tokenId: string; scopes?: AgentScope[] }> {
+  const res = await fetch(`/v1/agents/${agentId}/tokens`, {
+    method: 'POST',
+    headers,
+    // Absent means the full set, which is what every existing caller sends.
+    ...(scopes ? { body: JSON.stringify({ scopes }) } : {}),
+  });
   if (!res.ok) {
     const detail = (await res.json().catch(() => null)) as { error?: string } | null;
     throw new Error(detail?.error ?? `issueAgentToken failed (${res.status})`);
   }
-  return (await res.json()) as { token: string; tokenId: string };
+  return (await res.json()) as { token: string; tokenId: string; scopes?: AgentScope[] };
 }
 
 /**
