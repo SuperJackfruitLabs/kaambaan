@@ -155,6 +155,34 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     },
   );
 
+  /**
+   * The run this agent holds, lease epoch included.
+   *
+   * `complete` and `block` take `leaseEpoch` as an input because fencing only works if the caller
+   * supplies it — deriving it server-side would let a superseded holder act, which is the one
+   * thing the epoch exists to prevent.
+   *
+   * So an agent reporting its own outcome needs the epoch, and the obvious place to put it was the
+   * prompt. AgentPod's prompt corpus forbids exactly that: *no rendered prompt leaks a credential,
+   * a lease epoch or an AgentPod id*, because a prompt crosses into a harness process and can be
+   * echoed into a transcript the board renders. That rule predates agents having credentials and
+   * is still right. This is the other answer — the agent ASKS for its run rather than being told.
+   *
+   * A read, and therefore unscoped, for the reason `requiredScope` gives about `gates/pending`.
+   * `getRunContext` already refuses a run the caller does not own, so no ownership check is added
+   * here beside it — which is the shape the route audit asked for.
+   */
+  register(
+    'superpipeline_get_run',
+    {
+      description: "Read the run you hold — its lease epoch, its card, its stage and the prior stage's handoff.",
+      inputSchema: { boardId: z.string(), runId: z.string() },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ boardId, runId }) =>
+      fromResult(await deps.boardStub(boardId).getRunContext({ runId, agentId: auth.agentId })),
+  );
+
   register(
     'superpipeline_add_reference',
     {
