@@ -1,3 +1,5 @@
+import type { AgentScope } from '@superpipeline/contract';
+
 /**
  * What a `spa_` token is allowed to do.
  *
@@ -6,7 +8,9 @@
  * every MCP tool. An authorization field that is recorded and never checked reads as protection
  * that does not exist, which is worse than no field, so this is where the comparison lives.
  *
- * Two scopes, because there are two things an agent does:
+ * The two scope NAMES live in `@superpipeline/contract`, because the console mints with them too
+ * and two spellings of one word is a refusal with nothing to trace it to. What they permit is
+ * here, next to the routes it guards:
  *
  * - `claim` — take a card off the board (`POST …/claims`).
  * - `run`   — drive a claimed card (`GET/POST …/runs/*`) and the MCP tools that wrap those verbs.
@@ -18,10 +22,7 @@
  * cannot complete is not a safer claim. New tokens carry both explicitly, so the grandfather
  * clause ages out on its own as tokens are reissued.
  */
-export type AgentScope = 'claim' | 'run';
-
-/** What a freshly minted agent token carries. */
-export const AGENT_TOKEN_SCOPES: AgentScope[] = ['claim', 'run'];
+export { AGENT_TOKEN_SCOPES, isAgentScope, type AgentScope } from '@superpipeline/contract';
 
 /**
  * The scope a board route requires, or null when the route is not scope-gated.

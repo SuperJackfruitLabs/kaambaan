@@ -40,8 +40,14 @@ A2A at its core, with Linear's activity/signal model for transparency and human-
 2. Superpipeline issues a **bearer token** (`spa_…`) scoped to the tenant. The plaintext is shown once;
    only its SHA-256 hash is stored. **The same token is the credential on both wires** — MCP agents
    do *not* obtain tokens through an OAuth flow, because there is no authorization server
-   ([05 §2](./05-integration-surfaces.md)). A token records `scopes`, but **nothing enforces them
-   today**; the tenant and the agent identity are what actually constrain a token.
+   ([05 §2](./05-integration-surfaces.md)). A token's `scopes` are enforced — see
+   [01 → An agent token's scopes](./01-domain-model-and-glossary.md) — and a mint may ask for
+   fewer than the default: `POST /v1/agents/:id/tokens {"scopes":["run"]}`, or **Issue a run-only
+   token** in Workspace → Agents. A `run`-only credential drives the card the agent already holds
+   and cannot claim another, which is what makes it safe to hand to a *harness* — an agent
+   spending its own credential from inside a session someone else dispatched. Narrowing is a
+   human act: an agent cannot mint for itself at all, so it can neither narrow nor widen what it
+   was given.
 3. The agent connects: as an **MCP client** to `/mcp`, and/or via **REST** to `/v1/boards/*`, and/or
    by registering a **webhook** endpoint for push dispatch.
 4. **Discovery** — **⚠️ not built.** There is no `/.well-known/agent-card.json` and no AgentCard

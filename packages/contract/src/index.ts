@@ -7,3 +7,4 @@ export * from './verbs';
 export * from './templates';
 export * from './providers';
 export * from './completion';
+export * from './scopes';
