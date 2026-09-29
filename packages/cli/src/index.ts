@@ -49,6 +49,7 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
   supi set-stages <boardId> <file|->
                                replace a board's pipeline
   supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name ...]
+                               [--completion <file|->] [--clear-completion]
                                change ONE stage, leaving the others alone
   supi create-card <boardId> <title> [--spec <file|->] [--priority <n>]
                                queue a card, with this token as its grant
@@ -397,12 +398,30 @@ async function main(argv: string[]): Promise<void> {
       if (!pos[0] || !pos[1]) {
         fail(
           "usage: supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name <name>]",
-          "  [--gate none|approval] [--wip <n>] [--owner <capability>] [--clear-instructions]",
+          "  [--gate none|approval] [--wip <n>] [--owner <capability>] [--completion <file|->]\n" +
+            "  [--clear-instructions] [--clear-completion]",
         );
       }
       const patch: Record<string, unknown> = {};
       const instructionsArg = flag(rest, "--instructions");
       if (instructionsArg) patch.instructions = readText(instructionsArg);
+      /**
+       * What a run must produce here before the board believes it finished.
+       *
+       * A file rather than a flag per arm: the requirement is a small structure — keys, a
+       * reference shape — and spelling it as `--handoff url --handoff commit --ref-provider forge`
+       * would invent a second grammar for something the API already has one for.
+       */
+      const completionArg = flag(rest, "--completion");
+      if (completionArg) {
+        const raw = readText(completionArg);
+        try {
+          patch.completion = JSON.parse(raw);
+        } catch {
+          fail(`${completionArg === "-" ? "stdin" : completionArg} is not JSON.`);
+        }
+      }
+      if (rest.includes("--clear-completion")) patch.completion = null;
       // Explicit, and its own flag: `--instructions ""` cannot mean "remove" when an empty rule
       // is refused, and a flag that deletes something should have to be typed.
       if (rest.includes("--clear-instructions")) patch.instructions = null;

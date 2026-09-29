@@ -112,6 +112,7 @@ export interface StagePatch {
   gate?: 'none' | 'approval';
   wipLimit?: number | null;
   instructions?: string | null;
+  completion?: CompletionRequirement | null;
 }
 
 export const STAGE_INSTRUCTIONS_MAX = 4000;
@@ -126,6 +127,35 @@ export const STAGE_INSTRUCTIONS_MAX = 4000;
  * Checked HERE rather than only in `@superpipeline/contract` because the routes cast rather than
  * parse: a cap enforced only in the schema is a cap nothing enforces.
  */
+/**
+ * What is wrong with a completion requirement's SHAPE, or null.
+ *
+ * Checked on the way in because the evaluator is total: handed `handoff: "url"` instead of
+ * `["url"]` it reads a list, finds none, and blocks every run on the stage forever. A rule nothing
+ * can satisfy is worse than no rule, and it fails at the far end — on an agent's run — rather than
+ * here, where the person who typed it is standing.
+ */
+export function completionShapeError(c: unknown): string | null {
+  if (typeof c !== 'object' || c === null || Array.isArray(c)) {
+    return 'completion must be an object';
+  }
+  const r = c as Record<string, unknown>;
+  if (r.handoff !== undefined) {
+    if (!Array.isArray(r.handoff) || !r.handoff.every((k) => typeof k === 'string' && k.trim() !== '')) {
+      return 'completion.handoff must be a list of non-empty key names';
+    }
+  }
+  if (r.reference !== undefined) {
+    if (typeof r.reference !== 'object' || r.reference === null || Array.isArray(r.reference)) {
+      return 'completion.reference must be an object naming a provider and/or a sourceType';
+    }
+  }
+  if (r.live !== undefined && (typeof r.live !== 'string' || r.live.trim() === '')) {
+    return 'completion.live must name a handoff key';
+  }
+  return null;
+}
+
 export function stageFieldError(s: Pick<StageDef, 'key' | 'wipLimit' | 'instructions'>): string | null {
   if (s.wipLimit !== undefined && (!Number.isInteger(s.wipLimit) || s.wipLimit < 1)) {
     return `stage "${s.key}" needs a WIP limit of at least 1, or none`;
@@ -1242,6 +1272,12 @@ export class BoardDO extends DurableObject<Env> {
       }
       const invalid = stageFieldError(s);
       if (invalid) return { ok: false, code: 'INVALID_STAGES', message: invalid };
+      // Also here, not only in the PATCH: a check the whole-pipeline write skips is a check with
+      // a documented way around it.
+      if (s.completion !== undefined) {
+        const bad = completionShapeError(s.completion);
+        if (bad) return { ok: false, code: 'INVALID_STAGES', message: `stage "${s.key}": ${bad}` };
+      }
     }
     const keys = stages.map((s) => s.key);
     const duplicate = keys.find((k, i) => keys.indexOf(k) !== i);
@@ -1326,6 +1362,14 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.instructions !== undefined) {
       if (patch.instructions === null) delete next.instructions;
       else next.instructions = patch.instructions;
+    }
+    if (patch.completion !== undefined) {
+      if (patch.completion === null) delete next.completion;
+      else {
+        const invalid = completionShapeError(patch.completion);
+        if (invalid) return { ok: false, code: 'INVALID_STAGES', message: `stage "${stageKey}": ${invalid}` };
+        next.completion = patch.completion;
+      }
     }
 
     const invalid = stageFieldError(next);
