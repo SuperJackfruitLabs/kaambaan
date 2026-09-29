@@ -905,7 +905,12 @@ export default {
     // it lists, because agent routes reject human credentials. `supi gates <boardId>` answered
     // 401 for every human token as a result. Whoever must make the decision has at least as much
     // business reading this as the service that relays it.
-    const isEitherRoute = !!boardId && rest === 'gates/pending';
+    // Reading ONE gate joins `gates/pending` on the same footing, and for the same reason: a
+    // gate names nobody and carries no authority, and the caller that needs it is the hub asking
+    // "is the gate I put in a room still open, and if not, what was decided?" — after which it
+    // stops offering buttons for a decision already made. Deciding a gate stays human-only.
+    const isEitherRoute =
+      !!boardId && (rest === 'gates/pending' || /^gates\/[^/]+$/.test(rest));
     const isAgentRoute =
       !!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute);
     // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
@@ -1530,6 +1535,14 @@ export default {
       // gate that was never delivered is found rather than waited for.
       if (rest === 'gates/pending' && request.method === 'GET') {
         return Response.json({ gates: await stub.pendingGateDeliveries() });
+      }
+
+      // GET /v1/boards/:id/gates/:gateId — one gate, including how it was decided.
+      const oneGate = rest.match(/^gates\/([^/]+)$/);
+      if (oneGate && request.method === 'GET') {
+        const result = await stub.getGate(oneGate[1]!);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ gate: result.value });
       }
 
       // POST /v1/boards/:id/gates/:gateId/resolve — the signed-in human resolves an approval gate (docs/08 §6)
