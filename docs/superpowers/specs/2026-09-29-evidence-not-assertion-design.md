@@ -31,6 +31,30 @@ already records it. What is missing is that `complete` is unconditional. It shou
 
 ## Slices
 
+Numbered in dependency order. Slice 0 was added on 2026-09-29 after the operator observed that
+references will span far more providers than the enum names — Drive, Notion, Figma, Sentry — which
+turned out to change slice 3's shape rather than merely its list.
+
+### 0 — A provider registry, and a boundary that enforces it
+
+`ReferenceProvider` is `z.enum(['github', 'gitlab', 'forge', 'docs', 'url'])`, and **nothing parses
+it.** It appears in `verbs.ts` and `entities.ts`, and the routes cast request bodies rather than
+parsing them (22 casts, 0 zod parses in `apps/api/src/index.ts`), so the enum is documentation. On
+2026-09-28 `provider: "web"` was written to a live card and stored.
+
+Which means references to Notion, Google Drive, Figma, Sentry or Linear already "work" today:
+stored, unrecognised, no `externalId`, undedupable, and outside the enum that claims to constrain
+them. The vocabulary is simultaneously **too narrow and not enforced** — the worst pair, because
+the narrowness is visible and the non-enforcement is not.
+
+So: a registry rather than an enum. Each provider brings a host pattern, a recogniser producing
+`sourceType` and a durable `externalId`, and — see slice 3 — a **verification kind**. The
+registry is the one place a new provider is added, and the write boundary parses against it, which
+closes the `"web"` hole as a side effect rather than as a separate fix.
+
+The registry ships with what exists (`github`, `gitlab`, `forge`) plus the generic `url`. `docs` is
+removed: it is in the enum, produced by no recogniser and consumed by nothing.
+
 ### 1 — Stage completion requirements
 
 A stage declares what a run must produce. `complete()` evaluates it against the handoff and the
@@ -63,20 +87,35 @@ This closes the structural gap named in `../../15-product-audit-2026-09-29.md`: 
 that work happened and nothing about what was produced, so an activity naming
 `/root/.hermes/profiles/research-ray/brief.md` points at a machine the reader cannot reach.
 
-### 3 — Live verification
+### 3 — Live verification, where it means anything
 
 The strongest requirement is *"this URL answers 200"* — the check that would have caught a board
 reporting `published` over an unpushed commit.
 
-**D2 (decided): an allowlist, from three sources.**
+**It is only a meaningful check for some providers, and this is the part that shapes the design.**
+A Google Doc or a Notion page fetched without credentials returns a login page, frequently with
+status **200**. A Drive file deleted last week would still "verify". For a feature whose purpose is
+replacing assertion with evidence, that is the worst available failure: it manufactures false
+confidence and calls it proof.
+
+So a provider declares a **verification kind**, and permission is not the same question as
+meaning:
+
+| kind | providers | what a check proves |
+|---|---|---|
+| `fetch` | forge, github raw, a board's own published hosts | the artefact is there |
+| `api` | Drive, Notion, Figma, Linear, Sentry | nothing without a credential — **not built here** |
+| `none` | generic `url`, anything unrecognised | nothing |
+
+Only `fetch` providers are verified, and only against an allowlist.
+
+**D2 (decided): the allowlist has three sources.**
 
 1. The tenant's `forge_host` — already configured and already validated as a bare host.
-2. Fixed provider hosts: `github.com`, `api.github.com`, `raw.githubusercontent.com`,
-   `gitlab.com`. **Not** `docs` — it is in `ReferenceProvider`, produced by no recogniser and
-   consumed by nothing, so allowlisting it allowlists nothing. **Not** `url`, which is by
-   definition the category everything unrecognised falls into.
+2. The registry's `fetch`-kind provider hosts: `github.com`, `api.github.com`,
+   `raw.githubusercontent.com`, `gitlab.com`.
 3. A per-board `verifyHosts`, because the check this exists for is `superjackfruit.com` — which is
-   none of the above. Without it, slice 3 cannot verify the one thing that failed twice.
+   none of the providers. Without it, slice 3 cannot verify the one thing that failed twice.
 
 **Refused regardless of the list:**
 
@@ -91,9 +130,17 @@ reporting `published` over an unpushed commit.
 Workers' `fetch` does not run on a VM carrying instance metadata, so the classic metadata attack is
 weaker here than on EC2. Weaker is not absent, and none of the above leans on it.
 
-A host outside the list is **unverifiable, not failing**: the run completes and the trace records
-that the live check was skipped and why. Treating "we may not look" as "it is broken" would make
-the allowlist a denial-of-service on the operator's own boards.
+**"Unverifiable" is the common answer, not the edge case.** Most providers an operator uses in
+earnest — Drive, Notion, a customer's Jira — are `api` or `none`, so the honest result for most
+references is that the board did not check. That is recorded on the run and printed in the receipt,
+naming which of the three reasons applied: the provider cannot be checked this way, the host is not
+allowlisted, or the check ran and passed. A silent pass would be indistinguishable from a real
+verification, which is the whole failure this programme exists to end.
+
+An `api`-kind verification — OAuth per provider, stored credentials, refresh — is a larger piece of
+work than the rest of this spec combined and is deliberately **out of scope**. What belongs here is
+the registry field that says a provider needs it, so the board can say "not checked, and here is
+why" instead of "completed".
 
 ### 4 — Make a refusal read as one
 
@@ -116,7 +163,12 @@ check.
 
 It does not make an agent honest. An agent that writes `{"url": "https://example.test"}` into a
 handoff satisfies a structural requirement while having done nothing, and only slice 3 catches
-that — and only for hosts on the list.
+that — and only for `fetch`-kind providers on the allowlist, which will be the minority of the
+references a working board accumulates.
+
+It does not verify anything behind a login. Most of what an operator actually references — a Drive
+document, a Notion page, a customer's ticket — cannot be checked without a credential, and a
+fetch that returns somebody's login page with status 200 is worse than no check at all.
 
 The aim is narrower and worth stating plainly: **the board should stop making claims it has not
 checked.** Where it cannot check, it should say so rather than assert.
