@@ -1,15 +1,26 @@
 /**
  * Recognise a reference URL (docs/06 §1).
  *
- * The shapes and the host rules now live in `@superpipeline/contract`'s provider registry, so
- * "which providers exist" is one list rather than a function here and an enum there. This stays as
- * the API's entry point because `resolveReferenceInput` and the MCP wire both call it, and moving
- * those is a bigger change than this slice.
+ * The shapes and the host rules live in `@superpipeline/contract`'s provider registry, so "which
+ * providers exist" is one list rather than a function here and an enum there. The PARSING stays
+ * here: the contract compiles with no DOM and no Node types, and the host comparison it performs
+ * is a security boundary — `https://evil.com@forge.example.test/` must not read as the operator's
+ * forge, and that is the platform's URL parser's job rather than a regex's.
  */
-import { recognise, type RecognisedReference } from '@superpipeline/contract';
+import { recogniseParts, GENERIC, type RecognisedReference } from '@superpipeline/contract';
 
 export type { RecognisedReference };
 
 export function recognizeReference(url: string, forgeHost?: string | null): RecognisedReference {
-  return recognise(url, { forgeHost });
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return GENERIC;
+  }
+  return recogniseParts(
+    parsed.hostname.toLowerCase().replace(/^www\./, ''),
+    parsed.pathname.split('/').filter(Boolean),
+    { forgeHost },
+  );
 }

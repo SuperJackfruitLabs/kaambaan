@@ -4,7 +4,7 @@ import {
   isKnownProvider,
   providerKeys,
   verificationKindOf,
-  recognise,
+  recogniseParts,
 } from '../src/providers';
 
 /**
@@ -27,7 +27,7 @@ describe('the registry', () => {
     // is a claim about a link's ROLE, not about where it lives. Any host can serve a document.
     // Drive, Notion and Figma arrive the same way, before anybody writes them a recogniser.
     expect(isKnownProvider('docs')).toBe(true);
-    expect(recognise('https://example.test/a-design-doc')).toMatchObject({ provider: 'url' });
+    expect(recogniseParts('example.test', ['a-design-doc'])).toMatchObject({ provider: 'url' });
     expect(verificationKindOf('docs')).toBe('none');
   });
 
@@ -53,9 +53,15 @@ describe('the registry', () => {
   });
 });
 
-describe('recognise', () => {
+/**
+ * These take a host and path segments, not a URL: the package has no DOM and no Node types, and
+ * the parse belongs to whoever has a real parser. URL-level behaviour — a malformed string, or
+ * `https://evil.com@forge.example.test/` — is pinned in the API's adapter test, where it can
+ * exercise the parser that actually runs.
+ */
+describe('recogniseParts', () => {
   it('reads a GitHub pull request', () => {
-    expect(recognise('https://github.com/org/repo/pull/42')).toEqual({
+    expect(recogniseParts('github.com', ['org', 'repo', 'pull', '42'])).toEqual({
       provider: 'github',
       sourceType: 'pull_request',
       externalId: 'org/repo#42',
@@ -63,9 +69,9 @@ describe('recognise', () => {
   });
 
   it('reads a forge pull request only when told which host is the forge', () => {
-    const url = 'https://forge.example.test/org/repo/pulls/7';
-    expect(recognise(url)).toMatchObject({ provider: 'url' });
-    expect(recognise(url, { forgeHost: 'forge.example.test' })).toEqual({
+    const segments = ['org', 'repo', 'pulls', '7'];
+    expect(recogniseParts('forge.example.test', segments)).toMatchObject({ provider: 'url' });
+    expect(recogniseParts('forge.example.test', segments, { forgeHost: 'forge.example.test' })).toEqual({
       provider: 'forge',
       sourceType: 'pull_request',
       externalId: 'org/repo#7',
@@ -73,19 +79,17 @@ describe('recognise', () => {
   });
 
   it('keeps Forgejo’s own spellings — `pulls`, and a branch under `src/branch`', () => {
-    const at = (path: string) =>
-      recognise(`https://f.test${path}`, { forgeHost: 'f.test' });
-    expect(at('/o/r/pulls/1')).toMatchObject({ sourceType: 'pull_request' });
-    expect(at('/o/r/src/branch/main')).toMatchObject({ sourceType: 'branch', externalId: 'o/r@main' });
+    const at = (segments: string[]) => recogniseParts('f.test', segments, { forgeHost: 'f.test' });
+    expect(at(['o', 'r', 'pulls', '1'])).toMatchObject({ sourceType: 'pull_request' });
+    expect(at(['o', 'r', 'src', 'branch', 'main'])).toMatchObject({ sourceType: 'branch', externalId: 'o/r@main' });
   });
 
   it('falls back to the generic provider rather than guessing', () => {
-    expect(recognise('https://notion.so/some-page')).toMatchObject({ provider: 'url', sourceType: 'url' });
-    expect(recognise('not a url at all')).toMatchObject({ provider: 'url' });
+    expect(recogniseParts('notion.so', ['some-page'])).toMatchObject({ provider: 'url', sourceType: 'url' });
   });
 
   it('is not fooled by a host that merely ends with the forge host', () => {
-    expect(recognise('https://not-f.test/o/r/pulls/1', { forgeHost: 'f.test' })).toMatchObject({
+    expect(recogniseParts('not-f.test', ['o', 'r', 'pulls', '1'], { forgeHost: 'f.test' })).toMatchObject({
       provider: 'url',
     });
   });

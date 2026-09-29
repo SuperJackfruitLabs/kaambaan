@@ -161,17 +161,28 @@ export function verificationKindOf(key: string): VerificationKind {
   return [...PROVIDERS, ...DECLARED_ONLY].find((p) => p.key === key)?.verification ?? 'none';
 }
 
-export function recognise(url: string, ctx: ProviderContext = {}): RecognisedReference {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return GENERIC;
-  }
-  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+/**
+ * Recognise an ALREADY-PARSED url.
+ *
+ * This package compiles with `lib: ["ES2023"]` and `types: []` — no DOM, no Node — and nothing
+ * else in it reaches for a runtime global. Widening that for one function would trade a real
+ * property of the package (it compiles anywhere) for a convenience.
+ *
+ * Hand-rolling the parse instead would be worse. The host comparison here is a security boundary,
+ * and a naive split makes `https://evil.com@forge.example.test/` look like the operator's forge —
+ * userinfo confusion is not a thing to reimplement. So the platform's parser does the parsing, and
+ * the rules live here.
+ *
+ * `host` must already be lowercased with any leading `www.` removed; `segments` is the path split
+ * on `/` with empties dropped. `apps/api/src/references/reference-url.ts` is the adapter.
+ */
+export function recogniseParts(
+  host: string,
+  segments: string[],
+  ctx: ProviderContext = {},
+): RecognisedReference {
   const provider = PROVIDERS.find((p) => p.owns(host, ctx));
   if (!provider) return GENERIC;
-
-  const read = provider.read(parsed.pathname.split('/').filter(Boolean));
+  const read = provider.read(segments);
   return read ? { provider: provider.key, ...read } : { provider: provider.key, sourceType: 'url' };
 }
