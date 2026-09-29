@@ -567,7 +567,13 @@
       </div>
 
       <!-- dw-body -->
-      <div class="dw-body flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-5">
+      <!--
+        The drawer renders text nobody on this side wrote: handoffs, tool arguments, references,
+        card specs, an agent's own words. Any of it can be one long unbroken token — a URL, a JSON
+        blob, a sha, a path — and on a phone one such token pushes the whole panel sideways. The
+        rule is set here so a new section cannot forget it; `pre` blocks keep their own scrolling.
+      -->
+      <div class="dw-body flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-4 py-4 space-y-5" style="overflow-wrap:anywhere">
 
         {#if localError}
           <p role="alert" class="border-coral/40 text-coral mono rounded-[7px] border px-3 py-2 text-xs" style="background:rgba(255,107,87,.08)">{localError}</p>
@@ -885,9 +891,18 @@
         {#if cardDetail?.handoff && Object.keys(cardDetail.handoff).length > 0}
           <section class="sec">
             <div class="sec-h eyebrow">handoff from prior stage</div>
-            <div class="bg-inset border-border mono space-y-1 rounded-[8px] border p-3 text-[11px]">
+            <!--
+              `overflow-wrap:anywhere`, not `break-word`, and not nothing.
+
+              A handoff value is whatever the agent put there, and an agent that reports
+              `{"artifact_commit_readback":"passed","github_commit_public":"verified"}` has written a
+              single token with no space in it. `break-word` will not break inside one; the line ran
+              324px past the right edge of a phone. `anywhere` breaks it, and also lets the row
+              shrink below its longest word, which is what stops the drawer scrolling sideways.
+            -->
+            <div class="bg-inset border-border mono min-w-0 space-y-1 rounded-[8px] border p-3 text-[11px]" style="overflow-wrap:anywhere">
               {#each Object.entries(cardDetail.handoff) as [k, v] (k)}
-                <div><span class="text-muted-foreground">{k}:</span> {typeof v === 'string' ? v : JSON.stringify(v)}</div>
+                <div class="min-w-0"><span class="text-muted-foreground">{k}:</span> {typeof v === 'string' ? v : JSON.stringify(v)}</div>
               {/each}
             </div>
           </section>
