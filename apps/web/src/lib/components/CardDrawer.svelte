@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { groupActivities, isNarrative, defaultOpen } from '$lib/activity-groups';
   import { app } from '$lib/stores/app.svelte';
   import {
@@ -318,6 +319,80 @@
     if (state === 'done') return 'completed';
     return 'ready';
   }
+
+  /**
+   * Focus, which the drawer had none of.
+   *
+   * Moved onto the panel rather than onto its first control: a dialog that opens with the close
+   * button focused reads as "Close" to a screen-reader user before it reads as anything else, and
+   * `aria-labelledby` on a focused panel announces the card instead.
+   *
+   * The opener is remembered and restored, because sending focus back to the top of the document
+   * loses a keyboard user their place on a board that may be many columns wide.
+   */
+  let panelEl = $state<HTMLElement | null>(null);
+  /**
+   * The card whose tile opened this, by id rather than by node.
+   *
+   * Holding the element itself did not survive: the board re-renders while the drawer is open —
+   * a socket message is enough — and the stored button is then detached, so focusing it puts
+   * focus on `<body>`, which is exactly the state this is meant to prevent. An id can be looked
+   * up again against whatever the board has rendered by the time the drawer closes.
+   */
+  let openerCardId: string | null = null;
+
+  $effect(() => {
+    if (card && panelEl) {
+      // Recorded on the way IN only: this effect re-runs while the drawer is open — when the
+      // card's detail arrives, for one — and by then the focused element is the panel itself.
+      openerCardId ??= card.id;
+      panelEl.focus();
+    }
+  });
+
+  /**
+   * Restoring focus belongs in `onDestroy`, not in the effect above.
+   *
+   * The layout mounts this component inside `{#if app.openCardId}`, so closing a card destroys it
+   * outright — an effect branch for "the card is gone" never runs, because by then neither the
+   * effect nor the component exists. The microtask lets the board finish rendering the tile back
+   * before it is asked to take focus.
+   */
+  onDestroy(() => {
+    const id = openerCardId;
+    openerCardId = null;
+    if (!id || typeof document === 'undefined') return;
+    queueMicrotask(() => {
+      document.querySelector<HTMLElement>(`[data-card-open="${CSS.escape(id)}"]`)?.focus();
+    });
+  });
+
+  const FOCUSABLE =
+    'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
+
+  /** Keep Tab inside the dialog — the definition of modal, and the thing that was missing. */
+  function trapTab(e: KeyboardEvent): void {
+    if (e.key !== 'Tab' || !panelEl) return;
+    const items = [...panelEl.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+      (el) => el.offsetParent !== null || el === document.activeElement,
+    );
+    if (items.length === 0) {
+      // Nothing to move to; holding focus on the panel is better than letting it escape behind.
+      e.preventDefault();
+      panelEl.focus();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === panelEl)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 </script>
 
 {#if card}
@@ -326,7 +401,24 @@
     <button class="absolute inset-0 bg-black/55" onclick={close} aria-label="Close drawer" tabindex="-1"></button>
 
     <!-- drawer panel -->
-    <aside class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border-l shadow-2xl sm:max-w-[520px]">
+    <!--
+      A real dialog.
+
+      It had no role, no `aria-modal`, nothing labelling it, and no focus management at all:
+      opening a card left focus on `<body>`, and the first Tab landed on "superpipeline home" —
+      the navigation BEHIND the drawer. Its controls, including a gate's approve and reject, were
+      reachable only after tabbing through the whole board.
+    -->
+    <!-- A div, not an `<aside>`: `aside` is a complementary LANDMARK, and a modal dialog is
+         not complementary content sitting beside the page — it is the page, until it closes. -->
+    <div
+      bind:this={panelEl}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="drawer-title"
+      tabindex="-1"
+      onkeydown={trapTab}
+      class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border-l shadow-2xl sm:max-w-[520px]">
 
       <!-- dw-head -->
       <div class="dw-head border-border border-b p-4 pb-3.5 flex-none">
@@ -380,7 +472,7 @@
 
           <!-- dw-title -->
           <div class="flex items-start gap-2">
-            <h2 class="wordmark dw-title text-[17px] font-semibold leading-snug flex-1 min-w-0">{card.title}</h2>
+            <h2 id="drawer-title" class="wordmark dw-title text-[17px] font-semibold leading-snug flex-1 min-w-0">{card.title}</h2>
             <button onclick={startEdit} aria-label="Edit card" title="Edit card" class="text-muted-foreground hover:text-foreground hover:bg-accent shrink-0 rounded-[7px] p-1.5">
               <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
             </button>
@@ -800,6 +892,6 @@
           <button onclick={onDeleteCard} class="text-muted-foreground hover:text-coral text-xs">Delete card</button>
         </div>
       </div>
-    </aside>
+    </div>
   </div>
 {/if}

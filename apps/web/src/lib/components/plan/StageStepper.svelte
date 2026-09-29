@@ -46,11 +46,37 @@
     const lane = container?.querySelectorAll<HTMLElement>('[data-lane]')[i];
     lane?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
   }
+
+  /**
+   * Keep the selected stage on screen.
+   *
+   * `nearest` rather than `center`: centring yanks the strip on every change, including the first
+   * paint, which reads as the page moving under the reader's thumb.
+   */
+  let strip = $state<HTMLElement | null>(null);
+  let tabEls = $state<HTMLElement[]>([]);
+  $effect(() => {
+    const el = tabEls[current];
+    if (el && strip) el.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  });
 </script>
 
-<div class="border-border flex gap-1.5 overflow-x-auto border-b px-3 py-2 min-[900px]:hidden" role="tablist" aria-label="Stage" style="scrollbar-width:none">
+<!--
+  The strip scrolls, and its scrollbar is hidden. On a phone that left 525px of stages — more than
+  a screen's width — off the right edge with nothing to say they were there, and no guarantee the
+  stage you were ON was among the ones you could see. The active tab is scrolled into view, and
+  the edge is faded so there is a visible hint that the strip continues.
+-->
+<div
+  bind:this={strip}
+  class="stage-strip border-border flex gap-1.5 overflow-x-auto border-b px-3 py-2 min-[900px]:hidden"
+  role="tablist"
+  aria-label="Stage"
+  style="scrollbar-width:none"
+>
   {#each stages as s, i (s.key)}
     <button
+      bind:this={tabEls[i]}
       role="tab"
       aria-selected={current === i}
       onclick={() => jump(i)}

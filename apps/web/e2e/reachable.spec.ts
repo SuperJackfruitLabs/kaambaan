@@ -71,11 +71,24 @@ async function overflowing(page: Page): Promise<string[]> {
   });
 }
 
-/** Interactive targets under the WCAG 2.2 floor. Hidden elements cannot be tapped and are skipped. */
+/**
+ * Interactive targets under the WCAG 2.2 floor. Hidden elements cannot be tapped and are skipped.
+ *
+ * A control marked `data-stretch-target` is measured by its POSITIONED ANCESTOR rather than by its
+ * own box. The card tile's title is such a control: it is stretched across the whole tile with a
+ * pseudo-element, so its text is 19px tall and the area that actually activates it is the card.
+ * Measuring the text would report a failure the user cannot experience — and "make the text 24px
+ * tall" would add height to every card on the board to satisfy a number rather than a person.
+ */
 async function tooSmall(page: Page): Promise<string[]> {
   return page.evaluate(() =>
     [...document.querySelectorAll('button, a[href], input, select, textarea, [role="button"]')]
-      .map((el) => ({ el, r: el.getBoundingClientRect() }))
+      .map((el) => ({
+        el,
+        r: el.hasAttribute('data-stretch-target')
+          ? ((el as HTMLElement).offsetParent ?? el).getBoundingClientRect()
+          : el.getBoundingClientRect(),
+      }))
       .filter(({ r }) => r.width > 0 && r.height > 0 && (r.width < 24 || r.height < 24))
       .map(({ el, r }) => `${(el.getAttribute('aria-label') || el.textContent || '?').trim().slice(0, 24)} ${Math.round(r.width)}x${Math.round(r.height)}`),
   );

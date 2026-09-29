@@ -48,6 +48,8 @@ export interface AgentSummary {
 }
 
 export interface Stage {
+  /** The stage's standing rule, handed to every agent that claims a card here. */
+  instructions?: string;
   key: string;
   name: string;
   order: number;
@@ -315,6 +317,29 @@ export function updateCard(
  */
 export function setStages(boardId: string, stages: Stage[]): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/stages`, { method: 'PUT', headers, body: JSON.stringify({ stages }) });
+}
+
+/**
+ * Change ONE stage.
+ *
+ * `setStages` replaces the whole pipeline, so editing one field means sending every other stage
+ * back exactly as it was read — and any edit made in between, by a person or by the board itself,
+ * is overwritten by a form that never knew about it. `key` and `order` are not patchable; the
+ * route refuses them by name, because reordering is a statement about the pipeline as a whole.
+ */
+export function patchStage(
+  boardId: string,
+  stageKey: string,
+  patch: Partial<Pick<Stage, 'name' | 'owner' | 'ownerKind' | 'gate' | 'wipLimit'>> & {
+    instructions?: string | null;
+    requires?: Stage['requires'] | null;
+  },
+): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/stages/${encodeURIComponent(stageKey)}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify(patch),
+  });
 }
 
 /** Delete a card and everything scoped to it. */
@@ -752,6 +777,23 @@ export async function getWorkspace(): Promise<WorkspaceTenant | null> {
  * Returns the raw response so the caller can read the server's own refusal (a malformed fleet id)
  * rather than a generic failure, exactly as `setAgentPrincipal` does.
  */
+/**
+ * This workspace's forge host, shown and set.
+ *
+ * Its own route rather than part of `PATCH /v1/tenant`: that one is human-only because a hub
+ * token cannot establish the mapping that makes a hub token resolve, and the forge host has no
+ * such bootstrap problem.
+ */
+export async function getForgeHost(): Promise<string | null> {
+  const res = await fetch('/v1/tenant/forge', { headers });
+  if (!res.ok) return null;
+  return ((await res.json()) as { forgeHost: string | null }).forgeHost;
+}
+
+export function setForgeHost(forgeHost: string | null): Promise<Response> {
+  return fetch('/v1/tenant/forge', { method: 'PUT', headers, body: JSON.stringify({ forgeHost }) });
+}
+
 export function setWorkspaceFleet(externalId: string | null): Promise<Response> {
   return fetch('/v1/tenant', { method: 'PATCH', headers, body: JSON.stringify({ externalId }) });
 }
