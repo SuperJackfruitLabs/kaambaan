@@ -44,13 +44,20 @@ export async function resolveMcpAuth(request: Request, env: Env): Promise<McpAut
       // An agent told it has work and then refused it would retry forever, and the two tools take
       // the capability set from the same object precisely so that cannot happen.
       capabilities: await effectiveCapabilities(env.DB, found.tenantId, found.capabilities),
+      // Carried, and then actually consulted — see `registerTools`. The lookup has always
+      // returned this and this file dropped it, so a `run`-only token could claim over MCP while
+      // the identical token was refused `POST /claims` over REST.
+      scopes: found.scopes,
       externalId: found.externalId,
     };
   }
   if (env.DEV_AUTH === 'true') {
     const dev = resolveBearer(request);
     if (!dev) return null;
-    return { ...dev, capabilities: await effectiveCapabilities(env.DB, dev.tenantId, dev.capabilities) };
+    // `null`, not `[]`: the dev bearer does not come from `agent_tokens` at all, and
+    // `scopePermits` treats null as "unscoped credential" rather than "no permissions" — the same
+    // distinction `auth/resolve.ts` calls load-bearing.
+    return { ...dev, scopes: null, capabilities: await effectiveCapabilities(env.DB, dev.tenantId, dev.capabilities) };
   }
   return null;
 }
