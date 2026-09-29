@@ -648,6 +648,8 @@ export interface BoardStub {
     /** What the mover was permitted to dispatch, recorded with the card. */
     queuedGrant?: string[] | null,
   ): Promise<Result<CardView>>;
+  /** One card, in the same projection the board snapshot carries. */
+  getCardView(cardId: string): Promise<Result<CardView>>;
   updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
@@ -1194,6 +1196,22 @@ export class BoardDO extends DurableObject<Env> {
    * and who authorised its dispatch are different questions, and reassignment must not silently
    * rewrite the recorded authority a claim is checked against.
    */
+  /**
+   * One card, read.
+   *
+   * The projection is `getCard`'s, which is `allCards`', which is the snapshot's — deliberately,
+   * so a client reading one card and a client reading the board never disagree about it. Nothing
+   * new is computed here; this exists because the REST prefix served `PATCH` and `DELETE` and had
+   * no way to read (#90), while its own subroutes — `/attempts`, `/activities`, `/estimate` — all
+   * did.
+   */
+  async getCardView(cardId: string): Promise<Result<CardView>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const card = this.getCard(cardId);
+    if (!card) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    return { ok: true, value: card };
+  }
+
   async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };

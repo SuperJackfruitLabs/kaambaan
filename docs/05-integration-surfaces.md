@@ -87,7 +87,7 @@ that flow in the present tense. None of it was ever built.
 |------|---|---|
 | `superpipeline_list_work` | *(none — no `boardId` either)* | **none** — MCP-only; `GET /v1/boards` is human-auth and has no `readyForYou` |
 | `superpipeline_claim_card` | `maxConcurrency?` | `POST /v1/boards/:id/claims` *(REST also takes `profileKey`)* |
-| `superpipeline_get_card` | `cardId` | **none** — there is no `GET …/cards/:cardId` |
+| `superpipeline_get_card` | `cardId` | `GET …/cards/:cardId` *(human-auth; added for `supi card`, which had requested it since before it existed)* |
 | `superpipeline_get_run` | `runId` | `GET …/runs/:runId` *(the run context — lease epoch, card, stage, prior handoff)* |
 | `superpipeline_add_reference` | `cardId`, `url`, `provider?`, `sourceType?`, … | `PUT …/cards/:cardId/references` *(human-auth — MCP is the only agent path)* |
 | `superpipeline_heartbeat` | `runId`, `leaseEpoch` | `POST …/runs/:runId/heartbeat` |
