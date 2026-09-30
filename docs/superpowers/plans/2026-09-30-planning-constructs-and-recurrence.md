@@ -2057,7 +2057,31 @@ git commit -m "feat(schedules): recurring cards, fired from the worker cron with
 
 - [ ] **Step 1: Routes, following the existing board-subroute shape**
 
-Mirror how `/v1/boards/:id/cards` is matched in `index.ts` (`:1118`). Return the parser's message verbatim on a 400 — it is the only message that tells the author what to type instead.
+Mirror how `/v1/boards/:id/cards` is matched in `index.ts`. Return the parser's message verbatim on a
+400 — it is the only message that tells the author what to type instead.
+
+⚠️ **The CLI auth trap Phase 1 fell into — do not repeat it.** Phase 1 shipped `/v1/labels` resolving
+its caller with `resolveUser` alone, which reads session cookies and dev headers. `supi` sends a hub
+JWT that only `resolveHubUser` can read, so **every `supi label` verb 401'd** and told the person to
+run `fleet login`, which could not help. It was found only by the whole-branch review, because the
+route's own tests passed and the CLI's own tests only asserted the verb dispatched.
+
+You are adding `supi schedule` verbs against new routes. Every other CLI-reachable route falls back:
+
+```ts
+    let u = await resolveUser(request, env);
+    if (!u) u = await resolveHubUser(request, env);
+```
+
+Board subroutes already do this, so mirroring them correctly gets it right — but **verify it rather
+than assuming**, and add a test that drives the route with a hub JWT, as
+`apps/api/test/labels-hub-token.test.ts` now does. A test asserting the verb dispatches proves
+nothing about whether the request is accepted.
+
+**Validation belongs on these routes, not only in the DO.** `createSchedule`/`updateSchedule` validate
+the rule, timezone, `stageKey`, `overlap` and `createdBy` — but the DO trusts its callers by design,
+and this task is what first puts **user JSON** on that path. A non-string `rule`, or an `overlap` of
+`{}`, must answer 400 rather than reaching the DO. Phase 1 shipped exactly this hole twice.
 
 - [ ] **Step 2: The settings section**
 
