@@ -41,6 +41,12 @@ describe('parseRule', () => {
     expect(parseRule('daily at 25:00').ok).toBe(false);
     expect(parseRule('daily at 09:60').ok).toBe(false);
   });
+
+  it('refuses a zero interval, by the "at least 1" message rather than the five-minute floor', () => {
+    const r = parseRule('every 0 days');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('at least 1');
+  });
 });
 
 describe('nextFireAt', () => {
@@ -85,5 +91,17 @@ describe('nextFireAt', () => {
   it('is strictly forward: firing never returns the instant it was given', () => {
     const exact = '2026-09-30T09:00:00.000Z';
     expect(nextFireAt(mustParse('daily at 09:00'), 'UTC', exact)).not.toBe(exact);
+  });
+
+  it('gets the DST spring-forward right, which is exactly what the second pass in fromZonedWallClock is for', () => {
+    // America/New_York's 2026 spring-forward transition lands at 2026-03-08T07:00:00Z. A single-pass
+    // version of fromZonedWallClock measures the zone's offset only at the naive guess — for this wall
+    // clock that guess falls just before the transition, so it is measured in EST (UTC-5) and answers
+    // 08:00Z, an hour late. Read without its comment, the second pass looks like it recomputes the same
+    // offset for no reason, which makes deleting it look like a harmless cleanup; this test is what
+    // stops that. Without it, 13/13 stay green after the second pass is removed.
+    expect(nextFireAt(mustParse('daily at 03:00'), 'America/New_York', '2026-03-08T00:00:00.000Z')).toBe(
+      '2026-03-08T07:00:00.000Z',
+    );
   });
 });
