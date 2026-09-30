@@ -105,6 +105,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'NOT_INITIALIZED':
     case 'GATE_NOT_FOUND':
     case 'ELICITATION_NOT_FOUND':
+    case 'SCHEDULE_NOT_FOUND':
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
@@ -124,6 +125,9 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_SIGNATURE':
       return 401;
     case 'NOT_CONFIGURED':
+      return 400;
+    case 'INVALID_RULE':
+    case 'INVALID_TIMEZONE':
       return 400;
   }
 }

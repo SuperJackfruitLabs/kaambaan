@@ -14,6 +14,7 @@ import { parseWindowMs } from '../metering/window';
 import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
+import { parseRule, nextFireAt } from './recurrence';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -544,6 +545,24 @@ export interface GatePendingBody {
   ts: string;
 }
 
+/** A recurring card, and the cadence that fires it (spec §3.7). */
+export interface ScheduleView {
+  id: string;
+  enabled: boolean;
+  title: string;
+  spec: JsonValue;
+  priority: number;
+  labels: string[];
+  stageKey: string | null;
+  rule: string;
+  timezone: string;
+  overlap: 'skip' | 'allow';
+  nextFireAt: string;
+  lastFiredAt: string | null;
+  lastCardId: string | null;
+  skipCount: number;
+}
+
 /** A first-class external link on a card (docs/06). Idempotent on (cardId, url). */
 export interface ReferenceView {
   id: string;
@@ -654,7 +673,10 @@ export type BoardErrorCode =
   | 'INVALID_USAGE'
   | 'INVALID_STAGES'
   | 'STAGE_NOT_EMPTY'
-  | 'BUDGET_EXCEEDED';
+  | 'BUDGET_EXCEEDED'
+  | 'INVALID_RULE'
+  | 'INVALID_TIMEZONE'
+  | 'SCHEDULE_NOT_FOUND';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1094,6 +1116,29 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS webhook_deliveries (delivery_id TEXT PRIMARY KEY, received_at TEXT NOT NULL)`,
     );
+    // Recurring cards (spec §3.7). In the board rather than D1 because a schedule is a property of
+    // one board's pipeline, and firing it is a write to this DO.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS schedules (
+        id            TEXT PRIMARY KEY,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        title         TEXT NOT NULL,
+        spec_json     TEXT NOT NULL DEFAULT '{}',
+        priority      INTEGER NOT NULL DEFAULT 0,
+        labels        TEXT NOT NULL DEFAULT '[]',
+        stage_key     TEXT,
+        rule          TEXT NOT NULL,
+        timezone      TEXT NOT NULL,
+        overlap       TEXT NOT NULL DEFAULT 'skip',
+        next_fire_at  TEXT NOT NULL,
+        last_fired_at TEXT,
+        last_card_id  TEXT,
+        skip_count    INTEGER NOT NULL DEFAULT 0,
+        created_by    TEXT,
+        created_at    TEXT NOT NULL
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(next_fire_at)`);
   }
 
   // ----- RPC: board lifecycle -----
@@ -2163,6 +2208,257 @@ export class BoardDO extends DurableObject<Env> {
     return { sent, failed };
   }
 
+  // ----- RPC: schedules (spec §3.7) -----
+
+  /**
+   * Define a recurring card.
+   *
+   * `createdBy` is required, not optional: a schedule mints cards on its own, with no human in the
+   * loop at fire time, and Principle 3 says every card has a human owner. A schedule with no
+   * recorded creator cannot satisfy that, so it is refused here rather than accepted and quietly
+   * disabled later.
+   *
+   * The rule is validated through `parseRule` and its own error message is returned verbatim — a
+   * rule is typed by a human, and the parser's message is the only one worth showing them. The
+   * timezone is validated by construction: an `Intl.DateTimeFormat` either accepts it or throws.
+   * Never compare it against a list, or against `resolvedOptions().timeZone` — ICU canonicalises
+   * `Asia/Kolkata` to `Asia/Calcutta`, so a string comparison rejects zones that work perfectly
+   * (Task 1's spike). The operator's own spelling is what gets stored.
+   */
+  async createSchedule(input: {
+    title: string;
+    rule: string;
+    timezone: string;
+    overlap: 'skip' | 'allow';
+    createdBy: string;
+    spec?: JsonValue;
+    priority?: number;
+    labels?: string[];
+    stageKey?: string | null;
+    enabled?: boolean;
+  }): Promise<Result<ScheduleView>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+
+    const parsed = parseRule(input.rule);
+    if (!parsed.ok) return { ok: false, code: 'INVALID_RULE', message: parsed.error };
+
+    try {
+      new Intl.DateTimeFormat('en-GB', { timeZone: input.timezone });
+    } catch {
+      return { ok: false, code: 'INVALID_TIMEZONE', message: `"${input.timezone}" is not a time zone this runtime knows` };
+    }
+
+    const id = newId('sch');
+    const now = this.now();
+    const nextFire = nextFireAt(parsed.rule, input.timezone, now);
+    this.sql.exec(
+      `INSERT INTO schedules
+        (id, enabled, title, spec_json, priority, labels, stage_key, rule, timezone, overlap,
+         next_fire_at, last_fired_at, last_card_id, skip_count, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)`,
+      id,
+      input.enabled === false ? 0 : 1,
+      input.title,
+      JSON.stringify(input.spec ?? {}),
+      input.priority ?? 0,
+      JSON.stringify(input.labels ?? []),
+      input.stageKey ?? null,
+      input.rule,
+      // Stored exactly as typed — never the resolved spelling.
+      input.timezone,
+      input.overlap,
+      nextFire,
+      input.createdBy,
+      now,
+    );
+    const view = this.mustGetSchedule(id);
+    this.emit('schedule.created', { schedule: view });
+    return { ok: true, value: view };
+  }
+
+  /**
+   * Edit a schedule. Changing `rule` or `timezone` recomputes `next_fire_at` from now — it must
+   * not silently keep a fire time computed from the rule or zone being replaced.
+   */
+  async updateSchedule(
+    id: string,
+    patch: {
+      title?: string;
+      rule?: string;
+      timezone?: string;
+      overlap?: 'skip' | 'allow';
+      spec?: JsonValue;
+      priority?: number;
+      labels?: string[];
+      stageKey?: string | null;
+      enabled?: boolean;
+    },
+  ): Promise<Result<ScheduleView>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const existing = this.getScheduleRow(id);
+    if (!existing) return { ok: false, code: 'SCHEDULE_NOT_FOUND', message: `schedule not found: ${id}` };
+
+    const rule = patch.rule ?? (existing.rule as string);
+    const timezone = patch.timezone ?? (existing.timezone as string);
+    const ruleOrZoneChanged = patch.rule !== undefined || patch.timezone !== undefined;
+
+    // Re-parsed here (not reused from creation) because either half of the pair may be new: a
+    // changed rule needs re-validating, and an unchanged rule needs re-validating too when the zone
+    // it is read against changes, since `nextFireAt` recomputes from both together.
+    let reparsed: ReturnType<typeof parseRule> | null = null;
+    if (ruleOrZoneChanged) {
+      reparsed = parseRule(rule);
+      if (!reparsed.ok) return { ok: false, code: 'INVALID_RULE', message: reparsed.error };
+      if (patch.timezone !== undefined) {
+        try {
+          new Intl.DateTimeFormat('en-GB', { timeZone: timezone });
+        } catch {
+          return { ok: false, code: 'INVALID_TIMEZONE', message: `"${timezone}" is not a time zone this runtime knows` };
+        }
+      }
+    }
+
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (patch.title !== undefined) { sets.push('title = ?'); vals.push(patch.title); }
+    if (patch.spec !== undefined) { sets.push('spec_json = ?'); vals.push(JSON.stringify(patch.spec)); }
+    if (patch.priority !== undefined) { sets.push('priority = ?'); vals.push(patch.priority); }
+    if (patch.labels !== undefined) { sets.push('labels = ?'); vals.push(JSON.stringify(patch.labels)); }
+    if (patch.stageKey !== undefined) { sets.push('stage_key = ?'); vals.push(patch.stageKey); }
+    if (patch.overlap !== undefined) { sets.push('overlap = ?'); vals.push(patch.overlap); }
+    if (patch.enabled !== undefined) { sets.push('enabled = ?'); vals.push(patch.enabled ? 1 : 0); }
+    if (patch.rule !== undefined) { sets.push('rule = ?'); vals.push(patch.rule); }
+    if (patch.timezone !== undefined) { sets.push('timezone = ?'); vals.push(patch.timezone); }
+    // Must not silently keep a fire time computed from the rule or zone being replaced.
+    if (reparsed && reparsed.ok) {
+      sets.push('next_fire_at = ?');
+      vals.push(nextFireAt(reparsed.rule, timezone, this.now()));
+    }
+
+    if (sets.length > 0) {
+      this.sql.exec(`UPDATE schedules SET ${sets.join(', ')} WHERE id = ?`, ...vals, id);
+    }
+    const view = this.mustGetSchedule(id);
+    this.emit('schedule.updated', { schedule: view });
+    return { ok: true, value: view };
+  }
+
+  async deleteSchedule(id: string): Promise<Result<{ id: string }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!this.getScheduleRow(id)) return { ok: false, code: 'SCHEDULE_NOT_FOUND', message: `schedule not found: ${id}` };
+    this.sql.exec(`DELETE FROM schedules WHERE id = ?`, id);
+    this.emit('schedule.deleted', { scheduleId: id });
+    return { ok: true, value: { id } };
+  }
+
+  async listSchedules(): Promise<ScheduleView[]> {
+    return this.sql
+      .exec(`SELECT * FROM schedules ORDER BY created_at ASC`)
+      .toArray()
+      .map((r) => this.rowToSchedule(r));
+  }
+
+  /**
+   * Create cards for every schedule whose time has come.
+   *
+   * Called from `sweepBoard`, which the Worker cron calls every five minutes — so a schedule may
+   * fire up to five minutes late, and the UI says so next to the field.
+   *
+   * Idempotent by construction: `next_fire_at` advances in the same call that creates the card, so
+   * a double tick finds nothing due. If the create throws, `next_fire_at` is left alone and the next
+   * tick retries — at-least-once, which for a maintenance card is the right way round.
+   */
+  async fireDueSchedules(nowIso: string): Promise<{ fired: string[]; skipped: string[] }> {
+    const due = this.sql
+      .exec(`SELECT * FROM schedules WHERE enabled = 1 AND next_fire_at <= ? ORDER BY next_fire_at ASC`, nowIso)
+      .toArray();
+
+    const fired: string[] = [];
+    const skipped: string[] = [];
+
+    for (const row of due) {
+      const id = row.id as string;
+      // Principle 3: every card has a human owner. A schedule with no recorded creator cannot
+      // produce one, so it is disabled rather than allowed to mint ownerless cards. `createdBy` is
+      // required at creation, so this can only be a row predating that — it is not a normal state.
+      if (!row.created_by) {
+        this.sql.exec(`UPDATE schedules SET enabled = 0 WHERE id = ?`, id);
+        this.emit('schedule.disabled', { scheduleId: id, reason: 'no creator recorded; cannot own a card' });
+        continue;
+      }
+      const parsed = parseRule(row.rule as string);
+      if (!parsed.ok) {
+        // A rule that no longer parses cannot fire and must not be retried every five minutes
+        // forever. Disable it and say so, loudly, on the event log.
+        this.sql.exec(`UPDATE schedules SET enabled = 0 WHERE id = ?`, id);
+        this.emit('schedule.disabled', { scheduleId: id, reason: parsed.error });
+        continue;
+      }
+
+      if ((row.overlap as string) === 'skip' && this.scheduleInstanceOpen(row.last_card_id as string | null)) {
+        this.sql.exec(
+          `UPDATE schedules SET skip_count = skip_count + 1, next_fire_at = ? WHERE id = ?`,
+          nextFireAt(parsed.rule, row.timezone as string, nowIso),
+          id,
+        );
+        // Visible, not silent. A schedule quietly skipping for a month is the failure this guards.
+        this.emit('schedule.skipped', { scheduleId: id, openCardId: row.last_card_id, at: nowIso });
+        skipped.push(id);
+        continue;
+      }
+
+      const created = await this.createCardFromTrigger({
+        title: row.title as string,
+        ownerUserId: row.created_by as string,
+        spec: { ...(JSON.parse(row.spec_json as string) as Record<string, unknown>), scheduleId: id },
+      });
+      if (!created.ok) {
+        // next_fire_at is deliberately NOT advanced: the next tick tries again.
+        this.emit('schedule.failed', { scheduleId: id, reason: created.code });
+        continue;
+      }
+
+      const cardId = created.value.card.id;
+      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+      if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
+        await this.updateCard(cardId, {
+          priority: Number(row.priority),
+          labels: JSON.parse(row.labels as string) as string[],
+        });
+      }
+
+      this.sql.exec(
+        `UPDATE schedules SET next_fire_at = ?, last_fired_at = ?, last_card_id = ? WHERE id = ?`,
+        nextFireAt(parsed.rule, row.timezone as string, nowIso),
+        nowIso,
+        cardId,
+        id,
+      );
+      this.emit('schedule.fired', { scheduleId: id, cardId, at: nowIso });
+      fired.push(id);
+    }
+
+    return { fired, skipped };
+  }
+
+  /**
+   * Is the previous instance of a schedule still open? Absent or resolved both mean "go ahead".
+   *
+   * All four terminal states count as closed here — deliberately different from the
+   * blocker-resolution rule a later phase introduces, where only `completed` and `canceled` count
+   * as resolved, because a blocker that failed must keep its dependent blocked. A schedule's own
+   * previous instance is not a blocker: if it `failed`, the schedule must not wedge forever, so
+   * this helper is NOT shared with that later rule and does not use `isTerminal()`.
+   */
+  private scheduleInstanceOpen(lastCardId: string | null): boolean {
+    if (!lastCardId) return false;
+    const row = this.sql.exec(`SELECT state, archived_at FROM cards WHERE id = ?`, lastCardId).toArray()[0];
+    if (!row) return false; // the card was deleted; nothing to wait for
+    if (row.archived_at) return false;
+    const state = row.state as string;
+    return state !== 'completed' && state !== 'canceled' && state !== 'rejected' && state !== 'failed';
+  }
+
   /**
    * The per-board cron arm, called from the Worker's `scheduled()` every five minutes.
    *
@@ -2170,8 +2466,11 @@ export class BoardDO extends DurableObject<Env> {
    * this one already serves two jobs (lease reclaim and push drain — see `scheduleReclaim`). The
    * Worker cron already iterates every board, so this costs no new infrastructure.
    *
-   * `schedulesFired` is always 0 until Phase 2 fills it in; it is in the shape now so the caller
-   * does not change twice.
+   * Three jobs share this sweep now: the once-per-board backfill above, the overdue notification
+   * query below, and `fireDueSchedules`. Each is isolated from the other two — a failure in one
+   * must not silently disable the others, which is exactly the failure mode Phase 1's whole-branch
+   * review found here (a failing backfill had been taking the overdue sweep down with it, silently
+   * and forever). `schedulesFired` reports 0, honestly, when firing itself failed.
    */
   async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }> {
     // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
@@ -2219,11 +2518,22 @@ export class BoardDO extends DurableObject<Env> {
       this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
     }
 
-    // The overdue sweep above ran regardless of the backfill's outcome. Now that it has, surface
-    // the deferred failure so a caller (the cron loop) still learns the sweep was not clean.
+    // Its own try/catch, for the reason the backfill above has one: three jobs share this sweep, and
+    // a failure in any of them must not silently disable the other two. `schedulesFired` is still
+    // reported as 0 when firing failed, which is honest — nothing fired.
+    let schedulesFired = 0;
+    try {
+      schedulesFired = (await this.fireDueSchedules(nowIso)).fired.length;
+    } catch (err) {
+      this.emit('schedules.sweep_failed', { reason: String(err) });
+    }
+
+    // The overdue sweep and schedule firing above ran regardless of the backfill's outcome. Now
+    // that they have, surface the deferred failure so a caller (the cron loop) still learns the
+    // sweep was not clean.
     if (backfillError) throw backfillError;
 
-    return { overdueNotified: rows.length, schedulesFired: 0 };
+    return { overdueNotified: rows.length, schedulesFired };
   }
 
   /**
@@ -3566,6 +3876,35 @@ export class BoardDO extends DurableObject<Env> {
       .exec(`SELECT * FROM card_references ORDER BY created_at ASC`)
       .toArray()
       .map((r) => this.rowToReference(r));
+  }
+
+  private getScheduleRow(id: string): Row | null {
+    return this.sql.exec(`SELECT * FROM schedules WHERE id = ?`, id).toArray()[0] ?? null;
+  }
+
+  private rowToSchedule(row: Row): ScheduleView {
+    return {
+      id: row.id as string,
+      enabled: Number(row.enabled) === 1,
+      title: row.title as string,
+      spec: JSON.parse(row.spec_json as string) as JsonValue,
+      priority: Number(row.priority),
+      labels: JSON.parse(row.labels as string) as string[],
+      stageKey: (row.stage_key as string | null) ?? null,
+      rule: row.rule as string,
+      timezone: row.timezone as string,
+      overlap: row.overlap as 'skip' | 'allow',
+      nextFireAt: row.next_fire_at as string,
+      lastFiredAt: (row.last_fired_at as string | null) ?? null,
+      lastCardId: (row.last_card_id as string | null) ?? null,
+      skipCount: Number(row.skip_count),
+    };
+  }
+
+  private mustGetSchedule(id: string): ScheduleView {
+    const row = this.getScheduleRow(id);
+    if (!row) throw new Error(`invariant violation: schedule ${id} missing immediately after write`);
+    return this.rowToSchedule(row);
   }
 
   // ----- metering (docs/07 §6) -----
