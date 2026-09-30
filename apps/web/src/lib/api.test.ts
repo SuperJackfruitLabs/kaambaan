@@ -646,6 +646,41 @@ describe('listLinks', () => {
     expect(result.externalLinks[0]!.otherBoardName).toBeNull();
   });
 
+  /**
+   * Whole-branch review fix wave (`166abfe`): a same-board `relates` edge is decoration —
+   * `blockedWhere` never consults it — so the route now stamps `enforced: kind !== 'relates'`
+   * rather than `true` unconditionally, and `Link.enforced` here was corrected from the literal
+   * type `true` to `boolean` to match. Kept as a runtime regression check for the pass-through
+   * (nothing in `listLinks` computes `enforced`; it is a bare `res.json() as CardLinks`, so this
+   * mainly documents the shape a consumer can rely on). NOT a compile-time proof, despite the
+   * intuitive appeal of one: `@vitest/expect`'s `toBe<E>(expected: E): void` carries its OWN
+   * generic parameter, unconstrained by the assertion subject's type — `expect(x).toBe(false)`
+   * type-checks for any `x`, regardless of `x`'s declared type. Verified directly: temporarily
+   * reverting `Link.enforced` to the literal `true` and re-running `svelte-check` produced ZERO
+   * errors — confirmed against this exact file, whose type-checking `svelte-check` does otherwise
+   * catch (sanity-checked with a deliberately bad assignment in the same file, which DID error).
+   * So the literal-vs-boolean type fix stands on its own reasoning (already given where `Link` is
+   * declared in `api.ts`), not on this test.
+   */
+  it('a same-board `relates` edge is NOT enforced — the type is `boolean`, not always `true`', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            links: [{ fromCardId: 'card_a', toCardId: 'card_b', kind: 'relates', createdAt: '2026-01-01', createdBy: null, enforced: false }],
+            externalLinks: [],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await listLinks('brd_1', 'card_a');
+    expect(result.links[0]!.kind).toBe('relates');
+    expect(result.links[0]!.enforced).toBe(false);
+  });
+
   it('answers empty arrays rather than throwing when the read is refused', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
     expect(await listLinks('brd_1', 'card_a')).toEqual({ links: [], externalLinks: [] });

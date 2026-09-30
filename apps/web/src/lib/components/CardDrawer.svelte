@@ -29,7 +29,7 @@
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
-  import { buildLinkGroups, type RemoveArgs } from '$lib/components/link-groups';
+  import { buildLinkGroups, edgeKey, type RemoveArgs } from '$lib/components/link-groups';
   import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
 
   // ---- derived from store ----
@@ -98,10 +98,14 @@
   const linkGroups = $derived(
     card && boardId
       ? buildLinkGroups(boardId, card.id, card.blockedBy, cardLinks.links, cardLinks.externalLinks, (id) => app.cardById(id)?.title ?? id)
-      : { blockedBy: [], blocks: [], relates: [], advisory: [] },
+      : { blockedBy: [], resolvedBlockedBy: [], blocks: [], relates: [], advisory: [] },
   );
   const hasAnyLink = $derived(
-    linkGroups.blockedBy.length > 0 || linkGroups.blocks.length > 0 || linkGroups.relates.length > 0 || linkGroups.advisory.length > 0,
+    linkGroups.blockedBy.length > 0 ||
+      linkGroups.resolvedBlockedBy.length > 0 ||
+      linkGroups.blocks.length > 0 ||
+      linkGroups.relates.length > 0 ||
+      linkGroups.advisory.length > 0,
   );
 
   // ---- edit state ----
@@ -485,10 +489,16 @@
   // is the edge's OWN `fromBoardId` (which may not be THIS card's board at all) and `toBoardId`
   // names the other side — the same asymmetric contract `submitAddBlocker` already follows for
   // creation, so removal targets the same store creation would have written to.
+  //
+  // `removingKeys` is tracked by `edgeKey(args)` — the SAME function every `{#each}` below uses
+  // for its own key — rather than a second, hand-rolled string built here. One function computing
+  // "what identifies this edge" is what keeps the in-flight tracking and the render key from ever
+  // being able to name two different rows the same thing.
   let removingKeys = $state(new Set<string>());
   let linksError = $state<string | null>(null);
 
-  async function onRemoveLink(args: RemoveArgs, key: string): Promise<void> {
+  async function onRemoveLink(args: RemoveArgs): Promise<void> {
+    const key = edgeKey(args);
     if (removingKeys.has(key)) return;
     removingKeys = new Set(removingKeys).add(key);
     linksError = null;
@@ -1037,12 +1047,22 @@
         {/if}
 
         <!--
-          Links (whole-branch review, Important finding) — EVERY edge this card has, in four
+          Links (whole-branch review, Important finding) — EVERY edge this card has, in five
           groups that never share a row style, because a person could otherwise create a `relates`
           edge or an outgoing `blocks` edge through the dialogue below and never see it rendered
-          anywhere: what blocks this card (enforced, ⛔), what this card blocks, what it merely
-          relates to, and the advisory cross-board ones — each with its own "remove" control, since
-          `removeLink` (Task 17a) had shipped with zero callers in this app.
+          anywhere: what blocks this card (enforced, ⛔), what blocked it but has since resolved,
+          what this card blocks, what it merely relates to, and the advisory cross-board ones —
+          each with its own "remove" control, since `removeLink` (Task 17a) had shipped with zero
+          callers in this app.
+
+          Every `{#each}` below is keyed by `edgeKey(row.remove)` — the EDGE's own identity, never
+          `row.cardId`/`row.boardId` alone. See `edgeKey`'s own doc comment (`link-groups.ts`) for
+          why: two edges can legitimately name the same "other card" (mutual `relates`, since
+          `wouldCycle` excludes it from the cycle check), and a key that collides is not a cosmetic
+          bug — Svelte 5 throws on a duplicate `{#each}` key, which fails this whole section's
+          render. No test in this project can reach that failure directly (Vitest cannot import a
+          `.svelte` file here), which is exactly why the reasoning has to live here, not only in a
+          function nobody reading this template is forced to open.
         -->
         <section class="sec">
           <div class="sec-h eyebrow">links</div>
@@ -1050,12 +1070,35 @@
           {#if linkGroups.blockedBy.length > 0}
             <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocked by</div>
             <div class="mb-2.5 space-y-1.5">
-              {#each linkGroups.blockedBy as row (row.cardId)}
-                {@const key = `blockedBy:${row.cardId}`}
+              {#each linkGroups.blockedBy as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
                 <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]" title={row.badge.tooltip}>
                   <span class="blk-pill">{row.badge.glyph}</span>
                   <span class="min-w-0 flex-1 truncate">{row.title}</span>
-                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.resolvedBlockedBy.length > 0}
+            <!--
+              Re-review N2: `blockedBy` only ever carries UNRESOLVED inbound blockers (the claim
+              query's own predicate) — a blocker that has since completed drops out of it, but the
+              edge itself is never deleted, so it was previously visible in NEITHER group. Shown
+              here as resolved, never `⛔`: nothing is currently enforcing it, and re-opening the
+              blocker (`moveCard` sets a card back to `submitted` unconditionally) would silently
+              re-arm an edge its owner never saw — this is where they can see and clear it first.
+            -->
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocked by (resolved)</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.resolvedBlockedBy as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]" title="{row.title} blocked this card — resolved, no longer enforced">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
                     {removingKeys.has(key) ? '…' : 'remove'}
                   </button>
                 </div>
@@ -1066,11 +1109,11 @@
           {#if linkGroups.blocks.length > 0}
             <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocks</div>
             <div class="mb-2.5 space-y-1.5">
-              {#each linkGroups.blocks as row (row.cardId)}
-                {@const key = `blocks:${row.cardId}`}
+              {#each linkGroups.blocks as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
                 <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
                   <span class="min-w-0 flex-1 truncate">{row.title}</span>
-                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
                     {removingKeys.has(key) ? '…' : 'remove'}
                   </button>
                 </div>
@@ -1081,11 +1124,11 @@
           {#if linkGroups.relates.length > 0}
             <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">relates to</div>
             <div class="mb-2.5 space-y-1.5">
-              {#each linkGroups.relates as row (row.cardId)}
-                {@const key = `relates:${row.cardId}`}
+              {#each linkGroups.relates as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
                 <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
                   <span class="min-w-0 flex-1 truncate">{row.title}</span>
-                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
                     {removingKeys.has(key) ? '…' : 'remove'}
                   </button>
                 </div>
@@ -1096,8 +1139,8 @@
           {#if linkGroups.advisory.length > 0}
             <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">advisory (other boards)</div>
             <div class="mb-2.5 space-y-1.5">
-              {#each linkGroups.advisory as row (row.boardId + ':' + row.cardId + ':' + row.kind)}
-                {@const key = `advisory:${row.boardId}:${row.cardId}:${row.kind}`}
+              {#each linkGroups.advisory as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
                 <div
                   class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]"
                   title={row.badge?.tooltip ?? `${row.relation === 'blocks' ? 'Blocks' : 'Relates to'} ${row.title} on another board — advisory, not enforced`}
@@ -1109,7 +1152,7 @@
                     {row.title}
                     {#if row.relation !== 'blocked-by'}<span class="text-muted-foreground">· {row.relation}</span>{/if}
                   </span>
-                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
                     {removingKeys.has(key) ? '…' : 'remove'}
                   </button>
                 </div>
@@ -1129,6 +1172,19 @@
 
           {#if addBlockerOpen}
             <div class="bg-inset border-border mt-2.5 space-y-2 rounded-[8px] border p-3 text-xs">
+              <!--
+                Re-review N3: the dialogue always creates an edge pointing AT this card ("picked
+                card → this card") — there is no way, here, to create the reverse. That used to be
+                implicit in generic Board/Card/Kind fields sitting directly under a visible "blocks"
+                (outgoing) group, which invites exactly the wrong expectation. Said outright instead
+                of left to be inferred, per the reviewer's finding — the symmetry argument for NOT
+                adding an outgoing-creation path stands (that edge is always reachable from the
+                other card's own drawer), so this fixes the wording, not the architecture.
+              -->
+              <p class="text-muted-foreground mono text-[10.5px]">
+                The card you pick below will point <strong>at "{card.title}"</strong> — e.g. picking "blocks" creates
+                "picked card blocks this card", never the other way around.
+              </p>
               <div>
                 <label for="blocker-board" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Board</label>
                 <select
@@ -1149,7 +1205,7 @@
               {/if}
 
               <div>
-                <label for="blocker-card" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Card</label>
+                <label for="blocker-card" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Card (the one that will act on this one)</label>
                 <select
                   id="blocker-card"
                   bind:value={blockerCardId}
@@ -1169,8 +1225,8 @@
                   bind:value={blockerKind}
                   class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
                 >
-                  <option value="blocks">blocks — this card will not be claimed while it is open</option>
-                  <option value="relates">relates — informational only</option>
+                  <option value="blocks">blocks this card — this card will not be claimed while it is open</option>
+                  <option value="relates">relates to this card — informational only</option>
                 </select>
               </div>
 

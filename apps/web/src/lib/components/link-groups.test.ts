@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildLinkGroups } from './link-groups';
+import { buildLinkGroups, edgeKey } from './link-groups';
 
 const titleOf = (id: string) => (id === 'card_y' ? 'Write the doc' : id === 'card_z' ? 'Ship it' : id);
 
@@ -43,6 +43,116 @@ describe('buildLinkGroups', () => {
     expect(groups.relates).toHaveLength(1);
     expect(groups.relates[0]!.cardId).toBe('card_y');
     expect(groups.relates[0]!.remove).toEqual({ boardId: 'brd_1', fromCardId: 'card_y', toCardId: 'card_c', kind: 'relates' });
+  });
+
+  it('puts an ENFORCED blocker and an ADVISORY blocker on the same card in their own groups, each with its own honest badge — the two never merge or borrow each other\'s glyph', () => {
+    const groups = buildLinkGroups(
+      'brd_1',
+      'card_c',
+      [{ cardId: 'card_a', title: 'Fix the migration' }],
+      [],
+      [
+        {
+          fromBoardId: 'brd_2',
+          fromCardId: 'card_x',
+          toBoardId: 'brd_1',
+          toCardId: 'card_c',
+          kind: 'blocks',
+          otherCardTitle: 'Fix the layout',
+          otherBoardName: 'Design board',
+        },
+      ],
+      titleOf,
+    );
+    expect(groups.blockedBy).toHaveLength(1);
+    expect(groups.advisory).toHaveLength(1);
+    const glyphs = [groups.blockedBy[0]!.badge.glyph, groups.advisory[0]!.badge!.glyph].sort();
+    expect(glyphs).toEqual(['⚑', '⛔']);
+  });
+
+  describe('resolvedBlockedBy — an inbound `blocks` edge whose blocker has already resolved', () => {
+    it('gives a resolved inbound blocker its own home — visible and removable, but not ⛔', () => {
+      // `links` carries the edge regardless of state (the DO never deletes it on resolution);
+      // `blockedBy` (server-computed, unresolved only) does NOT carry it, since the blocker card
+      // has already resolved. Without this group the edge is in `links` but in no group at all —
+      // the exact "invisible and unremovable" defect this whole review is about, just for a
+      // different subset of the same edge kind.
+      const groups = buildLinkGroups(
+        'brd_1',
+        'card_c',
+        [], // blockedBy is EMPTY — the blocker already resolved
+        [{ fromCardId: 'card_a', toCardId: 'card_c', kind: 'blocks' }],
+        [],
+        titleOf,
+      );
+      expect(groups.blockedBy).toHaveLength(0); // never ⛔ for a resolved blocker
+      expect(groups.resolvedBlockedBy).toHaveLength(1);
+      expect(groups.resolvedBlockedBy[0]!.cardId).toBe('card_a');
+      expect(groups.resolvedBlockedBy[0]!.remove).toEqual({ boardId: 'brd_1', fromCardId: 'card_a', toCardId: 'card_c', kind: 'blocks' });
+      expect('badge' in groups.resolvedBlockedBy[0]!).toBe(false); // shown as resolved, not as ⛔
+    });
+
+    it('does NOT duplicate an unresolved blocker into `resolvedBlockedBy` — the two groups partition the same edge kind, never overlap', () => {
+      const groups = buildLinkGroups(
+        'brd_1',
+        'card_c',
+        [{ cardId: 'card_a', title: 'Fix the migration' }], // card_a is UNRESOLVED
+        [{ fromCardId: 'card_a', toCardId: 'card_c', kind: 'blocks' }],
+        [],
+        titleOf,
+      );
+      expect(groups.blockedBy).toHaveLength(1);
+      expect(groups.resolvedBlockedBy).toHaveLength(0);
+    });
+  });
+
+  describe('edgeKey — derived from the edge\'s own identity, never the other card\'s id', () => {
+    it('gives two DIFFERENT keys for mutual `relates` edges between the same pair of cards — the case that collided under a card-id key', () => {
+      // `wouldCycle` deliberately excludes `relates` from its cycle check, and `addExternalLink`
+      // has no cycle check at all, so A-relates-B and B-relates-A can BOTH exist. From card_a's
+      // drawer, both rows resolve to "the other card is card_b" — a key built from `cardId` alone
+      // collides, and Svelte 5 throws `each_key_duplicate` on a duplicate `{#each}` key.
+      const groups = buildLinkGroups(
+        'brd_1',
+        'card_a',
+        [],
+        [
+          { fromCardId: 'card_a', toCardId: 'card_b', kind: 'relates' },
+          { fromCardId: 'card_b', toCardId: 'card_a', kind: 'relates' },
+        ],
+        [],
+        titleOf,
+      );
+      expect(groups.relates).toHaveLength(2);
+      expect(groups.relates.every((r) => r.cardId === 'card_b')).toBe(true); // same "other card" both times
+      const keys = groups.relates.map((r) => edgeKey(r.remove));
+      expect(keys[0]).not.toBe(keys[1]);
+      expect(new Set(keys).size).toBe(2);
+    });
+
+    it('gives two DIFFERENT keys for an advisory row and a same-board row naming the same other card', () => {
+      const groups = buildLinkGroups(
+        'brd_1',
+        'card_c',
+        [{ cardId: 'card_a', title: 'Fix the migration' }],
+        [],
+        [
+          {
+            fromBoardId: 'brd_2',
+            fromCardId: 'card_a', // same id as the same-board blocker, different board
+            toBoardId: 'brd_1',
+            toCardId: 'card_c',
+            kind: 'blocks',
+            otherCardTitle: 'Unrelated card on another board',
+            otherBoardName: 'Design board',
+          },
+        ],
+        titleOf,
+      );
+      const key1 = edgeKey(groups.blockedBy[0]!.remove);
+      const key2 = edgeKey(groups.advisory[0]!.remove);
+      expect(key1).not.toBe(key2);
+    });
   });
 
   it('ignores `parent` edges entirely — those are the Sub-tasks section\'s job, not this one\'s', () => {
