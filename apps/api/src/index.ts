@@ -190,6 +190,53 @@ function statusForExternalLinkCode(code: string): number {
 }
 
 /**
+ * Names for the boards in `boardIds`, but ONLY the ones `tenantId` actually owns — a board id that
+ * names another tenant's board, or no board at all, simply has no entry in the returned map.
+ *
+ * This is the read-side guard for `GET .../cards/:cardId/links`'s `otherBoardName`: a cross-board
+ * advisory row's write is already checked against `FOREIGN_BOARD` (`addExternalLink`), but this
+ * read must not assume every row in `card_links_external` got there through that guard — a title
+ * is content, and resolving one for a board outside the tenant would disclose more than the 404
+ * that guard answers with. `tenant_id = ?` first, like every other D1 read in this codebase.
+ */
+async function boardNamesById(db: D1Database, tenantId: string, boardIds: string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(boardIds)];
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => '?').join(', ');
+  const { results } = await db
+    .prepare(`SELECT id, name FROM boards WHERE tenant_id = ? AND id IN (${placeholders})`)
+    .bind(tenantId, ...ids)
+    .all<{ id: string; name: string }>();
+  return new Map((results ?? []).map((row) => [row.id, row.name]));
+}
+
+/**
+ * The title of one card on another board, for one advisory edge's tooltip — or `null` if it
+ * cannot be read, for any reason. This is the one place a cross-DO read happens for a cross-board
+ * edge, and it is deliberately narrow: on-demand, per row, called only from the `GET .../links`
+ * route, never from `listExternalLinksFor` (the D1 module stays free of cross-DO concerns) and
+ * never consulted by a claim or advance decision — the read is stale the instant it returns, which
+ * is exactly why the edge it labels is advisory rather than enforced, and that does not change
+ * just because this read is now a little more informative than an id.
+ *
+ * Degrades rather than fails: an uninitialized board, a deleted card, or a thrown error (the DO
+ * being genuinely unavailable) all come back `null`, wrapped PER CALL so one bad reference cannot
+ * take the rest of a card's blocker list down with it — a 500 here would be a worse outcome than
+ * the id the drawer already falls back to showing.
+ *
+ * Callers must already have confirmed `boardId` belongs to `tenantId` (see `boardNamesById`); this
+ * function does not check tenancy itself, so it must never be reached for a foreign board.
+ */
+async function getOtherCardTitle(env: Env, tenantId: string, boardId: string, cardId: string): Promise<string | null> {
+  try {
+    const result = await boardStub(env, tenantId, boardId).getCardView(cardId);
+    return result.ok ? result.value.title : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * What an error nobody planned for looks like on the wire.
  *
  * One shape, shared by every route block, so a client can read a failure the
@@ -1621,6 +1668,16 @@ export default {
       // merged them into one list, or told them apart only by comparing `toBoardId` to this
       // board's id, is one bug away from drawing an enforced badge on an edge that enforces
       // nothing. 17b's badge logic is built on this response never requiring that inference.
+      //
+      // 17b follow-up: the specified tooltip ("Blocked by *Title* on *Board* — not enforced across
+      // boards") needs a title and a board name, and `ExternalLinkRow` only ever carried ids. Each
+      // `externalLinks` row here also carries `otherBoardName`/`otherCardTitle` for whichever end
+      // is NOT `cardId` — a cheap tenant-scoped D1 read for the name, and a per-row, on-demand
+      // cross-DO read for the title. This is the ONLY place that title read happens: it is not
+      // added to `listExternalLinksFor` (the module stays free of cross-DO concerns) and it never
+      // informs a claim or advance decision — the whole reason the edge is advisory rather than
+      // enforced is that a cross-DO read is stale the instant it returns, and that stays true of
+      // this one too; it exists solely to label one drawer, once, on request.
       const cardLinksMatch = rest.match(/^cards\/([^/]+)\/links$/);
       if (cardLinksMatch && request.method === 'GET') {
         const cardId = cardLinksMatch[1]!;
@@ -1628,9 +1685,41 @@ export default {
           stub.listLinks(cardId),
           listExternalLinksFor(env.DB, tenantId, cardId),
         ]);
+
+        // The other end of each advisory edge — `listExternalLinksFor` matches `cardId` from
+        // EITHER side, so which field holds "the other card" depends on the row's direction.
+        const otherEnds = externalLinks.map((l) =>
+          l.fromCardId === cardId
+            ? { boardId: l.toBoardId, cardId: l.toCardId }
+            : { boardId: l.fromBoardId, cardId: l.fromCardId },
+        );
+        // Tenant-scoped by the WHERE clause itself: a board this tenant does not own is simply
+        // absent from the map. That is deliberate defence in depth, not redundant with
+        // `addExternalLink`'s own `FOREIGN_BOARD` guard at write time — this read must not assume
+        // every row in the table got there through that guard. Boards not owned by the tenant, or
+        // no longer present at all, degrade to `otherBoardName: null` the same way an unresolved
+        // title does, never a leak or a failure.
+        const boardNames = await boardNamesById(env.DB, tenantId, otherEnds.map((e) => e.boardId));
+        // One on-demand, per-row cross-DO read per advisory edge, run in parallel rather than
+        // sequentially — not batched into a single multi-card DO call. Considered and rejected for
+        // now: these rows are hand-added one at a time through a board-picker dialogue, so the
+        // realistic count for one card is a handful at most, and rows just as often name DIFFERENT
+        // boards (nothing to batch within) as the same one. A batched "read several cards" RPC
+        // would mean a new Durable Object method, which is out of this route's scope. Skipped
+        // entirely — no DO call at all — for any end whose board did not resolve above, so a
+        // foreign board is never even asked, not just never shown.
+        const otherTitles = await Promise.all(
+          otherEnds.map((e) => (boardNames.has(e.boardId) ? getOtherCardTitle(env, tenantId, e.boardId, e.cardId) : null)),
+        );
+
         return Response.json({
           links: links.map((l) => ({ ...l, enforced: true as const })),
-          externalLinks: externalLinks.map((l) => ({ ...l, enforced: false as const })),
+          externalLinks: externalLinks.map((l, i) => ({
+            ...l,
+            enforced: false as const,
+            otherBoardName: boardNames.get(otherEnds[i]!.boardId) ?? null,
+            otherCardTitle: otherTitles[i] ?? null,
+          })),
         });
       }
 

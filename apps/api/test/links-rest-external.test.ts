@@ -201,3 +201,129 @@ describe('DELETE /v1/boards/:id/links with toBoardId', () => {
     expect(body.error.code).toBe('PARENT_MUST_BE_SAME_BOARD');
   });
 });
+
+/**
+ * 17b follow-up: the specified tooltip — "Blocked by *Title* on *Board* — not enforced across
+ * boards" — needs a title and a board name, and `ExternalLinkRow` only ever carried ids. This is
+ * the read that fills them in: a cheap tenant-scoped D1 read for the board name, and a per-row,
+ * on-demand cross-DO read for the card title. Neither is on the claim path (the card title read
+ * does not even touch `listExternalLinksFor` — it happens in the route, once, after the D1 rows
+ * come back), and neither read may fail the whole request: a row whose other board is having a
+ * bad day still comes back with its ids, `otherBoardName: null`, `otherCardTitle: null` — the
+ * drawer's existing id fallback, not a 500.
+ */
+describe('GET /v1/boards/:id/cards/:cardId/links — the other end\'s title and board name', () => {
+  it('resolves the real card title and board name for a healthy cross-board edge', async () => {
+    const home = await createBoard('Home6');
+    const away = await createBoard('Away Board Six');
+    const a = await createCard(home, 'A');
+    const b = await createCard(away, 'The Blocker');
+
+    await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: b, toBoardId: away, kind: 'blocks' }),
+    });
+
+    const res = await SELF.fetch(`${base}/v1/boards/${home}/cards/${a}/links`, { headers: T });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      externalLinks: Array<{ toCardId: string; toBoardId: string; otherCardTitle: string | null; otherBoardName: string | null }>;
+    };
+    expect(body.externalLinks).toHaveLength(1);
+    expect(body.externalLinks[0]).toMatchObject({
+      toCardId: b,
+      toBoardId: away,
+      otherCardTitle: 'The Blocker',
+      otherBoardName: 'Away Board Six',
+    });
+  });
+
+  it('degrades to a null title (never a 500) when the referenced board has not been initialized', async () => {
+    const home = await createBoard('Home7');
+    const a = await createCard(home, 'A');
+
+    // A real `boards` row — so the board NAME is resolvable — whose Durable Object was never
+    // `init()`'d, because it was never created through the board-creation route. This is a
+    // realistic version of "the other board's DO is unavailable": `getCardView` on it answers
+    // `NOT_INITIALIZED`, not a thrown error, and the route must still turn that into a 200 with a
+    // null title rather than letting it become this card's entire blocker list 500ing.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_ext_uninit', 'tnt_links_ext', 'Uninitialized Board', '[]')`,
+    ).run();
+
+    const post = await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: 'card_never_existed', toBoardId: 'brd_ext_uninit', kind: 'blocks' }),
+    });
+    expect(post.status).toBe(201);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${home}/cards/${a}/links`, { headers: T });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      externalLinks: Array<{ toBoardId: string; otherCardTitle: string | null; otherBoardName: string | null }>;
+    };
+    expect(body.externalLinks).toHaveLength(1);
+    // The board name is a plain tenant-scoped D1 read, independent of the DO's own state, so it
+    // still resolves even though the DO behind it has never been initialized.
+    expect(body.externalLinks[0]!.otherBoardName).toBe('Uninitialized Board');
+    expect(body.externalLinks[0]!.otherCardTitle).toBeNull();
+  });
+
+  it('degrades to a null title when the referenced card no longer exists on an otherwise healthy board', async () => {
+    const home = await createBoard('Home8');
+    const away = await createBoard('Away8');
+    const a = await createCard(home, 'A');
+
+    await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: 'card_deleted_or_never_was', toBoardId: away, kind: 'blocks' }),
+    });
+
+    const res = await SELF.fetch(`${base}/v1/boards/${home}/cards/${a}/links`, { headers: T });
+    const body = (await res.json()) as { externalLinks: Array<{ otherCardTitle: string | null; otherBoardName: string | null }> };
+    expect(body.externalLinks).toHaveLength(1);
+    expect(body.externalLinks[0]!.otherBoardName).toBe('Away8');
+    expect(body.externalLinks[0]!.otherCardTitle).toBeNull();
+  });
+
+  it('never resolves a title or board name for a row pointing at another tenant\'s board, even if one was written directly', async () => {
+    const home = await createBoard('Home9');
+    const a = await createCard(home, 'A');
+
+    // A second tenant, with a REAL board and a REAL card carrying a title that must never leak.
+    const LEAK_TENANT = { 'X-Tenant-Id': 'tnt_links_ext_leak', 'Content-Type': 'application/json' };
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_links_ext_leak', 'links-ext-leak', 'Leak')`).run();
+    const leakBoardRes = await SELF.fetch(`${base}/v1/boards`, {
+      method: 'POST',
+      headers: LEAK_TENANT,
+      body: JSON.stringify({ name: 'Secret Board', stages: STAGES }),
+    });
+    const leakBoardId = ((await leakBoardRes.json()) as { boardId: string }).boardId;
+    const leakCardRes = await SELF.fetch(`${base}/v1/boards/${leakBoardId}/cards`, {
+      method: 'POST',
+      headers: LEAK_TENANT,
+      body: JSON.stringify({ title: 'Secret Title', ownerUserId: 'usr_owner' }),
+    });
+    const leakCardId = ((await leakCardRes.json()) as { card: { id: string } }).card.id;
+
+    // The write route would refuse this as FOREIGN_BOARD — this row simulates one that got into
+    // `card_links_external` some other way, so the READ path's own tenant scoping is what is
+    // actually on trial here, not the write guard `addExternalLink` already has.
+    await env.DB.prepare(
+      `INSERT INTO card_links_external (tenant_id, from_board_id, from_card_id, to_board_id, to_card_id, kind) VALUES (?, ?, ?, ?, ?, 'blocks')`,
+    ).bind('tnt_links_ext', home, a, leakBoardId, leakCardId).run();
+
+    const res = await SELF.fetch(`${base}/v1/boards/${home}/cards/${a}/links`, { headers: T });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      externalLinks: Array<{ toCardId: string; otherCardTitle: string | null; otherBoardName: string | null }>;
+    };
+    expect(body.externalLinks).toHaveLength(1);
+    expect(body.externalLinks[0]!.toCardId).toBe(leakCardId);
+    expect(body.externalLinks[0]!.otherBoardName, 'must not disclose the foreign board\'s name').toBeNull();
+    expect(body.externalLinks[0]!.otherCardTitle, 'must not disclose the foreign card\'s title').toBeNull();
+  });
+});
