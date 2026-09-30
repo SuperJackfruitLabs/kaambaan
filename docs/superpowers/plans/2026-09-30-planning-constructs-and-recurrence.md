@@ -761,6 +761,9 @@ A due date that changes nothing is worse than no due date — it looks like a co
 
 - [ ] **Step 1: Write the failing test**
 
+Note the last case: it pins the claim query and the discovery count together, which is the whole
+reason Step 4 extracts a shared predicate.
+
 ```ts
 import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
@@ -828,6 +831,22 @@ describe('due dates in claim order', () => {
       expect((await board.claim({ agentId: 'agt_w', capabilities: ['writing'] })).claimed).toBe(false);
     });
   });
+
+  it('does not ADVERTISE an archived card either — discovery and claim must agree', async () => {
+    await runInDurableObject(stubFor('due-archived-count'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due4b', tenantId: 'tnt_a', name: 'D4b', stages: STAGES });
+      const card = await make(board, 'Archived', {});
+      expect(await board.countReadyForCapabilities('agt_w', ['writing'])).toBe(1);
+
+      await board.updateCard(card.id, { archivedAt: '2026-09-30T00:00:00.000Z' });
+
+      // `countReadyForCapabilities` is what `superpipeline_list_work` reports as `readyForYou`.
+      // If it still says 1 while claim says nothing is claimable, an agent polls, sees work, claims
+      // nothing, and polls again — forever.
+      expect(await board.countReadyForCapabilities('agt_w', ['writing'])).toBe(0);
+      expect((await board.claim({ agentId: 'agt_w', capabilities: ['writing'] })).claimed).toBe(false);
+    });
+  });
 });
 
 describe('overdue notification', () => {
@@ -889,17 +908,55 @@ Expected: FAIL — `updateCard` rejects `dueAt`/`archivedAt`, and `sweepBoard` d
     }
 ```
 
-- [ ] **Step 4: Change the claim query and the all-cards read**
+- [ ] **Step 4: Express card eligibility ONCE, then use it in all three places**
 
-`board-do.ts:2220-2224` becomes — note `(due_at IS NULL)` rather than `NULLS LAST`, and the new archived exclusion:
+⚠️ **Locate these by content, not by the line numbers in this plan.** Task 3 added ~82 lines to
+`board-do.ts`, so every line reference here is stale. Search for the quoted SQL instead.
+
+There are **two** independent queries asking "which cards may be handed out", not one:
+
+| where | what it does | find it by |
+|---|---|---|
+| `claim` | picks the single next card | `SELECT * FROM cards WHERE state = 'submitted'` |
+| `countReadyForCapabilities` | counts them for **work discovery** — this is `list_work`'s `readyForYou` | `SELECT COUNT(*) AS n FROM cards WHERE state = 'submitted'` |
+
+**They must never disagree.** The moment `claim` grows a condition the count does not, `list_work`
+advertises work `claim_card` then refuses: an agent polls, reads `readyForYou: 3`, claims, gets
+`{claimed:false}`, and polls again forever. It looks like a broken agent and it is a broken query.
+
+So extract the predicate rather than editing two copies. Add beside them:
 
 ```ts
-        `SELECT * FROM cards WHERE state = 'submitted' AND archived_at IS NULL
-           AND current_stage_key IN (${placeholders})
-         ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC LIMIT 1`,
+  /**
+   * The WHERE fragment deciding whether a card may be handed out, shared by the claim query and the
+   * work-discovery count so the two cannot drift apart.
+   *
+   * They were independent copies of `state = 'submitted' AND current_stage_key IN (…)`. Every
+   * condition added to claim from here on — archived here, blocked and parent-with-open-children in
+   * Task 13 — has to be invisible to `list_work` as well, or the board advertises work it will not
+   * hand out. The table is aliased `c` in both callers so this fragment can qualify its columns.
+   */
+  private claimableWhere(placeholders: string): string {
+    return `c.state = 'submitted' AND c.archived_at IS NULL AND c.current_stage_key IN (${placeholders})`;
+  }
 ```
 
-And `board-do.ts:3235`:
+Then the claim query becomes — note `(c.due_at IS NULL)` rather than `NULLS LAST`:
+
+```ts
+        `SELECT * FROM cards c WHERE ${this.claimableWhere(placeholders)}
+         ORDER BY c.priority DESC, (c.due_at IS NULL), c.due_at ASC, c.created_at ASC LIMIT 1`,
+```
+
+and the count becomes:
+
+```ts
+        `SELECT COUNT(*) AS n FROM cards c WHERE ${this.claimableWhere(placeholders)}`,
+```
+
+And separately, the all-cards read (find it by `SELECT * FROM cards ORDER BY priority`) gains the
+same ordering, but **not** the eligibility predicate — it lists every card, including archived ones,
+because the UI filters archived on its own side:
 
 ```ts
       .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
@@ -2141,26 +2198,48 @@ describe('a parent does not advance past an open child', () => {
 
 Run: `cd apps/api && pnpm vitest run test/links-enforcement.test.ts`
 
-- [ ] **Step 3: Add the exclusion to the claim query**
+- [ ] **Step 3: Extend the shared eligibility predicate — do not edit the claim query directly**
 
-The claim query from Task 5 gains one clause. Note this is an **exclusion, not a refusal**: `claim` takes no `cardId` (`apps/api/src/mcp/tools.ts:131`), so the server chooses and a blocked card is simply never chosen. Nothing outside this repo changes, and it cannot claim/refuse hot-loop.
+Task 5 extracted `claimableWhere(placeholders)` precisely so this task has one place to change.
+Editing the claim query alone would leave `countReadyForCapabilities` advertising blocked cards that
+`claim_card` refuses, and Task 5's `due-archived-count` test does not cover the blocked case.
+
+This is an **exclusion, not a refusal**: `claim` takes no `cardId` (`apps/api/src/mcp/tools.ts:131`),
+so the server chooses and a blocked card is simply never chosen. Nothing outside this repo changes,
+and it cannot claim/refuse hot-loop.
 
 ```ts
-        `SELECT * FROM cards c WHERE c.state = 'submitted' AND c.archived_at IS NULL
-           AND c.current_stage_key IN (${placeholders})
-           AND NOT EXISTS (
-             SELECT 1 FROM card_links l
-               JOIN cards b ON b.id = l.from_card_id
-              WHERE l.to_card_id = c.id AND l.kind = 'blocks'
-                AND b.state NOT IN ('completed', 'canceled')
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM card_links l
-               JOIN cards ch ON ch.id = l.to_card_id
-              WHERE l.from_card_id = c.id AND l.kind = 'parent'
-                AND ch.state NOT IN ('completed', 'canceled')
-           )
-         ORDER BY c.priority DESC, (c.due_at IS NULL), c.due_at ASC, c.created_at ASC LIMIT 1`,
+  private claimableWhere(placeholders: string): string {
+    return `c.state = 'submitted' AND c.archived_at IS NULL
+      AND c.current_stage_key IN (${placeholders})
+      AND NOT EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards b ON b.id = l.from_card_id
+         WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+           AND b.state NOT IN ('completed', 'canceled')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards ch ON ch.id = l.to_card_id
+         WHERE l.from_card_id = c.id AND l.kind = 'parent'
+           AND ch.state NOT IN ('completed', 'canceled')
+      )`;
+  }
+```
+
+Both callers pick the change up unchanged. **Add a test asserting the count agrees**, mirroring Task
+5's `due-archived-count`:
+
+```ts
+  it('does not advertise a blocked card either', async () => {
+    await runInDurableObject(stubFor('enf-count'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'enfcount');
+      expect(await board.countReadyForCapabilities('agt_w', ['writing'])).toBe(2);
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      // One claimable (the blocker), one excluded (the blocked card).
+      expect(await board.countReadyForCapabilities('agt_w', ['writing'])).toBe(1);
+    });
+  });
 ```
 
 `NOT IN ('completed', 'canceled')` is `isResolved` inverted, inline. **Do not widen it to the four terminal states** — the `enf-failed` test exists to catch exactly that edit.
