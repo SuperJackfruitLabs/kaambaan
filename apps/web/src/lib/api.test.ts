@@ -587,7 +587,18 @@ describe('listLinks', () => {
         new Response(
           JSON.stringify({
             links: [{ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks', createdAt: '2026-01-01', createdBy: null, enforced: true }],
-            externalLinks: [{ fromBoardId: 'brd_1', fromCardId: 'card_a', toBoardId: 'brd_2', toCardId: 'card_c', kind: 'blocks', enforced: false }],
+            externalLinks: [
+              {
+                fromBoardId: 'brd_1',
+                fromCardId: 'card_a',
+                toBoardId: 'brd_2',
+                toCardId: 'card_c',
+                kind: 'blocks',
+                enforced: false,
+                otherCardTitle: 'Fix the layout',
+                otherBoardName: 'Design board',
+              },
+            ],
           }),
           { status: 200 },
         ),
@@ -599,6 +610,40 @@ describe('listLinks', () => {
     expect(result.links[0]!.enforced).toBe(true);
     expect(result.externalLinks).toHaveLength(1);
     expect(result.externalLinks[0]!.enforced).toBe(false);
+    // 17b follow-up: the route resolves the other end's title/board name per row, typed here so
+    // a consumer (`blockerRows`) doesn't have to fall back to a bare id in the common case.
+    expect(result.externalLinks[0]!.otherCardTitle).toBe('Fix the layout');
+    expect(result.externalLinks[0]!.otherBoardName).toBe('Design board');
+  });
+
+  it('carries otherCardTitle/otherBoardName as null when the route could not resolve them — a real state, not a missing field', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            links: [],
+            externalLinks: [
+              {
+                fromBoardId: 'brd_1',
+                fromCardId: 'card_a',
+                toBoardId: 'brd_2',
+                toCardId: 'card_c',
+                kind: 'blocks',
+                enforced: false,
+                otherCardTitle: null,
+                otherBoardName: null,
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await listLinks('brd_1', 'card_a');
+    expect(result.externalLinks[0]!.otherCardTitle).toBeNull();
+    expect(result.externalLinks[0]!.otherBoardName).toBeNull();
   });
 
   it('answers empty arrays rather than throwing when the read is refused', async () => {

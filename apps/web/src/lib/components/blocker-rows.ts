@@ -7,6 +7,12 @@
  * filtered to `kind === 'blocks'` edges that point AT this card — the edges that name this card as
  * blocked, not the ones this card names as blocking something else.
  *
+ * `otherCardTitle`/`otherBoardName` (17b follow-up) are resolved server-side, per row, by the same
+ * route — never re-fetched or re-derived here. Either can be `null` (the other board is
+ * unavailable, the card is gone, or it belongs to another tenant) as a real, expected state, not an
+ * error: the fallback to the card id happens HERE, once, so both the visible row text and the
+ * badge's tooltip agree on the same fallback rather than disagreeing about what to show.
+ *
  * The two never merge into one list with one glyph: each row's badge comes from
  * `enforcedBadge`/`advisoryBadge` (`./board/card-blocked`), so a row can never accidentally borrow
  * the other kind's colour or claim.
@@ -17,8 +23,8 @@ export interface BlockerRow {
   cardId: string;
   /** null for a same-board (enforced) blocker; the foreign board id for an advisory one. */
   boardId: string | null;
-  /** The blocker's title, when known — `Card.blockedBy` always carries one; an advisory row may not. */
-  title: string | null;
+  /** The blocker's title — a real one for an enforced row, real-or-id for an advisory one; never null. */
+  title: string;
   badge: BlockedBadge;
 }
 
@@ -27,14 +33,13 @@ export interface ExternalBlockerLike {
   toCardId: string;
   fromCardId: string;
   fromBoardId: string;
+  /** The other end's card title, resolved server-side — null when it could not be read. */
+  otherCardTitle: string | null;
+  /** The other end's board name, resolved server-side — null when it could not be read. */
+  otherBoardName: string | null;
 }
 
-export function blockerRows(
-  cardId: string,
-  blockedBy: EnforcedBlocker[],
-  externalLinks: ExternalBlockerLike[],
-  boardName: (boardId: string) => string | null,
-): BlockerRow[] {
+export function blockerRows(cardId: string, blockedBy: EnforcedBlocker[], externalLinks: ExternalBlockerLike[]): BlockerRow[] {
   const enforced: BlockerRow[] = blockedBy.map((b) => ({
     cardId: b.cardId,
     boardId: null,
@@ -44,12 +49,17 @@ export function blockerRows(
 
   const advisory: BlockerRow[] = externalLinks
     .filter((l) => l.kind === 'blocks' && l.toCardId === cardId)
-    .map((l) => ({
-      cardId: l.fromCardId,
-      boardId: l.fromBoardId,
-      title: null,
-      badge: advisoryBadge(boardName(l.fromBoardId)),
-    }));
+    .map((l) => {
+      // The fallback lives here, once, so the row's visible label and its tooltip can never
+      // disagree about what stands in for a title the server could not resolve.
+      const title = l.otherCardTitle ?? l.fromCardId;
+      return {
+        cardId: l.fromCardId,
+        boardId: l.fromBoardId,
+        title,
+        badge: advisoryBadge(title, l.otherBoardName),
+      };
+    });
 
   return [...enforced, ...advisory];
 }

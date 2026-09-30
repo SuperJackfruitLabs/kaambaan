@@ -89,11 +89,11 @@
    * Blocker rows for the Blockers section — never one badge covering both kinds (Step 1). Enforced
    * rows come from `card.blockedBy` (the same field the tile's ⛔ badge reads); advisory rows come
    * from `cardLinks.externalLinks`, told apart by the `⚑` badge rather than anything guessed from
-   * board ids.
+   * board ids. The advisory title/board name are resolved server-side (`otherCardTitle`/
+   * `otherBoardName`, the 17b follow-up) and read straight off each row — no client-side lookup
+   * against `app.boards` needed here any more.
    */
-  const blockers = $derived(
-    card ? blockerRows(card.id, card.blockedBy, cardLinks.externalLinks, (bid) => app.boards.find((b) => b.id === bid)?.name ?? null) : [],
-  );
+  const blockers = $derived(card ? blockerRows(card.id, card.blockedBy, cardLinks.externalLinks) : []);
 
   // ---- edit state ----
   let editing = $state(false);
@@ -988,7 +988,7 @@
                   title={row.badge.tooltip}
                 >
                   <span class={row.badge.glyph === '⛔' ? 'blk-pill' : 'blk-pill blk-pill-advisory'}>{row.badge.glyph}</span>
-                  <span class="min-w-0 flex-1 truncate">{row.title ?? row.cardId}</span>
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
                   <span class="text-muted-foreground shrink-0">{row.badge.label}</span>
                 </div>
               {/each}

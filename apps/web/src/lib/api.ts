@@ -563,6 +563,16 @@ export interface ExternalLink {
   toCardId: string;
   kind: 'blocks' | 'relates';
   enforced: false;
+  /**
+   * The OTHER end's card title (whichever end is not the card `listLinks` was asked about),
+   * resolved server-side, per row, by `GET .../links` itself (17b follow-up, commit `433f4bb`) —
+   * never re-derived or re-fetched on the client. `null` is a real state, not a missing field: the
+   * other board may be unavailable, the card may be gone, or it may belong to another tenant, and
+   * the route degrades that one row rather than failing the whole response.
+   */
+  otherCardTitle: string | null;
+  /** The OTHER end's board name, resolved the same way and with the same `null` meaning. */
+  otherBoardName: string | null;
 }
 
 export interface CardLinks {
