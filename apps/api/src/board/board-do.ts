@@ -703,7 +703,8 @@ export type BoardErrorCode =
   | 'INVALID_SCHEDULE'
   | 'NO_SUCH_CARD'
   | 'LINK_WOULD_CYCLE'
-  | 'ALREADY_HAS_PARENT';
+  | 'ALREADY_HAS_PARENT'
+  | 'CARD_BLOCKED';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1467,6 +1468,22 @@ export class BoardDO extends DurableObject<Env> {
         message: `WIP limit reached for stage "${target.key}" (limit ${target.wipLimit})`,
       };
     }
+    // Advancing IS a refusal, unlike claim's exclusion: this is an explicit act by a named caller,
+    // not a selection from a set (see the header note on Task 13). Only an OPEN CHILD refuses it —
+    // a parent whose sub-tasks are unfinished is not something anyone should be able to mark done.
+    // An unresolved `blocks` edge deliberately does NOT refuse this: Principle 3 says a human owns
+    // the card and is accountable, and can see the blocker badge, so a human move through a blocker
+    // is allowed through (and recorded, below) rather than refused — the one place Linear's
+    // advisory model is right.
+    const openChildren = this.openChildCount(cardId);
+    if (openChildren > 0) {
+      return {
+        ok: false,
+        code: 'CARD_BLOCKED',
+        message: `${openChildren} sub-task${openChildren === 1 ? '' : 's'} still open`,
+      };
+    }
+    const unresolvedBlockers = this.unresolvedBlockerCount(cardId);
     const now = this.now();
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
@@ -1497,6 +1514,16 @@ export class BoardDO extends DurableObject<Env> {
       to: target.key,
       by: actorUserId ?? null,
     });
+    // The override is made VISIBLE, not silently allowed (Principle 3: a human is accountable for
+    // moving a card past a blocker they can see on the badge, and the record is how that
+    // accountability stays legible after the fact).
+    if (unresolvedBlockers > 0) {
+      this.notify(
+        'moved-while-blocked',
+        cardId,
+        `moved to "${target.name}" past ${unresolvedBlockers} unresolved blocker${unresolvedBlockers === 1 ? '' : 's'}${actorUserId ? ` by ${actorUserId}` : ''}`,
+      );
+    }
     return { ok: true, value: updated };
   }
 
@@ -2825,10 +2852,14 @@ export class BoardDO extends DurableObject<Env> {
    */
   private notifyWorkAvailable(cardId: string): void {
     const card = this.getCard(cardId);
-    // Mirrors `claimableWhere`'s archived exclusion, by hand: this is a JS predicate over a
-    // `CardView`, not SQL, so it cannot call that helper — but any eligibility condition added
-    // there needs its equivalent added here too, or a push fires for work `claim` will refuse.
-    if (!card || card.state !== 'submitted' || card.archivedAt) return;
+    // `state`/`archivedAt` mirror `claimableWhere`'s own conditions, by hand: this is a JS
+    // predicate over a `CardView`, not SQL, so it cannot call that helper directly. The blocked
+    // rule (unresolved `blocks`, open `parent` child) no longer needs its own hand-copy, though —
+    // it comes from the same `blockedWhere()` fragment `claimableWhere` uses, via `isHeldBack`, so
+    // the two cannot drift apart the way the archived check once risked. Any FUTURE eligibility
+    // condition added to `claimableWhere` still needs its equivalent added here too, or a push
+    // fires for work `claim` will refuse.
+    if (!card || card.state !== 'submitted' || card.archivedAt || this.isHeldBack(cardId)) return;
     if (this.boardOverBudget()) return;
     const stage = this.stages().find((s) => s.key === card.currentStageKey);
     if (!stage || !this.isAgentClaimable(stage)) return;
@@ -2927,12 +2958,90 @@ export class BoardDO extends DurableObject<Env> {
    * work-discovery count so the two cannot drift apart.
    *
    * They were independent copies of `state = 'submitted' AND current_stage_key IN (…)`. Every
-   * condition added to claim from here on — archived here, blocked and parent-with-open-children in
-   * Task 13 — has to be invisible to `list_work` as well, or the board advertises work it will not
-   * hand out. The table is aliased `c` in both callers so this fragment can qualify its columns.
+   * condition added to claim from here on — archived here, blocked and parent-with-open-children via
+   * `blockedWhere()` (Task 13) — has to be invisible to `list_work` as well, or the board advertises
+   * work it will not hand out. The table is aliased `c` in both callers so this fragment can qualify
+   * its columns.
    */
   private claimableWhere(placeholders: string): string {
-    return `c.state = 'submitted' AND c.archived_at IS NULL AND c.current_stage_key IN (${placeholders})`;
+    return `c.state = 'submitted' AND c.archived_at IS NULL
+      AND c.current_stage_key IN (${placeholders})
+      AND ${this.blockedWhere()}`;
+  }
+
+  /**
+   * Whether nothing holds `c` back from being handed out: no unresolved blocker (`blocks`), and no
+   * open child (`parent`). Parameterless and correlated on the alias `c`, so it composes directly
+   * into `claimableWhere`'s SELECT and into `isHeldBack`'s single-card check below, without either
+   * restating the rule. TRUE means eligible — `claimableWhere` ANDs it straight into its WHERE
+   * clause, and `isHeldBack` inverts the question to ask it about one card.
+   *
+   * A blocker is resolved only when it is `completed` or `canceled` — **not** all four terminal
+   * states. `TERMINAL_STATES` also contains `rejected` and `failed`; a blocker in either of those
+   * must keep its dependent blocked, or the edge does nothing in the situation it exists for. This
+   * is the SQL form of `isResolved` (`links.ts`) inlined, not a rewrite of it — do not widen it to
+   * `isTerminal()` or the four terminal states (`enf-rejected`/mid-retry tests in
+   * `links-enforcement.test.ts` exist to catch exactly that).
+   *
+   * One definition, three readers — the claim query (via `claimableWhere`), the discovery count
+   * (`countReadyForCapabilities`, which calls `claimableWhere` too), and `notifyWorkAvailable`'s JS
+   * gate, which reaches it through `isHeldBack` rather than mirroring the SQL by hand.
+   */
+  private blockedWhere(): string {
+    return `NOT EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards b ON b.id = l.from_card_id
+         WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+           AND b.state NOT IN ('completed', 'canceled')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards ch ON ch.id = l.to_card_id
+         WHERE l.from_card_id = c.id AND l.kind = 'parent'
+           AND ch.state NOT IN ('completed', 'canceled')
+      )`;
+  }
+
+  /** The same rule, asked about one card, for callers that are not a SELECT over the stage set. */
+  private isHeldBack(cardId: string): boolean {
+    return (
+      this.sql.exec(`SELECT 1 FROM cards c WHERE c.id = ? AND (${this.blockedWhere()})`, cardId).toArray().length ===
+      0
+    );
+  }
+
+  /**
+   * How many of `cardId`'s children (via the `parent` edge, `cardId` as source) are still
+   * unresolved. Used only by `moveCard`'s advance refusal — deliberately NOT `blockedWhere()`,
+   * which also folds in the `blocks` condition that `moveCard` must NOT refuse on (Principle 3).
+   */
+  private openChildCount(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+            WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ('completed', 'canceled')`,
+          cardId,
+        )
+        .one().n,
+    );
+  }
+
+  /**
+   * How many unresolved blockers (via the `blocks` edge, `cardId` as target) `cardId` has. Used
+   * only to decide whether `moveCard`'s human-override notification fires — a `blocks` edge never
+   * refuses the move itself.
+   */
+  private unresolvedBlockerCount(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM card_links l JOIN cards b ON b.id = l.from_card_id
+            WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ('completed', 'canceled')`,
+          cardId,
+        )
+        .one().n,
+    );
   }
 
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */

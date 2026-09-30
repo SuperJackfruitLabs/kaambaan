@@ -135,6 +135,10 @@ function statusForCode(code: BoardErrorCode): number {
     // succeeds once the cycle is avoided or the existing parent edge is removed first.
     case 'LINK_WOULD_CYCLE':
     case 'ALREADY_HAS_PARENT':
+    // Same shape: the same move succeeds once the open child resolves. Advancing is a refusal
+    // (Task 13), not the exclusion `claim` uses, but it is still a conflict with the graph the
+    // caller believed in, not a malformed request.
+    case 'CARD_BLOCKED':
       return 409;
   }
 }
