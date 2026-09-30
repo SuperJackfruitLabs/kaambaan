@@ -170,6 +170,20 @@ function unexpected(err: unknown): Response {
   return Response.json({ error: { message } }, { status: 500 });
 }
 
+/**
+ * Is this D1's own report of the `labels` table's `UNIQUE (tenant_id, name)` collision — the ONLY
+ * constraint that table carries?
+ *
+ * Narrow on purpose: `POST /v1/labels`'s catch must convert this one failure into a 409 sentence
+ * and let everything else (a transient D1 error, anything) fall through to `unexpected(err)`
+ * unaltered, rather than mislabelling every failure as a name collision and discarding the real
+ * error — which is what an unnarrowed `catch { return 409 }` did.
+ */
+function isLabelNameCollision(err: unknown): boolean {
+  const message = (err as { message?: string })?.message ?? '';
+  return message.includes('UNIQUE constraint failed: labels.tenant_id, labels.name');
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -605,19 +619,25 @@ export default {
 
         if (request.method === 'POST' && !labelId) {
           const body = (await request.json()) as { name?: string; colour?: string };
-          if (!body.name || body.name.trim() === '') {
+          const name = body.name?.trim() ?? '';
+          if (name === '') {
             return Response.json({ error: 'name is required' }, { status: 400 });
           }
           if (!body.colour || body.colour.trim() === '') {
             return Response.json({ error: 'colour is required' }, { status: 400 });
           }
           try {
-            const made = await createLabel(env.DB, u.tenantId, { name: body.name, colour: body.colour });
+            const made = await createLabel(env.DB, u.tenantId, { name, colour: body.colour });
             return Response.json({ label: made }, { status: 201 });
           } catch (err) {
-            // The UNIQUE(tenant_id, name) collision, read as a sentence rather than a raw SQLite
-            // constraint error — the same treatment `/v1/capabilities` gives its own collision.
-            return Response.json({ error: `a label named "${body.name}" already exists in this workspace` }, { status: 409 });
+            // Narrowed to the exact UNIQUE(tenant_id, name) collision — anything else (a transient
+            // D1 error, whatever) rethrows to the outer `unexpected(err)` handler rather than being
+            // mislabelled as a name collision and having the real error discarded.
+            if (!isLabelNameCollision(err)) throw err;
+            // Read as a sentence rather than a raw SQLite constraint error, and against the
+            // trimmed name actually attempted — the same treatment `/v1/capabilities` gives its
+            // own collision.
+            return Response.json({ error: `a label named "${name}" already exists in this workspace` }, { status: 409 });
           }
         }
 
@@ -1242,7 +1262,17 @@ export default {
         // The DO does not validate label ids — it cannot reach D1 usefully on a hot path — so the
         // route checks here, before the write lands, that every id names a real label in this
         // workspace's catalogue.
-        if (Array.isArray(body.labels)) {
+        if (body.labels !== undefined) {
+          // The type guard is not decoration. Without it, `labels: "urgent"` skips this whole check
+          // and reaches `[...new Set(patch.labels)]` in the DO, where a string is iterable and spreads
+          // into ['u','r','g','e','n','t'] — written to storage, no error raised. A plain object
+          // throws an unhandled TypeError inside the DO instead. Neither answers 400.
+          if (!Array.isArray(body.labels) || body.labels.some((l) => typeof l !== 'string')) {
+            return Response.json(
+              { error: { code: 'INVALID_LABELS', message: 'labels must be an array of label ids' } },
+              { status: 400 },
+            );
+          }
           const unknown = await unknownLabelIds(env.DB, tenantId, body.labels as string[]);
           if (unknown.length > 0) {
             return Response.json(

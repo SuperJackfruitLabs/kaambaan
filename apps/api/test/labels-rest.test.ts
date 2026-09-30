@@ -1,0 +1,160 @@
+import { SELF, env } from 'cloudflare:test';
+import { describe, it, expect } from 'vitest';
+import type { BoardInit } from '../src/board/board-do';
+
+/**
+ * `/v1/labels[/:id]` and the labels validation on `PATCH /v1/boards/:id/cards/:cardId` — the
+ * routing and validation layer over `src/db/labels.ts`, which the module-level tests
+ * (`test/labels.test.ts`) never exercise because they call the DB module or the DO directly.
+ *
+ * Two defects lived here, invisible to that suite: a catch-all in `POST /v1/labels` that reported
+ * EVERY create failure as a 409 name collision (discarding the real error), and a missing type
+ * guard on `PATCH .../cards/:cardId`'s `labels` field that let `labels: "urgent"` (a bare string)
+ * skip validation entirely and reach `[...new Set(patch.labels)]` in the DO, where a string is
+ * iterable and spreads into its individual characters — silently corrupting stored card data.
+ */
+
+const PIPE: BoardInit['stages'] = [{ key: 'draft', name: 'Draft', order: 0, ownerKind: 'capability', owner: 'writing' }];
+const dev = (tenant: string) => ({ 'X-Tenant-Id': tenant, 'Content-Type': 'application/json' });
+
+/**
+ * `labels` (migration 0010) carries `REFERENCES tenants(id)`, unlike every other table the test
+ * catalog mirrors — the FK is kept because the real migration file is run as-is (see
+ * `test/helpers/catalog.ts`). A route that writes into `labels` through a dev-header tenant with
+ * no `tenants` row fails on that FK, so any test that creates a label inserts one first.
+ */
+async function insertTenant(id: string, slug: string): Promise<void> {
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, ?)`).bind(id, slug, slug).run();
+}
+
+async function board(tenant: string): Promise<string> {
+  const res = await SELF.fetch('https://api.test/v1/boards', {
+    method: 'POST',
+    headers: dev(tenant),
+    body: JSON.stringify({ name: 'Labels', stages: PIPE }),
+  });
+  return (await res.json<{ boardId: string }>()).boardId;
+}
+
+async function card(tenant: string, boardId: string, title: string): Promise<string> {
+  const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+    method: 'POST',
+    headers: dev(tenant),
+    body: JSON.stringify({ title }),
+  });
+  return (await res.json<{ card: { id: string } }>()).card.id;
+}
+
+async function readCard(tenant: string, boardId: string, cardId: string): Promise<{ labels: string[] }> {
+  const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards/${cardId}`, { headers: dev(tenant) });
+  return (await res.json<{ card: { labels: string[] } }>()).card;
+}
+
+describe('POST /v1/labels', () => {
+  it('refuses a duplicate name as a 409 sentence, not a raw constraint failure', async () => {
+    const t = 'tnt_lbl_rest_dupe';
+    await insertTenant(t, 'lbl-rest-dupe');
+    const body = JSON.stringify({ name: 'urgent', colour: '#f00' });
+
+    const first = await SELF.fetch('https://api.test/v1/labels', { method: 'POST', headers: dev(t), body });
+    expect(first.status).toBe(201);
+
+    const again = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: '  urgent  ', colour: '#0f0' }), // untrimmed, same collision
+    });
+    expect(again.status).toBe(409);
+    // The message names the trimmed name actually attempted, not the raw untrimmed body value.
+    expect((await again.json<{ error: string }>()).error).toContain('"urgent"');
+  });
+});
+
+describe('PATCH /v1/boards/:id/cards/:cardId — labels validation', () => {
+  it('400s a bare string instead of spreading its characters into storage', async () => {
+    const t = 'tnt_lbl_rest_string';
+    const b = await board(t);
+    const id = await card(t, b, 'Malformed');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labels: 'urgent' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('INVALID_LABELS');
+
+    // The corruption is the point: confirm storage was never touched, not just the status code.
+    const after = await readCard(t, b, id);
+    expect(after.labels).toEqual([]);
+  });
+
+  it('400s an array containing a non-string element', async () => {
+    const t = 'tnt_lbl_rest_numarr';
+    const b = await board(t);
+    const id = await card(t, b, 'Malformed 2');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labels: [123] }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('INVALID_LABELS');
+
+    const after = await readCard(t, b, id);
+    expect(after.labels).toEqual([]);
+  });
+
+  it('400s a well-formed but unknown label id, naming only the unknown one', async () => {
+    const t = 'tnt_lbl_rest_unknown';
+    await insertTenant(t, 'lbl-rest-unknown');
+    const b = await board(t);
+    const id = await card(t, b, 'Unknown label');
+
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'known', colour: '#00f' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labels: [label.id, 'lbl_deadbeefdeadbeef'] }),
+    });
+    expect(res.status).toBe(400);
+    const err = (await res.json<{ error: { code: string; message: string } }>()).error;
+    expect(err.code).toBe('UNKNOWN_LABEL');
+    expect(err.message).toContain('lbl_deadbeefdeadbeef');
+    expect(err.message).not.toContain(label.id);
+
+    // Refused before the write lands — the card carries neither the known nor the unknown id.
+    const after = await readCard(t, b, id);
+    expect(after.labels).toEqual([]);
+  });
+
+  it('accepts a well-formed, all-known array', async () => {
+    const t = 'tnt_lbl_rest_ok';
+    await insertTenant(t, 'lbl-rest-ok');
+    const b = await board(t);
+    const id = await card(t, b, 'Good label');
+
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'ready', colour: '#0f0' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labels: [label.id] }),
+    });
+    expect(res.status).toBe(200);
+    const after = await readCard(t, b, id);
+    expect(after.labels).toEqual([label.id]);
+  });
+});
