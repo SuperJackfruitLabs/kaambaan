@@ -485,6 +485,69 @@ export function deleteCard(boardId: string, cardId: string): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'DELETE', headers });
 }
 
+/**
+ * Archive a card: `PATCH archivedAt` with a real timestamp, not a client-side flag. Phase 1
+ * shipped an `archivedAt` column and a "show archived" filter with no way to ever produce an
+ * archived card — a filter for a state nothing could reach. This is that write.
+ */
+export function archiveCard(boardId: string, cardId: string): Promise<Response> {
+  return updateCard(boardId, cardId, { archivedAt: new Date().toISOString() });
+}
+
+/** Dependencies and sub-task containment (spec §3.4) — one table on the DO, told apart by `kind`. */
+export type LinkKind = 'blocks' | 'relates' | 'parent';
+
+/** A same-board edge (Task 12's `card_links`, read on the claim path — this one is enforced). */
+export interface Link {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdAt: string;
+  createdBy: string | null;
+  enforced: true;
+}
+
+/**
+ * A cross-board edge (Task 16's `card_links_external`) — advisory, always. `parent` is not a valid
+ * kind here: a parent edge carries a rule (a parent does not advance while a child is open), and
+ * an edge nothing enforces cannot carry one.
+ */
+export interface ExternalLink {
+  fromBoardId: string;
+  fromCardId: string;
+  toBoardId: string;
+  toCardId: string;
+  kind: 'blocks' | 'relates';
+  enforced: false;
+}
+
+export interface CardLinks {
+  links: Link[];
+  externalLinks: ExternalLink[];
+}
+
+/**
+ * Declare an edge between two cards on THIS board. Returns the raw response, like `setStages`
+ * does, so a caller can show the DO's own refusal sentence — `LINK_WOULD_CYCLE` and
+ * `ALREADY_HAS_PARENT` each say which cards are involved, and "invalid link" would throw that
+ * away.
+ */
+export function addLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, { method: 'POST', headers, body: JSON.stringify({ fromCardId, toCardId, kind }) });
+}
+
+/** Remove a same-board edge. Removing one that is not there is not an error — same as the route it calls. */
+export function removeLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, { method: 'DELETE', headers, body: JSON.stringify({ fromCardId, toCardId, kind }) });
+}
+
+/** Every edge touching this card: same-board (enforced) and cross-board (advisory), kept apart. */
+export async function listLinks(boardId: string, cardId: string): Promise<CardLinks> {
+  const res = await fetch(`/v1/boards/${boardId}/cards/${cardId}/links`, { headers });
+  if (!res.ok) return { links: [], externalLinks: [] };
+  return (await res.json()) as CardLinks;
+}
+
 /** Attach a reference (link) to a card by hand. */
 export function addReference(boardId: string, cardId: string, ref: { url: string; title?: string }): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}/references`, { method: 'PUT', headers, body: JSON.stringify({ ...ref, addedBy: 'user' }) });

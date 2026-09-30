@@ -32,9 +32,11 @@ import {
   type Result,
   type JsonValue,
 } from './board/board-do';
+import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
+import { listExternalLinksFor } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
@@ -145,6 +147,27 @@ function statusForCode(code: BoardErrorCode): number {
     case 'TOO_MANY_CHILDREN':
     case 'NOTHING_TO_SPLIT':
       return 400;
+  }
+}
+
+/**
+ * `addLink`/`removeLink`'s own mapping (Task 17a) — kept separate from `statusForCode` above
+ * because the two disagree on `NOT_INITIALIZED`. Elsewhere that code means "the board this id
+ * names was never initialized", answered 404 because there is nothing to find. Here it can only
+ * mean the board's own DO exists (the route already resolved it) but was never sent `init` — the
+ * brief's own words, "the board exists but has no stages yet" — which is a conflict with the state
+ * the caller believed in, not a missing resource, so 409 rather than 404.
+ */
+function statusForLinkCode(code: BoardErrorCode): number {
+  switch (code) {
+    case 'NOT_INITIALIZED':
+    case 'LINK_WOULD_CYCLE':
+    case 'ALREADY_HAS_PARENT':
+      return 409;
+    case 'NO_SUCH_CARD':
+      return 404;
+    default:
+      return statusForCode(code);
   }
 }
 
@@ -1387,6 +1410,59 @@ export default {
         return new Response(null, { status: 204 });
       }
 
+      // POST /v1/boards/:id/links — declare a same-board edge · DELETE — remove one (spec §3.4).
+      //
+      // Task 12 built `addLink`/`removeLink` on the Durable Object (`board-do.ts:2139-2199`) with
+      // no HTTP surface; this is that surface, for the drawer's "Add blocker" and `supi link`.
+      // Cross-board (advisory) edges have no write route here — Task 16's D1 store
+      // (`db/card-links-external.ts`) is written wherever the drawer's board-picker dialogue
+      // lands (Task 17b), not by this task.
+      //
+      // Shape-checked here, not left to the DO: the DO trusts its callers by design, so `kind`
+      // outside the known set is refused as a 400 before it ever reaches `addLink`, rather than
+      // being stored or crashing inside the Durable Object.
+      if (rest === 'links' && (request.method === 'POST' || request.method === 'DELETE')) {
+        const body = (await request.json().catch(() => null)) as
+          | { fromCardId?: unknown; toCardId?: unknown; kind?: unknown }
+          | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        if (
+          typeof body.fromCardId !== 'string' ||
+          body.fromCardId.trim() === '' ||
+          typeof body.toCardId !== 'string' ||
+          body.toCardId.trim() === ''
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'fromCardId and toCardId are required, non-empty card ids' } },
+            { status: 400 },
+          );
+        }
+        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent') {
+          return Response.json(
+            {
+              error: {
+                code: 'INVALID_LINK_KIND',
+                message: `kind must be 'blocks', 'relates' or 'parent', got ${JSON.stringify(body.kind)}`,
+              },
+            },
+            { status: 400 },
+          );
+        }
+        const kind: LinkKind = body.kind;
+        const fromCardId = body.fromCardId;
+        const toCardId = body.toCardId;
+        if (request.method === 'POST') {
+          const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
+          if (!result.ok) return Response.json({ error: result }, { status: statusForLinkCode(result.code) });
+          return Response.json({ link: result.value }, { status: 201 });
+        }
+        const result = await stub.removeLink(fromCardId, toCardId, kind);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForLinkCode(result.code) });
+        return Response.json(result.value);
+      }
+
       // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
       // per (non-blank) line (Task 15, spec §3.4). A human/web route: the agent path reaches
       // `splitCard` through `superpipeline_split_card` (scope `run`) instead, calling the same DO
@@ -1463,6 +1539,30 @@ export default {
         const result = await stub.estimateCardCost(estimateMatch[1]!);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
+      }
+
+      // GET /v1/boards/:id/cards/:cardId/links — every edge touching this card, from both stores.
+      //
+      // `links` (same-board, from the DO's `listLinks`) and `externalLinks` (cross-board, from
+      // Task 16's advisory D1 rows, `card-links-external.ts`) are kept in two separate arrays
+      // rather than merged into one list, and each row also carries its own `enforced` boolean —
+      // belt and braces, because the two kinds mean different things. A same-board `blocks` is
+      // read on the claim path and genuinely refuses a claim; a cross-board `blocks` is shown and
+      // nothing more — `addExternalLink`'s own comment calls it "advisory, always". A client that
+      // merged them into one list, or told them apart only by comparing `toBoardId` to this
+      // board's id, is one bug away from drawing an enforced badge on an edge that enforces
+      // nothing. 17b's badge logic is built on this response never requiring that inference.
+      const cardLinksMatch = rest.match(/^cards\/([^/]+)\/links$/);
+      if (cardLinksMatch && request.method === 'GET') {
+        const cardId = cardLinksMatch[1]!;
+        const [links, externalLinks] = await Promise.all([
+          stub.listLinks(cardId),
+          listExternalLinksFor(env.DB, tenantId, cardId),
+        ]);
+        return Response.json({
+          links: links.map((l) => ({ ...l, enforced: true as const })),
+          externalLinks: externalLinks.map((l) => ({ ...l, enforced: false as const })),
+        });
       }
 
       // GET /v1/boards/:id/events — the board's own event log (docs/03).

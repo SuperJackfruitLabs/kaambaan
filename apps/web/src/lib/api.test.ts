@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -493,5 +493,97 @@ describe('an expired session is noticed, rather than presenting as a dead board'
 
     await resolveGate('brd_1', 'gate_1', 'approve');
     expect(fired).toBe(0);
+  });
+});
+
+/**
+ * Task 17a: the client for the link routes Task 12 (`addLink`/`removeLink`/`listLinks` on the
+ * DO) and Task 16 (cross-board advisory rows in D1) each shipped with no HTTP surface. `addLink`
+ * and `removeLink` return the raw response, like `setStages`/`patchStage` do, so a caller can
+ * surface the DO's own refusal sentence (a cycle, an existing parent) rather than a generic one.
+ */
+describe('addLink', () => {
+  it('POSTs fromCardId/toCardId/kind to the board\'s links route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ link: {} }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await addLink('brd_1', 'card_a', 'card_b', 'blocks');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/boards/brd_1/links');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks' });
+  });
+
+  it("surfaces the server's own refusal — a cycle says so, not \"invalid link\"", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ error: { code: 'LINK_WOULD_CYCLE', message: 'linking card_a -> card_b (blocks) would close a cycle' } }), { status: 409 })),
+    );
+
+    const res = await addLink('brd_1', 'card_a', 'card_b', 'blocks');
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('LINK_WOULD_CYCLE');
+    expect(body.error.message).toContain('cycle');
+  });
+});
+
+describe('removeLink', () => {
+  it('DELETEs fromCardId/toCardId/kind against the board\'s links route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeLink('brd_1', 'card_a', 'card_b', 'parent');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/boards/brd_1/links');
+    expect(init?.method).toBe('DELETE');
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'parent' });
+  });
+});
+
+describe('listLinks', () => {
+  it('reads a card\'s same-board (enforced) and cross-board (advisory) edges', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            links: [{ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks', createdAt: '2026-01-01', createdBy: null, enforced: true }],
+            externalLinks: [{ fromBoardId: 'brd_1', fromCardId: 'card_a', toBoardId: 'brd_2', toCardId: 'card_c', kind: 'blocks', enforced: false }],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await listLinks('brd_1', 'card_a');
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0]!.enforced).toBe(true);
+    expect(result.externalLinks).toHaveLength(1);
+    expect(result.externalLinks[0]!.enforced).toBe(false);
+  });
+
+  it('answers empty arrays rather than throwing when the read is refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+    expect(await listLinks('brd_1', 'card_a')).toEqual({ links: [], externalLinks: [] });
+  });
+});
+
+describe('archiveCard', () => {
+  it('PATCHes archivedAt with a real timestamp, so the existing "show archived" filter has something to filter', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ card: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await archiveCard('brd_1', 'card_a');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/boards/brd_1/cards/card_a');
+    expect(init?.method).toBe('PATCH');
+    const body = JSON.parse(init?.body as string) as { archivedAt: string };
+    expect(typeof body.archivedAt).toBe('string');
+    expect(Number.isNaN(Date.parse(body.archivedAt))).toBe(false);
   });
 });
