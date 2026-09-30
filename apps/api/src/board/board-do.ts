@@ -2464,10 +2464,21 @@ export class BoardDO extends DurableObject<Env> {
    * a double tick finds nothing due. If the create throws, `next_fire_at` is left alone and the next
    * tick retries — at-least-once, which for a maintenance card is the right way round.
    *
-   * Missed occurrences collapse to one: `next_fire_at` is always computed from `nowIso` — the
-   * instant this runs — never from the missed time itself. A board whose cron was down for a week
-   * produces one "sweep the logs" card when it comes back, not seven. That is the right shape for
-   * maintenance work, and is exactly what a later reader "fixes" into a card storm — leave it alone.
+   * Missed occurrences collapse to one. A board whose cron was down for a week produces one
+   * "sweep the logs" card when it comes back, not seven. That is the right shape for maintenance
+   * work, and it is exactly what a later reader "fixes" into a card storm — leave it alone.
+   *
+   * How that is achieved differs by rule kind, and the difference matters:
+   *   - **clock rules** (daily/weekly/monthly) recompute the next wall-clock occurrence after now,
+   *     so they are self-correcting;
+   *   - **interval rules** advance by whole intervals from the PREVIOUS `next_fire_at` until past
+   *     now (`advanceFireTime`), which collapses the backlog in one step AND keeps the phase.
+   *
+   * Advancing an interval rule from `nowIso` instead — the sweep instant, always a little after the
+   * scheduled one — looks equivalent and is not: each cycle absorbs that lateness permanently, so
+   * `every 5 minutes` becomes every 5 or 10, drifting without bound. That was a real defect here,
+   * found by review rather than by a test, which is why this paragraph is longer than it looks
+   * like it needs to be.
    */
   async fireDueSchedules(nowIso: string): Promise<{ fired: string[]; skipped: string[] }> {
     const due = this.sql
