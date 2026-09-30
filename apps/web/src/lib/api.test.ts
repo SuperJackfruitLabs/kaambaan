@@ -528,6 +528,31 @@ describe('addLink', () => {
     expect(body.error.code).toBe('LINK_WOULD_CYCLE');
     expect(body.error.message).toContain('cycle');
   });
+
+  /**
+   * Task 17d: `toBoardId` rides the same route — the server decides whether the edge is enforced
+   * (the DO) or advisory (Task 16's D1 store) by comparing it to the path's own board, so the
+   * wrapper's only job is to pass it through when the caller names one.
+   */
+  it('includes toBoardId in the body when a cross-board target is named', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ link: { enforced: false } }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await addLink('brd_1', 'card_a', 'card_b', 'blocks', 'brd_2');
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks', toBoardId: 'brd_2' });
+  });
+
+  it('omits toBoardId from the body when no cross-board target is given', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ link: {} }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await addLink('brd_1', 'card_a', 'card_b', 'blocks');
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks' });
+  });
 });
 
 describe('removeLink', () => {
@@ -541,6 +566,16 @@ describe('removeLink', () => {
     expect(url).toBe('/v1/boards/brd_1/links');
     expect(init?.method).toBe('DELETE');
     expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'parent' });
+  });
+
+  it('includes toBoardId in the body when removing a cross-board edge', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await removeLink('brd_1', 'card_a', 'card_b', 'blocks', 'brd_2');
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: 'card_a', toCardId: 'card_b', kind: 'blocks', toBoardId: 'brd_2' });
   });
 });
 

@@ -80,6 +80,77 @@ describe("supi link add", () => {
   });
 });
 
+/**
+ * Task 17d: `--to-board` rides the same route Task 17a built, defaulting to the path board. When
+ * it names a DIFFERENT board, the edge is advisory (Task 16's D1 store) rather than enforced (the
+ * DO) — and the CLI has to say so BEFORE sending the request, not after, or a person who asked for
+ * a blocker gets one that silently refuses nothing and finds out only from a badge later.
+ *
+ * Non-interactive by design: `supi` is used from scripts as much as a terminal, so the notice is a
+ * printed warning rather than a confirmation prompt that would hang a script with no stdin.
+ */
+describe("supi link add --to-board", () => {
+  it("prints the advisory notice BEFORE the request, for a cross-board target", async () => {
+    const order: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+      order.push(String(chunk));
+      return true;
+    });
+    fetchMock.mockImplementation(async () => {
+      order.push("FETCH");
+      return new Response(JSON.stringify({ link: { enforced: false } }), { status: 201 });
+    });
+
+    await run(["link", "add", "brd_1", "card_a", "card_b", "--kind", "blocks", "--to-board", "brd_2"]);
+
+    const noticeIndex = order.findIndex((line) => /advisory/i.test(line) && /not (be )?enforced/i.test(line));
+    const fetchIndex = order.indexOf("FETCH");
+    expect(noticeIndex, "the notice must be printed at all").toBeGreaterThanOrEqual(0);
+    expect(fetchIndex, "the request must be sent").toBeGreaterThanOrEqual(0);
+    expect(noticeIndex, "and the notice must come BEFORE the request, not after").toBeLessThan(fetchIndex);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://work.example/v1/boards/brd_1/links");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      fromCardId: "card_a",
+      toCardId: "card_b",
+      kind: "blocks",
+      toBoardId: "brd_2",
+    });
+  });
+
+  it("sends toBoardId without printing the advisory notice when it matches the path board", async () => {
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ link: { enforced: true } }), { status: 201 }));
+
+    await run(["link", "add", "brd_1", "card_a", "card_b", "--kind", "blocks", "--to-board", "brd_1"]);
+
+    const printed = writeSpy.mock.calls.map((c) => String(c[0]));
+    expect(printed.some((line) => /advisory/i.test(line))).toBe(false);
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({
+      fromCardId: "card_a",
+      toCardId: "card_b",
+      kind: "blocks",
+      toBoardId: "brd_1",
+    });
+  });
+
+  it("omits toBoardId from the body, and prints no notice, when --to-board is not given", async () => {
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ link: {} }), { status: 201 }));
+
+    await run(["link", "add", "brd_1", "card_a", "card_b", "--kind", "blocks"]);
+
+    const printed = writeSpy.mock.calls.map((c) => String(c[0]));
+    expect(printed.some((line) => /advisory/i.test(line))).toBe(false);
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({ fromCardId: "card_a", toCardId: "card_b", kind: "blocks" });
+  });
+});
+
 describe("supi link rm", () => {
   it("DELETEs fromCardId/toCardId/kind against the board's links route", async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
@@ -95,6 +166,20 @@ describe("supi link rm", () => {
   it("rejects an unknown --kind without sending a request", async () => {
     await expect(run(["link", "rm", "brd_1", "card_a", "card_b", "--kind", "nope"])).rejects.toThrow(ExitSignal);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("carries --to-board through to the DELETE body, for removing a cross-board edge", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+
+    await run(["link", "rm", "brd_1", "card_a", "card_b", "--kind", "blocks", "--to-board", "brd_2"]);
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({
+      fromCardId: "card_a",
+      toCardId: "card_b",
+      kind: "blocks",
+      toBoardId: "brd_2",
+    });
   });
 });
 

@@ -535,18 +535,34 @@ export interface CardLinks {
 }
 
 /**
- * Declare an edge between two cards on THIS board. Returns the raw response, like `setStages`
- * does, so a caller can show the DO's own refusal sentence — `LINK_WOULD_CYCLE` and
- * `ALREADY_HAS_PARENT` each say which cards are involved, and "invalid link" would throw that
- * away.
+ * Declare an edge between two cards. Returns the raw response, like `setStages` does, so a caller
+ * can show the server's own refusal sentence — `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` each
+ * say which cards are involved, and "invalid link" would throw that away.
+ *
+ * `toBoardId` names where `toCardId` lives when it is on another board. Omitted, the edge stays
+ * same-board and enforced (Task 12's DO). Given a board other than `boardId`, the SAME route
+ * (Task 17d) stores it in Task 16's advisory D1 table instead and the response says
+ * `enforced: false` — the server decides the store from this value, never the client.
  */
-export function addLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind): Promise<Response> {
-  return fetch(`/v1/boards/${boardId}/links`, { method: 'POST', headers, body: JSON.stringify({ fromCardId, toCardId, kind }) });
+export function addLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind, toBoardId?: string): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(toBoardId ? { fromCardId, toCardId, kind, toBoardId } : { fromCardId, toCardId, kind }),
+  });
 }
 
-/** Remove a same-board edge. Removing one that is not there is not an error — same as the route it calls. */
-export function removeLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind): Promise<Response> {
-  return fetch(`/v1/boards/${boardId}/links`, { method: 'DELETE', headers, body: JSON.stringify({ fromCardId, toCardId, kind }) });
+/**
+ * Remove an edge. Removing one that is not there is not an error — same as the route it calls.
+ * `toBoardId`, as in `addLink`, routes the removal to the advisory D1 store when it names another
+ * board.
+ */
+export function removeLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind, toBoardId?: string): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, {
+    method: 'DELETE',
+    headers,
+    body: JSON.stringify(toBoardId ? { fromCardId, toCardId, kind, toBoardId } : { fromCardId, toCardId, kind }),
+  });
 }
 
 /** Every edge touching this card: same-board (enforced) and cross-board (advisory), kept apart. */

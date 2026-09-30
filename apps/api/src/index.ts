@@ -36,7 +36,7 @@ import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
-import { listExternalLinksFor } from './db/card-links-external';
+import { listExternalLinksFor, addExternalLink, removeExternalLink } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
@@ -157,6 +157,35 @@ function statusForCode(code: BoardErrorCode): number {
     case 'TOO_MANY_CHILDREN':
     case 'NOTHING_TO_SPLIT':
       return 400;
+  }
+}
+
+/**
+ * Status mapping for Task 16's advisory D1 store (`db/card-links-external.ts`, `addExternalLink`'s
+ * `AddResult['code']`) — a DIFFERENT code space from `BoardErrorCode` above, used in exactly one
+ * place (the `toBoardId` arm of the `…/links` route below). That is why this is a second small
+ * mapping function rather than a violation of "one code, one status": the duplicate-mapping mistake
+ * `statusForCode` itself once made was the SAME code (`NOT_INITIALIZED`) getting two statuses. These
+ * codes are not `BoardErrorCode` at all, so there is no second status for anything already mapped.
+ */
+function statusForExternalLinkCode(code: string): number {
+  switch (code) {
+    case 'FOREIGN_BOARD':
+      // The board exists but belongs to another tenant. 404, not 403 — a 403 would confirm the
+      // board exists, which is a tenant-isolation leak by status code.
+      return 404;
+    case 'PARENT_MUST_BE_SAME_BOARD':
+    case 'SELF_EDGE':
+    case 'BAD_KIND':
+      // The same payload can never succeed; the caller must change it.
+      return 400;
+    case 'SAME_BOARD_EDGE':
+      // Unreachable through this route by construction — the route below sends a same-board edge
+      // to the DO and never to `addExternalLink`. If this ever fires, the routing logic is broken,
+      // not the caller's request, so the status says "our fault" rather than blaming them.
+      return 500;
+    default:
+      return 500;
   }
 }
 
@@ -1399,20 +1428,25 @@ export default {
         return new Response(null, { status: 204 });
       }
 
-      // POST /v1/boards/:id/links — declare a same-board edge · DELETE — remove one (spec §3.4).
+      // POST /v1/boards/:id/links — declare an edge · DELETE — remove one (spec §3.4).
       //
       // Task 12 built `addLink`/`removeLink` on the Durable Object (`board-do.ts:2139-2199`) with
-      // no HTTP surface; this is that surface, for the drawer's "Add blocker" and `supi link`.
-      // Cross-board (advisory) edges have no write route here — Task 16's D1 store
-      // (`db/card-links-external.ts`) is written wherever the drawer's board-picker dialogue
-      // lands (Task 17b), not by this task.
+      // no HTTP surface; Task 17a gave it one, for the drawer's "Add blocker" and `supi link`.
       //
-      // Shape-checked here, not left to the DO: the DO trusts its callers by design, so `kind`
-      // outside the known set is refused as a 400 before it ever reaches `addLink`, rather than
-      // being stored or crashing inside the Durable Object.
+      // Task 17d: the SAME route also carries Task 16's cross-board advisory edges
+      // (`db/card-links-external.ts`), via an optional `toBoardId` alongside `toCardId`. One
+      // route, and the DATA decides the store: `toBoardId` absent, or equal to the path's own
+      // board, stays same-board (the DO, enforced); any other value routes to D1 (advisory, never
+      // read on the claim path). The client names where the other end of the edge lives — it never
+      // picks the store, which is what keeps the enforced/advisory distinction from becoming a lie
+      // a client could tell by choosing wrong.
+      //
+      // Shape-checked here, not left to the DO or the D1 module: both trust their callers by
+      // design, so `kind` outside the known set — and now a malformed `toBoardId` — are refused as
+      // a 400 before either is called, rather than being stored or crashing downstream.
       if (rest === 'links' && (request.method === 'POST' || request.method === 'DELETE')) {
         const body = (await request.json().catch(() => null)) as
-          | { fromCardId?: unknown; toCardId?: unknown; kind?: unknown }
+          | { fromCardId?: unknown; toCardId?: unknown; kind?: unknown; toBoardId?: unknown }
           | null;
         if (!body || typeof body !== 'object') {
           return Response.json({ error: { message: 'Expected a JSON object.' } }, { status: 400 });
@@ -1439,17 +1473,63 @@ export default {
             { status: 400 },
           );
         }
+        if (body.toBoardId !== undefined && (typeof body.toBoardId !== 'string' || body.toBoardId.trim() === '')) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'toBoardId must be a non-empty board id when present' } },
+            { status: 400 },
+          );
+        }
         const kind: LinkKind = body.kind;
         const fromCardId = body.fromCardId;
         const toCardId = body.toCardId;
+        const toBoardId = typeof body.toBoardId === 'string' ? body.toBoardId : boardId;
+
+        if (toBoardId !== boardId) {
+          // Cross-board: Task 16's advisory D1 store. `parent` is refused here rather than handed
+          // to the module: `ExternalLinkKind` excludes it, and — unlike `addExternalLink` —
+          // `removeExternalLink` performs no validation of its own, so a DELETE with kind=parent
+          // would otherwise silently no-op (nothing was ever written under that kind) instead of
+          // saying why such an edge can never exist. Same code and message `addExternalLink` would
+          // give, so POST and DELETE disagree about nothing.
+          if (kind === 'parent') {
+            return Response.json(
+              {
+                error: {
+                  code: 'PARENT_MUST_BE_SAME_BOARD',
+                  message:
+                    "A parent edge carries a rule — a parent does not advance while a child is open — and an advisory containment relationship is one that fails to contain. Use a project to group cards across boards.",
+                },
+              },
+              { status: 400 },
+            );
+          }
+          if (request.method === 'POST') {
+            const result = await addExternalLink(env.DB, tenantId, {
+              from: { boardId, cardId: fromCardId },
+              to: { boardId: toBoardId, cardId: toCardId },
+              kind,
+            });
+            if (!result.ok) return Response.json({ error: result }, { status: statusForExternalLinkCode(result.code) });
+            return Response.json(
+              { link: { fromBoardId: boardId, fromCardId, toBoardId, toCardId, kind, enforced: false as const } },
+              { status: 201 },
+            );
+          }
+          await removeExternalLink(env.DB, tenantId, fromCardId, toCardId, kind);
+          return Response.json({ ok: true, enforced: false as const });
+        }
+
+        // Same-board: Task 12's enforced edge on the DO, unchanged from Task 17a except that the
+        // response now names its own `enforced` boolean too, matching the cross-board arm above so
+        // a caller never has to infer enforcement from whether `toBoardId` was sent.
         if (request.method === 'POST') {
           const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
           if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-          return Response.json({ link: result.value }, { status: 201 });
+          return Response.json({ link: { ...result.value, enforced: true as const } }, { status: 201 });
         }
         const result = await stub.removeLink(fromCardId, toCardId, kind);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-        return Response.json(result.value);
+        return Response.json({ ...result.value, enforced: true as const });
       }
 
       // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
