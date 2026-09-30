@@ -3355,6 +3355,41 @@ A single badge covering both would sometimes lie, and a badge that sometimes lie
 ⚠️ Any new route here carries Phase 1's two lessons: the `resolveHubUser` fallback (or every `supi`
 verb 401s), and route-level shape validation (the Durable Object trusts its callers by design).
 
+- [ ] **Step 1c: Surface "blocked" on the card, from the SAME SQL the claim query uses**
+
+Nothing in `CardView` says whether a card is blocked. Its fields are `parentCardId`, `openChildCount`
+and `costUsdRollup` — a client wanting the badge below would have to call `listLinks` per card and then
+resolve each blocker's state, some of which lives on another board. Step 1's badges and Step 2's
+per-stage count therefore have **no data source** until this exists.
+
+Add to `CardView`:
+
+```ts
+/**
+ * Is this card held back by an unresolved same-board `blocks` edge — the enforced kind?
+ *
+ * Derived from the SAME `blockedWhere()` fragment the claim query uses, never from a second
+ * expression that means the same thing today. A badge computed independently is a badge that will
+ * eventually disagree with the claim query, and the disagreement is invisible: the UI says
+ * "Blocked" while `claim_card` hands the card out, or the reverse. This plan has already had one
+ * claim/discovery divergence from exactly that cause.
+ */
+blockedBy: Array<{ cardId: string; title: string }>;
+```
+
+`blockedBy` rather than a boolean because the tooltip has to name the blocker ("Blocked by *Title*"),
+and a count alone would send the drawer back for another round trip.
+
+**Compute it once per board read, not once per card.** `rowToCard(row, pre?)` already takes a
+precomputed argument for exactly this reason — Task 14 added it because `rowToCard` had grown to five
+extra queries per card. Follow that pattern: one query per board read that returns every unresolved
+blocker edge for the whole board, grouped in memory, then handed to `rowToCard` through `pre`. Do not
+add a per-card query.
+
+Advisory cross-board edges (Task 16) are **not** in `blockedBy` — they block nothing, and putting them
+in a field named `blockedBy` is how a client ends up rendering the enforced badge for an advisory edge.
+They reach the client through the `GET …/links` route's separate advisory channel.
+
 - [ ] **Step 2: The blocked count per stage**
 
 Because a blocked card is *excluded* rather than refused, an agent reports "no work" and a human sees cards sitting in a column doing nothing. The stage header must show `3 blocked` or the board looks broken. **This is not optional polish** — it is the only place the exclusion is ever explained.
