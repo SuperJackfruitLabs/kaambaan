@@ -3307,9 +3307,21 @@ git commit -m "feat(links): advisory cross-board edges, refused for same-board a
   | `DELETE /v1/boards/:boardId/links` | same body → `removeLink` |
   | `GET    /v1/boards/:boardId/cards/:cardId/links` | → `listLinks`, merged with Task 16's advisory rows |
 
-  Map the DO's refusals to status codes rather than letting them fall through as 500s:
-  `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` → **409**, `CARD_NOT_FOUND` → **404**,
-  an unknown `kind` → **400**. The archive surface needs no new route — `PATCH` already validates
+  Map the DO's refusals to status codes rather than letting them fall through as 500s. These are the
+  codes `addLink` / `removeLink` actually return — read off `board-do.ts:2139-2199`, not guessed:
+
+  | code | status |
+  |---|---|
+  | `LINK_WOULD_CYCLE` | **409** |
+  | `ALREADY_HAS_PARENT` | **409** |
+  | `NO_SUCH_CARD` | **404** |
+  | `NOT_INITIALIZED` | **409** — the board exists but has no stages yet |
+  | an unknown `kind` at the route | **400**, refused before the DO is called |
+
+  An earlier draft of this table said `CARD_NOT_FOUND`. No such code exists; the DO says
+  `NO_SUCH_CARD`, and it omitted `NOT_INITIALIZED` entirely. Both would have fallen through to a 500.
+  `LinkKind` is `'blocks' | 'relates' | 'parent'` and `LinkInput` is
+  `{fromCardId, toCardId, kind, createdBy?}` (`links.ts:5`, `board-do.ts:676-681`). The archive surface needs no new route — `PATCH` already validates
   `archivedAt` (`index.ts:1325-1342`).
 
 - Modify: `apps/web/src/lib/api.ts` — `addLink`, `removeLink`, `listLinks` and `archiveCard`
