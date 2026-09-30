@@ -384,6 +384,60 @@ describe('CardView.blockedBy', () => {
     });
   });
 
+  /**
+   * The test above only exercises `rowToCard`'s single-card fallback (`blockersOf`) on an
+   * UNBLOCKED card — `claim` can never return a blocked one, by construction. That leaves the
+   * fallback's actual claim — "same predicate as the batched path" — unverified on the one shape
+   * that matters: a card that IS blocked. `getCardView` (`board-do.ts:1782`) is the public RPC the
+   * drawer's `GET /v1/boards/:id/cards/:cardId` route calls, and it goes straight through
+   * `getCard` → `rowToCard(row)` with no `pre` — the exact non-batched path 17b's card drawer will
+   * read from. "Correct by inspection, same predicate" is exactly the reasoning that let the
+   * claim/discovery divergence into this plan once before; asserting the two paths agree on one
+   * fixture is what actually proves it, and is what would break if a later edit touched one query
+   * and not the other.
+   */
+  it('the single-card read (getCardView, the drawer\'s path) agrees with the batched read on a BLOCKED card', async () => {
+    await runInDurableObject(stubFor('blockedby-single-blocked'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'bbsingleblocked');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+
+      const single = await board.getCardView(b.id);
+      if (!single.ok) throw new Error('expected getCardView to find b');
+      expect(single.value.blockedBy).toEqual([{ cardId: a.id, title: 'Blocker' }]);
+
+      const batched = (await board.getState()).cards.find((c) => c.id === b.id)!;
+      expect(single.value.blockedBy).toEqual(batched.blockedBy);
+    });
+  });
+
+  it('the single-card read also honours a `rejected` blocker — not just the batched read', async () => {
+    await runInDurableObject(stubFor('blockedby-single-rejected'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_bbsr', tenantId: 'tnt_a', name: 'BBSR', stages: GATED_STAGES });
+      const aR = await board.createCard({ title: 'Blocker', ownerUserId: 'usr_a' });
+      const bR = await board.createCard({ title: 'Blocked', ownerUserId: 'usr_a' });
+      if (!aR.ok || !bR.ok) throw new Error('setup failed');
+      const a = aR.value;
+      const b = bR.value;
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+
+      const c = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c.claimed || c.card.id !== a.id) throw new Error('expected a to be claimed first (b is blocked)');
+      await board.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'drafted' } });
+      const gates = (await board.getState()).gates.filter((g) => g.cardId === a.id && g.status === 'pending');
+      if (gates.length !== 1) throw new Error(`expected one pending gate on a, got ${gates.length}`);
+      const resolved = await board.resolveGate({ gateId: gates[0]!.id, decision: 'reject', decidedBy: 'usr_reviewer' });
+      if (!resolved.ok) throw new Error('resolveGate should not itself be refused');
+      expect(resolved.value.state).toBe('rejected');
+
+      const single = await board.getCardView(b.id);
+      if (!single.ok) throw new Error('expected getCardView to find b');
+      expect(single.value.blockedBy).toEqual([{ cardId: a.id, title: 'Blocker' }]);
+
+      const batched = (await board.getState()).cards.find((cd) => cd.id === b.id)!;
+      expect(single.value.blockedBy).toEqual(batched.blockedBy);
+    });
+  });
+
   it('is computed once per board read, not once per card (the batched path does not regress to N+1)', async () => {
     // A straight count of every `sql.exec` call during `getState()` is NOT usable here: rowToCard
     // already runs one unrelated per-card `SELECT v FROM meta …` (the budget-cap read), a
