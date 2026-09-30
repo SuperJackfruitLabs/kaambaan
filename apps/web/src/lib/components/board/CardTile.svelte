@@ -6,6 +6,7 @@
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { cardDraggable } from '$lib/dnd';
   import { Button } from '$lib/components/ui/button';
+  import { overdue } from './card-due';
 
   interface Props {
     card: Card;
@@ -95,19 +96,22 @@
     card.delegateAgentId ? initialOf(card.delegateAgentId).toUpperCase() : null,
   );
 
-  // Labels from spec
-  const labels = $derived(
-    Array.isArray(card.spec?.labels) ? (card.spec.labels as string[]) : [],
-  );
+  /**
+   * At most three chips plus "+N" — a tile is scanned, not read. An id with no catalogue entry
+   * (deleted since it was applied — Task 4's permissive deletion) renders nothing rather than a
+   * blank or broken chip.
+   */
+  const labelChips = $derived.by(() => {
+    const byId = app.labelById();
+    return card.labels.map((id) => byId.get(id)).filter((l): l is { name: string; colour: string } => l !== undefined);
+  });
+  const visibleLabelChips = $derived(labelChips.slice(0, 3));
+  const extraLabelCount = $derived(Math.max(0, labelChips.length - 3));
 
-  // Due date from spec. Overdue is a state worth showing: a date rendered in the same grey as
-  // everything else says when, and never says "and that has passed".
-  const due = $derived(
-    typeof card.spec?.due === 'string' ? card.spec.due : null,
-  );
-  const overdue = $derived(
-    due !== null && card.state !== 'completed' && new Date(`${due}T23:59:59`).getTime() < Date.now(),
-  );
+  // Due date is `dueAt`, its own column — not `spec.due`. Overdue is a state worth showing: a date
+  // rendered in the same grey as everything else says when, and never says "and that has passed".
+  const today = new Date().toISOString().slice(0, 10);
+  const isOverdue = $derived(overdue(card.dueAt, card.state, today));
 
   function handleClick() {
     app.openCard(card.id);
@@ -245,11 +249,14 @@
   </div>
 
   <!-- labels -->
-  {#if labels.length > 0}
+  {#if labelChips.length > 0}
     <div class="mb-2 flex flex-wrap gap-1">
-      {#each labels as lbl (lbl)}
-        <span class="lbl-pill">{lbl}</span>
+      {#each visibleLabelChips as lbl (lbl.name)}
+        <span class="lbl-pill" style="border-color:{lbl.colour}; color:{lbl.colour}">{lbl.name}</span>
       {/each}
+      {#if extraLabelCount > 0}
+        <span class="lbl-pill" title="{extraLabelCount} more label{extraLabelCount === 1 ? '' : 's'}">+{extraLabelCount}</span>
+      {/if}
     </div>
   {/if}
 
@@ -308,8 +315,8 @@
     {/if}
 
     <!-- due -->
-    {#if due}
-      <span class={overdue ? 'text-coral' : ''} title={overdue ? `Due ${due} — overdue` : `Due ${due}`}>· {due}{overdue ? ' ⚠' : ''}</span>
+    {#if card.dueAt}
+      <span class={isOverdue ? 'text-coral' : ''} title={isOverdue ? `Due ${card.dueAt} — overdue` : `Due ${card.dueAt}`}>· {card.dueAt}{isOverdue ? ' ⚠' : ''}</span>
     {/if}
 
   </div>

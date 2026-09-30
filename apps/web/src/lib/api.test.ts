@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -308,6 +308,61 @@ describe('issueAgentToken', () => {
     const [, init] = fetchSpy.mock.calls[0]!;
     expect(JSON.parse(init?.body as string)).toEqual({ scopes: ['run'] });
     expect(minted.scopes).toEqual(['run']);
+  });
+});
+
+/**
+ * `createCard` gaining `dueAt` (Task 6, Step 0b): the compose form can now set a due date at
+ * creation instead of create-then-patch, so a failure between the two round trips can no longer
+ * silently drop the date.
+ */
+describe('createCard', () => {
+  // `createCard` sends its request through `withAuthority`, which itself asks `/hub/token` (and,
+  // on a deployment with no back-end hand-off, the hub directly) before the real POST — so the
+  // call under test is not necessarily `fetchSpy.mock.calls[0]`. Answering everything that is not
+  // the cards route with a plain 404 keeps `hubToken()` on its "no authority" path without a
+  // second fetch, and picking the call by URL is robust to how many precede it.
+  function stubFetch() {
+    const spy = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (String(url).includes('/cards')) return new Response(JSON.stringify({ card: {} }), { status: 201 });
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', spy);
+    return spy;
+  }
+
+  it('sends dueAt in the body when given', async () => {
+    const fetchSpy = stubFetch();
+
+    await createCard('brd_1', 'A card', { dueAt: '2026-12-01' });
+
+    const call = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/cards'))!;
+    expect(JSON.parse(call[1]?.body as string)).toMatchObject({ dueAt: '2026-12-01' });
+  });
+
+  it('omits dueAt entirely when not given — a one-line dispatch stays exactly that', async () => {
+    const fetchSpy = stubFetch();
+
+    await createCard('brd_1', 'A card');
+
+    const call = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/cards'))!;
+    expect(JSON.parse(call[1]?.body as string)).not.toHaveProperty('dueAt');
+  });
+});
+
+describe('listLabels', () => {
+  it('reads the tenant label catalogue', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ labels: [{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }] }), { status: 200 })),
+    );
+
+    expect(await listLabels()).toEqual([{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }]);
+  });
+
+  it('answers an empty list rather than throwing when the read is refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+    expect(await listLabels()).toEqual([]);
   });
 });
 

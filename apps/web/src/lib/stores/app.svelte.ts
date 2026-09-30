@@ -31,7 +31,10 @@ import {
   type AgentSummary,
   getMembers,
   type Member,
+  listLabels,
+  type Label,
 } from '$lib/api';
+import { passesArchivedFilter } from './card-filters';
 
 const BOARD_KEY = 'superpipeline.boardId';
 const THEME_KEY = 'superpipeline.theme';
@@ -46,6 +49,10 @@ export interface CardFilters {
   needsReview: boolean;
   live: boolean;
   overBudget: boolean;
+  /** A card matches only when it carries EVERY selected label — narrowing is what a filter is for. */
+  labels: string[];
+  /** Archived cards are hidden by default; this is the one way back in. */
+  showArchived: boolean;
 }
 
 class AppStore {
@@ -86,12 +93,26 @@ class AppStore {
    * same complaint as printing an agent id.
    */
   members = $state<Member[]>([]);
+  /**
+   * The tenant's label catalogue (migration 0010), fetched once per board open rather than per
+   * card or per render — a tile only ever needs to look an id up in it.
+   */
+  labels = $state<Label[]>([]);
 
   // navigation + view
   theme = $state<Theme>('dark');
   view = $state<View>('board');
   listGroupBy = $state<ListGroupBy>('stage');
-  filters = $state<CardFilters>({ states: [], owners: [], minPriority: null, needsReview: false, live: false, overBudget: false });
+  filters = $state<CardFilters>({
+    states: [],
+    owners: [],
+    minPriority: null,
+    needsReview: false,
+    live: false,
+    overBudget: false,
+    labels: [],
+    showArchived: false,
+  });
 
   // overlays
   openCardId = $state<string | null>(null);
@@ -132,6 +153,10 @@ class AppStore {
   boardOwners(): string[] {
     return this.board ? [...new Set(this.board.cards.map((c) => c.ownerUserId))].sort() : [];
   }
+  /** id → {name, colour}, for a tile or filter that only knows a card's label ids. */
+  labelById(): Map<string, { name: string; colour: string }> {
+    return new Map(this.labels.map((l) => [l.id, { name: l.name, colour: l.colour }]));
+  }
   filteredCards(): Card[] {
     const b = this.board;
     if (!b) return [];
@@ -144,6 +169,8 @@ class AppStore {
         return false;
       if (f.live && c.state !== 'working') return false;
       if (f.overBudget && !c.overBudget) return false;
+      if (!passesArchivedFilter(f.showArchived, c.archivedAt)) return false;
+      if (f.labels.length > 0 && !f.labels.every((l) => c.labels.includes(l))) return false;
       return true;
     });
   }
@@ -269,11 +296,12 @@ class AppStore {
     localStorage.setItem(BOARD_KEY, id);
     await this.refresh();
     await this.loadBoards();
-    // Both are best-effort and independent: a workspace where one read is refused should still
-    // resolve the other rather than fall back to ids for everything.
-    const [agents, members] = await Promise.allSettled([getAgents(), getMembers()]);
+    // Best-effort and independent: a workspace where one read is refused should still resolve the
+    // others rather than fall back to ids for everything.
+    const [agents, members, labels] = await Promise.allSettled([getAgents(), getMembers(), listLabels()]);
     this.agents = agents.status === 'fulfilled' ? agents.value : [];
     this.members = members.status === 'fulfilled' ? members.value : [];
+    this.labels = labels.status === 'fulfilled' ? labels.value : [];
     this.#connect(id);
   }
 
@@ -352,6 +380,19 @@ class AppStore {
     } catch (e) {
       this.error = String(e);
     }
+    // Best-effort, same as openBoard: the label catalogue used to load ONLY there, so a label
+    // created (or renamed) after board load never updated `app.labels` — the drawer's editor then
+    // resolved a stale catalogue against a fresher card and could silently wipe labels off a card
+    // it could no longer see (finding 2, phase-1 fix wave). `refresh()` runs after every save
+    // (including the one that just created a label) and on every live-feed event, so this keeps
+    // the catalogue as current as the board itself. A failed reload here must not fail the whole
+    // refresh — `resolveCardLabelsForEdit`'s `blind` guard is what protects a save when the
+    // catalogue genuinely cannot be trusted.
+    try {
+      this.labels = await listLabels();
+    } catch {
+      /* stale catalogue is recoverable; failing refresh entirely is not */
+    }
   }
 
   /**
@@ -367,10 +408,12 @@ class AppStore {
     try {
       const spec: Record<string, unknown> = {};
       if (detail?.description && detail.description.trim() !== '') spec.description = detail.description.trim();
-      if (detail?.due && detail.due.trim() !== '') spec.due = detail.due.trim();
+      // The due date is `dueAt`, a first-class field on `createCard` — never `spec.due`. Two
+      // sources of truth for one date is the condition the `due_at` column exists to end.
       await createCard(this.boardId, title.trim(), {
         priority: detail?.priority,
         spec: Object.keys(spec).length > 0 ? spec : undefined,
+        dueAt: detail?.due && detail.due.trim() !== '' ? detail.due.trim() : undefined,
       });
       await this.refresh();
     } catch (e) {

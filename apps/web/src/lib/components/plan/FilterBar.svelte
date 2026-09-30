@@ -14,6 +14,8 @@
   const f = $derived(app.filters);
   const states = $derived(app.boardStates());
   const owners = $derived(app.boardOwners());
+  const labelCatalogue = $derived(app.labels);
+  const labelById = $derived(app.labelById());
 
   /** One chip per active filter, each knowing how to switch itself off. */
   const active = $derived([
@@ -23,6 +25,12 @@
     ...(f.needsReview ? [{ key: 'rev', label: 'needs review', clear: () => (app.filters.needsReview = false) }] : []),
     ...(f.live ? [{ key: 'live', label: 'working', clear: () => (app.filters.live = false) }] : []),
     ...(f.overBudget ? [{ key: 'bud', label: 'over budget', clear: () => (app.filters.overBudget = false) }] : []),
+    ...f.labels.map((id) => ({
+      key: `lbl:${id}`,
+      label: labelById.get(id)?.name ?? id,
+      clear: () => (app.filters.labels = f.labels.filter((x) => x !== id)),
+    })),
+    ...(f.showArchived ? [{ key: 'arch', label: 'archived', clear: () => (app.filters.showArchived = false) }] : []),
   ]);
 
   function toggle<T>(list: T[], v: T): T[] {
@@ -51,7 +59,7 @@
     {/each}
     {#if active.length > 1}
       <button
-        onclick={() => (app.filters = { states: [], owners: [], minPriority: null, needsReview: false, live: false, overBudget: false })}
+        onclick={() => (app.filters = { states: [], owners: [], minPriority: null, needsReview: false, live: false, overBudget: false, labels: [], showArchived: false })}
         class="text-muted-foreground hover:text-foreground mono text-[10px] underline underline-offset-2"
         style="min-height:var(--tap)"
       >clear all</button>
@@ -78,6 +86,17 @@
         {/each}
       </div>
 
+      {#if labelCatalogue.length > 0}
+        <div class="eyebrow mt-3 mb-1.5">labels</div>
+        <div class="flex flex-wrap gap-1">
+          {#each labelCatalogue as l (l.id)}
+            <button onclick={() => (app.filters.labels = toggle(f.labels, l.id))} aria-pressed={f.labels.includes(l.id)}
+              class="mono rounded-[5px] border px-1.5 text-[10px] {f.labels.includes(l.id) ? 'border-marigold text-marigold' : 'border-border text-muted-foreground'}"
+              style="min-height:var(--tap)">{l.name}</button>
+          {/each}
+        </div>
+      {/if}
+
       <label class="text-muted-foreground mono mt-3 flex items-center gap-2 text-[11px]">
         min priority
         <input type="number" min="0" value={f.minPriority ?? ''} placeholder="—"
@@ -85,10 +104,10 @@
           class="bg-inset border-border focus:border-marigold w-14 rounded-[5px] border px-1.5 py-1" />
       </label>
 
-      {#each [['needsReview', 'needs review'], ['live', 'an agent is working it'], ['overBudget', 'over budget']] as [key, label] (key)}
+      {#each [['needsReview', 'needs review'], ['live', 'an agent is working it'], ['overBudget', 'over budget'], ['showArchived', 'show archived']] as [key, label] (key)}
         <label class="text-muted-foreground mt-2 flex items-center gap-2 text-[11px]">
-          <input type="checkbox" class="accent-marigold" checked={f[key as 'needsReview' | 'live' | 'overBudget']}
-            onchange={(e) => (app.filters[key as 'needsReview' | 'live' | 'overBudget'] = e.currentTarget.checked)} />
+          <input type="checkbox" class="accent-marigold" checked={f[key as 'needsReview' | 'live' | 'overBudget' | 'showArchived']}
+            onchange={(e) => (app.filters[key as 'needsReview' | 'live' | 'overBudget' | 'showArchived'] = e.currentTarget.checked)} />
           {label}
         </label>
       {/each}

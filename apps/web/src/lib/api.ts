@@ -103,6 +103,19 @@ export interface Card {
   overBudget: boolean;
   attemptCount: number;
   delegateAgentId?: string | null;
+  /** Applied label ids; the catalogue itself is fetched separately (`listLabels`). */
+  labels: string[];
+  dueAt: string | null;
+  archivedAt: string | null;
+}
+
+/** One entry in the tenant's label catalogue (migration 0010). */
+export interface Label {
+  id: string;
+  tenantId: string;
+  name: string;
+  colour: string;
+  createdAt: string;
 }
 
 export interface Attempt {
@@ -309,14 +322,19 @@ export async function getBoard(boardId: string): Promise<BoardSnapshot> {
 export async function createCard(
   boardId: string,
   title: string,
-  detail?: { priority?: number; spec?: Record<string, unknown> },
+  detail?: { priority?: number; spec?: Record<string, unknown>; dueAt?: string },
 ): Promise<void> {
   const res = await fetch(`/v1/boards/${boardId}/cards`, {
     method: 'POST',
     headers: await withAuthority(headers),
-    // Owner is the signed-in user, set by the server. Priority and spec are sent only when given,
-    // so a one-line dispatch produces exactly the request it always did.
-    body: JSON.stringify({ title, ...(detail?.priority !== undefined ? { priority: detail.priority } : {}), ...(detail?.spec ? { spec: detail.spec } : {}) }),
+    // Owner is the signed-in user, set by the server. Priority, spec and dueAt are sent only when
+    // given, so a one-line dispatch produces exactly the request it always did.
+    body: JSON.stringify({
+      title,
+      ...(detail?.priority !== undefined ? { priority: detail.priority } : {}),
+      ...(detail?.spec ? { spec: detail.spec } : {}),
+      ...(detail?.dueAt !== undefined ? { dueAt: detail.dueAt } : {}),
+    }),
   });
   if (!res.ok) throw new Error(`createCard failed (${res.status})`);
 }
@@ -330,7 +348,21 @@ export async function createCard(
 export function updateCard(
   boardId: string,
   cardId: string,
-  patch: { title?: string; spec?: Record<string, unknown>; priority?: number; ownerUserId?: string },
+  patch: {
+    title?: string;
+    spec?: Record<string, unknown>;
+    priority?: number;
+    ownerUserId?: string;
+    labels?: string[];
+    /**
+     * The comma-separated names `CardDrawer`'s Labels input parses — resolved to catalogue ids
+     * server-side (`resolveLabelNames`), which creates a name that does not exist yet rather than
+     * refusing it. Sent instead of `labels`, never alongside it.
+     */
+    labelNames?: string[];
+    dueAt?: string | null;
+    archivedAt?: string | null;
+  },
 ): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
 }
@@ -787,6 +819,25 @@ export function updateCapability(
 
 export function deleteCapability(id: string): Promise<Response> {
   return fetch(`/v1/capabilities/${id}`, { method: 'DELETE', headers });
+}
+
+/** The tenant's label catalogue (migration 0010). Tenant-scoped, not board-scoped — see `/v1/labels`. */
+export async function listLabels(): Promise<Label[]> {
+  const res = await fetch('/v1/labels', { headers });
+  if (!res.ok) return [];
+  return ((await res.json()) as { labels: Label[] }).labels;
+}
+
+export function createLabel(input: { name: string; colour: string }): Promise<Response> {
+  return fetch('/v1/labels', { method: 'POST', headers, body: JSON.stringify(input) });
+}
+
+export function updateLabel(id: string, patch: { name?: string; colour?: string }): Promise<Response> {
+  return fetch(`/v1/labels/${id}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });
+}
+
+export function deleteLabel(id: string): Promise<Response> {
+  return fetch(`/v1/labels/${id}`, { method: 'DELETE', headers });
 }
 
 /** This workspace, and the hub fleet it is linked to (or null for a standalone board). */

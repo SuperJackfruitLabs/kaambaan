@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 /**
  * What a stage may require of a run before the board believes it finished.
  *
@@ -18,19 +20,28 @@
  * real property of it.
  */
 
-export interface CompletionRequirement {
-  /** Keys the handoff must carry, each present and non-blank. */
-  handoff?: string[];
-  /** A reference of this shape must exist on the card. */
-  reference?: { provider?: string; sourceType?: string };
-  /**
-   * The handoff key naming a URL that must answer — slice 3 of the design.
-   *
-   * Declared here so the shape is stable and so a board configuring it today gets an honest
-   * "not checked, and here is why" rather than a silent pass.
-   */
-  live?: string;
-}
+export const CompletionRequirement = z
+  .object({
+    /** Keys the handoff must carry, each present and non-blank. */
+    handoff: z.array(z.string()).optional(),
+    /** A reference of this shape must exist on the card. */
+    reference: z
+      .object({
+        provider: z.string().optional(),
+        sourceType: z.string().optional(),
+      })
+      .optional(),
+    /**
+     * The handoff key naming a URL that must answer — slice 3 of the design.
+     *
+     * Declared here so the shape is stable and so a board configuring it today gets an honest
+     * "not checked, and here is why" rather than a silent pass.
+     */
+    live: z.string().optional(),
+  })
+  .strict();
+
+export interface CompletionRequirement extends z.infer<typeof CompletionRequirement> {}
 
 export interface CompletionEvidence {
   handoff: unknown;

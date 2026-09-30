@@ -62,8 +62,29 @@ import {
   listImplications,
   removeImplication,
 } from './db/implications';
+import {
+  listLabels,
+  createLabel,
+  updateLabel,
+  deleteLabel,
+  unknownLabelIds,
+  resolveLabelNames,
+  isLabelNameCollision,
+} from './db/labels';
 
 export { BoardDO };
+
+const DUE_AT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * `due_at` drives claim order and the overdue cron sweep on a board that runs unattended
+ * (board-do.ts `claimableWhere`/`sweepBoard`), so garbage here does not fail loudly at write time
+ * — it silently misorders or mis-fires later. Only a bare date (the column's own shape) or `null`
+ * is accepted. Shared by the card PATCH route and `createCard` so there is exactly one rule.
+ */
+function isInvalidDueAt(value: unknown): boolean {
+  return value !== undefined && value !== null && (typeof value !== 'string' || !DUE_AT_RE.test(value));
+}
 
 function statusForCode(code: BoardErrorCode): number {
   switch (code) {
@@ -570,6 +591,97 @@ export default {
             return Response.json({ error: `${cap.key} is still used by ${who}`, usage: used }, { status: 409 });
           }
           await deleteCapability(env.DB, u.tenantId, capId);
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
+    // /v1/labels[/:id] — the tenant's label catalogue (migration 0010).
+    //
+    // `Card.labels` has named this since the contract's Card schema existed, with no table and no
+    // route behind it (docs/01). The catalogue is tenant-scoped, not board-scoped, because a label
+    // that means one thing on one board and another on a second is not a label. What a card carries
+    // is validated and stored separately, on the `PATCH /v1/boards/:id/cards/:cardId` route below.
+    const labelsMatch = path.match(/^\/v1\/labels(?:\/([^/]+))?$/);
+    if (labelsMatch) {
+      try {
+        // The CLI's `supi label list|add|rm` send a hub JWT (Authorization: Bearer), never a
+        // session cookie — `resolveUser` alone can't read it. Unconditional on method, unlike the
+        // GET-only fallback on `/v1/capabilities`: those verbs are CLI-reachable too, and
+        // `refuseByRole(u, 'manage')` below is what actually gates the writes, exactly as it
+        // already gates a session-authenticated write.
+        let u = await resolveUser(request, env);
+        if (!u) u = await resolveHubUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const labelId = labelsMatch[1];
+
+        if (request.method === 'GET' && !labelId) {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ labels: await listLabels(env.DB, u.tenantId) });
+        }
+
+        // Defining the workspace's labels is the same class of act as managing its capabilities.
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !labelId) {
+          const body = (await request.json()) as { name?: string; colour?: string };
+          const name = body.name?.trim() ?? '';
+          if (name === '') {
+            return Response.json({ error: 'name is required' }, { status: 400 });
+          }
+          if (!body.colour || body.colour.trim() === '') {
+            return Response.json({ error: 'colour is required' }, { status: 400 });
+          }
+          try {
+            const made = await createLabel(env.DB, u.tenantId, { name, colour: body.colour });
+            return Response.json({ label: made }, { status: 201 });
+          } catch (err) {
+            // Narrowed to the exact UNIQUE(tenant_id, name) collision — anything else (a transient
+            // D1 error, whatever) rethrows to the outer `unexpected(err)` handler rather than being
+            // mislabelled as a name collision and having the real error discarded.
+            if (!isLabelNameCollision(err)) throw err;
+            // Read as a sentence rather than a raw SQLite constraint error, and against the
+            // trimmed name actually attempted — the same treatment `/v1/capabilities` gives its
+            // own collision.
+            return Response.json({ error: `a label named "${name}" already exists in this workspace` }, { status: 409 });
+          }
+        }
+
+        if (labelId && request.method === 'PATCH') {
+          const body = (await request.json()) as { name?: string; colour?: string };
+          // Same type guard as POST: a non-string or empty `name` must not reach `.trim()` in
+          // `db/labels.ts` (a bare throw there, caught by neither branch below) or `updateLabel`'s
+          // own `throw` on an empty trimmed name — both currently 500 instead of 400.
+          if (body.name !== undefined) {
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            if (name === '') {
+              return Response.json({ error: 'name is required' }, { status: 400 });
+            }
+          }
+          try {
+            const updated = await updateLabel(env.DB, u.tenantId, labelId, body);
+            if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
+            return Response.json({ label: updated });
+          } catch (err) {
+            // Same narrowed collision catch as POST — renaming onto an existing name (including a
+            // case variant, which migration 0011's index makes collide) is a clean 409, not a raw
+            // constraint failure surfaced as a 500.
+            if (!isLabelNameCollision(err)) throw err;
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            return Response.json({ error: `a label named "${name}" already exists in this workspace` }, { status: 409 });
+          }
+        }
+
+        if (labelId && request.method === 'DELETE') {
+          if (!(await deleteLabel(env.DB, u.tenantId, labelId))) {
+            return Response.json({ error: 'label not found' }, { status: 404 });
+          }
           return new Response(null, { status: 204 });
         }
 
@@ -1122,7 +1234,14 @@ export default {
           ownerUserId?: string;
           spec?: JsonValue;
           priority?: number;
+          dueAt?: string;
         };
+        if (isInvalidDueAt(body.dueAt)) {
+          return Response.json(
+            { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
+            { status: 400 },
+          );
+        }
         // The authority that accompanied the act, recorded with the card. A
         // session-cookie caller carries none, and `undefined` there means "no
         // one with permission asked for this to run" — which is refused under
@@ -1167,9 +1286,76 @@ export default {
         return Response.json({ card: result.value });
       }
       if (cardMatch && request.method === 'PATCH') {
-        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string };
+        const body = (await request.json()) as {
+          title?: string;
+          spec?: JsonValue;
+          priority?: number;
+          ownerUserId?: string;
+          labels?: string[];
+          /**
+           * The free-text names `CardDrawer.svelte`'s comma-separated Labels input sends —
+           * resolved to catalogue ids here rather than in the client, since the resolver both
+           * reads and writes D1 (`resolveLabelNames`, `src/db/labels.ts`). A name not yet in the
+           * catalogue is created with `origin: 'inferred'` (migration 0011), the same treatment
+           * `capabilities` gives a tag "registered on first use". Sent instead of `labels`, never
+           * alongside it — the drawer is the one caller, and it only ever has names.
+           */
+          labelNames?: string[];
+          dueAt?: string | null;
+          archivedAt?: string | null;
+        };
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
+        }
+        if (isInvalidDueAt(body.dueAt)) {
+          return Response.json(
+            { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
+            { status: 400 },
+          );
+        }
+        if (
+          body.archivedAt !== undefined &&
+          body.archivedAt !== null &&
+          (typeof body.archivedAt !== 'string' || Number.isNaN(Date.parse(body.archivedAt)))
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_ARCHIVED_AT', message: 'archivedAt must be null or an ISO timestamp' } },
+            { status: 400 },
+          );
+        }
+        if (body.labelNames !== undefined) {
+          if (!Array.isArray(body.labelNames) || body.labelNames.some((n) => typeof n !== 'string')) {
+            return Response.json(
+              { error: { code: 'INVALID_LABELS', message: 'labelNames must be an array of strings' } },
+              { status: 400 },
+            );
+          }
+          // Resolved BEFORE the unknown-id check below, so a freshly created id still passes it —
+          // it was just inserted into the same tenant's catalogue this request resolved against.
+          body.labels = await resolveLabelNames(env.DB, tenantId, body.labelNames, user?.userId ?? null);
+        }
+
+        // The DO does not validate label ids — it cannot reach D1 usefully on a hot path — so the
+        // route checks here, before the write lands, that every id names a real label in this
+        // workspace's catalogue.
+        if (body.labels !== undefined) {
+          // The type guard is not decoration. Without it, `labels: "urgent"` skips this whole check
+          // and reaches `[...new Set(patch.labels)]` in the DO, where a string is iterable and spreads
+          // into ['u','r','g','e','n','t'] — written to storage, no error raised. A plain object
+          // throws an unhandled TypeError inside the DO instead. Neither answers 400.
+          if (!Array.isArray(body.labels) || body.labels.some((l) => typeof l !== 'string')) {
+            return Response.json(
+              { error: { code: 'INVALID_LABELS', message: 'labels must be an array of label ids' } },
+              { status: 400 },
+            );
+          }
+          const unknown = await unknownLabelIds(env.DB, tenantId, body.labels as string[]);
+          if (unknown.length > 0) {
+            return Response.json(
+              { error: { code: 'UNKNOWN_LABEL', message: `no such label in this workspace: ${unknown.join(', ')}` } },
+              { status: 400 },
+            );
+          }
         }
         const result = await stub.updateCard(cardMatch[1]!, body);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
@@ -1603,6 +1789,14 @@ export default {
             await boardStub(env, board.tenantId, board.id).dispatchPushDeliveries();
           } catch {
             /* one board's failure is not the sweep's */
+          }
+          try {
+            await boardStub(env, board.tenantId, board.id).sweepBoard(new Date().toISOString());
+          } catch (err) {
+            // A failing sweep on one board must not stop the rest of the loop — but swallowing it
+            // silently meant a board failing every five-minute tick, forever, left no trace
+            // anywhere. Logged, not rethrown: the loop still continues to the next board.
+            console.error(`sweepBoard failed for board ${board.id}`, err);
           }
         }
       })(),

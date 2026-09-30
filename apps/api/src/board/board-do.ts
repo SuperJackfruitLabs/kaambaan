@@ -13,9 +13,32 @@ import { estimateCostUsd } from '../metering/pricing';
 import { parseWindowMs } from '../metering/window';
 import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
+import { resolveLabelNames } from '../db/labels';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * Strip the pre-migration keys `spec.due` and `spec.labels` from a spec, once the once-per-board
+ * backfill has already run.
+ *
+ * `backfillDueDates`/`backfillLabelNames` move these onto `due_at`/`labels` exactly once per
+ * board (`dueBackfillDone`), and BEFORE that pass a card legitimately carries them — that is what
+ * the backfill exists to find. Nothing stopped a caller — an API or MCP client posting raw `spec`
+ * JSON, or `CardDrawer.saveCard`'s `...card.spec` spread carrying a stale key forward — from
+ * writing `spec.due`/`spec.labels` again AFTER that pass, and the backfill's own guard
+ * (`WHERE due_at IS NULL`) then skips that card forever: the same save that writes the stale spec
+ * key also writes `due_at` directly, so the key is not "cleared at the next tick" — it is
+ * permanent. Stripped here (once the guard says there is nothing left to migrate) rather than
+ * refused with a 400: a 400 would break saving any card that still carries a stale key for an
+ * unrelated reason, whereas stripping is self-healing and closes a door the backfill cannot reach.
+ */
+function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined {
+  if (spec === undefined || spec === null || typeof spec !== 'object' || Array.isArray(spec)) return spec;
+  if (!('due' in spec) && !('labels' in spec)) return spec;
+  const { due: _due, labels: _labels, ...rest } = spec;
+  return rest;
+}
 
 /** How long an agent may go without a heartbeat before its run is reclaimed (docs/08 §3, ⚠️ OPEN). */
 const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -270,6 +293,11 @@ export interface CardView {
   queuedBy: string | null;
   /** What the queuer was permitted to dispatch, as granted when they queued it. */
   queuedGrant: string[] | null;
+  /** Applied label ids; the catalogue lives in D1 (`src/db/labels.ts`). */
+  labels: string[];
+  /** ISO date (no time), or null. */
+  dueAt: string | null;
+  archivedAt: string | null;
   currentStageKey: string;
   state: TaskState;
   delegateAgentId: string | null;
@@ -640,6 +668,7 @@ export interface BoardStub {
     ownerUserId: string;
     spec?: JsonValue;
     priority?: number;
+    dueAt?: string;
   }): Promise<Result<CardView>>;
   moveCard(
     cardId: string,
@@ -650,7 +679,10 @@ export interface BoardStub {
   ): Promise<Result<CardView>>;
   /** One card, in the same projection the board snapshot carries. */
   getCardView(cardId: string): Promise<Result<CardView>>;
-  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>>;
+  updateCard(
+    cardId: string,
+    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+  ): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
   setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
@@ -686,6 +718,7 @@ export interface BoardStub {
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
+  sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
   setForgeSecret(secret: string): Promise<Result<{ configured: true }>>;
   handleForgeWebhook(input: {
@@ -949,6 +982,40 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /** Applied label ids (D1 catalogue, migration 0010). JSON array; ids, not names. */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * A due date, promoted out of `spec.due`.
+     *
+     * A date, not a timestamp — that is what the UI has always written, and inventing a time of
+     * day would make every existing value wrong by up to a day.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN due_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * When the owner was last told this card is overdue. Internal to the sweep and deliberately
+     * absent from `CardView`: a five-minute cron tick with nothing to remember would notify on
+     * every tick forever.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN overdue_notified_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    /** Archived cards stay on the board's record and leave its working set. */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN archived_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_due_at ON cards(due_at)`);
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS notifications (
@@ -1054,6 +1121,12 @@ export class BoardDO extends DurableObject<Env> {
     ownerUserId: string;
     spec?: JsonValue;
     priority?: number;
+    /**
+     * Set at creation rather than requiring create-then-patch: a second round trip means a
+     * failure between the two silently drops the due date. Validated at the route (same rule as
+     * `PATCH /cards/:id`'s `dueAt`), so this DO trusts a bare `YYYY-MM-DD` string.
+     */
+    dueAt?: string;
   }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
@@ -1065,11 +1138,11 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant, due_at)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
-      JSON.stringify(input.spec ?? {}),
+      JSON.stringify((this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(input.spec) : input.spec) ?? {}),
       input.ownerUserId,
       first.key,
       input.priority ?? 0,
@@ -1080,11 +1153,102 @@ export class BoardDO extends DurableObject<Env> {
       // moment it exists, so the creator is the principal who dispatched it.
       input.ownerUserId,
       input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
+      input.dueAt ?? null,
     );
     const card = this.mustGetCard(id);
     this.emit('card.created', { card });
     this.notifyWorkAvailable(id);
     return { ok: true, value: card };
+  }
+
+  /**
+   * Move `spec.due` onto the `due_at` column, once per board.
+   *
+   * Idempotent, and it *removes* the key from the spec rather than leaving a copy: two sources of
+   * truth for one date is the condition this column exists to end. See the spec's §3.3 note — this
+   * also takes the due date out of the agent prompt, which is intended, not a regression.
+   */
+  async backfillDueDates(): Promise<{ migrated: number }> {
+    const rows = this.sql.exec(`SELECT id, spec_json FROM cards WHERE due_at IS NULL`).toArray();
+    let migrated = 0;
+    for (const row of rows) {
+      let spec: Record<string, unknown>;
+      try {
+        spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+      } catch {
+        continue; // an unparseable spec is not this migration's problem to fix
+      }
+      const due = spec.due;
+      if (typeof due !== 'string' || due.trim() === '') continue;
+      delete spec.due;
+      this.sql.exec(
+        `UPDATE cards SET due_at = ?, spec_json = ?, updated_at = ? WHERE id = ?`,
+        due.trim(),
+        JSON.stringify(spec),
+        this.now(),
+        row.id as string,
+      );
+      migrated += 1;
+    }
+    return { migrated };
+  }
+
+  /**
+   * Move `spec.labels` onto `labels` (catalogue ids), once per board.
+   *
+   * Shares `sweepBoard`'s `dueBackfillDone` guard rather than a flag of its own — the reason this
+   * exists is the same reason `backfillDueDates` does, so it runs at the same time, in the same
+   * once-per-board pass. Names resolve through `resolveLabelNames` (`src/db/labels.ts`), which
+   * reaches D1's tenant-scoped label catalogue rather than this DO's own SQLite storage — a name
+   * not yet declared is created with `origin: 'inferred'`, exactly as a person typing it into
+   * `CardDrawer.svelte` today would cause.
+   *
+   * Idempotent, and it *removes* the key from the spec rather than leaving a copy — two sources of
+   * truth for one fact is the condition `card.labels` exists to end, same as `due_at`.
+   */
+  async backfillLabelNames(): Promise<{ migrated: number }> {
+    const tenantId = this.getMeta('tenantId');
+    if (!tenantId) return { migrated: 0 };
+    const rows = this.sql.exec(`SELECT id, spec_json, labels FROM cards`).toArray();
+    let migrated = 0;
+    for (const row of rows) {
+      let spec: Record<string, unknown>;
+      try {
+        spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+      } catch {
+        continue; // an unparseable spec is not this migration's problem to fix
+      }
+      const raw = spec.labels;
+      if (!Array.isArray(raw) || raw.length === 0) continue;
+      const names = raw.filter((n): n is string => typeof n === 'string' && n.trim() !== '');
+      delete spec.labels;
+      if (names.length === 0) {
+        // Nothing resolvable — an array of blanks or non-strings — but the stale key is cleared
+        // regardless, same as a legacy `due` that fails its own shape check is still removed.
+        this.sql.exec(`UPDATE cards SET spec_json = ?, updated_at = ? WHERE id = ?`, JSON.stringify(spec), this.now(), row.id as string);
+        continue;
+      }
+      const resolvedIds = await resolveLabelNames(this.env.DB, tenantId, names, null);
+      const existing = row.labels ? (JSON.parse(row.labels as string) as string[]) : [];
+      const merged = [...new Set([...existing, ...resolvedIds])];
+      this.sql.exec(
+        `UPDATE cards SET labels = ?, spec_json = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify(merged),
+        JSON.stringify(spec),
+        this.now(),
+        row.id as string,
+      );
+      migrated += 1;
+    }
+    return { migrated };
+  }
+
+  /** Test-only: put a due date back in the spec and clear the column, to rehearse the migration. */
+  async __testResetDueToSpec(cardId: string): Promise<void> {
+    const row = this.sql.exec(`SELECT spec_json, due_at FROM cards WHERE id = ?`, cardId).one();
+    const spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+    if (row.due_at) spec.due = row.due_at as string;
+    this.sql.exec(`UPDATE cards SET due_at = NULL, spec_json = ? WHERE id = ?`, JSON.stringify(spec), cardId);
   }
 
   /**
@@ -1214,9 +1378,13 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: card };
   }
 
-  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>> {
+  async updateCard(
+    cardId: string,
+    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+  ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
-    if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    const existing = this.getCard(cardId);
+    if (!existing) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (patch.title !== undefined) {
@@ -1225,7 +1393,7 @@ export class BoardDO extends DurableObject<Env> {
     }
     if (patch.spec !== undefined) {
       sets.push('spec_json = ?');
-      vals.push(JSON.stringify(patch.spec));
+      vals.push(JSON.stringify(this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(patch.spec) : patch.spec));
     }
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
@@ -1234,6 +1402,28 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.ownerUserId !== undefined) {
       sets.push('owner_user_id = ?');
       vals.push(patch.ownerUserId);
+    }
+    if (patch.labels !== undefined) {
+      sets.push('labels = ?');
+      vals.push(JSON.stringify([...new Set(patch.labels)]));
+    }
+    if (patch.dueAt !== undefined) {
+      sets.push('due_at = ?');
+      // Validation lives at the route (`PATCH /cards/:id` in index.ts) — this DO is reachable from
+      // more than one caller, so a non-string here is stored as-is rather than crashing `.trim()`.
+      const normalizedDueAt = patch.dueAt === null || typeof patch.dueAt !== 'string' ? patch.dueAt : patch.dueAt.trim();
+      vals.push(normalizedDueAt);
+      // A changed date is a new chance to be told about it — but `dueAt` is sent on EVERY save
+      // (CardDrawer.svelte), not only when the date itself changed, so this must compare against
+      // the value actually stored rather than fire on `patch.dueAt !== undefined` alone. Otherwise
+      // editing a card's title re-arms the overdue nag and the next sweep spams the owner again.
+      if (normalizedDueAt !== existing.dueAt) {
+        sets.push('overdue_notified_at = NULL'); // no placeholder, so no `vals` entry
+      }
+    }
+    if (patch.archivedAt !== undefined) {
+      sets.push('archived_at = ?');
+      vals.push(patch.archivedAt);
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
@@ -1974,13 +2164,79 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * The per-board cron arm, called from the Worker's `scheduled()` every five minutes.
+   *
+   * It is here rather than on the DO alarm deliberately: a Durable Object has exactly one alarm and
+   * this one already serves two jobs (lease reclaim and push drain — see `scheduleReclaim`). The
+   * Worker cron already iterates every board, so this costs no new infrastructure.
+   *
+   * `schedulesFired` is always 0 until Phase 2 fills it in; it is in the shape now so the caller
+   * does not change twice.
+   */
+  async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }> {
+    // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
+    // (`WHERE due_at IS NULL`) matches every card that never had a due date — i.e. most of them,
+    // forever — so running it on each five-minute tick would be a full table scan for nothing.
+    // A board whose backfill can never succeed (e.g. a missing tenant row `backfillLabelNames`
+    // needs) must not lose its overdue sweep forever — that would silently kill notifications AND
+    // re-scan the whole card table every five minutes. So the backfill's own failure is caught
+    // here and deferred past the overdue query below, rather than aborting the whole sweep before
+    // it runs. The flag stays unset on failure — a failure still retries the whole pass next
+    // sweep, which is deliberate and tested (`backfillLabelNames` above) — but the deferred error
+    // is re-thrown at the end so a caller still sees the sweep failed.
+    let backfillError: unknown = null;
+    if (!this.getMeta('dueBackfillDone')) {
+      try {
+        const { migrated } = await this.backfillDueDates();
+        // Same guard, same pass: a card's legacy `spec.labels` is the other half of "two sources of
+        // truth for one fact" this flag exists to close. If either backfill throws, the flag below
+        // is never set — a failure retries the whole pass next sweep rather than skipping either
+        // migration forever. Both backfills are individually idempotent, so a retried
+        // `backfillDueDates` after a `backfillLabelNames` failure costs nothing extra.
+        const { migrated: labelsMigrated } = await this.backfillLabelNames();
+        this.setMeta('dueBackfillDone', '1');
+        if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
+        if (labelsMigrated > 0) this.emit('cards.labels_backfilled', { migrated: labelsMigrated });
+      } catch (err) {
+        backfillError = err;
+      }
+    }
+
+    const today = nowIso.slice(0, 10); // the column is a date, so compare dates
+    const rows = this.sql
+      .exec(
+        `SELECT id, title, due_at FROM cards
+          WHERE due_at IS NOT NULL AND due_at < ?
+            AND archived_at IS NULL
+            AND overdue_notified_at IS NULL
+            AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
+        today,
+      )
+      .toArray();
+
+    for (const row of rows) {
+      this.notify('overdue', row.id as string, `"${row.title as string}" was due ${row.due_at as string}`);
+      this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
+    }
+
+    // The overdue sweep above ran regardless of the backfill's outcome. Now that it has, surface
+    // the deferred failure so a caller (the cron loop) still learns the sweep was not clean.
+    if (backfillError) throw backfillError;
+
+    return { overdueNotified: rows.length, schedulesFired: 0 };
+  }
+
+  /**
    * Queue `work.available` deliveries for a claimable card, only to configs that could actually claim
    * it (docs/05 §4): a capability stage targets configs advertising that capability; an agent-owned
    * stage targets only that agent. No pings while the board is over budget (claim would refuse).
    */
   private notifyWorkAvailable(cardId: string): void {
     const card = this.getCard(cardId);
-    if (!card || card.state !== 'submitted') return;
+    // Mirrors `claimableWhere`'s archived exclusion, by hand: this is a JS predicate over a
+    // `CardView`, not SQL, so it cannot call that helper — but any eligibility condition added
+    // there needs its equivalent added here too, or a push fires for work `claim` will refuse.
+    if (!card || card.state !== 'submitted' || card.archivedAt) return;
     if (this.boardOverBudget()) return;
     const stage = this.stages().find((s) => s.key === card.currentStageKey);
     if (!stage || !this.isAgentClaimable(stage)) return;
@@ -2074,6 +2330,19 @@ export class BoardDO extends DurableObject<Env> {
     return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)), gates: this.gatesForCard(cardId) };
   }
 
+  /**
+   * The WHERE fragment deciding whether a card may be handed out, shared by the claim query and the
+   * work-discovery count so the two cannot drift apart.
+   *
+   * They were independent copies of `state = 'submitted' AND current_stage_key IN (…)`. Every
+   * condition added to claim from here on — archived here, blocked and parent-with-open-children in
+   * Task 13 — has to be invisible to `list_work` as well, or the board advertises work it will not
+   * hand out. The table is aliased `c` in both callers so this fragment can qualify its columns.
+   */
+  private claimableWhere(placeholders: string): string {
+    return `c.state = 'submitted' AND c.archived_at IS NULL AND c.current_stage_key IN (${placeholders})`;
+  }
+
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
   async countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number> {
     if (!this.getMeta('boardId')) return 0;
@@ -2084,7 +2353,7 @@ export class BoardDO extends DurableObject<Env> {
     const placeholders = claimableKeys.map(() => '?').join(', ');
     return Number(
       this.sql
-        .exec(`SELECT COUNT(*) AS n FROM cards WHERE state = 'submitted' AND current_stage_key IN (${placeholders})`, ...claimableKeys)
+        .exec(`SELECT COUNT(*) AS n FROM cards c WHERE ${this.claimableWhere(placeholders)}`, ...claimableKeys)
         .one().n,
     );
   }
@@ -2220,8 +2489,8 @@ export class BoardDO extends DurableObject<Env> {
     const placeholders = claimableKeys.map(() => '?').join(', ');
     const row = this.sql
       .exec(
-        `SELECT * FROM cards WHERE state = 'submitted' AND current_stage_key IN (${placeholders})
-         ORDER BY priority DESC, created_at ASC LIMIT 1`,
+        `SELECT * FROM cards c WHERE ${this.claimableWhere(placeholders)}
+         ORDER BY c.priority DESC, (c.due_at IS NULL), c.due_at ASC, c.created_at ASC LIMIT 1`,
         ...claimableKeys,
       )
       .toArray()[0];
@@ -3232,7 +3501,7 @@ export class BoardDO extends DurableObject<Env> {
       attemptsByCard.set(r.card_id as string, Number(r.n));
     }
     return this.sql
-      .exec(`SELECT * FROM cards ORDER BY priority DESC, created_at ASC`)
+      .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
       .toArray()
       .map((r) => this.rowToCard(r, { costUsd: costByCard.get(r.id as string) ?? 0, attemptCount: attemptsByCard.get(r.id as string) ?? 0 }));
   }
@@ -3249,6 +3518,9 @@ export class BoardDO extends DurableObject<Env> {
       ownerUserId: row.owner_user_id as string,
       queuedBy: (row.queued_by as string | null) ?? null,
       queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
+      labels: row.labels ? (JSON.parse(row.labels as string) as string[]) : [],
+      dueAt: (row.due_at as string | null) ?? null,
+      archivedAt: (row.archived_at as string | null) ?? null,
       currentStageKey: row.current_stage_key as string,
       state: row.state as TaskState,
       delegateAgentId: (row.delegate_agent_id as string | null) ?? null,

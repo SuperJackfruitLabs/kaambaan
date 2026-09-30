@@ -22,6 +22,7 @@ import {
   ReferenceSourceType,
   SyncState,
 } from './primitives';
+import { CompletionRequirement } from './completion';
 
 const timestamps = {
   createdAt: z.string(),
@@ -103,6 +104,12 @@ export const Stage = z.object({
    */
   instructions: z.string().min(1).max(4000).optional(),
   gate: StageGate.default('none'),
+  /**
+   * The stage's standing rule for what a completion must carry, enforced by `evaluateCompletion`.
+   * It has been on the Board DO (`board-do.ts:115`) and absent here since it shipped; a contract
+   * that omits a field the server enforces is a trap for anyone writing a client against it.
+   */
+  completion: CompletionRequirement.nullish(),
   wipLimit: z.number().int().min(1).optional(),
 });
 export type Stage = z.infer<typeof Stage>;
@@ -173,10 +180,21 @@ export const Card = z.object({
   ownerUserId: UserId,
   currentStageKey: z.string().min(1),
   delegateAgentId: AgentId.optional(),
-  currentTaskId: TaskId.optional(),
   priority: z.number().int().default(0),
   labels: z.array(z.string()).default([]),
-  archivedAt: z.string().optional(),
+  /**
+   * The card's due date (`YYYY-MM-DD`), or explicitly `null` when it has none — matches
+   * `CardView.dueAt` (`apps/api/src/board/board-do.ts`'s `rowToCard`), which is `string | null`,
+   * never `undefined`. `.optional()` besides `.nullable()` so a hand-built `Card` (as in tests
+   * here) may still omit it entirely.
+   */
+  dueAt: z.string().nullable().optional(),
+  /**
+   * `CardView.archivedAt` is likewise always `string | null`, never `undefined` — `.nullable()`
+   * so `Card.parse` on a live, unarchived card (which sends `archivedAt: null`, not an absent
+   * key) does not reject it.
+   */
+  archivedAt: z.string().nullable().optional(),
   ...timestamps,
 });
 export type Card = z.infer<typeof Card>;

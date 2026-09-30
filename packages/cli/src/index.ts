@@ -26,7 +26,7 @@ import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, expired, inspect, resolveCredential, ENV_TOKEN } from "./credential.ts";
 import { renderBoards, renderBoard, renderGates, renderLog } from "./render.ts";
-import { flag, positionals } from "./args.ts";
+import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 
 const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the same command)
@@ -52,8 +52,14 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                [--completion <file|->] [--clear-completion]
                                change ONE stage, leaving the others alone
   supi create-card <boardId> <title> [--spec <file|->] [--priority <n>]
+                               [--due YYYY-MM-DD] [--label <id>]...
                                queue a card, with this token as its grant
   supi templates               the starting pipelines --template accepts
+
+  supi label list               the tenant's label catalogue
+  supi label add <name> <colour>
+                               declare a label
+  supi label rm <id>           remove a label (cards keep the stale id)
 
   supi forge [<host>|none]     this workspace's forge host, shown or set
   supi agents                  the workspace's agents and what they declare
@@ -73,6 +79,13 @@ Explicit environment tokens are used as supplied; superpipeline verifies them of
 Not here: staffing agents, editing capabilities, changing the fleet link.
 What you may do is your seat in the workspace, which the server decides — not this
 command. A refusal comes back as a 403 and is printed as it arrives.`;
+
+/**
+ * `create-card --due`'s own shape check, matching the API's (`DUE_AT_RE`, apps/api/src/index.ts).
+ * Checked here rather than left to the server: a malformed value never leaves the terminal, so the
+ * person sees this message instead of the API's 400 — a worse sentence for the same mistake.
+ */
+const DUE_AT_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function wantsJson(args: string[]): boolean {
   return args.includes("--json");
@@ -442,9 +455,17 @@ async function main(argv: string[]): Promise<void> {
     }
 
     case "create-card": {
-      if (!pos[0] || !pos[1]) fail("usage: supi create-card <boardId> <title> [--spec <file|->]");
+      if (!pos[0] || !pos[1]) {
+        fail(
+          "usage: supi create-card <boardId> <title> [--spec <file|->] [--priority <n>]",
+          "  [--due YYYY-MM-DD] [--label <id>]...",
+        );
+      }
       const specArg = flag(rest, "--spec");
       const priorityArg = flag(rest, "--priority");
+      const dueArg = flag(rest, "--due");
+      // Repeatable — a card can carry more than one label at creation.
+      const labelIds = flags(rest, "--label");
       // Every remaining positional is the title, so a sentence needs no quoting.
       const body: Record<string, unknown> = { title: pos.slice(1).join(" ") };
       if (specArg) {
@@ -456,7 +477,31 @@ async function main(argv: string[]): Promise<void> {
         }
       }
       if (priorityArg) body.priority = Number(priorityArg);
-      out(await api(`/v1/boards/${pos[0]}/cards`, { method: "POST", body: JSON.stringify(body) }));
+      if (dueArg) {
+        // Checked here, not sent and refused: `POST /cards` answers a malformed `dueAt` with a
+        // 400 whose sentence is about a field named `dueAt`, not the flag the person typed.
+        if (!DUE_AT_RE.test(dueArg)) {
+          fail(`--due is not a date in YYYY-MM-DD form: ${dueArg}`);
+        }
+        body.dueAt = dueArg;
+      }
+      const created = (await api(`/v1/boards/${pos[0]}/cards`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      })) as { card: { id: string } };
+      // Labels are not part of `POST /cards` — applied with a follow-up PATCH against the same
+      // route the drawer and `supi move` already use, hitting the label-id validation there
+      // (`unknownLabelIds`) rather than duplicating it here.
+      if (labelIds.length > 0) {
+        out(
+          await api(`/v1/boards/${pos[0]}/cards/${created.card.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ labels: labelIds }),
+          }),
+        );
+        return;
+      }
+      out(created);
       return;
     }
 
@@ -494,6 +539,35 @@ async function main(argv: string[]): Promise<void> {
     case "implications":
       out(await api("/v1/capabilities/implications"));
       return;
+
+    /**
+     * The tenant's label catalogue (Task 4's `/v1/labels[/:id]`) — the same one
+     * `resolveLabelNames` resolves a card's typed names against, so a person can see what already
+     * exists, or declare one deliberately instead of leaving it to be inferred from what they type
+     * into a card.
+     */
+    case "label": {
+      const sub = pos[0];
+      if (sub === "list") {
+        out(await api("/v1/labels"));
+        return;
+      }
+      if (sub === "add") {
+        const name = pos[1];
+        const colour = pos[2];
+        if (!name || !colour) fail("usage: supi label add <name> <colour>");
+        out(await api("/v1/labels", { method: "POST", body: JSON.stringify({ name, colour }) }));
+        return;
+      }
+      if (sub === "rm") {
+        const id = pos[1];
+        if (!id) fail("usage: supi label rm <id>");
+        await api(`/v1/labels/${id}`, { method: "DELETE" });
+        out({ deleted: id }, () => `Deleted ${id}.`);
+        return;
+      }
+      fail("usage: supi label list | supi label add <name> <colour> | supi label rm <id>");
+    }
 
     case "templates": {
       // No credential needed: these are shipped with the CLI, not fetched. Someone deciding

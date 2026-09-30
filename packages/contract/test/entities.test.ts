@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Agent, Board, Card, Reference, Tenant } from '../src';
+import { Agent, Board, Card, Reference, Stage, Tenant } from '../src';
 
 describe('entity schemas', () => {
   it('parses a board with a pipeline and applies stage defaults', () => {
@@ -57,6 +57,106 @@ describe('entity schemas', () => {
     });
     expect(ok.success).toBe(true);
     expect(Reference.safeParse({ id: 'ref_abc123' }).success).toBe(false);
+  });
+
+  it('carries the completion requirement the Board DO already enforces', () => {
+    const parsed = Stage.parse({
+      key: 'publish',
+      name: 'Publish',
+      order: 0,
+      ownerKind: 'capability',
+      owner: 'code',
+      completion: { handoff: ['url'], reference: { provider: 'forge', sourceType: 'commit' } },
+    });
+    expect(parsed.completion).toEqual({
+      handoff: ['url'],
+      reference: { provider: 'forge', sourceType: 'commit' },
+    });
+  });
+
+  it('leaves completion absent on a stage that declares no rule', () => {
+    const parsed = Stage.parse({ key: 'draft', name: 'Draft', order: 0, ownerKind: 'human' });
+    expect(parsed.completion).toBeUndefined();
+  });
+
+  it('no longer declares currentTaskId on a card, because Task is not implemented', () => {
+    // docs/01 warns that Task has no table and no id is ever minted. A contract field for a
+    // record that cannot exist is a trap for anyone writing a client against it.
+    expect('currentTaskId' in Card.shape).toBe(false);
+  });
+
+  it('leaves archivedAt absent on a fresh card', () => {
+    const card = Card.parse({
+      id: 'card_0000000000000001',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'A card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(card.archivedAt).toBeUndefined();
+  });
+
+  /**
+   * `CardView.archivedAt` (apps/api/src/board/board-do.ts) is ALWAYS `string | null`, never
+   * `undefined` — the DO's `rowToCard` does `(row.archived_at as string | null) ?? null`. Before
+   * this, the contract's `archivedAt: z.string().optional()` accepted `undefined` but rejected an
+   * explicit `null`, so `Card.parse` on a real card view — not a hand-built object skipping the
+   * field, an actual live one — would reject every unarchived card.
+   */
+  it('accepts archivedAt: null, exactly what a live CardView sends for an unarchived card', () => {
+    const parsed = Card.safeParse({
+      id: 'card_0000000000000002',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'A live card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      archivedAt: null,
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.archivedAt).toBeNull();
+  });
+
+  /**
+   * `dueAt` (this branch's own column, `due_at` on `cards`) has been a real field with an index, a
+   * claim-order term (`due-dates.test.ts`) and a cron sweep behind it since Task 6 — but the
+   * contract never declared it. This branch exists to end exactly this kind of drift.
+   */
+  it('declares dueAt, matching CardView\'s string | null shape', () => {
+    expect('dueAt' in Card.shape).toBe(true);
+
+    const withDate = Card.safeParse({
+      id: 'card_0000000000000003',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'Due card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      dueAt: '2026-10-01',
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(withDate.success).toBe(true);
+    if (withDate.success) expect(withDate.data.dueAt).toBe('2026-10-01');
+
+    const withNull = Card.safeParse({
+      id: 'card_0000000000000004',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'Undated card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      dueAt: null,
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(withNull.success).toBe(true);
+    if (withNull.success) expect(withNull.data.dueAt).toBeNull();
   });
 });
 
