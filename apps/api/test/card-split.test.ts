@@ -71,6 +71,29 @@ describe('splitCard', () => {
     });
   });
 
+  // Regression for a review finding on the Important-1 fix: dropping the pre-trim (so it could no
+  // longer eat the checkbox's separating space) also removed the ONLY thing that unwrapped leading
+  // whitespace before a marker — and an indented checklist item is the ordinary shape of a nested
+  // markdown checklist ("- [ ] parent" with "  - [ ] child" under it), exactly the input this
+  // converter exists to eat.
+  it('unwraps a bullet/checkbox indented with spaces or a tab — a nested checklist item', async () => {
+    await runInDurableObject(stubFor('split-md-indented'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitmdindented');
+      const r = await board.splitCard(
+        parentId,
+        ['  - [ ] task', '\t- [ ] task', '- [ ] Parent task', '  - [ ] Child task'],
+        'usr_a',
+      );
+      if (!r.ok) throw new Error(r.message);
+      expect(r.value.children.map((c) => c.title)).toEqual([
+        'task',
+        'task',
+        'Parent task',
+        'Child task',
+      ]);
+    });
+  });
+
   it('ignores blank lines rather than creating untitled cards', async () => {
     await runInDurableObject(stubFor('split-blank'), async (board: BoardDO) => {
       const parentId = await parentOn(board, 'splitblank');

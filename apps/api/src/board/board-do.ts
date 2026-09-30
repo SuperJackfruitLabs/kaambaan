@@ -60,14 +60,27 @@ function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined 
  * bullet does, and the caller got no signal that its title had been rewritten — that mangled name
  * is what the next agent's prompt would carry.
  *
- * Deliberately does NOT trim `raw` before stripping (only the final return trims): an earlier
- * version did, and that pre-trim consumed the separating space `\s+` needs to see, so a line that
- * was JUST a checkbox with a trailing space (`'- [ ] '`) stopped stripping to `''` — the one-space
- * requirement above only works if that space is still there when the checkbox regex runs.
+ * Deliberately does NOT trim `raw` as one whole-string operation before stripping (only the final
+ * return trims): an earlier version did, and that pre-trim consumed the separating space `\s+`
+ * needs to see, so a line that was JUST a checkbox with a trailing space (`'- [ ] '`) stopped
+ * stripping to `''` — the one-space requirement above only works if that space is still there when
+ * the checkbox regex runs. `'- [ ] '` stripping to `''` is not a bug to guard against, it is the
+ * spec: a marker with no title text is blank, the same as an empty line — see the "ignores blank
+ * lines" test, which asserts exactly this input is dropped.
+ *
+ * Each marker regex instead carries its OWN leading `\s*`, rather than one whole-string pre-trim,
+ * so an indented bullet/checkbox — the ordinary shape of a nested markdown checklist (`- [ ] parent`
+ * with `  - [ ] child` under it) — still unwraps. This differs from the removed pre-trim in the one
+ * way that matters: `\s*` at the FRONT of a regex only ever consumes LEADING characters at THAT
+ * match's own start position; it cannot reach into the string's trailing end the way a whole-string
+ * `.trim()` did, so it cannot repeat the original bug of eating the checkbox's separating space
+ * before the checkbox regex gets to run. Verified empirically against every case above plus
+ * indentation (leading spaces, a leading tab, a nested item) before shipping — see the fix-round
+ * report.
  */
 function stripListLineSyntax(raw: string): string {
-  let s = raw.replace(/^(?:[-*]|\d+\.)\s+/, ''); // bullet: "-", "*", or "2.", each followed by a space
-  s = s.replace(/^\[[ xX]\]\s+/, ''); // checkbox: "[ ]" or "[x]"/"[X]", followed by a space
+  let s = raw.replace(/^\s*(?:[-*]|\d+\.)\s+/, ''); // optional indent, then bullet: "-", "*", or "2.", each followed by a space
+  s = s.replace(/^\s*\[[ xX]\]\s+/, ''); // optional indent, then checkbox: "[ ]" or "[x]"/"[X]", followed by a space
   return s.trim();
 }
 
