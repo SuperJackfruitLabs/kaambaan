@@ -3091,7 +3091,14 @@ git commit -m "feat(links): advisory cross-board edges, refused for same-board a
 ## Task 17: Phase 3 in the UI, and the live check
 
 **Files:**
-- Modify: `apps/web/src/lib/components/CardDrawer.svelte` — a Sub-tasks section (children with state and cost), a Blockers section, an "Add sub-task" action
+- Modify: `apps/web/src/lib/components/CardDrawer.svelte` — a Sub-tasks section (children with state and cost), a Blockers section, an **"Add sub-task"**, an **"Add blocker"** and an **"Archive card"** action
+- Modify: `packages/cli/src/index.ts` — **`supi link add|rm|list`** and **`supi archive`**
+
+> **Why these are here and were not before.** An audit found this plan specified read surfaces
+> thoroughly and write surfaces unevenly: `supi link` appeared in the File Structure and in no task,
+> and archiving shipped a column and a "show archived" filter in Phase 1 with **no way to archive
+> anything** — a filter for a state nothing could produce. A construct a person can see and cannot
+> create is half-built, and the half that is missing is the half they would use.
 - Modify: `apps/web/src/lib/components/board/CardTile.svelte` — a blocked badge, a `2/5` child counter
 - Modify: `apps/web/src/lib/components/board/BoardKanban.svelte` — a per-stage blocked count
 - Modify: `apps/web/src/lib/api.ts`
@@ -3106,6 +3113,23 @@ This is the part the design is most specific about. An enforced blocker and an a
 | cross-board `blocks`, unresolved | `⚑ Blocked (advisory)` | "Blocked by *Title* on *Board* — not enforced across boards" |
 
 A single badge covering both would sometimes lie, and a badge that sometimes lies is worse than two honest badges.
+
+- [ ] **Step 1b: Creating an edge, and archiving**
+
+- **Add blocker** in the drawer: pick another card on this board, pick `blocks` or `relates`, and
+  surface Task 12's three refusals as sentences — a cycle and an existing parent each say which,
+  because "invalid link" tells a person nothing about what to do next.
+- **Archive** in the drawer, and `supi archive <boardId> <cardId>`. Both send `archivedAt`; the
+  existing filter then does what it has always claimed to do.
+- `supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent`, plus `rm` and
+  `list`. Reject an unknown `--kind` in the CLI rather than sending it.
+- **Cross-board edges (Task 16) get a creation surface too** — the same "Add blocker" dialogue,
+  with a board picker, writing to the advisory D1 store when the target is on another board. The
+  badge already distinguishes them; the dialogue must say so **before** the edge is created, not
+  after, or a person will expect enforcement they will not get.
+
+⚠️ Any new route here carries Phase 1's two lessons: the `resolveHubUser` fallback (or every `supi`
+verb 401s), and route-level shape validation (the Durable Object trusts its callers by design).
 
 - [ ] **Step 2: The blocked count per stage**
 
@@ -3440,9 +3464,20 @@ git commit -m "feat(projects): card membership and a cached cross-board rollup t
 ## Task 20: Projects in the UI and in `supi`
 
 **Files:**
-- Create: `apps/web/src/lib/components/plan/ProjectView.svelte`
-- Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`
+- Create: `apps/web/src/lib/components/plan/ProjectView.svelte`, **`apps/web/src/lib/components/workspace/LabelManager.svelte`**
+- Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`, **`apps/web/src/routes/workspace/[tab]/+page.svelte`**
 - Modify: `packages/cli/src/index.ts` — `supi project list|add|show|rm`, `supi milestone add|rm`
+
+**Also close two write-surface gaps the same audit found:**
+
+- **A label manager**, as a `labels` tab beside `capabilities`/`people`/`connections` in `/workspace`.
+  `api.ts` already exports `createLabel`, `updateLabel` and `deleteLabel` and **no component calls
+  them** — so a label can be created by typing a name into a card, and then never renamed,
+  recoloured or removed. List the catalogue with each label's `origin`, so an operator can see which
+  ones were `inferred` from a typo, which is the cost `capabilities` already accepted for the same
+  convenience.
+- **Creating and editing milestones in `ProjectView`**, not only through `supi milestone`. A project
+  view that lists milestones and cannot add one sends a person to a terminal to do the obvious thing.
 
 - [ ] **Step 1: The view**
 
