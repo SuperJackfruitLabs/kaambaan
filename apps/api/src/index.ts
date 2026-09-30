@@ -1573,6 +1573,18 @@ export default {
               { status: 400 },
             );
           }
+          // `spec` was the one field here with no shape guard, which reopens exactly the bug the
+          // guards above exist for: `board-do.ts` spreads the parsed spec as
+          // `{ ...JSON.parse(row.spec_json), scheduleId: id }`, and a string is iterable, so
+          // `spec: "urgent"` would spread into `{0:'u',1:'r',...,scheduleId:'sch_…'}` instead of
+          // being rejected. Reject a non-object (or null, or an array) here, before it ever reaches
+          // that spread.
+          if (body.spec !== undefined && (typeof body.spec !== 'object' || body.spec === null || Array.isArray(body.spec))) {
+            return Response.json(
+              { error: { code: 'INVALID_SCHEDULE', message: '`spec` must be a JSON object.' } },
+              { status: 400 },
+            );
+          }
 
           const result = await stub.createSchedule({
             title: body.title,
@@ -1583,6 +1595,12 @@ export default {
             timezone: body.timezone,
             overlap: (body.overlap as 'skip' | 'allow' | undefined) ?? 'skip',
             createdBy: user!.userId,
+            // Same reasoning as `POST /v1/boards/:id/triggers`' `queuedGrant`: creating a schedule
+            // IS the act of authorising unattended dispatch, and this is the only moment there is a
+            // caller present to record it from. Without it, every card this schedule ever mints
+            // falls back to the board's GitHub-webhook grant — which most boards never set — and
+            // parks unclaimable under enforcement (whole-branch review, Important 1).
+            queuedGrant: user?.mayDispatch ?? null,
             ...(body.stageKey !== undefined ? { stageKey: body.stageKey as string | null } : {}),
             ...(body.priority !== undefined ? { priority: body.priority as number } : {}),
             ...(body.labels !== undefined ? { labels: body.labels as string[] } : {}),
@@ -1653,6 +1671,13 @@ export default {
           if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
             return Response.json(
               { error: { code: 'INVALID_SCHEDULE', message: '`enabled` must be a boolean.' } },
+              { status: 400 },
+            );
+          }
+          // Same shape guard as the create route — see its comment.
+          if (body.spec !== undefined && (typeof body.spec !== 'object' || body.spec === null || Array.isArray(body.spec))) {
+            return Response.json(
+              { error: { code: 'INVALID_SCHEDULE', message: '`spec` must be a JSON object.' } },
               { status: 400 },
             );
           }

@@ -61,11 +61,15 @@ describe('POST /v1/boards/:id/schedules', () => {
       body: JSON.stringify({ title: 'Sweep logs', rule: 'daily at 09:00', timezone: 'UTC' }),
     });
     expect(res.status).toBe(201);
-    const { schedule } = await res.json<{ schedule: { id: string; nextFireAt: string; overlap: string } }>();
+    const { schedule } = await res.json<{ schedule: { id: string; nextFireAt: string; overlap: string; createdBy: string | null } }>();
     expect(schedule.id).toMatch(/^sch_/);
     expect(schedule.nextFireAt).toMatch(/T09:00:00\.000Z$/);
     // Overlap defaults to 'skip' when the caller does not send one.
     expect(schedule.overlap).toBe('skip');
+    // `createdBy` is never read from the body — the route stamps the signed-in user — and it is
+    // validated hard at creation, then becomes the future card's owner. Asserted here because the
+    // chain authenticated-user → created_by → card.ownerUserId had no coverage at all before this.
+    expect(schedule.createdBy).toBe('usr_dev');
   });
 
   it('stores the operator\'s own timezone spelling, never the resolved one', async () => {
@@ -185,6 +189,43 @@ describe('POST /v1/boards/:id/schedules', () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it('refuses a string spec at the route, before it can spread into an indexed object', async () => {
+    // `board-do.ts` does `{ ...(JSON.parse(row.spec_json) as Record<string, unknown>), scheduleId }`
+    // when a schedule fires. A string is iterable, so `spec: "urgent"` would silently become
+    // `{0:'u',1:'r',2:'g',...,scheduleId:'sch_…'}` on the minted card instead of being refused —
+    // the exact class of hole the other shape guards on this route exist to close, reopened here.
+    const t = 'tnt_sch_spec_string';
+    const b = await board(t);
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/schedules`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'x', rule: 'daily at 09:00', timezone: 'UTC', spec: 'urgent' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses a null spec at the route', async () => {
+    const t = 'tnt_sch_spec_null';
+    const b = await board(t);
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/schedules`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'x', rule: 'daily at 09:00', timezone: 'UTC', spec: null }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses an array spec at the route', async () => {
+    const t = 'tnt_sch_spec_array';
+    const b = await board(t);
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/schedules`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'x', rule: 'daily at 09:00', timezone: 'UTC', spec: ['urgent'] }),
+    });
+    expect(res.status).toBe(400);
+  });
 });
 
 describe('PATCH /v1/boards/:id/schedules/:scheduleId', () => {
@@ -249,6 +290,18 @@ describe('PATCH /v1/boards/:id/schedules/:scheduleId', () => {
       method: 'PATCH',
       headers: dev(t),
       body: JSON.stringify({ overlap: {} }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses a string spec on patch too', async () => {
+    const t = 'tnt_sch_patch_spec_string';
+    const b = await board(t);
+    const id = await created(t, b);
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/schedules/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ spec: 'urgent' }),
     });
     expect(res.status).toBe(400);
   });

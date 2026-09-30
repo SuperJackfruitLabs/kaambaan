@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseRule, nextFireAt, type Rule } from '../src/board/recurrence';
+import { parseRule, nextFireAt, advanceFireTime, type Rule } from '../src/board/recurrence';
 
 function mustParse(text: string): Rule {
   const r = parseRule(text);
@@ -103,5 +103,55 @@ describe('nextFireAt', () => {
     expect(nextFireAt(mustParse('daily at 03:00'), 'America/New_York', '2026-03-08T00:00:00.000Z')).toBe(
       '2026-03-08T07:00:00.000Z',
     );
+  });
+});
+
+describe('advanceFireTime', () => {
+  it('keeps an interval rule on phase across repeated slightly-late sweeps, unlike naive addition from `now`', () => {
+    // `nextFireAt(rule, tz, nowIso)` — what `fireDueSchedules` used before this fix — adds the
+    // interval to the SWEEP INSTANT, not to the instant that was actually due. Every tick's
+    // lateness is then baked into the next due time permanently. `advanceFireTime` instead walks
+    // forward in whole steps from the PREVIOUS `next_fire_at`, so the phase never moves.
+    const rule = mustParse('every 5 minutes');
+    const lateness = [300, 150, 400, 50, 250, 100]; // ms the sweep tick observes each cycle, late
+    const start = '2026-09-30T10:00:00.000Z';
+
+    let corrected = start;
+    let naive = start;
+    for (const ms of lateness) {
+      const nowForCorrected = new Date(new Date(corrected).getTime() + ms).toISOString();
+      corrected = advanceFireTime(rule, 'UTC', corrected, nowForCorrected);
+
+      const nowForNaive = new Date(new Date(naive).getTime() + ms).toISOString();
+      naive = nextFireAt(rule, 'UTC', nowForNaive);
+    }
+
+    // The fix: six 5-minute steps land exactly back on the original phase, to the millisecond.
+    expect(corrected).toBe('2026-09-30T10:30:00.000Z');
+    // The bug this replaces: naive addition from `now` accumulates every tick's lateness (here,
+    // 300+150+400+50+250+100 = 1250ms) and never lands back on :00.000. Proof the two diverge —
+    // if `advanceFireTime` collapsed to `nextFireAt(rule, tz, nowIso)` this assertion would fail.
+    expect(naive).toBe('2026-09-30T10:30:01.250Z');
+    expect(corrected).not.toBe(naive);
+  });
+
+  it('collapses a week-old schedule into exactly one upcoming occurrence, still on phase', () => {
+    const rule = mustParse('every 5 minutes');
+    const previous = '2026-09-23T10:00:00.000Z'; // next_fire_at, stale by a week
+    const now = '2026-09-30T10:00:03.000Z'; // the sweep finally runs again
+
+    const next = advanceFireTime(rule, 'UTC', previous, now);
+
+    expect(new Date(next).getTime()).toBeGreaterThan(new Date(now).getTime());
+    // Exactly one 5-minute step past the stale value, not a step per missed occurrence, and
+    // still on the original :00 phase.
+    expect(next).toBe('2026-09-30T10:05:00.000Z');
+  });
+
+  it('delegates clock rules to the same wall-clock computation as nextFireAt, unaffected by the interval fix', () => {
+    const rule = mustParse('daily at 09:00');
+    const previous = '2026-09-29T09:00:00.000Z';
+    const now = '2026-09-30T09:00:00.300Z';
+    expect(advanceFireTime(rule, 'UTC', previous, now)).toBe(nextFireAt(rule, 'UTC', now));
   });
 });

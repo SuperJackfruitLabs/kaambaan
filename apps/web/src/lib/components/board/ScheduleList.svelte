@@ -15,7 +15,6 @@
   let { boardId, stages }: { boardId: string; stages: Stage[] } = $props();
 
   let schedules = $state<Schedule[]>([]);
-  let loaded = $state(false);
   let busy = $state('');
   let formError = $state<string | null>(null);
 
@@ -26,13 +25,17 @@
   let priority = $state('');
   let overlap = $state<'skip' | 'allow'>('skip');
 
-  async function load(): Promise<void> {
-    schedules = await getSchedules(boardId);
-    loaded = true;
+  async function load(id: string): Promise<void> {
+    schedules = await getSchedules(id);
   }
 
+  // Re-runs whenever `boardId` changes — `boardId` is read synchronously here, which is what
+  // makes it a tracked dependency. A one-shot `loaded` flag here previously meant a client-side
+  // navigation between two boards' settings pages (the component instance is reused, only the
+  // prop changes) rendered board A's schedules under board B, and pause/delete then PATCHed board
+  // B with A's schedule ids and failed silently.
   $effect(() => {
-    if (!loaded) void load();
+    void load(boardId);
   });
 
   async function add(): Promise<void> {
@@ -64,7 +67,7 @@
       stageKey = '';
       priority = '';
       overlap = 'skip';
-      await load();
+      await load(boardId);
     } finally {
       busy = '';
     }
@@ -74,7 +77,7 @@
     busy = s.id;
     try {
       await updateSchedule(boardId, s.id, { enabled: !s.enabled });
-      await load();
+      await load(boardId);
     } finally {
       busy = '';
     }
@@ -84,7 +87,7 @@
     busy = s.id;
     try {
       await deleteSchedule(boardId, s.id);
-      await load();
+      await load(boardId);
     } finally {
       busy = '';
     }
@@ -136,6 +139,11 @@
           <div class="text-muted-foreground mono mt-0.5 text-[10px]">
             next {formatFireTime(s.nextFireAt, s.timezone)} · last {formatFireTime(s.lastFiredAt, s.timezone)}
           </div>
+          <!-- Whose cards this schedule will create — validated hard at creation, but invisible
+               to any client until this line existed. -->
+          {#if s.createdBy}
+            <div class="text-muted-foreground mono mt-0.5 text-[10px]">owner {s.createdBy}</div>
+          {/if}
           <!--
             A skip means the previous instance was still open when the next fire came due — the
             signal this schedule is fighting an open card. Invisible if not shown, so it is shown

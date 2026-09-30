@@ -137,6 +137,47 @@ export function nextFireAt(rule: Rule, timezone: string, afterIso: string): stri
     return new Date(after.getTime() + rule.every * ms).toISOString();
   }
 
+  return nextClockFireAt(rule, timezone, after).toISOString();
+}
+
+/**
+ * Advance a fired (or skipped) schedule's `next_fire_at` for its next occurrence.
+ *
+ * For an INTERVAL rule this is deliberately NOT `nextFireAt(rule, timezone, nowIso)`. `nowIso` is
+ * the sweep instant — always a little after the instant that was actually due — and pure addition
+ * from it absorbs that lateness into the phase forever: fire at 10:00:00.3 → naive next
+ * 10:05:00.3 → the 10:05:00.1 tick finds it not due → the card lands at 10:10. `every 5 minutes`
+ * drifts into "every 5 or 10, unpredictably", without bound.
+ *
+ * Instead: advance by whole intervals from the PREVIOUS `next_fire_at` until the result is
+ * strictly after `now`. That keeps the phase (:00 stays :00) and still collapses a missed week —
+ * a cron that was down, or a schedule nobody looked at — into a single upcoming occurrence rather
+ * than a backlog of steps to replay. Both properties matter; see `fireDueSchedules`'s own doc
+ * comment on why a card storm is the wrong shape for a missed maintenance window.
+ *
+ * Clock rules (`daily`/`weekly`/`monthly`) are immune to this: they recompute a wall-clock
+ * occurrence from `now` rather than adding a fixed step, so they delegate to `nextFireAt` (via
+ * `nextClockFireAt`) unchanged.
+ */
+export function advanceFireTime(rule: Rule, timezone: string, previousFireAt: string, nowIso: string): string {
+  if (rule.kind !== 'interval') return nextClockFireAt(rule, timezone, new Date(nowIso)).toISOString();
+
+  const ms = rule.unit === 'minutes' ? 60000 : rule.unit === 'hours' ? 3600000 : 86400000;
+  const step = rule.every * ms;
+  const now = new Date(nowIso).getTime();
+  let next = new Date(previousFireAt).getTime();
+
+  if (next <= now) {
+    // Round the gap up to a whole number of steps, so the result lands strictly after `now` while
+    // staying on the original phase — never a partial step that would re-absorb the lateness.
+    const stepsBehind = Math.floor((now - next) / step) + 1;
+    next += stepsBehind * step;
+  }
+
+  return new Date(next).toISOString();
+}
+
+function nextClockFireAt(rule: Extract<Rule, { kind: 'daily' | 'weekly' | 'monthly' }>, timezone: string, after: Date): Date {
   const p = zonedParts(after, timezone);
 
   // Walk candidate days forward until one lands strictly after `after`. At most 40 iterations,
@@ -152,8 +193,8 @@ export function nextFireAt(rule: Rule, timezone: string, afterIso: string): stri
     if (rule.kind === 'monthly' && d !== rule.day) continue;
 
     const candidate = fromZonedWallClock(y, mo, d, rule.hour, rule.minute, timezone);
-    if (candidate.getTime() > after.getTime()) return candidate.toISOString();
+    if (candidate.getTime() > after.getTime()) return candidate;
   }
 
-  throw new Error(`no next occurrence found for ${JSON.stringify(rule)} in ${timezone} after ${afterIso}`);
+  throw new Error(`no next occurrence found for ${JSON.stringify(rule)} in ${timezone} after ${after.toISOString()}`);
 }

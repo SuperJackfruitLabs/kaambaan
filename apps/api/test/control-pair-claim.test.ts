@@ -2,6 +2,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect, afterEach, beforeAll } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { valuePermitsAgent, grantPermitsAgent } from '../src/auth/grant-match';
+import type { BoardStub } from '../src/board/board-do';
 
 /**
  * The control pair, enforced where work is handed out.
@@ -305,5 +306,160 @@ describe('claiming under enforcement', () => {
       const [card] = await cards(t, boardId);
       expect(card!.queuedGrant).toEqual(['prn_0000000000000000cp05']);
     });
+  });
+});
+
+/** A Board DO stub by (tenant, boardId) — identical to `src/board/stub.ts`'s `boardStub`. */
+function boardDo(tenantId: string, boardId: string): BoardStub {
+  return env.BOARD_DO.get(env.BOARD_DO.idFromName(`${tenantId}:${boardId}`)) as unknown as BoardStub;
+}
+
+/**
+ * `fireDueSchedules` is not part of `BoardStub` — only `sweepBoard`, which calls it, is — so it
+ * needs its own narrow cast rather than widening `boardDo`'s return type to the full DO class,
+ * which reintroduces the deep RPC type instantiation `BoardStub` was hand-typed to avoid
+ * (`board-do.ts`'s own comment on `BoardStub`).
+ */
+function fireSchedules(stub: BoardStub, nowIso: string): Promise<{ fired: string[]; skipped: string[] }> {
+  return (
+    stub as unknown as { fireDueSchedules(nowIso: string): Promise<{ fired: string[]; skipped: string[] }> }
+  ).fireDueSchedules(nowIso);
+}
+
+/**
+ * Links a hub subject to a local user with `admin` membership, so a hub JWT naming that subject
+ * can reach `POST /v1/boards/:id/schedules` (gated at `manage`, i.e. `admin`+) — `resolveHubUser`
+ * gives an UNLINKED subject only `member`, which the route would refuse.
+ */
+async function adminLinkedTo(tenant: string, sub: string): Promise<string> {
+  const userId = `usr_${sub}`;
+  await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES (?, ?, ?)`)
+    .bind(userId, `${sub}@test.invalid`, sub)
+    .run();
+  await env.DB.prepare(`UPDATE users SET external_source = 'agentpod', external_id = ? WHERE id = ?`)
+    .bind(sub, userId)
+    .run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO memberships (id, tenant_id, user_id, role) VALUES (?, ?, ?, 'admin')`)
+    .bind(`mem_${sub}`, tenant, userId)
+    .run();
+  return userId;
+}
+
+async function jwtFor(sub: string, mayDispatch: string[]): Promise<string> {
+  return new SignJWT({ sub, principalKind: 'human', tenant: FLEET, mayDispatch })
+    .setProtectedHeader({ alg: 'EdDSA', kid: 'cp-kid' })
+    .setIssuedAt()
+    .setIssuer(ISSUER)
+    .setAudience([ISSUER, PLANE])
+    .setExpirationTime('5m')
+    .sign(signingKey);
+}
+
+/**
+ * Important 1 (whole-branch review, Phase 2 fix wave — 2026-09-30): `fireDueSchedules` had
+ * nothing to give `createCardFromTrigger` but `undefined`, so its `?? this.triggerGrant()`
+ * fallback ran on EVERY scheduled card. `triggerGrant()` is the board's GitHub-webhook grant,
+ * with exactly one writer in the whole codebase (`PUT /v1/boards/:id/github`) — a board whose
+ * operator never saved GitHub settings has `null` there. Under enforcement `grantPermitsAgent`
+ * on `null` is false, so every scheduled card parked in `input-required` on first claim; because
+ * that state is not terminal, `scheduleInstanceOpen` then read the instance as open forever, and
+ * the default `overlap: 'skip'` silenced the schedule behind it — one unclaimable card, then
+ * silence, with a rising `skipCount`.
+ *
+ * The fix: `createSchedule` now accepts `queuedGrant`, the ROUTE passes `user.mayDispatch` (the
+ * same value `POST /v1/boards/:id/triggers` already uses), and `fireDueSchedules` passes the
+ * stored grant to `createCardFromTrigger` — capturing authority at the moment a human declares
+ * the schedule, the only moment there is a caller present to ask.
+ *
+ * The two tests below are identical in every respect — same route, same board, same
+ * `ENFORCE_CONTROL_PAIR = 'true'` — except for whether the grant in the JWT that created the
+ * schedule names the claiming agent's principal. That is what makes this pair discriminating:
+ * flip only the grant, and the claim result flips with it. Both run with enforcement ACTUALLY on
+ * (unlike the suite default, `ENFORCE_CONTROL_PAIR: 'false'` — `apps/api/vitest.config.ts` — which
+ * is exactly how this shipped unnoticed).
+ */
+describe('a scheduled card is claimable under enforcement only when its schedule carries a matching grant', () => {
+  it('is claimable when the schedule was declared through the route by a caller whose grant names the agent', async () => {
+    const t = 'tnt_cp_sched_yes';
+    const boardId = await board(t);
+    await agentMappedTo(t, 'agt_sched_yes', 'prn_00000000000schedyes');
+    await adminLinkedTo(t, 'sub_sched_yes');
+
+    await withIssuer(t, async () => {
+      (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+      const jwt = await jwtFor('sub_sched_yes', ['prn_00000000000schedyes']);
+
+      const created = await SELF.fetch(`https://api.test/v1/boards/${boardId}/schedules`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Sweep', rule: 'daily at 09:00', timezone: 'UTC' }),
+      });
+      expect(created.status).toBe(201);
+
+      const fired = await fireSchedules(boardDo(t, boardId), '2099-01-01T10:00:00.000Z');
+      expect(fired.fired).toHaveLength(1);
+
+      // The mechanism this test exists to prove: if `queuedGrant` had not been captured and
+      // stored at creation, `fireDueSchedules` would pass `undefined`, `createCardFromTrigger`
+      // would fall back to `triggerGrant()` — unset on this fresh board, so `null` — and this
+      // claim would be false, exactly like the sibling test below.
+      expect((await claim(t, boardId, 'agt_sched_yes')).claimed).toBe(true);
+    });
+  });
+
+  it('is NOT claimable when the schedule\'s grant does not name the agent, even though creation went through the identical route', async () => {
+    const t = 'tnt_cp_sched_no';
+    const boardId = await board(t);
+    await agentMappedTo(t, 'agt_sched_no', 'prn_00000000000schedno1');
+    await adminLinkedTo(t, 'sub_sched_no');
+
+    await withIssuer(t, async () => {
+      (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+      // A grant is present — creation is not the failure mode here — it just does not cover this
+      // agent's principal. The one thing that differs from the "yes" test above.
+      const jwt = await jwtFor('sub_sched_no', ['prn_00000000somebodyelse']);
+
+      const created = await SELF.fetch(`https://api.test/v1/boards/${boardId}/schedules`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Sweep', rule: 'daily at 09:00', timezone: 'UTC' }),
+      });
+      expect(created.status).toBe(201);
+
+      const stub = boardDo(t, boardId);
+      const fired = await fireSchedules(stub, '2099-01-01T10:00:00.000Z');
+      expect(fired.fired).toHaveLength(1); // the card is minted — it is claiming it that fails
+
+      expect((await claim(t, boardId, 'agt_sched_no')).claimed).toBe(false);
+      const state = await stub.getState();
+      expect(state.cards[0]!.state).toBe('input-required');
+    });
+  });
+
+  it('falls back to the board\'s standing trigger grant for a schedule that predates this column (queued_grant IS NULL)', async () => {
+    // Not every schedule will have been created through the fixed route — this is the
+    // backward-compatibility half `createCardFromTrigger`'s `?? this.triggerGrant()` still
+    // covers, exercised the same way `sch-grant` in `schedules.test.ts` does but with enforcement
+    // actually on, so the fallback is proven to matter under the same conditions Important 1 does.
+    const t = 'tnt_cp_sched_fallback';
+    const boardId = await board(t);
+    await agentMappedTo(t, 'agt_sched_fb', 'prn_0000000000schedfback');
+
+    const stub = boardDo(t, boardId);
+    const sch = await stub.createSchedule({
+      title: 'Legacy schedule',
+      rule: 'daily at 09:00',
+      timezone: 'UTC',
+      overlap: 'skip',
+      createdBy: 'usr_owner',
+      // queuedGrant omitted entirely — the pre-Important-1 shape.
+    });
+    if (!sch.ok) throw new Error(sch.message);
+    const config = await stub.setGithubConfig({ triggerGrant: ['prn_0000000000schedfback'] });
+    if (!config.ok) throw new Error(config.message);
+
+    (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+    await fireSchedules(stub, '2099-01-01T10:00:00.000Z');
+    expect((await claim(t, boardId, 'agt_sched_fb')).claimed).toBe(true);
   });
 });

@@ -174,4 +174,112 @@ describe('schedules', () => {
       expect(events.some((e) => e.type === 'schedule.stage_failed')).toBe(true);
     });
   });
+
+  // Important 2 (whole-branch review, Phase 2 fix wave): `next_fire_at` used to advance by
+  // `nextFireAt(rule, tz, nowIso)` — pure addition from the SWEEP instant, which is always a
+  // little after the instant that was actually due. Every tick's lateness got baked into the
+  // phase forever, so `every 5 minutes` drifted into "every 5 or 10, unpredictably". The pure-math
+  // proof lives in `recurrence.test.ts`; these two exercise the same fix through the DO's own
+  // `fireDueSchedules`, which is what a real cron tick actually calls.
+  it('keeps an interval schedule on phase across repeated slightly-late fires, end to end', async () => {
+    await runInDurableObject(stubFor('sch-interval-phase'), async (board: BoardDO) => {
+      const r = await boardWithSchedule(board, 'schintphase', {
+        rule: 'every 5 minutes',
+        overlap: 'allow', // so three fires in a row each mint a card rather than skipping
+      });
+      const first = new Date(r.nextFireAt).getTime();
+
+      // Fire three times, each observed a little late relative to the schedule's OWN due instant
+      // — not relative to wall-clock "now", which would make a real-time test fragile.
+      let dueAt = first;
+      for (const lateMs of [120, 340, 90]) {
+        const nowIso = new Date(dueAt + lateMs).toISOString();
+        // eslint-disable-next-line no-await-in-loop -- sequential ticks are the point being tested
+        await board.fireDueSchedules(nowIso);
+        dueAt += 5 * 60000; // the next due instant, on the ORIGINAL phase
+      }
+
+      const after = (await board.listSchedules())[0]!;
+      // Exactly on phase: three 5-minute steps past the first fire time, to the millisecond — not
+      // "first fire + the sum of every tick's lateness", which is what firing off `nowIso` each
+      // time (the pre-fix behaviour) would produce.
+      expect(after.nextFireAt).toBe(new Date(first + 3 * 5 * 60000).toISOString());
+      expect((await board.getState()).cards).toHaveLength(3);
+    });
+  });
+
+  it('an interval schedule fired far past due — a cron outage — still produces exactly one card, and does not immediately re-fire', async () => {
+    await runInDurableObject(stubFor('sch-interval-collapse'), async (board: BoardDO) => {
+      const r = await boardWithSchedule(board, 'schintcollapse', { rule: 'every 5 minutes' });
+
+      // Years past the schedule's own first fire time — the same shape a cron that was down for a
+      // long stretch (or a schedule nobody looked at) leaves behind. Before the fix this loop
+      // shape ("collapse a missed week into one card") lived only in `nextFireAt`'s single
+      // addition, which happened to also collapse correctly; the drift bug was orthogonal to it.
+      // What this proves is that `advanceFireTime` did not reintroduce a replay-every-step bug
+      // while fixing the drift.
+      const result = await board.fireDueSchedules('2099-01-01T10:00:03.000Z');
+      expect(result.fired).toEqual([r.id]);
+      expect((await board.getState()).cards).toHaveLength(1);
+
+      // And `next_fire_at` landed strictly after that sweep instant — one 5-minute step past the
+      // stale value, not still-due — so the very next tick does not fire again immediately.
+      const again = await board.fireDueSchedules('2099-01-01T10:00:04.000Z');
+      expect(again.fired).toEqual([]);
+      expect((await board.getState()).cards).toHaveLength(1);
+    });
+  });
+
+  // Minor 5 (whole-branch review): `updateCard`'s Result was discarded here, four lines after the
+  // fix that stopped discarding `moveCard`'s. Its only realistic failures (`NOT_INITIALIZED`,
+  // `CARD_NOT_FOUND`) cannot happen on this path today, so this proves the CHECK exists — via
+  // fault injection, the same device the `sweepBoard` isolation test uses, since there is no
+  // data-driven way to make this particular call fail for real.
+  it('reports it, rather than discarding it, when the priority/labels update after firing fails', async () => {
+    await runInDurableObject(stubFor('sch-update-card-failed'), async (board: BoardDO) => {
+      const r = await boardWithSchedule(board, 'schupdatefail', { priority: 5 });
+
+      (board as unknown as { updateCard: (...args: unknown[]) => Promise<{ ok: boolean; code?: string }> }).updateCard =
+        async () => ({ ok: false, code: 'CARD_NOT_FOUND' });
+
+      const result = await board.fireDueSchedules('2099-01-01T10:00:00.000Z');
+      // The card still exists and firing is still reported as successful — a dropped
+      // priority/labels update does not mean the card itself failed to mint.
+      expect(result.fired).toEqual([r.id]);
+
+      const events = await board.getEvents(50);
+      expect(events.some((e) => e.type === 'schedule.card_update_failed')).toBe(true);
+    });
+  });
+
+  // Minor 6 (whole-branch review): the one state whose treatment differs between
+  // `scheduleInstanceOpen` (all four terminal states closed) and Phase 3's coming blocker rule
+  // (only completed/canceled resolved) had no test — precisely the case a later "unification"
+  // would break without anyone noticing.
+  it('fires again once the previous instance FAILED, not only when it completed', async () => {
+    await runInDurableObject(stubFor('sch-resume-after-fail'), async (board: BoardDO) => {
+      await boardWithSchedule(board, 'schresumefail');
+      await board.fireDueSchedules('2099-01-01T10:00:00.000Z');
+      const [card] = (await board.getState()).cards;
+
+      // `scheduleInstanceOpen` treats a FAILED previous instance as CLOSED — deliberately
+      // different from Phase 3's coming blocker rule, where only completed/canceled resolve a
+      // dependency and a failed one must keep blocking. Nothing in today's application drives a
+      // card to the literal state 'failed' through a public verb: `fail()` is a RUN-level
+      // retry/circuit-breaker (it leaves the card 'submitted' or, past the retry limit,
+      // 'input-required' — never 'failed'), and per the contract's state machine 'failed' is only
+      // ever produced by an `error` activity, which `postActivity` does not currently apply to the
+      // card's own state. So the precondition is set directly here, the same column
+      // `scheduleInstanceOpen`'s own SQL reads — this test is about that helper's branch, not
+      // about how a card gets there.
+      (board as unknown as { sql: { exec: (q: string, ...p: unknown[]) => unknown } }).sql.exec(
+        `UPDATE cards SET state = 'failed' WHERE id = ?`,
+        card!.id,
+      );
+
+      const again = await board.fireDueSchedules('2099-01-03T10:00:00.000Z');
+      expect(again.fired).toHaveLength(1);
+      expect((await board.getState()).cards).toHaveLength(2);
+    });
+  });
 });

@@ -323,6 +323,8 @@ export interface Schedule {
   lastFiredAt: string | null;
   lastCardId: string | null;
   skipCount: number;
+  /** Who declared this schedule, and who every card it mints is owned by. */
+  createdBy: string | null;
 }
 
 /** A board's schedules. Answers an empty list rather than throwing when the read is refused. */

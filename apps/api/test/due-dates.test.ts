@@ -314,6 +314,49 @@ describe('sweepBoard also migrates spec.labels, under the same guard', () => {
     });
   });
 
+  it('still fires due schedules when the overdue-notification block itself throws — that block is not isolated by comment alone', async () => {
+    // A whole-branch review found the backfill and `fireDueSchedules` each wrapped in their own
+    // try/catch, but the overdue block sitting between them was not, even though `sweepBoard`'s
+    // doc comment claims all three jobs are isolated. Before the fix, a throw here aborted the
+    // whole sweep before `fireDueSchedules` ever ran — Phase 1's failure shape, one slot down.
+    //
+    // Unlike the backfill (which has a genuine FK failure to lean on), there is no data-driven way
+    // to make `notify`'s plain INSERT fail for real, so the failure is injected directly at the
+    // one call the overdue block makes. That is fault injection, not a mock of the thing under
+    // test: `sweepBoard`'s own try/catch (or absence of it) is exactly what is being exercised.
+    await runInDurableObject(stubFor('due-overdue-fails-still-fires-schedule'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due19', tenantId: 'tnt_overdue_isolation', name: 'D19', stages: STAGES });
+      const sch = await board.createSchedule({
+        title: 'Sweep the logs',
+        rule: 'daily at 09:00',
+        timezone: 'UTC',
+        overlap: 'skip',
+        createdBy: 'usr_a',
+      });
+      if (!sch.ok) throw new Error(sch.message);
+      const created = await make(board, 'Overdue card', { dueAt: '2026-09-01' });
+
+      (board as unknown as { notify: (...args: unknown[]) => void }).notify = () => {
+        throw new Error('injected overdue-notification failure');
+      };
+
+      // Far enough past the schedule's first fire time (computed from real "now" at creation
+      // above) that it is due no matter when this test runs — the same device Task 9's own
+      // `fireDueSchedules` tests use.
+      const result = await board.sweepBoard('2099-01-01T10:00:00.000Z');
+
+      // The overdue block failed and was reported...
+      const events = await board.getEvents(50);
+      expect(events.some((e) => e.type === 'overdue.sweep_failed')).toBe(true);
+      // ...but did NOT take the schedule down with it. Before the fix this assertion is never
+      // reached: `sweepBoard` above rejects instead of returning.
+      expect(result.schedulesFired).toBe(1);
+      const cards = (await board.getState()).cards;
+      expect(cards.some((c) => c.title === 'Sweep the logs')).toBe(true);
+      expect(cards.some((c) => c.id === created.id)).toBe(true);
+    });
+  });
+
   it('does not touch a second board\'s legacy spec.labels on a second sweep — same once-per-board flag', async () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_a', 'due-dates', 'Due Dates')`).run();
 

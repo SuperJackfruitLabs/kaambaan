@@ -14,7 +14,7 @@ import { parseWindowMs } from '../metering/window';
 import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
-import { parseRule, nextFireAt } from './recurrence';
+import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -561,6 +561,12 @@ export interface ScheduleView {
   lastFiredAt: string | null;
   lastCardId: string | null;
   skipCount: number;
+  /**
+   * The human who declared this schedule, and — via `createCardFromTrigger`'s `ownerUserId` —
+   * the owner every card it mints inherits. Exposed so a client can show whose cards a schedule
+   * will create; before this it was validated hard at creation but invisible everywhere after.
+   */
+  createdBy: string | null;
 }
 
 /** A first-class external link on a card (docs/06). Idempotent on (cardId, url). */
@@ -753,6 +759,8 @@ export interface BoardStub {
     labels?: string[];
     stageKey?: string | null;
     enabled?: boolean;
+    /** What the creator was permitted to dispatch, captured at the moment of the act. */
+    queuedGrant?: string[] | null;
   }): Promise<Result<ScheduleView>>;
   updateSchedule(
     id: string,
@@ -1164,10 +1172,34 @@ export class BoardDO extends DurableObject<Env> {
         last_card_id  TEXT,
         skip_count    INTEGER NOT NULL DEFAULT 0,
         created_by    TEXT,
-        created_at    TEXT NOT NULL
+        created_at    TEXT NOT NULL,
+        queued_grant  TEXT
       )`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(next_fire_at)`);
+    /**
+     * What the creator was PERMITTED to dispatch, as granted at the moment the schedule was
+     * declared — the same reasoning `cards.queued_grant` above already follows, applied one step
+     * earlier. Creating a schedule IS the act of authorising unattended dispatch, exactly as
+     * wiring a webhook's `triggerGrant` is: there is no human present when the schedule fires
+     * later, so the answer to "may this run?" has to be written down now, while it is still
+     * askable.
+     *
+     * Without this column, `fireDueSchedules` had nothing to pass but `undefined`, so
+     * `createCardFromTrigger` fell back to `triggerGrant()` — the board's GitHub-webhook grant,
+     * which has exactly one writer (`PUT /v1/boards/:id/github`). A board whose operator never
+     * saved GitHub settings has `null` there, so under enforcement every scheduled card parked in
+     * `input-required` on first claim, forever, and — because that state is not terminal —
+     * `scheduleInstanceOpen` read the instance as open forever too, silencing the schedule behind
+     * its own default `overlap: 'skip'`. Guarded ALTER, matching the `cards.queued_grant` migration
+     * above, because a board's DO may already have a `schedules` table from before this column
+     * existed — the `CREATE TABLE IF NOT EXISTS` above only helps a board created fresh.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE schedules ADD COLUMN queued_grant TEXT`);
+    } catch {
+      // column already exists
+    }
   }
 
   // ----- RPC: board lifecycle -----
@@ -2272,6 +2304,13 @@ export class BoardDO extends DurableObject<Env> {
     labels?: string[];
     stageKey?: string | null;
     enabled?: boolean;
+    /**
+     * What the creator was permitted to dispatch, captured at the moment the schedule was
+     * declared — the only moment there is a caller present to ask. `fireDueSchedules` passes this
+     * straight to `createCardFromTrigger`, whose own `?? this.triggerGrant()` fallback remains for
+     * schedules created before this field existed. See the `schedules.queued_grant` column note.
+     */
+    queuedGrant?: string[] | null;
   }): Promise<Result<ScheduleView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
 
@@ -2302,8 +2341,8 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `INSERT INTO schedules
         (id, enabled, title, spec_json, priority, labels, stage_key, rule, timezone, overlap,
-         next_fire_at, last_fired_at, last_card_id, skip_count, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?)`,
+         next_fire_at, last_fired_at, last_card_id, skip_count, created_by, created_at, queued_grant)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?)`,
       id,
       input.enabled === false ? 0 : 1,
       input.title,
@@ -2318,6 +2357,7 @@ export class BoardDO extends DurableObject<Env> {
       nextFire,
       input.createdBy,
       now,
+      input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
     );
     const view = this.mustGetSchedule(id);
     this.emit('schedule.created', { schedule: view });
@@ -2471,6 +2511,17 @@ export class BoardDO extends DurableObject<Env> {
       const created = await this.createCardFromTrigger({
         title: row.title as string,
         ownerUserId: row.created_by as string,
+        // The grant captured when the schedule was created (`createSchedule`'s `queuedGrant`).
+        // `createCardFromTrigger` falls back to `triggerGrant()` when this is `undefined` OR
+        // `null` (`??` treats both as nullish) — that fallback is what a board's GitHub-webhook
+        // grant covers, and is exactly the wrong one to lean on here: it has exactly one writer
+        // (`PUT /v1/boards/:id/github`), so a board whose operator never saved GitHub settings has
+        // `null` there, and under enforcement the card would park in `input-required` on first
+        // claim, forever — `scheduleInstanceOpen` then reads the instance as open forever too,
+        // silencing the schedule behind its own default `overlap: 'skip'`. A row predating this
+        // column has `queued_grant IS NULL`, which is exactly the same fallback behaviour a
+        // schedule with no queuedGrant supplied at creation gets — nothing regresses for it.
+        queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : undefined,
         spec: { ...(JSON.parse(row.spec_json as string) as Record<string, unknown>), scheduleId: id },
       });
       if (!created.ok) {
@@ -2490,15 +2541,28 @@ export class BoardDO extends DurableObject<Env> {
         if (!moved.ok) this.emit('schedule.stage_failed', { scheduleId: id, cardId, stageKey: row.stage_key, reason: moved.code });
       }
       if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
-        await this.updateCard(cardId, {
+        // Checked for the same reason `moveCard`'s Result is checked just above: an unchecked
+        // Result reads as a fix half-applied. In practice `updateCard` can only fail here with
+        // `NOT_INITIALIZED` (the board this schedule just fired on) or `CARD_NOT_FOUND` (the card
+        // `createCardFromTrigger` just created, moments ago) — neither realistic on this path — but
+        // "cannot fail today" is not the same guarantee as "checked", and the next caller to touch
+        // this block should not have to re-derive that.
+        const updated = await this.updateCard(cardId, {
           priority: Number(row.priority),
           labels: JSON.parse(row.labels as string) as string[],
         });
+        if (!updated.ok) this.emit('schedule.card_update_failed', { scheduleId: id, cardId, reason: updated.code });
       }
 
+      // `advanceFireTime`, not `nextFireAt(parsed.rule, row.timezone, nowIso)`: `nowIso` is the
+      // sweep instant, always a little after the instant that was actually due, and pure addition
+      // from it bakes that lateness into the phase forever — `every 5 minutes` drifts into "every
+      // 5 or 10, unpredictably". Advancing by whole intervals from the PREVIOUS `next_fire_at`
+      // keeps the phase and still collapses a missed week into one card. Clock rules are immune
+      // and `advanceFireTime` delegates to the same wall-clock computation for them unchanged.
       this.sql.exec(
         `UPDATE schedules SET next_fire_at = ?, last_fired_at = ?, last_card_id = ? WHERE id = ?`,
-        nextFireAt(parsed.rule, row.timezone as string, nowIso),
+        advanceFireTime(parsed.rule, row.timezone as string, row.next_fire_at as string, nowIso),
         nowIso,
         cardId,
         id,
@@ -2570,21 +2634,33 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
-    const today = nowIso.slice(0, 10); // the column is a date, so compare dates
-    const rows = this.sql
-      .exec(
-        `SELECT id, title, due_at FROM cards
-          WHERE due_at IS NOT NULL AND due_at < ?
-            AND archived_at IS NULL
-            AND overdue_notified_at IS NULL
-            AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
-        today,
-      )
-      .toArray();
+    // Its own try/catch too, for the same reason the backfill and `fireDueSchedules` below each
+    // have one: three jobs share this sweep, and the comment above claims all three are isolated
+    // — a claim a whole-branch review found false for this block specifically. Before this, a
+    // throw here (e.g. from `notify`) aborted the sweep before `fireDueSchedules` ever ran,
+    // reintroducing Phase 1's failure shape one slot lower. `overdueNotified` is reported as
+    // however many were notified before a failure, which is honest — that many were.
+    let overdueNotified = 0;
+    try {
+      const today = nowIso.slice(0, 10); // the column is a date, so compare dates
+      const rows = this.sql
+        .exec(
+          `SELECT id, title, due_at FROM cards
+            WHERE due_at IS NOT NULL AND due_at < ?
+              AND archived_at IS NULL
+              AND overdue_notified_at IS NULL
+              AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
+          today,
+        )
+        .toArray();
 
-    for (const row of rows) {
-      this.notify('overdue', row.id as string, `"${row.title as string}" was due ${row.due_at as string}`);
-      this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
+      for (const row of rows) {
+        this.notify('overdue', row.id as string, `"${row.title as string}" was due ${row.due_at as string}`);
+        this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
+        overdueNotified += 1;
+      }
+    } catch (err) {
+      this.emit('overdue.sweep_failed', { reason: String(err) });
     }
 
     // Its own try/catch, for the reason the backfill above has one: three jobs share this sweep, and
@@ -2602,7 +2678,7 @@ export class BoardDO extends DurableObject<Env> {
     // sweep was not clean.
     if (backfillError) throw backfillError;
 
-    return { overdueNotified: rows.length, schedulesFired };
+    return { overdueNotified, schedulesFired };
   }
 
   /**
@@ -3967,6 +4043,7 @@ export class BoardDO extends DurableObject<Env> {
       lastFiredAt: (row.last_fired_at as string | null) ?? null,
       lastCardId: (row.last_card_id as string | null) ?? null,
       skipCount: Number(row.skip_count),
+      createdBy: (row.created_by as string | null) ?? null,
     };
   }
 
