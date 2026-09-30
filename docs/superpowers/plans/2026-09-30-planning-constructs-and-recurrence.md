@@ -1241,6 +1241,27 @@ Requires an `origin TEXT NOT NULL DEFAULT 'declared' CHECK (origin IN ('declared
 column on `labels`, and a `created_by TEXT`. Both go in a **new migration** (the next free number),
 not by editing `0010` — it has already been applied.
 
+⚠️ **The same migration must make uniqueness case-insensitive, or this function creates duplicates.**
+`0010` declares `UNIQUE (tenant_id, name)`, and SQLite compares TEXT with BINARY collation — so
+`Urgent` and `urgent` are two different rows. A `resolveLabelNames` that matches case-insensitively
+would look for `urgent`, not find the existing `Urgent`, insert it successfully, and leave the tenant
+with two labels that read identically to a person. The lookup rule and the constraint have to agree.
+
+SQLite cannot alter an existing constraint, so add an index alongside it:
+
+```sql
+-- The catalogue lookup matches case-insensitively, so uniqueness must too. Without this,
+-- `Urgent` and `urgent` are two rows that render identically and split a filter in half.
+CREATE UNIQUE INDEX labels_tenant_name_nocase ON labels (tenant_id, name COLLATE NOCASE);
+```
+
+Applying it will **fail on any board that already holds a case-variant pair**, which is the correct
+outcome — it says so before the data gets worse. If it fails, resolve the duplicates first rather
+than dropping the index.
+
+Both `resolveLabelNames`' lookup and `createLabel`'s existing collision check must use the same
+`COLLATE NOCASE` comparison, or the two paths disagree about what "already exists" means.
+
 Test: two names, one existing and one new, return two ids and create exactly one row; the same call
 twice creates nothing the second time; `"Urgent"` and `"urgent"` resolve to one id.
 
