@@ -1193,7 +1193,73 @@ git commit -m "feat(web): label chips, a filter, and the due date read off its o
 
 ---
 
-## Task 7: `supi` verbs, and the Phase 1 live check
+## Task 7: One labels concept, then `supi` verbs and the Phase 1 live check
+
+### Part A — reconcile the two labels concepts
+
+Phase 1 must not ship with two. What exists after Task 6:
+
+| | `spec.labels` | `card.labels` |
+|---|---|---|
+| what | free text, comma-separated | `lbl_` ids from the D1 catalogue |
+| age | pre-existed this branch, on `main` | added by Task 4 |
+| edited where | `CardDrawer.svelte:536` | nowhere in the UI |
+| shown where | nowhere | the tile's chips (Task 6) |
+
+So today the drawer edits a Labels field that never appears on the tile, and the tile's chips are
+always empty because no interface writes `card.labels`. That is this plan's doing, not a pre-existing
+fault.
+
+**Resolve it by pointing the input people already use at the catalogue** — do not build a new picker
+and do not keep both.
+
+- [ ] **Step A1: Resolve typed names to catalogue ids, creating what is missing**
+
+Add to `apps/api/src/db/labels.ts`:
+
+```ts
+/**
+ * Turn the names a person typed into label ids, registering any that do not exist yet.
+ *
+ * `origin: 'inferred'` is the same answer `capabilities` gives for a tag that "appeared as a stage
+ * owner and was registered on first use" (migration 0006). The alternative — refusing a name that is
+ * not already in the catalogue — would mean a person cannot label a card without first visiting a
+ * management screen, which is why the free-text input existed in the first place.
+ *
+ * Matching is by name within the tenant, case-insensitively, so "Urgent" and "urgent" do not become
+ * two labels.
+ */
+export async function resolveLabelNames(
+  db: D1Database,
+  tenantId: string,
+  names: string[],
+  createdBy: string | null,
+): Promise<string[]>
+```
+
+Requires an `origin TEXT NOT NULL DEFAULT 'declared' CHECK (origin IN ('declared','inferred'))`
+column on `labels`, and a `created_by TEXT`. Both go in a **new migration** (the next free number),
+not by editing `0010` — it has already been applied.
+
+Test: two names, one existing and one new, return two ids and create exactly one row; the same call
+twice creates nothing the second time; `"Urgent"` and `"urgent"` resolve to one id.
+
+- [ ] **Step A2: Point the drawer at it, and stop writing `spec.labels`**
+
+`CardDrawer.svelte:192-197` currently splits the input and writes the array into the **spec** object.
+Change it to send the names to a route that resolves them and sets `card.labels`, then **delete
+`labels` from the spec literal**. Keep the comma-separated input exactly as it looks — the point is
+that the interface does not change, only where the value goes.
+
+- [ ] **Step A3: Migrate what is already in `spec.labels`**
+
+Extend Task 6's meta-guarded backfill: for each card with a non-empty `spec.labels`, resolve the names
+through `resolveLabelNames`, set `card.labels`, and delete the key from the spec. Same guard, same
+once-per-board property, and the same reason — two sources of truth for one fact is what this closes.
+
+Test a board carrying both `spec.due` and `spec.labels` and assert one sweep migrates both.
+
+### Part B — `supi` verbs, and the Phase 1 live check
 
 **Files:**
 - Modify: `packages/cli/src/index.ts` (verb table ~`:299-494`), `packages/cli/src/verbs.test.ts`
