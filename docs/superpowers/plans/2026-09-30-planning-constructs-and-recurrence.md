@@ -1987,12 +1987,30 @@ Store `input.timezone` **as the operator typed it** — never the resolved spell
 
 Note `scheduleInstanceOpen` treats **all four** terminal states as closed. An instance that `failed` should not wedge the schedule forever — that is the opposite of a *blocker* that failed (Task 11), and the two must not share a helper.
 
-- [ ] **Step 6: Call it from `sweepBoard`**
+- [ ] **Step 6: Call it from `sweepBoard` — in its own try/catch**
+
+⚠️ **`sweepBoard` has changed since this plan was written.** Phase 1's whole-branch review found that
+a failing backfill took the overdue sweep down with it, silently and forever, so the backfill now sits
+in its own `try/catch` and the overdue query runs regardless. **Read the current shape before editing
+it**, and apply the same reasoning to your addition: a schedule that cannot fire must not stop the
+overdue notifications for that board, or every card on it goes unnoticed because one schedule is
+broken.
 
 ```ts
-    const schedules = await this.fireDueSchedules(nowIso);
-    return { overdueNotified: rows.length, schedulesFired: schedules.fired.length };
+    // Its own try/catch, for the reason the backfill above has one: three jobs share this sweep, and
+    // a failure in any of them must not silently disable the other two. `schedulesFired` is still
+    // reported as 0 when firing failed, which is honest — nothing fired.
+    let schedulesFired = 0;
+    try {
+      schedulesFired = (await this.fireDueSchedules(nowIso)).fired.length;
+    } catch (err) {
+      this.emit('schedules.sweep_failed', { reason: String(err) });
+    }
+    return { overdueNotified: rows.length, schedulesFired };
 ```
+
+Note the failure is **emitted**, not swallowed. Phase 1's review found `scheduled()` catching with an
+empty block, so a board failing every tick was invisible everywhere; do not reintroduce that.
 
 - [ ] **Step 7: Run everything**
 
