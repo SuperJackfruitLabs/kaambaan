@@ -687,7 +687,17 @@ In `apps/api/src/index.ts`, beside the existing `/v1/capabilities` routes:
 And in the existing `PATCH /v1/boards/:id/cards/:cardId` handler, before calling the DO:
 
 ```ts
-      if (Array.isArray(body.labels)) {
+      if (body.labels !== undefined) {
+        // The type guard is not decoration. Without it, `labels: "urgent"` skips this whole check
+        // and reaches `[...new Set(patch.labels)]` in the DO, where a string is iterable and spreads
+        // into ['u','r','g','e','n','t'] — written to storage, no error raised. A plain object
+        // throws an unhandled TypeError inside the DO instead. Neither answers 400.
+        if (!Array.isArray(body.labels) || body.labels.some((l) => typeof l !== 'string')) {
+          return Response.json(
+            { error: { code: 'INVALID_LABELS', message: 'labels must be an array of label ids' } },
+            { status: 400 },
+          );
+        }
         const unknown = await unknownLabelIds(env.DB, tenantId, body.labels as string[]);
         if (unknown.length > 0) {
           return Response.json(
@@ -697,6 +707,11 @@ And in the existing `PATCH /v1/boards/:id/cards/:cardId` handler, before calling
         }
       }
 ```
+
+> **Any route that forwards a client value into the DO needs this shape**, not just this one. The DO
+> trusts its callers by design — it cannot reach D1 to validate on a hot path — so the route is the
+> only place a malformed payload is stopped. Later tasks adding `projectId`, `milestoneId` and link
+> ids to a PATCH body carry the same obligation.
 
 - [ ] **Step 6b: Teach the test catalog about migration 0010 — without this, nothing passes**
 
