@@ -3049,16 +3049,23 @@ git commit -m "feat(sub-tasks): split a card into children, over REST and over M
 -- contain. Cross-board decomposition is a project (migration 0013).
 CREATE TABLE card_links_external (
   tenant_id     TEXT NOT NULL REFERENCES tenants(id),
-  from_board_id TEXT NOT NULL,
+  from_board_id TEXT NOT NULL REFERENCES boards(id),
   from_card_id  TEXT NOT NULL,
-  to_board_id   TEXT NOT NULL,
+  to_board_id   TEXT NOT NULL REFERENCES boards(id),
   to_card_id    TEXT NOT NULL,
   kind          TEXT NOT NULL CHECK (kind IN ('blocks', 'relates')),
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (from_card_id, to_card_id, kind)
+  PRIMARY KEY (from_card_id, to_card_id, kind),
+  -- A card blocking itself is never a fact worth storing, and across boards it cannot even be a
+  -- typo the UI would catch: the two ends come from two different pickers.
+  CHECK (from_card_id <> to_card_id)
 );
 CREATE INDEX idx_card_links_external_tenant ON card_links_external(tenant_id);
+-- BOTH ends are indexed because `listExternalLinksFor` matches either one: a card's badge has to
+-- show the edges it declares as well as the edges declared against it. One index would leave half
+-- the reads doing a table scan.
 CREATE INDEX idx_card_links_external_to ON card_links_external(to_card_id);
+CREATE INDEX idx_card_links_external_from ON card_links_external(from_card_id);
 ```
 
 - [ ] **Step 2: Test that the boundary holds**
@@ -3074,6 +3081,13 @@ const B = { boardId: 'brd_releases', cardId: 'card_bbbbbbbbbbbbbbbb' };
 beforeAll(async () => {
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_x', 'x', 'X')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_y', 'y', 'Y')`).run();
+  // Both fixture boards must EXIST and belong to tnt_x: the migration FKs the board ids and
+  // `addExternalLink` checks tenant ownership of both ends.
+  for (const b of [A.boardId, B.boardId]) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES (?, 'tnt_x', ?, '[]')`,
+    ).bind(b, b).run();
+  }
 });
 
 describe('cross-board edges', () => {
@@ -3113,6 +3127,28 @@ describe('cross-board edges', () => {
     expect(await listExternalLinksFor(env.DB, 'tnt_y', B.cardId)).toHaveLength(0);
   });
 
+  it('finds the edge from EITHER end, not just the one it points at', async () => {
+    await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'blocks' });
+    // The card that DECLARES the edge has to show a badge too. Querying only `to_card_id` makes a
+    // card's own outgoing blockers invisible on the card that owns them.
+    expect(await listExternalLinksFor(env.DB, 'tnt_x', A.cardId)).not.toHaveLength(0);
+  });
+
+  it('refuses an edge into a board belonging to another tenant', async () => {
+    // `boards` is in D1 with a `tenant_id`, so this is checkable rather than assumed. Without the
+    // check, a tenant names any board id it likes and reads back rows about a board it cannot see.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_theirs', 'tnt_y', 'Theirs', '[]')`,
+    ).run();
+    const r = await addExternalLink(env.DB, 'tnt_x', {
+      from: A,
+      to: { boardId: 'brd_theirs', cardId: 'card_dddddddddddddddd' },
+      kind: 'blocks',
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('FOREIGN_BOARD');
+  });
+
   it('is idempotent on the same triple, rather than duplicating the badge', async () => {
     await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'relates' });
     await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'relates' });
@@ -3126,9 +3162,104 @@ describe('cross-board edges', () => {
 
 The `SAME_BOARD_EDGE` refusal is the one that protects the design: the enforced and advisory stores must never both be able to hold one edge.
 
-- [ ] **Step 3: Implement, run, commit**
+- [ ] **Step 3: Implement the module**
+
+The tests above are the contract. `apps/api/src/db/card-links-external.ts`:
+
+```ts
+/**
+ * Cross-board card edges (migration 0012) — ADVISORY, always.
+ *
+ * Same-board edges live in the board Durable Object's `card_links`, where the claim path reads them
+ * and they can actually refuse a claim. These cannot be: the two ends are in two different DOs, so
+ * any enforcement would rest on a cross-DO read that is stale the moment it returns. They exist to
+ * be SHOWN, and the UI must say so before an edge is created, not after.
+ */
+export type ExternalLinkKind = 'blocks' | 'relates';
+export interface ExternalEnd { boardId: string; cardId: string }
+export interface ExternalLinkRow { fromBoardId: string; fromCardId: string; toBoardId: string; toCardId: string; kind: ExternalLinkKind }
+
+const COLUMNS =
+  'from_board_id AS fromBoardId, from_card_id AS fromCardId, to_board_id AS toBoardId, to_card_id AS toCardId, kind';
+
+export type AddResult = { ok: true } | { ok: false; code: string; message: string };
+
+export async function addExternalLink(
+  db: D1Database,
+  tenantId: string,
+  edge: { from: ExternalEnd; to: ExternalEnd; kind: ExternalLinkKind },
+): Promise<AddResult> {
+  if (edge.kind === ('parent' as string)) {
+    return { ok: false, code: 'PARENT_MUST_BE_SAME_BOARD', message:
+      'A parent edge carries a rule — a parent does not advance while a child is open — and an advisory containment relationship is one that fails to contain. Use a project to group cards across boards.' };
+  }
+  if (edge.kind !== 'blocks' && edge.kind !== 'relates') {
+    return { ok: false, code: 'BAD_KIND', message: `kind must be 'blocks' or 'relates', got '${edge.kind}'` };
+  }
+  if (edge.from.boardId === edge.to.boardId) {
+    return { ok: false, code: 'SAME_BOARD_EDGE', message:
+      'Both cards are on the same board, so this edge belongs in the board\'s own card_links where it is enforced. Storing it here would show a badge that refuses nothing.' };
+  }
+  if (edge.from.cardId === edge.to.cardId) {
+    return { ok: false, code: 'SELF_EDGE', message: 'A card cannot block itself.' };
+  }
+  // Both boards must exist AND belong to this tenant. One query, so a caller naming a board it
+  // cannot see is refused identically to one naming a board that does not exist.
+  const owned = await db
+    .prepare(`SELECT COUNT(*) AS n FROM boards WHERE tenant_id = ? AND id IN (?, ?)`)
+    .bind(tenantId, edge.from.boardId, edge.to.boardId)
+    .first<{ n: number }>();
+  if ((owned?.n ?? 0) !== 2) {
+    return { ok: false, code: 'FOREIGN_BOARD', message: 'Both boards must exist and belong to this tenant.' };
+  }
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO card_links_external
+         (tenant_id, from_board_id, from_card_id, to_board_id, to_card_id, kind)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(tenantId, edge.from.boardId, edge.from.cardId, edge.to.boardId, edge.to.cardId, edge.kind)
+    .run();
+  return { ok: true };
+}
+
+/** Every advisory edge touching this card, from EITHER end. Tenant-scoped, like every D1 read. */
+export async function listExternalLinksFor(
+  db: D1Database,
+  tenantId: string,
+  cardId: string,
+): Promise<ExternalLinkRow[]> {
+  const { results } = await db
+    .prepare(`SELECT ${COLUMNS} FROM card_links_external WHERE tenant_id = ? AND (from_card_id = ? OR to_card_id = ?)`)
+    .bind(tenantId, cardId, cardId)
+    .all<ExternalLinkRow>();
+  return results ?? [];
+}
+
+export async function removeExternalLink(
+  db: D1Database,
+  tenantId: string,
+  fromCardId: string,
+  toCardId: string,
+  kind: ExternalLinkKind,
+): Promise<void> {
+  await db
+    .prepare(`DELETE FROM card_links_external WHERE tenant_id = ? AND from_card_id = ? AND to_card_id = ? AND kind = ?`)
+    .bind(tenantId, fromCardId, toCardId, kind)
+    .run();
+}
+```
+
+- [ ] **Step 4: Register the migration in the TEST catalogue, or every test above fails**
+
+`apps/api/test/helpers/catalog.ts`'s `setupCatalog()` builds the D1 schema the test environment
+sees. It does NOT read `migrations/`. A new migration file is invisible to every test until its
+DDL is added there — add `card_links_external` (table and all three indexes) alongside `labels`.
+
+- [ ] **Step 5: Run and commit**
 
 ```bash
+pnpm --filter @superpipeline/api test
 git add apps/api/migrations/0012_card_links_external.sql apps/api/src apps/api/test
 git commit -m "feat(links): advisory cross-board edges, refused for same-board and for parent"
 ```
