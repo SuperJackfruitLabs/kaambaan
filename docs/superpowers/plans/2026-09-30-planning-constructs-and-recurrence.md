@@ -2555,8 +2555,44 @@ and it cannot claim/refuse hot-loop.
   }
 ```
 
-Both callers pick the change up unchanged. **Add a test asserting the count agrees**, mirroring Task
-5's `due-archived-count`:
+Both callers pick the change up unchanged.
+
+⚠️ **There is a THIRD eligibility site, and Phase 1 left you a note on it.** `notifyWorkAvailable`
+(`board-do.ts:2700`) is a JS predicate over a `CardView`, so it cannot call a SQL fragment. Its comment
+says exactly what this task must do:
+
+> Mirrors `claimableWhere`'s archived exclusion, by hand … any eligibility condition added there needs
+> its equivalent added here too, or a push fires for work `claim` will refuse.
+
+A blocked card that is reworked, returned, retried or gate-resolved would otherwise queue
+`work.available` pushes for work the claim path then declines. Bounded — one spurious ping, not the
+`readyForYou` loop — but it is the same family.
+
+**Do not hand-write a third copy of the rule.** Extract the two `NOT EXISTS` clauses into their own
+parameterless fragment and use it in both places:
+
+```ts
+  /**
+   * What makes a card ineligible regardless of stage or state: an unresolved blocker, or an open
+   * child. Parameterless and correlated on `c`, so it composes into `claimableWhere`'s SELECT and
+   * into a single-card check without either restating it.
+   *
+   * One definition, three readers — the claim query, the discovery count, and `notifyWorkAvailable`'s
+   * JS gate, which reaches it through `isHeldBack` below rather than by mirroring the SQL by hand.
+   */
+  private blockedWhere(): string { … }
+
+  /** The same rule, asked about one card, for callers that are not a SELECT over the stage set. */
+  private isHeldBack(cardId: string): boolean {
+    return this.sql.exec(`SELECT 1 FROM cards c WHERE c.id = ? AND (${this.blockedWhere()}) LIMIT 1`, cardId)
+      .toArray().length === 0;
+  }
+```
+
+Then `notifyWorkAvailable` gains `|| this.isHeldBack(card.id)` beside its archived check, and its
+comment is updated to say the blocked rule now comes from a shared fragment rather than by hand.
+
+**Add a test asserting the count agrees**, mirroring Task 5's `due-archived-count`:
 
 ```ts
   it('does not advertise a blocked card either', async () => {
