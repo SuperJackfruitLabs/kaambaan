@@ -1048,7 +1048,46 @@ git commit -m "feat(due dates): claim order, an overdue notification, and a per-
 
 ---
 
-## Task 6: Phase 1 in the UI
+## Task 6: Make the due date real, end to end
+
+Two gaps found after Task 5, which together mean due dates would pass every test and do nothing in
+production. Both are fixed here because "a due date set in the UI actually works" is one deliverable.
+
+- **`backfillDueDates` has no production caller.** Task 3 wrote it; only a test calls it. Every card
+  created before this work keeps its date in `spec.due` where nothing reads it.
+- **`ComposeSheet` still writes `spec.due`** (`app.svelte.ts:370`). So every *new* card would get a
+  due date in the blob that claim ordering, the sweep and the tile all ignore.
+
+- [ ] **Step 0a: Give the backfill a caller — once per board, not per tick**
+
+In `sweepBoard`, before the overdue scan, guarded by a `meta` flag so it runs once ever per board:
+
+```ts
+    // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
+    // (`WHERE due_at IS NULL`) matches every card that never had a due date — i.e. most of them,
+    // forever — so running it on each five-minute tick would be a full table scan for nothing.
+    if (!this.getMeta('dueBackfillDone')) {
+      const { migrated } = await this.backfillDueDates();
+      this.setMeta('dueBackfillDone', '1');
+      if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
+    }
+```
+
+Check the exact `getMeta`/`setMeta` signatures in the file before using them; if `setMeta` does not
+exist, follow however `boardId` is persisted in `meta`. Off the request path and once per board is
+the shape that matters — do not call it from the DO constructor.
+
+Test it: a board with a card carrying `spec.due` gets it migrated by the first `sweepBoard`, a second
+`sweepBoard` migrates nothing, and the flag survives.
+
+- [ ] **Step 0b: Let `createCard` accept a due date**
+
+`createCard` does not accept `dueAt`, so the compose form would have to create-then-patch — two round
+trips, and a failure between them leaves a card whose due date silently vanished. Add `dueAt?: string`
+to `createCard`'s input and its INSERT, validated at the route with the **same** `^\d{4}-\d{2}-\d{2}$`
+rule Task 5 added to the card PATCH. Reuse that validator rather than writing a second one.
+
+## Task 6 (continued): Phase 1 in the UI
 
 **Files:**
 - Modify: `apps/web/src/lib/api.ts` — `Card` gains `labels`, `dueAt`, `archivedAt`; add `listLabels`/`createLabel`/`updateLabel`/`deleteLabel`
@@ -1118,6 +1157,12 @@ Then in `CardTile.svelte` replace the inline block with:
 ```
 
 and render `card.dueAt` where it rendered `due`. Delete the `spec?.due` read entirely — the field is gone from `spec` after Task 3's backfill, and leaving the fallback would hide a regression.
+
+- [ ] **Step 3b: Stop writing `spec.due`**
+
+`app.svelte.ts:365-372` puts the date into `spec.due`. Change `dispatchCard` to send `dueAt` as a
+first-class field via Step 0b's widened `createCard`, and **delete** the `spec.due` write. Leaving
+both would recreate the two-sources-of-truth problem this column exists to end.
 
 - [ ] **Step 4: Label chips on the tile**
 
