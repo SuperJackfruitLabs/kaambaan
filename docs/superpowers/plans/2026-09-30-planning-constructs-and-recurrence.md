@@ -3403,6 +3403,42 @@ blockedBy: Array<{ cardId: string; title: string }>;
 `blockedBy` rather than a boolean because the tooltip has to name the blocker ("Blocked by *Title*"),
 and a count alone would send the drawer back for another round trip.
 
+**Only the `blocks` half.** `blockedWhere()` is two `NOT EXISTS` clauses, not one: an unresolved
+`blocks` edge pointing *at* this card, and an unresolved `parent` edge pointing *from* it (an open
+child). Both exclude a card from claiming, but they are different facts with different badges, and
+`CardView` already carries `openChildCount` for the second. `blockedBy` covers the **first clause
+only**; a card with open children is not "Blocked by" anything.
+
+So extract the two clauses into named fragments and compose `blockedWhere()` from them:
+
+```ts
+/** An unresolved `blocks` edge pointing at `c.id`. The enforced dependency. */
+private unresolvedBlockerExists(): string {
+  return `EXISTS (
+      SELECT 1 FROM card_links l JOIN cards b ON b.id = l.from_card_id
+       WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+         AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
+    )`;
+}
+/** An unresolved child of `c.id` — surfaced as `openChildCount`, not as a blocker. */
+private openChildExists(): string { /* the `parent` clause, same shape */ }
+
+private blockedWhere(): string {
+  return `NOT ${this.unresolvedBlockerExists()} AND NOT ${this.openChildExists()}`;
+}
+```
+
+This is the point of the exercise: the badge and the claim query must not be able to disagree about
+what "unresolved" means, and the only durable way to guarantee that is for one spelling of the rule to
+exist. `RESOLVED_SQL` already centralises the state list; these fragments centralise the two shapes
+built on it. The `blockedBy` batch query then reuses the same `kind = 'blocks'` + `RESOLVED_SQL`
+predicate to select the blocker rows themselves.
+
+Note that only **one** of `rowToCard`'s three call sites passes `pre` today (`board-do.ts:4636`, the
+batched board read); the other two (`:3524`, `:4583`) are single-card reads that fall back to
+per-card queries. Follow that existing split rather than changing it — add `blockedBy` to the `pre`
+shape for the batched path, and a single-card fallback query for the other two.
+
 **Compute it once per board read, not once per card.** `rowToCard(row, pre?)` already takes a
 precomputed argument for exactly this reason — Task 14 added it because `rowToCard` had grown to five
 extra queries per card. Follow that pattern: one query per board read that returns every unresolved
