@@ -62,6 +62,7 @@ import {
   listImplications,
   removeImplication,
 } from './db/implications';
+import { listLabels, createLabel, updateLabel, deleteLabel, unknownLabelIds } from './db/labels';
 
 export { BoardDO };
 
@@ -570,6 +571,67 @@ export default {
             return Response.json({ error: `${cap.key} is still used by ${who}`, usage: used }, { status: 409 });
           }
           await deleteCapability(env.DB, u.tenantId, capId);
+          return new Response(null, { status: 204 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
+    // /v1/labels[/:id] — the tenant's label catalogue (migration 0010).
+    //
+    // `Card.labels` has named this since the contract's Card schema existed, with no table and no
+    // route behind it (docs/01). The catalogue is tenant-scoped, not board-scoped, because a label
+    // that means one thing on one board and another on a second is not a label. What a card carries
+    // is validated and stored separately, on the `PATCH /v1/boards/:id/cards/:cardId` route below.
+    const labelsMatch = path.match(/^\/v1\/labels(?:\/([^/]+))?$/);
+    if (labelsMatch) {
+      try {
+        const u = await resolveUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const labelId = labelsMatch[1];
+
+        if (request.method === 'GET' && !labelId) {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ labels: await listLabels(env.DB, u.tenantId) });
+        }
+
+        // Defining the workspace's labels is the same class of act as managing its capabilities.
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !labelId) {
+          const body = (await request.json()) as { name?: string; colour?: string };
+          if (!body.name || body.name.trim() === '') {
+            return Response.json({ error: 'name is required' }, { status: 400 });
+          }
+          if (!body.colour || body.colour.trim() === '') {
+            return Response.json({ error: 'colour is required' }, { status: 400 });
+          }
+          try {
+            const made = await createLabel(env.DB, u.tenantId, { name: body.name, colour: body.colour });
+            return Response.json({ label: made }, { status: 201 });
+          } catch (err) {
+            // The UNIQUE(tenant_id, name) collision, read as a sentence rather than a raw SQLite
+            // constraint error — the same treatment `/v1/capabilities` gives its own collision.
+            return Response.json({ error: `a label named "${body.name}" already exists in this workspace` }, { status: 409 });
+          }
+        }
+
+        if (labelId && request.method === 'PATCH') {
+          const body = (await request.json()) as { name?: string; colour?: string };
+          const updated = await updateLabel(env.DB, u.tenantId, labelId, body);
+          if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
+          return Response.json({ label: updated });
+        }
+
+        if (labelId && request.method === 'DELETE') {
+          if (!(await deleteLabel(env.DB, u.tenantId, labelId))) {
+            return Response.json({ error: 'label not found' }, { status: 404 });
+          }
           return new Response(null, { status: 204 });
         }
 
@@ -1167,9 +1229,27 @@ export default {
         return Response.json({ card: result.value });
       }
       if (cardMatch && request.method === 'PATCH') {
-        const body = (await request.json()) as { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string };
+        const body = (await request.json()) as {
+          title?: string;
+          spec?: JsonValue;
+          priority?: number;
+          ownerUserId?: string;
+          labels?: string[];
+        };
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
+        }
+        // The DO does not validate label ids — it cannot reach D1 usefully on a hot path — so the
+        // route checks here, before the write lands, that every id names a real label in this
+        // workspace's catalogue.
+        if (Array.isArray(body.labels)) {
+          const unknown = await unknownLabelIds(env.DB, tenantId, body.labels as string[]);
+          if (unknown.length > 0) {
+            return Response.json(
+              { error: { code: 'UNKNOWN_LABEL', message: `no such label in this workspace: ${unknown.join(', ')}` } },
+              { status: 400 },
+            );
+          }
         }
         const result = await stub.updateCard(cardMatch[1]!, body);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });

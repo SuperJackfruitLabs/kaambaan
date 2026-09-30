@@ -1293,7 +1293,7 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: card };
   }
 
-  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>> {
+  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[] }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
@@ -1313,6 +1313,10 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.ownerUserId !== undefined) {
       sets.push('owner_user_id = ?');
       vals.push(patch.ownerUserId);
+    }
+    if (patch.labels !== undefined) {
+      sets.push('labels = ?');
+      vals.push(JSON.stringify([...new Set(patch.labels)]));
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
