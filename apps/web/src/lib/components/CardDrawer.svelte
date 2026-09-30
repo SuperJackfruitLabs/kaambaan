@@ -19,6 +19,7 @@
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
+  import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -71,6 +72,16 @@
   let editPriority = $state(0);
   let editDesc = $state('');
   let editLabels = $state('');
+  /**
+   * True when the card carries label ids but the catalogue resolved none of them by name — a
+   * stale or failed `app.labels` (finding 2, phase-1 fix wave). `editLabels` reads as empty in
+   * that case even though the card is NOT actually unlabelled, and `saveCard` must not write
+   * `labelNames` from it: an ordinary save (even title-only — `labelNames` is sent every time)
+   * would send `labelNames: []`, which the server reads as "replace with nothing" and silently
+   * wipes every label off the card. A UI that cannot see the labels must not be able to delete
+   * them.
+   */
+  let editLabelsBlind = $state(false);
   let editAC = $state('');
   // `dueAt` is its own column (Task 6), not `spec.due` — two sources of truth for one date is
   // the condition that column exists to end.
@@ -180,11 +191,10 @@
     // Names, read back from the catalogue by the ids the card actually carries — `card.labels`
     // (Task 4), not `spec.labels`. The catalogue is already in the store (`app.labels`, fetched at
     // board load), so no extra round trip is needed to show what a person typed before.
-    const byId = app.labelById();
-    editLabels = card.labels
-      .map((id) => byId.get(id)?.name)
-      .filter((name): name is string => Boolean(name))
-      .join(', ');
+    const byName = new Map([...app.labelById()].map(([id, l]) => [id, l.name]));
+    const resolved = resolveCardLabelsForEdit(card.labels, byName);
+    editLabels = resolved.text;
+    editLabelsBlind = resolved.blind;
     const existingAC = Array.isArray(card.spec?.acceptanceCriteria) ? (card.spec!.acceptanceCriteria as string[]) : [];
     editAC = existingAC.join('\n');
     editDue = card.dueAt ?? '';
@@ -199,7 +209,13 @@
       // creates whatever does not exist yet rather than refusing it. `spec.labels` is not written:
       // that field is what left the tile's chips permanently empty, since nothing ever wrote
       // `card.labels` (the field the tile actually reads).
-      const labelNames = editLabels.split(',').map((l) => l.trim()).filter(Boolean);
+      //
+      // Omitted entirely (not sent as `[]`) when `editLabelsBlind` — the catalogue could not
+      // resolve any of the card's current label ids, so `editLabels` reads as empty even though
+      // the card is not actually unlabelled. Sending `labelNames: []` there would tell the server
+      // to replace the card's labels with nothing, wiping them from a save that never meant to
+      // touch labels at all (finding 2, phase-1 fix wave).
+      const labelNames = editLabelsBlind ? undefined : editLabels.split(',').map((l) => l.trim()).filter(Boolean);
       const ac = editAC.split('\n').map((l) => l.trim()).filter(Boolean);
       const spec = {
         ...(card?.spec ?? {}),
@@ -210,7 +226,7 @@
         title: editTitle.trim(),
         priority: Number(editPriority) || 0,
         spec,
-        labelNames,
+        ...(labelNames !== undefined ? { labelNames } : {}),
         // Empty clears it — null, not an omitted field, so "no due date" is a real write rather
         // than a value the server never hears about.
         dueAt: editDue.trim() === '' ? null : editDue.trim(),
@@ -548,8 +564,14 @@
               id="edit-labels"
               bind:value={editLabels}
               placeholder="bug, frontend, urgent"
-              class="bg-inset border-border focus:border-marigold mt-1 w-full rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+              disabled={editLabelsBlind}
+              class="bg-inset border-border focus:border-marigold mt-1 w-full rounded-[6px] border px-2.5 py-1.5 text-xs outline-none disabled:opacity-60"
             />
+            {#if editLabelsBlind}
+              <p class="text-muted-foreground mono mt-1 text-[10px]">
+                Couldn't load this card's labels from the catalogue — editing is disabled so saving does not clear them. Reopen the card to retry.
+              </p>
+            {/if}
             <label for="edit-ac" class="text-muted-foreground mono mt-3 block text-[11px] uppercase tracking-widest">Acceptance Criteria <span class="normal-case">(one per line)</span></label>
             <textarea
               id="edit-ac"

@@ -182,7 +182,19 @@ export const Card = z.object({
   delegateAgentId: AgentId.optional(),
   priority: z.number().int().default(0),
   labels: z.array(z.string()).default([]),
-  archivedAt: z.string().optional(),
+  /**
+   * The card's due date (`YYYY-MM-DD`), or explicitly `null` when it has none — matches
+   * `CardView.dueAt` (`apps/api/src/board/board-do.ts`'s `rowToCard`), which is `string | null`,
+   * never `undefined`. `.optional()` besides `.nullable()` so a hand-built `Card` (as in tests
+   * here) may still omit it entirely.
+   */
+  dueAt: z.string().nullable().optional(),
+  /**
+   * `CardView.archivedAt` is likewise always `string | null`, never `undefined` — `.nullable()`
+   * so `Card.parse` on a live, unarchived card (which sends `archivedAt: null`, not an absent
+   * key) does not reject it.
+   */
+  archivedAt: z.string().nullable().optional(),
   ...timestamps,
 });
 export type Card = z.infer<typeof Card>;

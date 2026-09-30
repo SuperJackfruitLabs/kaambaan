@@ -98,6 +98,66 @@ describe('entity schemas', () => {
     });
     expect(card.archivedAt).toBeUndefined();
   });
+
+  /**
+   * `CardView.archivedAt` (apps/api/src/board/board-do.ts) is ALWAYS `string | null`, never
+   * `undefined` — the DO's `rowToCard` does `(row.archived_at as string | null) ?? null`. Before
+   * this, the contract's `archivedAt: z.string().optional()` accepted `undefined` but rejected an
+   * explicit `null`, so `Card.parse` on a real card view — not a hand-built object skipping the
+   * field, an actual live one — would reject every unarchived card.
+   */
+  it('accepts archivedAt: null, exactly what a live CardView sends for an unarchived card', () => {
+    const parsed = Card.safeParse({
+      id: 'card_0000000000000002',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'A live card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      archivedAt: null,
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.archivedAt).toBeNull();
+  });
+
+  /**
+   * `dueAt` (this branch's own column, `due_at` on `cards`) has been a real field with an index, a
+   * claim-order term (`due-dates.test.ts`) and a cron sweep behind it since Task 6 — but the
+   * contract never declared it. This branch exists to end exactly this kind of drift.
+   */
+  it('declares dueAt, matching CardView\'s string | null shape', () => {
+    expect('dueAt' in Card.shape).toBe(true);
+
+    const withDate = Card.safeParse({
+      id: 'card_0000000000000003',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'Due card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      dueAt: '2026-10-01',
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(withDate.success).toBe(true);
+    if (withDate.success) expect(withDate.data.dueAt).toBe('2026-10-01');
+
+    const withNull = Card.safeParse({
+      id: 'card_0000000000000004',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'Undated card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      dueAt: null,
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(withNull.success).toBe(true);
+    if (withNull.success) expect(withNull.data.dueAt).toBeNull();
+  });
 });
 
 /**

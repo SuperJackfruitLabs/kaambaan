@@ -18,6 +18,28 @@ import { resolveLabelNames } from '../db/labels';
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * Strip the pre-migration keys `spec.due` and `spec.labels` from a spec, once the once-per-board
+ * backfill has already run.
+ *
+ * `backfillDueDates`/`backfillLabelNames` move these onto `due_at`/`labels` exactly once per
+ * board (`dueBackfillDone`), and BEFORE that pass a card legitimately carries them — that is what
+ * the backfill exists to find. Nothing stopped a caller — an API or MCP client posting raw `spec`
+ * JSON, or `CardDrawer.saveCard`'s `...card.spec` spread carrying a stale key forward — from
+ * writing `spec.due`/`spec.labels` again AFTER that pass, and the backfill's own guard
+ * (`WHERE due_at IS NULL`) then skips that card forever: the same save that writes the stale spec
+ * key also writes `due_at` directly, so the key is not "cleared at the next tick" — it is
+ * permanent. Stripped here (once the guard says there is nothing left to migrate) rather than
+ * refused with a 400: a 400 would break saving any card that still carries a stale key for an
+ * unrelated reason, whereas stripping is self-healing and closes a door the backfill cannot reach.
+ */
+function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined {
+  if (spec === undefined || spec === null || typeof spec !== 'object' || Array.isArray(spec)) return spec;
+  if (!('due' in spec) && !('labels' in spec)) return spec;
+  const { due: _due, labels: _labels, ...rest } = spec;
+  return rest;
+}
+
 /** How long an agent may go without a heartbeat before its run is reclaimed (docs/08 §3, ⚠️ OPEN). */
 const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
 /** Consecutive failed/reclaimed runs before a card auto-blocks for a human (docs/08 §4, ⚠️ OPEN). */
@@ -1120,7 +1142,7 @@ export class BoardDO extends DurableObject<Env> {
        VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
-      JSON.stringify(input.spec ?? {}),
+      JSON.stringify((this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(input.spec) : input.spec) ?? {}),
       input.ownerUserId,
       first.key,
       input.priority ?? 0,
@@ -1361,7 +1383,8 @@ export class BoardDO extends DurableObject<Env> {
     patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
   ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
-    if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    const existing = this.getCard(cardId);
+    if (!existing) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (patch.title !== undefined) {
@@ -1370,7 +1393,7 @@ export class BoardDO extends DurableObject<Env> {
     }
     if (patch.spec !== undefined) {
       sets.push('spec_json = ?');
-      vals.push(JSON.stringify(patch.spec));
+      vals.push(JSON.stringify(this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(patch.spec) : patch.spec));
     }
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
@@ -1388,9 +1411,15 @@ export class BoardDO extends DurableObject<Env> {
       sets.push('due_at = ?');
       // Validation lives at the route (`PATCH /cards/:id` in index.ts) — this DO is reachable from
       // more than one caller, so a non-string here is stored as-is rather than crashing `.trim()`.
-      vals.push(patch.dueAt === null || typeof patch.dueAt !== 'string' ? patch.dueAt : patch.dueAt.trim());
-      // A changed date is a new chance to be told about it. No placeholder, so no `vals` entry.
-      sets.push('overdue_notified_at = NULL');
+      const normalizedDueAt = patch.dueAt === null || typeof patch.dueAt !== 'string' ? patch.dueAt : patch.dueAt.trim();
+      vals.push(normalizedDueAt);
+      // A changed date is a new chance to be told about it — but `dueAt` is sent on EVERY save
+      // (CardDrawer.svelte), not only when the date itself changed, so this must compare against
+      // the value actually stored rather than fire on `patch.dueAt !== undefined` alone. Otherwise
+      // editing a card's title re-arms the overdue nag and the next sweep spams the owner again.
+      if (normalizedDueAt !== existing.dueAt) {
+        sets.push('overdue_notified_at = NULL'); // no placeholder, so no `vals` entry
+      }
     }
     if (patch.archivedAt !== undefined) {
       sets.push('archived_at = ?');
@@ -2148,17 +2177,29 @@ export class BoardDO extends DurableObject<Env> {
     // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
     // (`WHERE due_at IS NULL`) matches every card that never had a due date — i.e. most of them,
     // forever — so running it on each five-minute tick would be a full table scan for nothing.
+    // A board whose backfill can never succeed (e.g. a missing tenant row `backfillLabelNames`
+    // needs) must not lose its overdue sweep forever — that would silently kill notifications AND
+    // re-scan the whole card table every five minutes. So the backfill's own failure is caught
+    // here and deferred past the overdue query below, rather than aborting the whole sweep before
+    // it runs. The flag stays unset on failure — a failure still retries the whole pass next
+    // sweep, which is deliberate and tested (`backfillLabelNames` above) — but the deferred error
+    // is re-thrown at the end so a caller still sees the sweep failed.
+    let backfillError: unknown = null;
     if (!this.getMeta('dueBackfillDone')) {
-      const { migrated } = await this.backfillDueDates();
-      // Same guard, same pass: a card's legacy `spec.labels` is the other half of "two sources of
-      // truth for one fact" this flag exists to close. If either backfill throws, the flag below
-      // is never set — a failure retries the whole pass next sweep rather than skipping either
-      // migration forever. Both backfills are individually idempotent, so a retried
-      // `backfillDueDates` after a `backfillLabelNames` failure costs nothing extra.
-      const { migrated: labelsMigrated } = await this.backfillLabelNames();
-      this.setMeta('dueBackfillDone', '1');
-      if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
-      if (labelsMigrated > 0) this.emit('cards.labels_backfilled', { migrated: labelsMigrated });
+      try {
+        const { migrated } = await this.backfillDueDates();
+        // Same guard, same pass: a card's legacy `spec.labels` is the other half of "two sources of
+        // truth for one fact" this flag exists to close. If either backfill throws, the flag below
+        // is never set — a failure retries the whole pass next sweep rather than skipping either
+        // migration forever. Both backfills are individually idempotent, so a retried
+        // `backfillDueDates` after a `backfillLabelNames` failure costs nothing extra.
+        const { migrated: labelsMigrated } = await this.backfillLabelNames();
+        this.setMeta('dueBackfillDone', '1');
+        if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
+        if (labelsMigrated > 0) this.emit('cards.labels_backfilled', { migrated: labelsMigrated });
+      } catch (err) {
+        backfillError = err;
+      }
     }
 
     const today = nowIso.slice(0, 10); // the column is a date, so compare dates
@@ -2177,6 +2218,10 @@ export class BoardDO extends DurableObject<Env> {
       this.notify('overdue', row.id as string, `"${row.title as string}" was due ${row.due_at as string}`);
       this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
     }
+
+    // The overdue sweep above ran regardless of the backfill's outcome. Now that it has, surface
+    // the deferred failure so a caller (the cron loop) still learns the sweep was not clean.
+    if (backfillError) throw backfillError;
 
     return { overdueNotified: rows.length, schedulesFired: 0 };
   }

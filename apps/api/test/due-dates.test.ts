@@ -119,6 +119,26 @@ describe('overdue notification', () => {
     });
   });
 
+  it('does not re-arm the notification when an edit resends the SAME due date (CardDrawer sends dueAt on every save)', async () => {
+    await runInDurableObject(stubFor('due-unrelated-edit'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due14', tenantId: 'tnt_a', name: 'D14', stages: STAGES });
+      const card = await make(board, 'Overdue', { dueAt: '2026-09-01' });
+
+      expect((await board.sweepBoard('2026-09-30T10:00:00.000Z')).overdueNotified).toBe(1);
+
+      // An unrelated field changes (a title edit), but the client resends the SAME dueAt it
+      // already had — exactly what CardDrawer.svelte does on every save, not only a due-date edit.
+      const u = await board.updateCard(card.id, { title: 'Overdue (retitled)', dueAt: '2026-09-01' });
+      if (!u.ok) throw new Error(u.message);
+
+      // No second notification: the value never actually changed.
+      expect((await board.sweepBoard('2026-09-30T10:05:00.000Z')).overdueNotified).toBe(0);
+
+      const notes = (await board.getNotifications()).filter((n) => n.kind === 'overdue');
+      expect(notes).toHaveLength(1);
+    });
+  });
+
   it('says nothing about a card that is not yet due', async () => {
     await runInDurableObject(stubFor('due-future'), async (board: BoardDO) => {
       await board.init({ id: 'brd_due6', tenantId: 'tnt_a', name: 'D6', stages: STAGES });
@@ -180,7 +200,11 @@ describe('sweepBoard runs the due-date backfill once per board', () => {
 
       const untouched = (await board.getState()).cards.find((c) => c.id === second.value.id)!;
       expect(untouched.dueAt).toBeNull();
-      expect((untouched.spec as Record<string, unknown>).due).toBe('2026-08-02');
+      // NOT '2026-08-02': `createCard` strips the stale `spec.due` key on write once the
+      // once-per-board backfill has already run (finding 9) rather than letting it sit there
+      // forever — the second sweep's `WHERE due_at IS NULL` guard will never revisit this card, so
+      // a surviving raw key would be permanent, not merely unmigrated.
+      expect((untouched.spec as Record<string, unknown>).due).toBeUndefined();
 
       const eventsAfter = await board.getEvents();
       expect(eventsAfter.filter((e) => e.type === 'cards.due_backfilled')).toHaveLength(1);
@@ -266,6 +290,30 @@ describe('sweepBoard also migrates spec.labels, under the same guard', () => {
     });
   });
 
+  it('still sends the SAME sweep\'s overdue notifications when the backfill throws', async () => {
+    // No `tenants` row for this tenant id — same FK failure the previous test relies on, the real
+    // way `backfillLabelNames` can fail, not a mock. Before the fix, this failure threw BEFORE the
+    // overdue query at all, so a board that can never backfill successfully would never send an
+    // overdue notification either, forever — on top of the empty-catch in `scheduled()` making
+    // that failure invisible everywhere.
+    await runInDurableObject(stubFor('due-backfill-fails-still-notifies'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due16', tenantId: 'tnt_backfill_retry_notify', name: 'D16', stages: STAGES });
+      const created = await board.createCard({
+        title: 'Legacy labels + overdue',
+        ownerUserId: 'usr_a',
+        spec: { labels: ['bug'] }, // makes backfillLabelNames attempt (and fail) its FK insert
+      });
+      if (!created.ok) throw new Error(created.message);
+      const dueSet = await board.updateCard(created.value.id, { dueAt: '2026-09-01' });
+      if (!dueSet.ok) throw new Error(dueSet.message);
+
+      await expect(board.sweepBoard('2026-09-30T10:00:00.000Z')).rejects.toThrow();
+
+      const notes = (await board.getNotifications()).filter((n) => n.kind === 'overdue');
+      expect(notes).toHaveLength(1);
+    });
+  });
+
   it('does not touch a second board\'s legacy spec.labels on a second sweep — same once-per-board flag', async () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_a', 'due-dates', 'Due Dates')`).run();
 
@@ -284,7 +332,58 @@ describe('sweepBoard also migrates spec.labels, under the same guard', () => {
 
       const untouched = (await board.getState()).cards.find((c) => c.id === second.value.id)!;
       expect(untouched.labels).toEqual([]);
-      expect((untouched.spec as Record<string, unknown>).labels).toEqual(['docs']);
+      // NOT ['docs']: `createCard` strips the stale `spec.labels` key on write (finding 9) rather
+      // than letting it sit there forever — the once-per-board backfill (`WHERE due_at IS NULL`
+      // equivalent guard) will never revisit this card, so a surviving raw key would be permanent,
+      // not merely unmigrated.
+      expect((untouched.spec as Record<string, unknown>).labels).toBeUndefined();
+    });
+  });
+});
+
+describe('createCard/updateCard strip the stale spec.due/spec.labels keys on write (finding 9)', () => {
+  it('createCard never stores spec.due or spec.labels, even after the once-per-board backfill has already run', async () => {
+    await runInDurableObject(stubFor('spec-strip-create'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due17', tenantId: 'tnt_spec_strip_create', name: 'D17', stages: STAGES });
+
+      // Run the backfill pass once, on a board with nothing to migrate — so `dueBackfillDone` is
+      // set and any FRESH card carrying `spec.due`/`spec.labels` from here on is exactly the
+      // post-backfill scenario finding 9 describes: an API or MCP caller re-creating the old
+      // locations, which the once-per-board guard can never reach again.
+      await board.sweepBoard('2026-09-30T10:00:00.000Z');
+
+      const created = await board.createCard({
+        title: 'Fresh card with stale spec keys',
+        ownerUserId: 'usr_a',
+        spec: { due: '2026-08-01', labels: ['bug'], description: 'kept' },
+      });
+      if (!created.ok) throw new Error(created.message);
+
+      const spec = created.value.spec as Record<string, unknown>;
+      expect(spec.due).toBeUndefined();
+      expect(spec.labels).toBeUndefined();
+      expect(spec.description).toBe('kept');
+    });
+  });
+
+  it('updateCard strips spec.due/spec.labels from a spec write, same as createCard', async () => {
+    await runInDurableObject(stubFor('spec-strip-update'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due18', tenantId: 'tnt_spec_strip_update', name: 'D18', stages: STAGES });
+      const created = await board.createCard({ title: 'Plain card', ownerUserId: 'usr_a' });
+      if (!created.ok) throw new Error(created.message);
+      // Same "after the backfill has already run" precondition as the createCard test above —
+      // before that pass, a card legitimately carries these keys, and stripping must not fire.
+      await board.sweepBoard('2026-09-30T10:00:00.000Z');
+
+      const updated = await board.updateCard(created.value.id, {
+        spec: { due: '2026-08-01', labels: ['bug'], description: 'kept' },
+      });
+      if (!updated.ok) throw new Error(updated.message);
+
+      const spec = updated.value.spec as Record<string, unknown>;
+      expect(spec.due).toBeUndefined();
+      expect(spec.labels).toBeUndefined();
+      expect(spec.description).toBe('kept');
     });
   });
 });

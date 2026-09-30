@@ -103,6 +103,50 @@ describe('POST /v1/labels', () => {
   });
 });
 
+describe('PATCH /v1/labels/:id', () => {
+  it('refuses a rename onto an existing name as a 409 sentence, not a 500', async () => {
+    const t = 'tnt_lbl_rest_patch_dupe';
+    await insertTenant(t, 'lbl-rest-patch-dupe');
+    await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'taken', colour: '#f00' }),
+    });
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'renameable', colour: '#0f0' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/labels/${label.id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'taken' }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json<{ error: string }>()).error).toContain('"taken"');
+  });
+
+  it('refuses a rename to an empty name as a 400, not a 500', async () => {
+    const t = 'tnt_lbl_rest_patch_empty';
+    await insertTenant(t, 'lbl-rest-patch-empty');
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'has-a-name', colour: '#00f' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/labels/${label.id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ name: '   ' }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('PATCH /v1/boards/:id/cards/:cardId — labels validation', () => {
   it('400s a bare string instead of spreading its characters into storage', async () => {
     const t = 'tnt_lbl_rest_string';

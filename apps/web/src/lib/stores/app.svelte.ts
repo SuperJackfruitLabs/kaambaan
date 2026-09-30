@@ -34,6 +34,7 @@ import {
   listLabels,
   type Label,
 } from '$lib/api';
+import { passesArchivedFilter } from './card-filters';
 
 const BOARD_KEY = 'superpipeline.boardId';
 const THEME_KEY = 'superpipeline.theme';
@@ -168,7 +169,7 @@ class AppStore {
         return false;
       if (f.live && c.state !== 'working') return false;
       if (f.overBudget && !c.overBudget) return false;
-      if (!f.showArchived && c.archivedAt !== null) return false;
+      if (!passesArchivedFilter(f.showArchived, c.archivedAt)) return false;
       if (f.labels.length > 0 && !f.labels.every((l) => c.labels.includes(l))) return false;
       return true;
     });
@@ -378,6 +379,19 @@ class AppStore {
       this.notifications = await getNotifications(this.boardId);
     } catch (e) {
       this.error = String(e);
+    }
+    // Best-effort, same as openBoard: the label catalogue used to load ONLY there, so a label
+    // created (or renamed) after board load never updated `app.labels` — the drawer's editor then
+    // resolved a stale catalogue against a fresher card and could silently wipe labels off a card
+    // it could no longer see (finding 2, phase-1 fix wave). `refresh()` runs after every save
+    // (including the one that just created a label) and on every live-feed event, so this keeps
+    // the catalogue as current as the board itself. A failed reload here must not fail the whole
+    // refresh — `resolveCardLabelsForEdit`'s `blind` guard is what protects a save when the
+    // catalogue genuinely cannot be trusted.
+    try {
+      this.labels = await listLabels();
+    } catch {
+      /* stale catalogue is recoverable; failing refresh entirely is not */
     }
   }
 

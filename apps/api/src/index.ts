@@ -609,7 +609,13 @@ export default {
     const labelsMatch = path.match(/^\/v1\/labels(?:\/([^/]+))?$/);
     if (labelsMatch) {
       try {
-        const u = await resolveUser(request, env);
+        // The CLI's `supi label list|add|rm` send a hub JWT (Authorization: Bearer), never a
+        // session cookie — `resolveUser` alone can't read it. Unconditional on method, unlike the
+        // GET-only fallback on `/v1/capabilities`: those verbs are CLI-reachable too, and
+        // `refuseByRole(u, 'manage')` below is what actually gates the writes, exactly as it
+        // already gates a session-authenticated write.
+        let u = await resolveUser(request, env);
+        if (!u) u = await resolveHubUser(request, env);
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const labelId = labelsMatch[1];
 
@@ -649,9 +655,27 @@ export default {
 
         if (labelId && request.method === 'PATCH') {
           const body = (await request.json()) as { name?: string; colour?: string };
-          const updated = await updateLabel(env.DB, u.tenantId, labelId, body);
-          if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
-          return Response.json({ label: updated });
+          // Same type guard as POST: a non-string or empty `name` must not reach `.trim()` in
+          // `db/labels.ts` (a bare throw there, caught by neither branch below) or `updateLabel`'s
+          // own `throw` on an empty trimmed name — both currently 500 instead of 400.
+          if (body.name !== undefined) {
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            if (name === '') {
+              return Response.json({ error: 'name is required' }, { status: 400 });
+            }
+          }
+          try {
+            const updated = await updateLabel(env.DB, u.tenantId, labelId, body);
+            if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
+            return Response.json({ label: updated });
+          } catch (err) {
+            // Same narrowed collision catch as POST — renaming onto an existing name (including a
+            // case variant, which migration 0011's index makes collide) is a clean 409, not a raw
+            // constraint failure surfaced as a 500.
+            if (!isLabelNameCollision(err)) throw err;
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            return Response.json({ error: `a label named "${name}" already exists in this workspace` }, { status: 409 });
+          }
         }
 
         if (labelId && request.method === 'DELETE') {
@@ -1768,8 +1792,11 @@ export default {
           }
           try {
             await boardStub(env, board.tenantId, board.id).sweepBoard(new Date().toISOString());
-          } catch {
-            /* a failing sweep on one board must not stop the rest of the loop */
+          } catch (err) {
+            // A failing sweep on one board must not stop the rest of the loop — but swallowing it
+            // silently meant a board failing every five-minute tick, forever, left no trace
+            // anywhere. Logged, not rethrown: the loop still continues to the next board.
+            console.error(`sweepBoard failed for board ${board.id}`, err);
           }
         }
       })(),

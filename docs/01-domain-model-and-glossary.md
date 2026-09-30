@@ -160,7 +160,8 @@ The durable unit of work. Fields:
 - `currentStageKey`, `priority`, `labels`
 - `delegateAgentId` — the agent currently executing (the *delegate*; nullable)
 - `references[]` — external links (see below)
-- `currentTaskId` — the active A2A Task, if any
+- `dueAt` — a due date (`YYYY-MM-DD`), or `null`; feeds claim order (behind priority) and the
+  overdue cron sweep
 - timestamps, `archivedAt`
 
 ### Task *(A2A-aligned)* — **⚠️ not implemented**
