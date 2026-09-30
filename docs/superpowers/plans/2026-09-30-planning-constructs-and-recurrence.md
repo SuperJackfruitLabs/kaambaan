@@ -39,7 +39,7 @@
 - **`apps/api/src/board/recurrence.ts`** *(new)* — the recurrence-rule grammar: parse, validate, and `nextFireAt(rule, tz, after)`. Pure, no DO, no clock.
 - **`apps/api/src/db/labels.ts`** *(new)* — D1 label catalogue.
 - **`apps/api/src/db/projects.ts`** *(new)* — D1 projects + milestones + the rollup cache.
-- **`apps/api/migrations/0010_labels.sql`**, **`0011_projects_and_milestones.sql`**, **`0012_card_links_external.sql`** *(new)*.
+- **`apps/api/migrations/0010_labels.sql`** (Task 4), **`0011_card_links_external.sql`** (Task 16), **`0012_projects_and_milestones.sql`** (Task 18) *(new)* — numbered in the order the phases run.
 - **`apps/api/src/index.ts`** — new routes; the `scheduled()` handler gains the board sweep.
 - **`packages/contract/src/entities.ts`** — `Stage.completion` added; `Card.currentTaskId` removed; `Card.labels`/`archivedAt` become real.
 - **`apps/web/src/lib/`** — `api.ts` types + calls; `CardTile.svelte` (label chips, due from column, blocker badge); `FilterBar.svelte`; `plan/ListView.svelte`; `CardDrawer.svelte` (labels, due, sub-tasks, blockers); new `components/plan/ProjectView.svelte`; new `components/board/ScheduleList.svelte` under settings.
@@ -74,12 +74,36 @@ describe('workerd Intl', () => {
     expect(f.format(new Date('2026-01-15T00:00:00Z'))).toBe('05:30');
   });
 
-  it('reports the zone back, rather than silently falling back to UTC', () => {
+  it('recognises the zone rather than silently falling back to UTC', () => {
     const resolved = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata' }).resolvedOptions();
-    expect(resolved.timeZone).toBe('Asia/Kolkata');
+    // ICU canonicalises Asia/Kolkata to its older alias Asia/Calcutta, so the string that comes
+    // back is NOT the string that went in. Asserting equality here fails on a runtime that
+    // supports zones perfectly well. What matters is that a REAL zone came back: a runtime with no
+    // zone data answers 'UTC'.
+    expect(resolved.timeZone).not.toBe('UTC');
+    // …and that the spelling it returned denotes the same zone as the one we asked for.
+    const at = new Date('2026-01-15T00:00:00Z');
+    const hhmm = (tz: string): string =>
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+      }).format(at);
+    expect(hhmm(resolved.timeZone)).toBe(hhmm('Asia/Kolkata'));
+  });
+
+  it('throws RangeError on an unknown zone — which is how a schedule validates one', () => {
+    // Task 9 uses this: a zone is validated by trying to construct a formatter, never by
+    // comparing strings, because the canonical spelling differs from the input.
+    expect(() => new Intl.DateTimeFormat('en-GB', { timeZone: 'Mars/Olympus' })).toThrow(RangeError);
   });
 });
 ```
+
+> **Carry this into Phase 2.** Two consequences of the aliasing, both cheap to get wrong:
+> 1. `createSchedule` validates a `timezone` by **constructing an `Intl.DateTimeFormat` and catching
+>    `RangeError`**, never by comparing against a list or against `resolvedOptions().timeZone`.
+> 2. Store and display the **operator's own spelling**. Echoing `resolvedOptions().timeZone` back
+>    would show someone who typed `Asia/Kolkata` a schedule that says `Asia/Calcutta`, which reads
+>    as a bug. `recurrence.ts` must never compare zone strings for equality.
 
 - [ ] **Step 2: Run it**
 
@@ -87,7 +111,9 @@ Run: `cd apps/api && pnpm vitest run test/intl-timezone-support.test.ts`
 
 Two possible outcomes, and **both are a result, not a failure**:
 - **PASS** → Phase 2 uses IANA zones as specced. Record it and continue.
-- **FAIL** (either an exception on an unknown zone, or `05:30` coming back as `00:00`) → zone data is absent. Record the exact failure, then **amend the spec's §3.7** to a `utc_offset_minutes INTEGER` column in place of `timezone TEXT`, and note that the Task 12 UI collects an offset rather than a zone. Do not work around it in code.
+- **FAIL** — specifically `05:30` coming back as `00:00`, or a `RangeError` on `Asia/Kolkata` → zone data is absent. Record the exact failure, then **amend the spec's §3.7** to a `utc_offset_minutes INTEGER` column in place of `timezone TEXT`, and note that the Task 12 UI collects an offset rather than a zone. Do not work around it in code.
+
+A mismatch in the *spelling* of the resolved zone is neither of those — it is ICU canonicalisation and is expected. All three tests must be green before this task is complete; a committed red test takes CI down.
 
 - [ ] **Step 3: Commit**
 
@@ -108,19 +134,23 @@ Branch: `feat/planning-phase1-labels-and-dates`
 
 **Files:**
 - Modify: `packages/contract/src/entities.ts:79-107` (Stage), `:166-181` (Card)
-- Test: `packages/contract/test/card-and-stage-shape.test.ts` (create)
+- Modify: `packages/contract/test/entities.test.ts` — its `entity schemas` describe already covers Stage defaults (`:5`) and Card defaults *including* `labels` (`:31`), so these cases extend it. Do **not** create a second test file for one module, and do not re-assert the `labels` default that `:31` already owns.
 
 **Interfaces:**
 - Produces: `Stage.completion?: CompletionRequirement | null`; `Card` without `currentTaskId`; `Card.labels` and `Card.archivedAt` now backed by storage (Task 3).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+Add `Stage` to the existing import in `test/entities.test.ts`:
 
 ```ts
-import { describe, it, expect } from 'vitest';
-import { Stage, Card } from '../src/entities';
+import { Agent, Board, Card, Reference, Stage, Tenant } from '../src';
+```
 
-describe('Stage', () => {
-  it('accepts the completion requirement the Board DO already enforces', () => {
+Then add these cases inside the existing `describe('entity schemas', ...)` block:
+
+```ts
+  it('carries the completion requirement the Board DO already enforces', () => {
     const parsed = Stage.parse({
       key: 'publish',
       name: 'Publish',
@@ -135,39 +165,38 @@ describe('Stage', () => {
     });
   });
 
-  it('still parses a stage with no completion rule', () => {
-    expect(Stage.parse({ key: 'draft', name: 'Draft', order: 0, ownerKind: 'human' }).completion).toBeUndefined();
+  it('leaves completion absent on a stage that declares no rule', () => {
+    const parsed = Stage.parse({ key: 'draft', name: 'Draft', order: 0, ownerKind: 'human' });
+    expect(parsed.completion).toBeUndefined();
   });
-});
 
-describe('Card', () => {
-  const base = {
-    id: 'card_0000000000000001',
-    boardId: 'brd_0000000000000001',
-    tenantId: 'tnt_0000000000000001',
-    contextId: 'ctx_0000000000000001',
-    title: 'A card',
-    ownerUserId: 'usr_0000000000000001',
-    currentStageKey: 'draft',
-    createdAt: '2026-09-30T00:00:00.000Z',
-  };
-
-  it('no longer declares currentTaskId, because Task is not implemented', () => {
+  it('no longer declares currentTaskId on a card, because Task is not implemented', () => {
+    // docs/01 warns that Task has no table and no id is ever minted. A contract field for a
+    // record that cannot exist is a trap for anyone writing a client against it.
     expect('currentTaskId' in Card.shape).toBe(false);
   });
 
-  it('defaults labels to empty and leaves archivedAt absent', () => {
-    const c = Card.parse(base);
-    expect(c.labels).toEqual([]);
-    expect(c.archivedAt).toBeUndefined();
+  it('leaves archivedAt absent on a fresh card', () => {
+    const card = Card.parse({
+      id: 'card_0000000000000001',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'A card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(card.archivedAt).toBeUndefined();
   });
-});
 ```
 
 - [ ] **Step 2: Run it to see it fail**
 
-Run: `cd packages/contract && pnpm vitest run test/card-and-stage-shape.test.ts`
-Expected: FAIL — `completion` is stripped by zod (so `toEqual` gets `undefined`), and `'currentTaskId' in Card.shape` is `true`.
+Run: `cd packages/contract && pnpm vitest run test/entities.test.ts`
+Expected: FAIL on two of the four — `completion` is stripped by zod (so `toEqual` receives `undefined`), and `'currentTaskId' in Card.shape` is `true`. The other two pass immediately, which is fine: they are guards, not the change.
+
+Baseline for comparison: the contract suite is **98 passing across 8 files** before this task.
 
 - [ ] **Step 3: Make the changes**
 
@@ -198,7 +227,7 @@ Expected: PASS, and no other contract test breaks. If one does, it was reading `
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/contract/src/entities.ts packages/contract/test/card-and-stage-shape.test.ts
+git add packages/contract/src/entities.ts packages/contract/test/entities.test.ts
 git commit -m "fix(contract): carry Stage.completion, drop the unimplemented Card.currentTaskId"
 ```
 
@@ -309,6 +338,8 @@ Beside the existing guarded ALTERs in `board-do.ts` (after the `queued_grant` bl
     }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_due_at ON cards(due_at)`);
 ```
+
+The accumulator locals in `updateCard` are `sets` and **`vals`** (`board-do.ts:1220-1221`) — not `params`. Every task below that extends `updateCard` uses `vals`.
 
 Add to `CardView`:
 
@@ -460,7 +491,7 @@ function stubFor(name: string): DurableObjectStub<BoardDO> {
 }
 
 beforeAll(async () => {
-  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_lbl', 'Labels')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_lbl', 'labels', 'Labels')`).run();
 });
 
 describe('label catalogue', () => {
@@ -470,7 +501,7 @@ describe('label catalogue', () => {
   });
 
   it('is tenant-scoped', async () => {
-    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_other', 'Other')`).run();
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_other', 'other', 'Other')`).run();
     await createLabel(env.DB, 'tnt_other', { name: 'urgent', colour: '#00f' });
     const mine = await listLabels(env.DB, 'tnt_lbl');
     expect(mine.filter((l) => l.name === 'urgent')).toHaveLength(1);
@@ -638,7 +669,7 @@ In `board-do.ts`, extend `updateCard`'s patch type with `labels?: string[]` and 
 ```ts
     if (patch.labels !== undefined) {
       sets.push('labels = ?');
-      params.push(JSON.stringify([...new Set(patch.labels)]));
+      vals.push(JSON.stringify([...new Set(patch.labels)]));
     }
 ```
 
@@ -813,13 +844,13 @@ Expected: FAIL — `updateCard` rejects `dueAt`/`archivedAt`, and `sweepBoard` d
 ```ts
     if (patch.dueAt !== undefined) {
       sets.push('due_at = ?');
-      params.push(patch.dueAt === null ? null : patch.dueAt.trim());
-      // A changed date is a new chance to be told about it.
+      vals.push(patch.dueAt === null ? null : patch.dueAt.trim());
+      // A changed date is a new chance to be told about it. No placeholder, so no `vals` entry.
       sets.push('overdue_notified_at = NULL');
     }
     if (patch.archivedAt !== undefined) {
       sets.push('archived_at = ?');
-      params.push(patch.archivedAt);
+      vals.push(patch.archivedAt);
     }
 ```
 
@@ -1407,6 +1438,7 @@ async function boardWithSchedule(board: BoardDO, name: string, patch: Record<str
     rule: 'daily at 09:00',
     timezone: 'UTC',
     overlap: 'skip',
+    createdBy: 'usr_a',
     ...patch,
   });
   if (!r.ok) throw new Error(r.message);
@@ -1417,7 +1449,9 @@ describe('schedules', () => {
   it('refuses an unreadable rule at creation, with the parser’s own message', async () => {
     await runInDurableObject(stubFor('sch-bad'), async (board: BoardDO) => {
       await board.init({ id: 'brd_sb', tenantId: 'tnt_a', name: 'SB', stages: STAGES });
-      const r = await board.createSchedule({ title: 'x', rule: 'every 2 minutes', timezone: 'UTC', overlap: 'skip' });
+      const r = await board.createSchedule({
+        title: 'x', rule: 'every 2 minutes', timezone: 'UTC', overlap: 'skip', createdBy: 'usr_a',
+      });
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.message).toContain('5');
     });
@@ -1554,7 +1588,7 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
 - [ ] **Step 4: Write CRUD**
 
-`createSchedule` validates through `parseRule` and **returns the parser's own error message** — a rule is typed by a human and the parser's message is the only useful one. It then sets `next_fire_at = nextFireAt(rule, timezone, now)`. `updateSchedule` re-parses and recomputes `next_fire_at` whenever `rule` or `timezone` changes; it must not silently keep a fire time computed from the old rule.
+`createSchedule` takes a **required** `createdBy` (the route supplies the authenticated user) — a schedule mints cards, and Principle 3 says every card has a human owner, so a schedule without one is not creatable. It validates through `parseRule` and **returns the parser's own error message** — a rule is typed by a human and the parser's message is the only useful one. It then sets `next_fire_at = nextFireAt(rule, timezone, now)`. `updateSchedule` re-parses and recomputes `next_fire_at` whenever `rule` or `timezone` changes; it must not silently keep a fire time computed from the old rule.
 
 - [ ] **Step 5: Write `fireDueSchedules`**
 
@@ -1579,6 +1613,14 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
     for (const row of due) {
       const id = row.id as string;
+      // Principle 3: every card has a human owner. A schedule with no recorded creator cannot
+      // produce one, so it is disabled rather than allowed to mint ownerless cards. `createdBy` is
+      // required at creation, so this can only be a row predating that — it is not a normal state.
+      if (!row.created_by) {
+        this.sql.exec(`UPDATE schedules SET enabled = 0 WHERE id = ?`, id);
+        this.emit('schedule.disabled', { scheduleId: id, reason: 'no creator recorded; cannot own a card' });
+        continue;
+      }
       const parsed = parseRule(row.rule as string);
       if (!parsed.ok) {
         // A rule that no longer parses cannot fire and must not be retried every five minutes
@@ -1602,7 +1644,7 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
       const created = await this.createCardFromTrigger({
         title: row.title as string,
-        ownerUserId: this.scheduleOwner(row.created_by as string | null),
+        ownerUserId: row.created_by as string,
         spec: { ...(JSON.parse(row.spec_json as string) as Record<string, unknown>), scheduleId: id },
       });
       if (!created.ok) {
@@ -1612,7 +1654,7 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
       }
 
       const cardId = created.value.card.id;
-      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, this.scheduleOwner(row.created_by as string | null));
+      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
       if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
         await this.updateCard(cardId, {
           priority: Number(row.priority),
@@ -1900,6 +1942,36 @@ export function wouldCycle(links: LinkRow[], candidate: LinkRow): boolean {
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_to ON card_links(to_card_id, kind)`);
 ```
+
+- [ ] **Step 4b: Make `deleteCard` remove a card's edges — both directions**
+
+`deleteCard` (`board-do.ts:1252`) clears card-scoped rows from a fixed list of tables, every one of
+which keys on `card_id`. `card_links` keys on **two** columns, so it cannot join that list:
+
+```ts
+    // Both directions. A deleted card's edges must go with it: a lingering `blocks` row points at a
+    // card that no longer exists, and the drawer would render a blocker nobody can open or resolve.
+    this.sql.exec(`DELETE FROM card_links WHERE from_card_id = ? OR to_card_id = ?`, cardId, cardId);
+```
+
+Add a test for it:
+
+```ts
+  it('takes a card\u2019s links with it when the card is deleted', async () => {
+    await runInDurableObject(stubFor('link-delete'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'linkdelete');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      await board.deleteCard(a.id);
+      expect(await board.listLinks(b.id)).toEqual([]);
+      // And b is claimable again, rather than blocked forever by a card that is gone.
+      expect((await board.claim({ agentId: 'agt_w', capabilities: ['writing'] })).claimed).toBe(true);
+    });
+  });
+```
+
+The claim exclusion in Task 13 JOINs `cards` on the blocker, so a dangling edge already fails to
+block — it degrades safely. The row still has to go: the UI reads links directly and would show a
+blocker that cannot be opened.
 
 `addLink` refuses, with a distinct code each: a card that does not exist (`NO_SUCH_CARD`), a cycle (`LINK_WOULD_CYCLE`), a second parent (`ALREADY_HAS_PARENT`). One code per reason — "invalid link" tells the caller nothing about what to do next.
 
@@ -2211,7 +2283,35 @@ In `rowToCard`, add:
       costUsdRollup: costUsd + this.childrenCost(id),
 ```
 
+`childrenCost` is new; define it beside the existing `cardCost` (`board-do.ts:3301`) and in its
+style — one query, `COALESCE(SUM(...), 0)`:
+
+```ts
+  /**
+   * The summed cost of a card's direct children.
+   *
+   * One level deep, matching `costUsdRollup`. Deliberately a sibling of `cardCost` rather than a
+   * parameter to it: `cardCost` feeds the budget gate (`board-do.ts:2320`) and must keep meaning
+   * "what this card itself spent".
+   */
+  private childrenCost(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COALESCE(SUM(u.cost_usd), 0) AS c FROM usage_records u
+             WHERE u.card_id IN (SELECT to_card_id FROM card_links WHERE from_card_id = ? AND kind = 'parent')`,
+          cardId,
+        )
+        .one().c,
+    );
+  }
+```
+
 > ⚠️ `rowToCard` runs for **every card on every board read**. These are three extra queries per card. If a board read gets slow, batch them in `getState` and pass them through the existing `pre?` parameter — which is exactly why that parameter exists for `costUsd` already.
+>
+> ⚠️ **Do not route the rollup through `cardCost`.** `cardCost` is what the budget gate reads at
+> `board-do.ts:2320` to decide whether to stop handing out work; widening it to include children
+> would silently move that gate. The two functions stay separate for that reason.
 
 - [ ] **Step 3: Run and commit**
 
@@ -2346,7 +2446,7 @@ The markdown case matters: the input is whatever a human or an agent pasted, and
 
 ```ts
 import { describe, it, expect } from 'vitest';
-import { TOOL_SCOPES } from '../src/mcp/tools';
+import { TOOL_SCOPE } from '../src/mcp/tools';
 
 describe('superpipeline_split_card scope', () => {
   it('is run-scoped, not claim-scoped', () => {
@@ -2354,11 +2454,11 @@ describe('superpipeline_split_card scope', () => {
     // the one card it is working. Decomposition is something an agent does to ITS card mid-run, so
     // it belongs to `run`. Scoped to `claim` it would be handed to the thing that should only be
     // taking work, which is the separation #622 established with two credentials per agent.
-    expect(TOOL_SCOPES.superpipeline_split_card).toBe('run');
+    expect(TOOL_SCOPE.superpipeline_split_card).toBe('run');
   });
 
   it('leaves claim_card the only tool a run-only token cannot reach', () => {
-    const runnable = Object.entries(TOOL_SCOPES)
+    const runnable = Object.entries(TOOL_SCOPE)
       .filter(([, scope]) => scope !== 'run')
       .map(([name]) => name);
     // Verified live in #622: tools/list with a run-only token returned 11 tools and withheld
@@ -2369,7 +2469,7 @@ describe('superpipeline_split_card scope', () => {
 });
 ```
 
-`TOOL_SCOPES` is the table at `apps/api/src/mcp/tools.ts:48-57`; export it if it is not already exported. The second test is the one that keeps its value over time — it fails if *any* future tool is given a scope other than `run`, which is the moment to think rather than the moment to discover it live.
+`TOOL_SCOPE` — **singular**, and currently `const TOOL_SCOPE`, not exported (`apps/api/src/mcp/tools.ts:47`). Export it as part of this task. Note that read-only tools are deliberately absent from the table (the comment above it says reads are unscoped), so `Object.entries` sees only the mutating tools. The second test is the one that keeps its value over time — it fails if *any* future tool is given a scope other than `run`, which is the moment to think rather than the moment to discover it live.
 
 - [ ] **Step 3: Implement, run, commit**
 
@@ -2393,14 +2493,14 @@ git commit -m "feat(sub-tasks): split a card into children, over REST and over M
 ## Task 16: Cross-board edges — advisory, in D1, and labelled as such
 
 **Files:**
-- Create: `apps/api/migrations/0012_card_links_external.sql`, `apps/api/src/db/card-links-external.ts`
+- Create: `apps/api/migrations/0011_card_links_external.sql`, `apps/api/src/db/card-links-external.ts`
 - Modify: `apps/api/src/index.ts`
 - Test: `apps/api/test/card-links-external.test.ts` (create)
 
 - [ ] **Step 1: The migration**
 
 ```sql
--- Cross-board card edges. ADVISORY, always — read the design before extending this.
+-- Migration 0011. Cross-board card edges. ADVISORY, always — read the design before extending this.
 --
 -- Cards live in per-board Durable Objects, so an edge whose ends are in different DOs cannot be
 -- consulted on the claim path without a cross-DO read, and a stale cross-DO read either refuses a
@@ -2435,8 +2535,8 @@ const A = { boardId: 'brd_press', cardId: 'card_aaaaaaaaaaaaaaaa' };
 const B = { boardId: 'brd_releases', cardId: 'card_bbbbbbbbbbbbbbbb' };
 
 beforeAll(async () => {
-  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_x', 'X')`).run();
-  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_y', 'Y')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_x', 'x', 'X')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_y', 'y', 'Y')`).run();
 });
 
 describe('cross-board edges', () => {
@@ -2492,7 +2592,7 @@ The `SAME_BOARD_EDGE` refusal is the one that protects the design: the enforced 
 - [ ] **Step 3: Implement, run, commit**
 
 ```bash
-git add apps/api/migrations/0012_card_links_external.sql apps/api/src apps/api/test
+git add apps/api/migrations/0011_card_links_external.sql apps/api/src apps/api/test
 git commit -m "feat(links): advisory cross-board edges, refused for same-board and for parent"
 ```
 
@@ -2551,7 +2651,7 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 ## Task 18: Projects and milestones in D1
 
 **Files:**
-- Create: `apps/api/migrations/0011_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
+- Create: `apps/api/migrations/0012_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
 - Test: `apps/api/test/projects.test.ts` (create)
 
 **Interfaces:**
@@ -2569,7 +2669,7 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 - [ ] **Step 1: The migration**
 
 ```sql
--- Projects group work ACROSS boards; milestones are ordered checkpoints inside one project.
+-- Migration 0012. Projects group work ACROSS boards; milestones are ordered checkpoints inside one project.
 --
 -- Here rather than in a board's Durable Object because that is the whole point: a project confined
 -- to one board would be indistinguishable from a label, and labels already exist (migration 0010).
@@ -2629,8 +2729,8 @@ import {
 
 beforeAll(async () => {
   await env.DB.batch([
-    env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_p1', 'One')`),
-    env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_p2', 'Two')`),
+    env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_p1', 'p-one', 'One')`),
+    env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_p2', 'p-two', 'Two')`),
   ]);
 });
 
@@ -2701,7 +2801,7 @@ Follow `capabilities.ts`: hand-written SQL, `tenant_id = ?` first, always. The l
 - [ ] **Step 3: Run and commit**
 
 ```bash
-git add apps/api/migrations/0011_projects_and_milestones.sql apps/api/src/db/projects.ts apps/api/test/projects.test.ts
+git add apps/api/migrations/0012_projects_and_milestones.sql apps/api/src/db/projects.ts apps/api/test/projects.test.ts
 git commit -m "feat(projects): projects, milestones and a rollup cache in D1"
 ```
 
@@ -2761,7 +2861,7 @@ async function seedBoard(name: string, projectId: string, titles: string[]): Pro
 }
 
 beforeAll(async () => {
-  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, name) VALUES ('tnt_r', 'Rollup')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_r', 'rollup', 'Rollup')`).run();
 });
 
 describe('project rollup', () => {
