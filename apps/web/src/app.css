@@ -231,6 +231,38 @@
     border: 1px solid var(--line);
   }
 
+  /* blocked badge — ⛔ enforced (coral) vs ⚑ advisory (marigold): never the same pill, never the
+     same colour, so a glance can't mistake one for the other (Task 17b, Step 1). */
+  .blk-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 5px;
+    color: var(--coral);
+    background: rgba(255, 107, 87, 0.13);
+  }
+  .blk-pill-advisory {
+    color: var(--marigold);
+    background: rgba(244, 165, 38, 0.13);
+  }
+
+  /* sub-task open/total counter */
+  .child-pill {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 5px;
+    color: var(--muted);
+    background: var(--inset);
+    border: 1px solid var(--line);
+  }
+
   /*
      The tile's title is its single primary control, stretched over the whole tile.
 

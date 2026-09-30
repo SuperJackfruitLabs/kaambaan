@@ -7,6 +7,8 @@
   import { cardDraggable } from '$lib/dnd';
   import { Button } from '$lib/components/ui/button';
   import { overdue } from './card-due';
+  import { enforcedBadge } from './card-blocked';
+  import { childCounter, countChildren } from './card-children';
 
   interface Props {
     card: Card;
@@ -28,6 +30,24 @@
    * than a third chip saying "P3".
    */
   const priColour = $derived(card.priority === 1 ? 'var(--coral)' : card.priority === 2 ? 'var(--marigold)' : null);
+
+  /**
+   * The ⛔ badge and the `open/total` sub-task counter (Task 17b, Step 1 / 1c).
+   *
+   * `blocked` is built ONLY from `card.blockedBy` — the server's own claim-query predicate
+   * (Task 17c). Never re-derived from anything else here: a badge computed independently of it is
+   * a badge that can eventually disagree with `claim_card`. The tile never shows the cross-board
+   * `⚑ Blocked (advisory)` badge — that reads `externalLinks`, which nothing on the board grid
+   * fetches per-tile; it lives in the drawer's Blockers section instead, where the data is already
+   * being fetched.
+   *
+   * `children` pairs `openChildCount` (server-computed) with a sibling count taken from the
+   * board's own card list — a card with open children is never "Blocked by" anything, so the two
+   * badges can both be present and never fight over which one to show.
+   */
+  const blocked = $derived(enforcedBadge(card.blockedBy));
+  const totalChildren = $derived(countChildren(app.board?.cards ?? [], card.id));
+  const children = $derived(childCounter(card.openChildCount, totalChildren));
 
   // Reference chip helpers (ported from page.svelte)
   const SUB_STATE_LABELS: Record<string, string> = {
@@ -247,6 +267,19 @@
       <span class="live-dot mt-1 shrink-0" title="Agent working"></span>
     {/if}
   </div>
+
+  <!-- blocked badge + sub-task counter — the ⛔ badge is the highest-priority signal on the tile
+       after the title, so it sits right under row1 rather than buried in the meta row. -->
+  {#if blocked || children}
+    <div class="mb-2 flex flex-wrap items-center gap-1.5">
+      {#if blocked}
+        <span class="blk-pill" title={blocked.tooltip}>{blocked.glyph} {blocked.label}</span>
+      {/if}
+      {#if children}
+        <span class="child-pill" title="{children.open} of {children.total} sub-tasks still open">{children.open}/{children.total}</span>
+      {/if}
+    </div>
+  {/if}
 
   <!-- labels -->
   {#if labelChips.length > 0}

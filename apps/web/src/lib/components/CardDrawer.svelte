@@ -12,14 +12,23 @@
     addReference,
     resolveGate,
     answerElicitation,
+    archiveCard,
+    addLink,
+    listLinks,
+    splitCard,
+    getBoard,
     type CardActivities,
     type Attempt,
     type Estimate,
     type GateDecision,
+    type CardLinks,
+    type LinkKind,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
+  import { blockerRows } from '$lib/components/blocker-rows';
+  import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -50,6 +59,14 @@
     card && app.board ? (app.board.stages.find((s) => s.key === card.currentStageKey)?.name ?? card.currentStageKey) : '',
   );
 
+  /**
+   * Sub-tasks: this card's direct children, read straight off the board's own card list by
+   * `parentCardId` — same-board only (`kind: 'parent'` refuses a cross-board edge server-side), so
+   * no extra fetch is needed; the children are already in `app.board.cards`.
+   */
+  const children = $derived(card ? (app.board?.cards ?? []).filter((c) => c.parentCardId === card.id) : []);
+  const totalChildren = $derived(children.length);
+
   // ---- local async state ----
   /**
    * Tool calls are hidden by default.
@@ -65,6 +82,18 @@
   const activityGroups = $derived(groupActivities(cardDetail?.activities ?? [], drawerAttempts ?? []));
 
   let cardEstimate = $state<Estimate | null>(null);
+  /** Same-board (enforced) and cross-board (advisory) edges touching this card — Task 17a/17d's `GET …/links`. */
+  let cardLinks = $state<CardLinks>({ links: [], externalLinks: [] });
+
+  /**
+   * Blocker rows for the Blockers section — never one badge covering both kinds (Step 1). Enforced
+   * rows come from `card.blockedBy` (the same field the tile's ⛔ badge reads); advisory rows come
+   * from `cardLinks.externalLinks`, told apart by the `⚑` badge rather than anything guessed from
+   * board ids.
+   */
+  const blockers = $derived(
+    card ? blockerRows(card.id, card.blockedBy, cardLinks.externalLinks, (bid) => app.boards.find((b) => b.id === bid)?.name ?? null) : [],
+  );
 
   // ---- edit state ----
   let editing = $state(false);
@@ -120,20 +149,30 @@
       editing = false;
       newRefUrl = '';
       localError = null;
+      newSubtaskTitle = '';
+      subtaskError = null;
+      addBlockerOpen = false;
+      blockerError = null;
+      // The board switcher list — needed to name a cross-board advisory blocker's board, and to
+      // populate the Add-blocker dialogue's board picker. Best-effort, same as everywhere else
+      // `app.boards` is read: a board the catalogue could not resolve just shows no name.
+      void app.loadBoards();
       void refreshDrawer(id, boardId);
     } else {
       cardDetail = null;
       drawerAttempts = [];
       cardEstimate = null;
+      cardLinks = { links: [], externalLinks: [] };
     }
   });
 
   async function refreshDrawer(id: string, bid: string): Promise<void> {
     try {
-      [cardDetail, drawerAttempts, cardEstimate] = await Promise.all([
+      [cardDetail, drawerAttempts, cardEstimate, cardLinks] = await Promise.all([
         getCardActivities(bid, id),
         getAttempts(bid, id),
         getEstimate(bid, id),
+        listLinks(bid, id),
       ]);
     } catch {
       /* best-effort */
@@ -281,6 +320,128 @@
       await app.refresh();
     } else {
       localError = `Couldn't add that link (${res.status})`;
+    }
+  }
+
+  // ---- archive (Step 1b) ----
+  // A construct a person can see and cannot create is half-built. Phase 1 shipped the
+  // `archivedAt` column and a "show archived" filter with no way to ever produce an archived
+  // card; this is that write. Sends a real timestamp (`archiveCard`), not a client-side flag.
+  let archiving = $state(false);
+  async function onArchiveCard(): Promise<void> {
+    if (!boardId || !cardId) return;
+    if (!confirm('Archive this card? It will drop off the board unless "show archived" is on.')) return;
+    archiving = true;
+    try {
+      const res = await archiveCard(boardId, cardId);
+      if (res.ok) {
+        close();
+        await app.refresh();
+      } else {
+        localError = `Couldn't archive the card (${res.status})`;
+      }
+    } finally {
+      archiving = false;
+    }
+  }
+
+  // ---- sub-tasks (Step 1b) ----
+  // "Add sub-task" reuses Task 15's split (one title in, one child out) rather than
+  // createCard + addLink('parent'): createCard's wrapper discards its response body, so it
+  // cannot hand back the new child's id to link, while split's response already carries it.
+  let newSubtaskTitle = $state('');
+  let addingSubtask = $state(false);
+  let subtaskError = $state<string | null>(null);
+  async function addSubtask(): Promise<void> {
+    if (!boardId || !cardId || newSubtaskTitle.trim() === '' || addingSubtask) return;
+    addingSubtask = true;
+    subtaskError = null;
+    try {
+      const res = await splitCard(boardId, cardId, [newSubtaskTitle.trim()]);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        subtaskError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      newSubtaskTitle = '';
+      await app.refresh();
+    } finally {
+      addingSubtask = false;
+    }
+  }
+
+  // ---- add blocker (Step 1b) ----
+  // Cross-board blockers get a board picker in THIS dialogue, and the advisory notice
+  // (`crossBoardNoticeText` below) must say the edge will not be enforced BEFORE the edge is
+  // created, not after — a person who asks for a blocker and gets a silent no-op has already
+  // been misled by the time any response comes back.
+  let addBlockerOpen = $state(false);
+  let blockerBoardId = $state('');
+  let blockerCardId = $state('');
+  let blockerKind = $state<LinkKindChoice>('blocks');
+  let blockerBoardCards = $state<{ id: string; title: string }[]>([]);
+  let addingBlocker = $state(false);
+  let blockerError = $state<string | null>(null);
+
+  /** Computed client-side, from the same board-id comparison the server route makes — no round trip needed. */
+  const crossBoardNoticeText = $derived(boardId ? crossBoardNotice(blockerBoardId, boardId) : null);
+
+  function openAddBlocker(): void {
+    if (!boardId || !cardId) return;
+    addBlockerOpen = true;
+    blockerBoardId = boardId;
+    blockerCardId = '';
+    blockerKind = 'blocks';
+    blockerError = null;
+    blockerBoardCards = (app.board?.cards ?? []).filter((c) => c.id !== cardId);
+  }
+
+  async function onBlockerBoardChange(): Promise<void> {
+    blockerCardId = '';
+    if (!boardId || !cardId) return;
+    if (blockerBoardId === boardId) {
+      blockerBoardCards = (app.board?.cards ?? []).filter((c) => c.id !== cardId);
+      return;
+    }
+    if (!blockerBoardId) {
+      blockerBoardCards = [];
+      return;
+    }
+    try {
+      const snap = await getBoard(blockerBoardId);
+      blockerBoardCards = snap.cards;
+    } catch {
+      blockerBoardCards = [];
+    }
+  }
+
+  async function onAddBlocker(): Promise<void> {
+    if (!boardId || !cardId || !blockerBoardId || !blockerCardId || addingBlocker) return;
+    addingBlocker = true;
+    blockerError = null;
+    try {
+      const res = await submitAddBlocker(
+        { blockerBoardId, blockerCardId, thisBoardId: boardId, thisCardId: cardId, kind: blockerKind },
+        {
+          addLink: (bid, from, to, kind, toBoardId) => addLink(bid, from, to, kind as LinkKind, toBoardId),
+          // A no-op body: the reactive `crossBoardNoticeText` banner above already shows the
+          // notice as soon as a different board is picked, well before this submit even runs.
+          // Still routed through `submitAddBlocker` (rather than calling `addLink` directly) so
+          // this code path runs through the SAME order-of-operations the unit test asserts —
+          // `notify` before `addLink` — instead of a second implementation that could drift from it.
+          notify: () => {},
+        },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        blockerError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      addBlockerOpen = false;
+      await app.refresh();
+      if (cardId && boardId) void refreshDrawer(cardId, boardId);
+    } finally {
+      addingBlocker = false;
     }
   }
 
@@ -812,6 +973,133 @@
           </section>
         {/if}
 
+        <!--
+          Blockers (Step 1/1b) — same-board (⛔ enforced) and cross-board (⚑ advisory) never share
+          a row style. `blockers` (script, above) is built from `card.blockedBy` +
+          `cardLinks.externalLinks`, never re-derived from card state here.
+        -->
+        <section class="sec">
+          <div class="sec-h eyebrow">blockers</div>
+          {#if blockers.length > 0}
+            <div class="mb-2.5 space-y-1.5">
+              {#each blockers as row (row.boardId ?? 'same' + row.cardId)}
+                <div
+                  class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]"
+                  title={row.badge.tooltip}
+                >
+                  <span class={row.badge.glyph === '⛔' ? 'blk-pill' : 'blk-pill blk-pill-advisory'}>{row.badge.glyph}</span>
+                  <span class="min-w-0 flex-1 truncate">{row.title ?? row.cardId}</span>
+                  <span class="text-muted-foreground shrink-0">{row.badge.label}</span>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <p class="text-muted-foreground mb-2.5 text-xs">Nothing is blocking this card.</p>
+          {/if}
+
+          <Button size="sm" variant="outline" onclick={openAddBlocker}>Add blocker</Button>
+
+          {#if addBlockerOpen}
+            <div class="bg-inset border-border mt-2.5 space-y-2 rounded-[8px] border p-3 text-xs">
+              <div>
+                <label for="blocker-board" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Board</label>
+                <select
+                  id="blocker-board"
+                  bind:value={blockerBoardId}
+                  onchange={() => void onBlockerBoardChange()}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  {#each app.boards as b (b.id)}
+                    <option value={b.id}>{b.name}</option>
+                  {/each}
+                </select>
+              </div>
+
+              {#if crossBoardNoticeText}
+                <!-- Shown the moment a different board is picked — BEFORE any request, never after. -->
+                <p class="mono text-[11px]" style="color:var(--marigold)">⚑ {crossBoardNoticeText}</p>
+              {/if}
+
+              <div>
+                <label for="blocker-card" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Card</label>
+                <select
+                  id="blocker-card"
+                  bind:value={blockerCardId}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  <option value="">Pick a card…</option>
+                  {#each blockerBoardCards as c (c.id)}
+                    <option value={c.id}>{c.title}</option>
+                  {/each}
+                </select>
+              </div>
+
+              <div>
+                <label for="blocker-kind" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Kind</label>
+                <select
+                  id="blocker-kind"
+                  bind:value={blockerKind}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  <option value="blocks">blocks — this card will not be claimed while it is open</option>
+                  <option value="relates">relates — informational only</option>
+                </select>
+              </div>
+
+              <div class="flex gap-1.5">
+                <Button size="sm" onclick={() => void onAddBlocker()} disabled={blockerCardId === '' || addingBlocker}>
+                  {addingBlocker ? 'Adding…' : 'Add'}
+                </Button>
+                <Button size="sm" variant="ghost" onclick={() => (addBlockerOpen = false)}>Cancel</Button>
+              </div>
+
+              {#if blockerError}
+                <p role="alert" class="text-coral mono text-[11px]">{blockerError}</p>
+              {/if}
+            </div>
+          {/if}
+        </section>
+
+        <!--
+          Sub-tasks (Step 1b) — children with their state and cost, plus "Add sub-task".
+          `children` (script, above) reads `parentCardId` straight off the board's own card list;
+          `card.openChildCount`/the count of `children` is the same pair `CardTile`'s counter shows.
+        -->
+        <section class="sec">
+          <div class="sec-h eyebrow">
+            sub-tasks
+            {#if totalChildren > 0}<span class="ml-auto">{card.openChildCount}/{totalChildren} open</span>{/if}
+          </div>
+          {#if children.length > 0}
+            <div class="mb-2.5 space-y-1.5">
+              {#each children as child (child.id)}
+                <button
+                  onclick={() => app.openCard(child.id)}
+                  class="bg-inset border-border mono flex w-full items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-left text-[11px]"
+                >
+                  <span class="min-w-0 flex-1 truncate">{child.title}</span>
+                  <span class={statePillClass(child.state)} style="padding:1px 7px;font-size:9.5px">{statePillLabel(child.state)}</span>
+                  {#if child.costUsd > 0}<span class="text-muted-foreground shrink-0">{fmtUsd(child.costUsd)}</span>{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <div class="flex gap-1.5">
+            <input
+              bind:value={newSubtaskTitle}
+              placeholder="New sub-task title…"
+              onkeydown={(e) => { if (e.key === 'Enter') void addSubtask(); }}
+              class="bg-inset border-border focus:border-marigold flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+            />
+            <Button size="sm" variant="outline" onclick={() => void addSubtask()} disabled={newSubtaskTitle.trim() === '' || addingSubtask}>
+              {addingSubtask ? 'Adding…' : 'Add'}
+            </Button>
+          </div>
+          {#if subtaskError}
+            <p role="alert" class="text-coral mono mt-1.5 text-[11px]">{subtaskError}</p>
+          {/if}
+        </section>
+
         <!-- activity stream -->
         <section class="sec">
           <div class="sec-h eyebrow">session activity</div>
@@ -1051,8 +1339,11 @@
           </div>
         </section>
 
-        <!-- delete -->
-        <div class="border-border/60 border-t pt-4">
+        <!-- archive / delete -->
+        <div class="border-border/60 flex gap-3 border-t pt-4">
+          <button onclick={() => void onArchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
+            {archiving ? 'Archiving…' : 'Archive card'}
+          </button>
           <button onclick={onDeleteCard} class="text-muted-foreground hover:text-coral text-xs">Delete card</button>
         </div>
       </div>

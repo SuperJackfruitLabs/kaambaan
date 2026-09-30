@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard, splitCard } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -620,5 +620,38 @@ describe('archiveCard', () => {
     const body = JSON.parse(init?.body as string) as { archivedAt: string };
     expect(typeof body.archivedAt).toBe('string');
     expect(Number.isNaN(Date.parse(body.archivedAt))).toBe(false);
+  });
+});
+
+/**
+ * Task 17b: "Add sub-task" reuses Task 15's `POST …/cards/:cardId/split` (one title in, one
+ * child out) rather than `createCard` + `addLink('parent')` — `createCard`'s wrapper discards the
+ * response body, so it cannot hand back the new card's id to link as a child; `splitCard`'s
+ * response already carries the created children in full.
+ */
+describe('splitCard', () => {
+  it('POSTs titles to the card\'s split route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ children: [] }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await splitCard('brd_1', 'card_a', ['Write the doc']);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/boards/brd_1/cards/card_a/split');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(init?.body as string)).toEqual({ titles: ['Write the doc'] });
+  });
+
+  it('surfaces the server\'s own refusal rather than throwing', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ error: { code: 'NOTHING_TO_SPLIT', message: 'every line was blank — nothing to split into' } }), { status: 400 })),
+    );
+
+    const res = await splitCard('brd_1', 'card_a', ['   ']);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('NOTHING_TO_SPLIT');
   });
 });

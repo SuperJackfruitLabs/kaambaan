@@ -108,6 +108,24 @@ export interface Card {
   dueAt: string | null;
   archivedAt: string | null;
   /**
+   * This card's `parent` edge (`card_links`, this card as `to_card_id`), or null if it has none.
+   * Task 14; type-only addition here (Task 17b) — already on the wire via `CardView`, just never
+   * declared on this client type until the sub-tasks UI needed to count siblings by it.
+   */
+  parentCardId: string | null;
+  /**
+   * How many of this card's direct children are still unresolved — the same rule
+   * `blockedWhere`/`openChildCount` enforce at claim time (Task 14). A DIFFERENT fact from
+   * `blockedBy`: an open child parks the PARENT (it cannot advance), it does not block anything
+   * from being claimed, so it gets its own counter rather than sharing the `⛔` badge.
+   */
+  openChildCount: number;
+  /**
+   * `costUsd` plus one level of children's summed cost (Task 14). Deliberately separate from
+   * `costUsd`, which still means "what this card itself spent" for `overBudget`.
+   */
+  costUsdRollup: number;
+  /**
    * Unresolved same-board `blocks` edges holding this card back — the enforced kind, derived
    * server-side from the same predicate the claim query uses (`CardView.blockedBy`, Task 17c).
    * Empty when nothing blocks the card, including when it only has an open child (that is
@@ -423,6 +441,24 @@ export async function createCard(
     }),
   });
   if (!res.ok) throw new Error(`createCard failed (${res.status})`);
+}
+
+/**
+ * Split a card into children, one per (non-blank) title (Task 15's `POST …/cards/:cardId/split`,
+ * unwired to any web client until now). "Add sub-task" (Task 17b) calls this with a single title
+ * rather than `createCard` + `addLink('parent')`: `createCard`'s wrapper above discards its
+ * response body, so it has no way to hand back the new card's id to link as a child, while this
+ * route's response already carries the created children in full — one call, no race.
+ *
+ * Returns the raw response, like `addLink`/`removeLink` do, so a caller can surface the server's
+ * own refusal (`TOO_MANY_CHILDREN`, `NOTHING_TO_SPLIT`, `CARD_BLOCKED`) as a sentence.
+ */
+export function splitCard(boardId: string, cardId: string, titles: string[]): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/cards/${cardId}/split`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ titles }),
+  });
 }
 
 /**
