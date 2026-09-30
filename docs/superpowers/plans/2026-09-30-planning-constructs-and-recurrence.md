@@ -1901,6 +1901,12 @@ Store `input.timezone` **as the operator typed it** — never the resolved spell
 
 `createSchedule` takes a **required** `createdBy` (the route supplies the authenticated user) — a schedule mints cards, and Principle 3 says every card has a human owner, so a schedule without one is not creatable. It validates through `parseRule` and **returns the parser's own error message** — a rule is typed by a human and the parser's message is the only useful one. It then sets `next_fire_at = nextFireAt(rule, timezone, now)`. `updateSchedule` re-parses and recomputes `next_fire_at` whenever `rule` or `timezone` changes; it must not silently keep a fire time computed from the old rule.
 
+**The schedule records its creator's authority.** Add `queued_grant TEXT` to the `schedules` table and
+accept `queuedGrant?: string[] | null` on `createSchedule`; the route passes `user.mayDispatch`.
+Creating a schedule *is* the act of authorising unattended dispatch, exactly as wiring a webhook is, so
+the authority is captured at the only moment the authoriser is present — the same reasoning
+`queued_grant` on a card already follows.
+
 - [ ] **Step 5: Write `fireDueSchedules`**
 
 ```ts
@@ -1956,6 +1962,14 @@ Store `input.timezone` **as the operator typed it** — never the resolved spell
       const created = await this.createCardFromTrigger({
         title: row.title as string,
         ownerUserId: row.created_by as string,
+        // The grant captured when the schedule was created. `createCardFromTrigger` falls back to
+        // `triggerGrant()`, but that meta key has exactly ONE writer in the codebase —
+        // `PUT /v1/boards/:id/github` — so a board whose operator never saved GitHub settings has
+        // null, and under enforcement the card parks in `input-required` on first claim. That state
+        // is NOT terminal, so `scheduleInstanceOpen` then reads the instance as open forever and the
+        // default `overlap: 'skip'` stops the schedule firing again: one unclaimable card, then
+        // silence. The suite cannot see it because tests run with ENFORCE_CONTROL_PAIR off.
+        queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : undefined,
         spec: { ...(JSON.parse(row.spec_json as string) as Record<string, unknown>), scheduleId: id },
       });
       if (!created.ok) {
@@ -1981,9 +1995,17 @@ Store `input.timezone` **as the operator typed it** — never the resolved spell
         });
       }
 
+      // ⚠️ Advance an INTERVAL rule from its previous fire time, not from `nowIso`.
+      // `nowIso` is the sweep instant, always slightly after the scheduled one, and for a
+      // pure-addition interval rule that lateness is absorbed into the phase permanently: fire at
+      // 10:00:00.3 → next 10:05:00.3 → the 10:05:00.1 tick finds it not due → the card lands at
+      // 10:10. `every 5 minutes` becomes "every 5 or 10, unpredictably", drifting without bound.
+      // Clock rules (daily/weekly/monthly) recompute a wall-clock occurrence and are immune.
+      // Advance by whole intervals from the old value until past now — that keeps the phase AND
+      // still collapses a missed week into one card.
       this.sql.exec(
         `UPDATE schedules SET next_fire_at = ?, last_fired_at = ?, last_card_id = ? WHERE id = ?`,
-        nextFireAt(parsed.rule, row.timezone as string, nowIso),
+        advanceFireTime(parsed.rule, row.timezone as string, row.next_fire_at as string, nowIso),
         nowIso,
         cardId,
         id,
