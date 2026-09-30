@@ -3253,8 +3253,25 @@ export async function removeExternalLink(
 - [ ] **Step 4: Register the migration in the TEST catalogue, or every test above fails**
 
 `apps/api/test/helpers/catalog.ts`'s `setupCatalog()` builds the D1 schema the test environment
-sees. It does NOT read `migrations/`. A new migration file is invisible to every test until its
-DDL is added there — add `card_links_external` (table and all three indexes) alongside `labels`.
+sees. It does NOT apply `migrations/` wholesale. A new migration file is invisible to every test
+until it is registered there, and this plan has already lost a task to that.
+
+Follow the **`labels` pattern** at `catalog.ts:101-111`, not the hand-written-DDL pattern above it:
+
+```ts
+import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
+// …alongside the labels block:
+if (!(await tableExists('card_links_external'))) {
+  for (const st of statementsOf(cardLinksExternal)) await env.DB.prepare(st).run();
+}
+```
+
+The distinction matters. The hand-written `CREATE TABLE` statements at the top of that file
+deliberately **drop** their `REFERENCES tenants(id)` clauses (compare `catalog.ts:16`'s `boards` to
+`0001_catalog.sql:33-41`); importing the migration `?raw` keeps every constraint the real schema
+has, which for this table is the point — the `boards` FKs and the `from_card_id <> to_card_id` CHECK
+are behaviour Task 16's tests assert. `boards` itself already exists in the catalogue, so the FK is
+satisfiable; the test seeds real `boards` rows for exactly that reason.
 
 - [ ] **Step 5: Run and commit**
 
