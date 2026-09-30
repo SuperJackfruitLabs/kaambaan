@@ -39,7 +39,7 @@
 - **`apps/api/src/board/recurrence.ts`** *(new)* — the recurrence-rule grammar: parse, validate, and `nextFireAt(rule, tz, after)`. Pure, no DO, no clock.
 - **`apps/api/src/db/labels.ts`** *(new)* — D1 label catalogue.
 - **`apps/api/src/db/projects.ts`** *(new)* — D1 projects + milestones + the rollup cache.
-- **`apps/api/migrations/0010_labels.sql`** (Task 4), **`0011_card_links_external.sql`** (Task 16), **`0012_projects_and_milestones.sql`** (Task 18) *(new)* — numbered in the order the phases run.
+- **`apps/api/migrations/0010_labels.sql`** (Task 4), **`0012_card_links_external.sql`** (Task 16), **`0013_projects_and_milestones.sql`** (Task 18) *(new)* — numbered in the order the phases run.
 - **`apps/api/src/index.ts`** — new routes; the `scheduled()` handler gains the board sweep.
 - **`packages/contract/src/entities.ts`** — `Stage.completion` added; `Card.currentTaskId` removed; `Card.labels`/`archivedAt` become real.
 - **`apps/web/src/lib/`** — `api.ts` types + calls; `CardTile.svelte` (label chips, due from column, blocker badge); `FilterBar.svelte`; `plan/ListView.svelte`; `CardDrawer.svelte` (labels, due, sub-tasks, blockers); new `components/plan/ProjectView.svelte`; new `components/board/ScheduleList.svelte` under settings.
@@ -2759,14 +2759,14 @@ git commit -m "feat(sub-tasks): split a card into children, over REST and over M
 ## Task 16: Cross-board edges — advisory, in D1, and labelled as such
 
 **Files:**
-- Create: `apps/api/migrations/0011_card_links_external.sql`, `apps/api/src/db/card-links-external.ts`
+- Create: `apps/api/migrations/0012_card_links_external.sql`, `apps/api/src/db/card-links-external.ts`
 - Modify: `apps/api/src/index.ts`
 - Test: `apps/api/test/card-links-external.test.ts` (create)
 
 - [ ] **Step 1: The migration**
 
 ```sql
--- Migration 0011. Cross-board card edges. ADVISORY, always — read the design before extending this.
+-- Migration 0012. Cross-board card edges. ADVISORY, always — read the design before extending this.
 --
 -- Cards live in per-board Durable Objects, so an edge whose ends are in different DOs cannot be
 -- consulted on the claim path without a cross-DO read, and a stale cross-DO read either refuses a
@@ -2775,7 +2775,7 @@ git commit -m "feat(sub-tasks): split a card into children, over REST and over M
 --
 -- `parent` is deliberately NOT an allowed kind: a parent edge carries a rule (a parent does not
 -- advance while a child is open), and an advisory containment relationship is one that fails to
--- contain. Cross-board decomposition is a project (migration 0011).
+-- contain. Cross-board decomposition is a project (migration 0013).
 CREATE TABLE card_links_external (
   tenant_id     TEXT NOT NULL REFERENCES tenants(id),
   from_board_id TEXT NOT NULL,
@@ -2858,7 +2858,7 @@ The `SAME_BOARD_EDGE` refusal is the one that protects the design: the enforced 
 - [ ] **Step 3: Implement, run, commit**
 
 ```bash
-git add apps/api/migrations/0011_card_links_external.sql apps/api/src apps/api/test
+git add apps/api/migrations/0012_card_links_external.sql apps/api/src apps/api/test
 git commit -m "feat(links): advisory cross-board edges, refused for same-board and for parent"
 ```
 
@@ -2917,7 +2917,7 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 ## Task 18: Projects and milestones in D1
 
 **Files:**
-- Create: `apps/api/migrations/0012_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
+- Create: `apps/api/migrations/0013_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
 - Test: `apps/api/test/projects.test.ts` (create)
 
 **Interfaces:**
@@ -2935,7 +2935,7 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 - [ ] **Step 1: The migration**
 
 ```sql
--- Migration 0012. Projects group work ACROSS boards; milestones are ordered checkpoints inside one project.
+-- Migration 0013. Projects group work ACROSS boards; milestones are ordered checkpoints inside one project.
 --
 -- Here rather than in a board's Durable Object because that is the whole point: a project confined
 -- to one board would be indistinguishable from a label, and labels already exist (migration 0010).
@@ -3067,7 +3067,7 @@ Follow `capabilities.ts`: hand-written SQL, `tenant_id = ?` first, always. The l
 - [ ] **Step 3: Run and commit**
 
 ```bash
-git add apps/api/migrations/0012_projects_and_milestones.sql apps/api/src/db/projects.ts apps/api/test/projects.test.ts
+git add apps/api/migrations/0013_projects_and_milestones.sql apps/api/src/db/projects.ts apps/api/test/projects.test.ts
 git commit -m "feat(projects): projects, milestones and a rollup cache in D1"
 ```
 
