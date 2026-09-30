@@ -62,7 +62,7 @@ import {
   listImplications,
   removeImplication,
 } from './db/implications';
-import { listLabels, createLabel, updateLabel, deleteLabel, unknownLabelIds } from './db/labels';
+import { listLabels, createLabel, updateLabel, deleteLabel, unknownLabelIds, resolveLabelNames } from './db/labels';
 
 export { BoardDO };
 
@@ -1274,6 +1274,15 @@ export default {
           priority?: number;
           ownerUserId?: string;
           labels?: string[];
+          /**
+           * The free-text names `CardDrawer.svelte`'s comma-separated Labels input sends —
+           * resolved to catalogue ids here rather than in the client, since the resolver both
+           * reads and writes D1 (`resolveLabelNames`, `src/db/labels.ts`). A name not yet in the
+           * catalogue is created with `origin: 'inferred'` (migration 0011), the same treatment
+           * `capabilities` gives a tag "registered on first use". Sent instead of `labels`, never
+           * alongside it — the drawer is the one caller, and it only ever has names.
+           */
+          labelNames?: string[];
           dueAt?: string | null;
           archivedAt?: string | null;
         };
@@ -1296,6 +1305,18 @@ export default {
             { status: 400 },
           );
         }
+        if (body.labelNames !== undefined) {
+          if (!Array.isArray(body.labelNames) || body.labelNames.some((n) => typeof n !== 'string')) {
+            return Response.json(
+              { error: { code: 'INVALID_LABELS', message: 'labelNames must be an array of strings' } },
+              { status: 400 },
+            );
+          }
+          // Resolved BEFORE the unknown-id check below, so a freshly created id still passes it —
+          // it was just inserted into the same tenant's catalogue this request resolved against.
+          body.labels = await resolveLabelNames(env.DB, tenantId, body.labelNames, user?.userId ?? null);
+        }
+
         // The DO does not validate label ids — it cannot reach D1 usefully on a hot path — so the
         // route checks here, before the write lands, that every id names a real label in this
         // workspace's catalogue.

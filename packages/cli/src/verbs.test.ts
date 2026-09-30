@@ -57,6 +57,13 @@ describe("verb surface", () => {
     }
   });
 
+  it("dispatches the label verb, so the drawer's Labels input has a catalogue to resolve against", () => {
+    // `supi label list|add|rm` hits the Task 4 routes (`/v1/labels[/:id]`) — the same catalogue
+    // `resolveLabelNames` resolves a card's free-text labels against server-side.
+    const got = dispatched();
+    expect(got.has("label"), "label is not dispatched").toBe(true);
+  });
+
   it("dispatches the registry reads a board's routing depends on", () => {
     // Routing is exact string equality between a stage's `owner` and an agent's EFFECTIVE
     // capability set. When a card does not move, the whole diagnosis is that comparison — so the

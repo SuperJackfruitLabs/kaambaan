@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { flag, positionals } from "./args";
+import { flag, flags, positionals } from "./args";
 
 describe("flag", () => {
   it("reads both spellings", () => {
@@ -22,6 +22,21 @@ describe("flag", () => {
   it("is null when absent, and when a flag is followed by another flag", () => {
     expect(flag(["--json"], "--spec")).toBe(null);
     expect(flag(["--spec", "--json"], "--spec")).toBe(null);
+  });
+});
+
+describe("flags", () => {
+  // `--label` is the one repeatable flag on this surface (`create-card`), and `flag` only ever
+  // reads the first occurrence — `supi create-card b t --label a --label b` needs both.
+  it("collects every occurrence, in either spelling", () => {
+    expect(flags(["--label", "lbl_a", "--label", "lbl_b"], "--label")).toEqual(["lbl_a", "lbl_b"]);
+    expect(flags(["--label=lbl_a", "--label=lbl_b"], "--label")).toEqual(["lbl_a", "lbl_b"]);
+    expect(flags(["--label", "lbl_a", "--label=lbl_b"], "--label")).toEqual(["lbl_a", "lbl_b"]);
+  });
+
+  it("is empty when absent, and skips a bare flag followed by another flag", () => {
+    expect(flags(["--json"], "--label")).toEqual([]);
+    expect(flags(["--label", "--json"], "--label")).toEqual([]);
   });
 });
 
@@ -42,5 +57,12 @@ describe("positionals", () => {
   it("keeps a title that merely looks like a path", () => {
     // The bug was never about the shape of the value — only about its position.
     expect(positionals(["brd_1", "./notes.md"])).toEqual(["brd_1", "./notes.md"]);
+  });
+
+  it("skips the value of a repeated flag, once per occurrence", () => {
+    expect(positionals(["brd_1", "A title", "--label", "lbl_a", "--label", "lbl_b"])).toEqual([
+      "brd_1",
+      "A title",
+    ]);
   });
 });

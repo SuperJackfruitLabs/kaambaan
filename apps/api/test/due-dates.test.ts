@@ -198,3 +198,93 @@ describe('createCard accepts a due date directly', () => {
     });
   });
 });
+
+describe('sweepBoard also migrates spec.labels, under the same guard', () => {
+  it('one sweep migrates a card carrying both spec.due and spec.labels', async () => {
+    // `labels` (migration 0010) carries `REFERENCES tenants(id)`, unlike the tables this suite's
+    // boards otherwise touch — so resolving a label name needs a real tenant row first.
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_a', 'due-dates', 'Due Dates')`).run();
+
+    await runInDurableObject(stubFor('due-labels-backfill'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due11', tenantId: 'tnt_a', name: 'D11', stages: STAGES });
+      const created = await board.createCard({
+        title: 'Legacy card',
+        ownerUserId: 'usr_a',
+        // Both legacy facts on the one card — `due` the pre-Task-6 shape, `labels` the free-text
+        // shape `CardDrawer.svelte` wrote before this branch pointed it at the catalogue.
+        spec: { due: '2026-08-05', labels: ['bug', 'Urgent'], description: 'kept' },
+      });
+      if (!created.ok) throw new Error(created.message);
+
+      const before = (await board.getState()).cards[0]!;
+      expect(before.dueAt).toBeNull();
+      expect(before.labels).toEqual([]);
+
+      await board.sweepBoard('2026-09-30T10:00:00.000Z');
+
+      const migrated = (await board.getState()).cards[0]!;
+      expect(migrated.dueAt).toBe('2026-08-05');
+      expect((migrated.spec as Record<string, unknown>).due).toBeUndefined();
+      expect((migrated.spec as Record<string, unknown>).labels).toBeUndefined();
+      expect((migrated.spec as Record<string, unknown>).description).toBe('kept');
+      expect(migrated.labels).toHaveLength(2);
+
+      const rows = await env.DB.prepare(`SELECT name FROM labels WHERE tenant_id = 'tnt_a'`).all<{ name: string }>();
+      const names = (rows.results ?? []).map((r) => r.name);
+      expect(names).toContain('bug');
+      expect(names).toContain('Urgent');
+    });
+  });
+
+  it('does not set the backfill flag when the labels half of the pass throws, so the next sweep retries', async () => {
+    // No `tenants` row for this id yet: `labels` (migration 0010) carries `REFERENCES tenants(id)`,
+    // so `resolveLabelNames`' INSERT fails on that FK — the real way this pass can fail, not a
+    // mock. This is the same FK `test/labels-rest.test.ts` documents relying on.
+    await runInDurableObject(stubFor('due-labels-backfill-fails'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due13', tenantId: 'tnt_backfill_retry', name: 'D13', stages: STAGES });
+      const created = await board.createCard({
+        title: 'Legacy card',
+        ownerUserId: 'usr_a',
+        spec: { labels: ['bug'] },
+      });
+      if (!created.ok) throw new Error(created.message);
+
+      await expect(board.sweepBoard('2026-09-30T10:00:00.000Z')).rejects.toThrow();
+
+      // Proof the flag was never set: with nothing else changed but a `tenants` row now existing,
+      // the SAME once-per-board pass runs again and actually migrates the card. If the flag had
+      // been set on the failed attempt, this second sweep would see nothing left to migrate and
+      // the card would still carry `spec.labels` forever.
+      await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_backfill_retry', 'retry', 'Retry')`).run();
+      await board.sweepBoard('2026-09-30T10:05:00.000Z');
+
+      const migrated = (await board.getState()).cards[0]!;
+      expect(migrated.labels).toHaveLength(1);
+      expect((migrated.spec as Record<string, unknown>).labels).toBeUndefined();
+      const events = await board.getEvents();
+      expect(events.filter((e) => e.type === 'cards.labels_backfilled')).toHaveLength(1);
+    });
+  });
+
+  it('does not touch a second board\'s legacy spec.labels on a second sweep — same once-per-board flag', async () => {
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_a', 'due-dates', 'Due Dates')`).run();
+
+    await runInDurableObject(stubFor('due-labels-backfill-twice'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due12', tenantId: 'tnt_a', name: 'D12', stages: STAGES });
+      const first = await board.createCard({ title: 'First', ownerUserId: 'usr_a', spec: { labels: ['chore'] } });
+      if (!first.ok) throw new Error(first.message);
+
+      await board.sweepBoard('2026-09-30T10:00:00.000Z');
+      expect((await board.getState()).cards[0]!.labels).toHaveLength(1);
+
+      const second = await board.createCard({ title: 'Second', ownerUserId: 'usr_a', spec: { labels: ['docs'] } });
+      if (!second.ok) throw new Error(second.message);
+
+      await board.sweepBoard('2026-09-30T10:05:00.000Z');
+
+      const untouched = (await board.getState()).cards.find((c) => c.id === second.value.id)!;
+      expect(untouched.labels).toEqual([]);
+      expect((untouched.spec as Record<string, unknown>).labels).toEqual(['docs']);
+    });
+  });
+});

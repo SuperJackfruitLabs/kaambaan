@@ -92,6 +92,55 @@ export async function deleteLabel(db: D1Database, tenantId: string, id: string):
   return (res.meta.changes ?? 0) > 0;
 }
 
+/**
+ * A label nobody chose a colour for. Neutral, not decorative: a person who wants a real colour
+ * still has `PATCH /v1/labels/:id`, or `supi label add` if they meant to declare it up front.
+ */
+const INFERRED_LABEL_COLOUR = '#8a8a8a';
+
+/**
+ * Turn the names a person typed into label ids, registering any that do not exist yet.
+ *
+ * `origin: 'inferred'` is the same answer `capabilities` gives for a tag that "appeared as a stage
+ * owner and was registered on first use" (migration 0006). The alternative — refusing a name that
+ * is not already in the catalogue — would mean a person cannot label a card without first visiting
+ * a management screen, which is why the free-text input existed in the first place.
+ *
+ * Matching is by name within the tenant, case-insensitively (migration 0011's
+ * `labels_tenant_name_nocase`), so "Urgent" and "urgent" do not become two labels. The lookup and
+ * the unique index have to agree on that, or this function is how a tenant ends up with two rows
+ * that read identically to a person.
+ */
+export async function resolveLabelNames(
+  db: D1Database,
+  tenantId: string,
+  names: string[],
+  createdBy: string | null,
+): Promise<string[]> {
+  // Blank entries are not names — same filter the drawer already applies before sending anything.
+  const wanted = names.map((n) => n.trim()).filter((n) => n !== '');
+  const ids: string[] = [];
+  for (const name of wanted) {
+    const existing = await db
+      .prepare(`SELECT id FROM labels WHERE tenant_id = ? AND name = ? COLLATE NOCASE`)
+      .bind(tenantId, name)
+      .first<{ id: string }>();
+    if (existing) {
+      ids.push(existing.id);
+      continue;
+    }
+    const id = newId('lbl');
+    await db
+      .prepare(
+        `INSERT INTO labels (id, tenant_id, name, colour, origin, created_by) VALUES (?, ?, ?, ?, 'inferred', ?)`,
+      )
+      .bind(id, tenantId, name, INFERRED_LABEL_COLOUR, createdBy)
+      .run();
+    ids.push(id);
+  }
+  return ids;
+}
+
 /** Which of these ids do not exist in this tenant — so a card write can be refused before it lands. */
 export async function unknownLabelIds(db: D1Database, tenantId: string, ids: string[]): Promise<string[]> {
   const wanted = [...new Set(ids)].filter((id) => id.trim() !== '');

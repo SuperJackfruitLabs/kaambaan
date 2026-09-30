@@ -6,6 +6,7 @@ import dropUnused from '../../migrations/0005_drop_unused.sql?raw';
 import userExternalMapping from '../../migrations/0008_user_external_mapping.sql?raw';
 import tenantForgeHost from '../../migrations/0009_tenant_forge_host.sql?raw';
 import labels from '../../migrations/0010_labels.sql?raw';
+import labelsOrigin from '../../migrations/0011_labels_origin.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -102,5 +103,11 @@ export async function setupCatalog(): Promise<void> {
   // test that reaches labels inserts a real `tenants` row first.
   if (!(await tableExists('labels'))) {
     for (const s of statementsOf(labels)) await env.DB.prepare(s).run();
+  }
+  // 0011 adds `origin`/`created_by` to `labels` plus the case-insensitive unique index that
+  // `resolveLabelNames` depends on agreeing with. Guarded on the column, same as every other
+  // ALTER-TABLE migration mirrored above.
+  if (!(await tableHasColumn('labels', 'origin'))) {
+    for (const s of statementsOf(labelsOrigin)) await env.DB.prepare(s).run();
   }
 }

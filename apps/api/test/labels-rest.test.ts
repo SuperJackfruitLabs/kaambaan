@@ -158,3 +158,75 @@ describe('PATCH /v1/boards/:id/cards/:cardId — labels validation', () => {
     expect(after.labels).toEqual([label.id]);
   });
 });
+
+describe('PATCH /v1/boards/:id/cards/:cardId — labelNames (the drawer\'s free-text input)', () => {
+  it('resolves typed names to ids, creating one that does not exist yet', async () => {
+    const t = 'tnt_lbl_rest_names';
+    await insertTenant(t, 'lbl-rest-names');
+    const b = await board(t);
+    const id = await card(t, b, 'Drawer card');
+
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'bug', colour: '#f00' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labelNames: ['bug', 'freshly typed'] }),
+    });
+    expect(res.status).toBe(200);
+    const after = await readCard(t, b, id);
+    expect(after.labels).toHaveLength(2);
+    expect(after.labels).toContain(label.id);
+
+    const catalogue = await SELF.fetch('https://api.test/v1/labels', { headers: dev(t) });
+    const { labels: all } = await catalogue.json<{ labels: { name: string }[] }>();
+    expect(all.some((l) => l.name === 'freshly typed')).toBe(true);
+  });
+
+  it('resolves "Urgent" and "urgent" typed on two different requests to the same id', async () => {
+    const t = 'tnt_lbl_rest_names_case';
+    await insertTenant(t, 'lbl-rest-names-case');
+    const b = await board(t);
+    const id = await card(t, b, 'Case card');
+
+    await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labelNames: ['Urgent'] }),
+    });
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labelNames: ['urgent'] }),
+    });
+    expect(res.status).toBe(200);
+    const after = await readCard(t, b, id);
+    expect(after.labels).toHaveLength(1);
+
+    const catalogue = await SELF.fetch('https://api.test/v1/labels', { headers: dev(t) });
+    const { labels: all } = await catalogue.json<{ labels: { name: string }[] }>();
+    expect(all.filter((l) => l.name.toLowerCase() === 'urgent')).toHaveLength(1);
+  });
+
+  it('400s a labelNames array containing a non-string element, same as labels does', async () => {
+    const t = 'tnt_lbl_rest_names_bad';
+    const b = await board(t);
+    const id = await card(t, b, 'Bad names');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ labelNames: ['ok', 42] }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('INVALID_LABELS');
+
+    const after = await readCard(t, b, id);
+    expect(after.labels).toEqual([]);
+  });
+});

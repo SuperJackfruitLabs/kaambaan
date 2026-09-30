@@ -22,6 +22,25 @@ export function flag(args: string[], name: string): string | null {
 }
 
 /**
+ * Every value of a repeatable flag, in either spelling — `--label` may appear more than once
+ * (`supi create-card <board> <title> --label lbl_a --label lbl_b`), and `flag` above only ever
+ * reads the first occurrence.
+ */
+export function flags(args: string[], name: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === name) {
+      const next = args[i + 1];
+      if (next && !next.startsWith("--")) out.push(next);
+      continue;
+    }
+    if (a.startsWith(`${name}=`)) out.push(a.slice(name.length + 1));
+  }
+  return out;
+}
+
+/**
  * The positional arguments, with each flag and the value it consumed removed.
  *
  * Filtering on `startsWith("--")` alone keeps the value: `create-card <board> "A title" --spec

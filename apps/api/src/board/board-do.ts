@@ -13,6 +13,7 @@ import { estimateCostUsd } from '../metering/pricing';
 import { parseWindowMs } from '../metering/window';
 import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
+import { resolveLabelNames } from '../db/labels';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -1170,6 +1171,56 @@ export class BoardDO extends DurableObject<Env> {
     return { migrated };
   }
 
+  /**
+   * Move `spec.labels` onto `labels` (catalogue ids), once per board.
+   *
+   * Shares `sweepBoard`'s `dueBackfillDone` guard rather than a flag of its own — the reason this
+   * exists is the same reason `backfillDueDates` does, so it runs at the same time, in the same
+   * once-per-board pass. Names resolve through `resolveLabelNames` (`src/db/labels.ts`), which
+   * reaches D1's tenant-scoped label catalogue rather than this DO's own SQLite storage — a name
+   * not yet declared is created with `origin: 'inferred'`, exactly as a person typing it into
+   * `CardDrawer.svelte` today would cause.
+   *
+   * Idempotent, and it *removes* the key from the spec rather than leaving a copy — two sources of
+   * truth for one fact is the condition `card.labels` exists to end, same as `due_at`.
+   */
+  async backfillLabelNames(): Promise<{ migrated: number }> {
+    const tenantId = this.getMeta('tenantId');
+    if (!tenantId) return { migrated: 0 };
+    const rows = this.sql.exec(`SELECT id, spec_json, labels FROM cards`).toArray();
+    let migrated = 0;
+    for (const row of rows) {
+      let spec: Record<string, unknown>;
+      try {
+        spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+      } catch {
+        continue; // an unparseable spec is not this migration's problem to fix
+      }
+      const raw = spec.labels;
+      if (!Array.isArray(raw) || raw.length === 0) continue;
+      const names = raw.filter((n): n is string => typeof n === 'string' && n.trim() !== '');
+      delete spec.labels;
+      if (names.length === 0) {
+        // Nothing resolvable — an array of blanks or non-strings — but the stale key is cleared
+        // regardless, same as a legacy `due` that fails its own shape check is still removed.
+        this.sql.exec(`UPDATE cards SET spec_json = ?, updated_at = ? WHERE id = ?`, JSON.stringify(spec), this.now(), row.id as string);
+        continue;
+      }
+      const resolvedIds = await resolveLabelNames(this.env.DB, tenantId, names, null);
+      const existing = row.labels ? (JSON.parse(row.labels as string) as string[]) : [];
+      const merged = [...new Set([...existing, ...resolvedIds])];
+      this.sql.exec(
+        `UPDATE cards SET labels = ?, spec_json = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify(merged),
+        JSON.stringify(spec),
+        this.now(),
+        row.id as string,
+      );
+      migrated += 1;
+    }
+    return { migrated };
+  }
+
   /** Test-only: put a due date back in the spec and clear the column, to rehearse the migration. */
   async __testResetDueToSpec(cardId: string): Promise<void> {
     const row = this.sql.exec(`SELECT spec_json, due_at FROM cards WHERE id = ?`, cardId).one();
@@ -2099,8 +2150,15 @@ export class BoardDO extends DurableObject<Env> {
     // forever — so running it on each five-minute tick would be a full table scan for nothing.
     if (!this.getMeta('dueBackfillDone')) {
       const { migrated } = await this.backfillDueDates();
+      // Same guard, same pass: a card's legacy `spec.labels` is the other half of "two sources of
+      // truth for one fact" this flag exists to close. If either backfill throws, the flag below
+      // is never set — a failure retries the whole pass next sweep rather than skipping either
+      // migration forever. Both backfills are individually idempotent, so a retried
+      // `backfillDueDates` after a `backfillLabelNames` failure costs nothing extra.
+      const { migrated: labelsMigrated } = await this.backfillLabelNames();
       this.setMeta('dueBackfillDone', '1');
       if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
+      if (labelsMigrated > 0) this.emit('cards.labels_backfilled', { migrated: labelsMigrated });
     }
 
     const today = nowIso.slice(0, 10); // the column is a date, so compare dates

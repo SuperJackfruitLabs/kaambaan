@@ -177,8 +177,14 @@
     editTitle = card.title;
     editPriority = card.priority;
     editDesc = (card.spec?.description as string | undefined) ?? '';
-    const existingLabels = Array.isArray(card.spec?.labels) ? (card.spec!.labels as string[]) : [];
-    editLabels = existingLabels.join(', ');
+    // Names, read back from the catalogue by the ids the card actually carries — `card.labels`
+    // (Task 4), not `spec.labels`. The catalogue is already in the store (`app.labels`, fetched at
+    // board load), so no extra round trip is needed to show what a person typed before.
+    const byId = app.labelById();
+    editLabels = card.labels
+      .map((id) => byId.get(id)?.name)
+      .filter((name): name is string => Boolean(name))
+      .join(', ');
     const existingAC = Array.isArray(card.spec?.acceptanceCriteria) ? (card.spec!.acceptanceCriteria as string[]) : [];
     editAC = existingAC.join('\n');
     editDue = card.dueAt ?? '';
@@ -189,18 +195,22 @@
     if (!boardId || !cardId || editTitle.trim() === '') return;
     savingCard = true;
     try {
-      const labels = editLabels.split(',').map((l) => l.trim()).filter(Boolean);
+      // Names, not ids — resolved against the catalogue server-side (`resolveLabelNames`), which
+      // creates whatever does not exist yet rather than refusing it. `spec.labels` is not written:
+      // that field is what left the tile's chips permanently empty, since nothing ever wrote
+      // `card.labels` (the field the tile actually reads).
+      const labelNames = editLabels.split(',').map((l) => l.trim()).filter(Boolean);
       const ac = editAC.split('\n').map((l) => l.trim()).filter(Boolean);
       const spec = {
         ...(card?.spec ?? {}),
         description: editDesc,
-        labels,
         acceptanceCriteria: ac,
       };
       const res = await updateCard(boardId, cardId, {
         title: editTitle.trim(),
         priority: Number(editPriority) || 0,
         spec,
+        labelNames,
         // Empty clears it — null, not an omitted field, so "no due date" is a real write rather
         // than a value the server never hears about.
         dueAt: editDue.trim() === '' ? null : editDue.trim(),

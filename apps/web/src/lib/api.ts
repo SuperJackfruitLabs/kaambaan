@@ -354,6 +354,12 @@ export function updateCard(
     priority?: number;
     ownerUserId?: string;
     labels?: string[];
+    /**
+     * The comma-separated names `CardDrawer`'s Labels input parses — resolved to catalogue ids
+     * server-side (`resolveLabelNames`), which creates a name that does not exist yet rather than
+     * refusing it. Sent instead of `labels`, never alongside it.
+     */
+    labelNames?: string[];
     dueAt?: string | null;
     archivedAt?: string | null;
   },
