@@ -61,6 +61,18 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                declare a label
   supi label rm <id>           remove a label (cards keep the stale id)
 
+  supi schedule list <boardId> the board's recurring cards
+  supi schedule add <boardId> --title <t> --rule <r> --tz <tz>
+                               [--stage <key>] [--priority <n>] [--overlap skip|allow]
+                               declare a schedule; rule is "every <n> minutes|hours|days",
+                               "daily at HH:MM", "weekly on <mon-sun> at HH:MM", or
+                               "monthly on <1-28> at HH:MM" — checked every five minutes,
+                               so it may fire up to five minutes after its stated time
+  supi schedule rm <boardId> <scheduleId>
+                               remove a schedule
+  supi schedule pause <boardId> <scheduleId>
+  supi schedule resume <boardId> <scheduleId>
+
   supi forge [<host>|none]     this workspace's forge host, shown or set
   supi agents                  the workspace's agents and what they declare
   supi capabilities            the capability registry, with each one's origin
@@ -567,6 +579,82 @@ async function main(argv: string[]): Promise<void> {
         return;
       }
       fail("usage: supi label list | supi label add <name> <colour> | supi label rm <id>");
+    }
+
+    /**
+     * A recurring card, and the cadence that fires it (Task 8's rule grammar, Task 9's CRUD on the
+     * DO, Task 10's route). `add` validates only the SHAPE of what it sends — required flags are
+     * present and `--overlap`/`--priority` parse to the right type — never the rule's grammar: the
+     * server owns that, and its own message (`INVALID_RULE`'s `error.message`, printed as `api()`
+     * already prints any refusal) is the sentence that tells the author what to type instead. A
+     * client that re-validated the grammar is a client that will one day disagree with the server
+     * about what a valid rule is.
+     */
+    case "schedule": {
+      const sub = pos[0];
+
+      if (sub === "list") {
+        const boardId = pos[1];
+        if (!boardId) fail("usage: supi schedule list <boardId>");
+        out(await api(`/v1/boards/${boardId}/schedules`));
+        return;
+      }
+
+      if (sub === "add") {
+        const boardId = pos[1];
+        const usage =
+          "usage: supi schedule add <boardId> --title <t> --rule <r> --tz <tz>\n" +
+          "  [--stage <key>] [--priority <n>] [--overlap skip|allow]";
+        if (!boardId) fail(usage);
+        const title = flag(rest, "--title");
+        const rule = flag(rest, "--rule");
+        const tz = flag(rest, "--tz");
+        if (!title || !rule || !tz) fail(usage);
+        const body: Record<string, unknown> = { title, rule, timezone: tz };
+        const stage = flag(rest, "--stage");
+        if (stage) body.stageKey = stage;
+        const priorityArg = flag(rest, "--priority");
+        if (priorityArg) body.priority = Number(priorityArg);
+        const overlapArg = flag(rest, "--overlap");
+        if (overlapArg) {
+          if (overlapArg !== "skip" && overlapArg !== "allow") {
+            fail(`--overlap must be "skip" or "allow", not "${overlapArg}"`);
+          }
+          body.overlap = overlapArg;
+        }
+        out(await api(`/v1/boards/${boardId}/schedules`, { method: "POST", body: JSON.stringify(body) }));
+        return;
+      }
+
+      if (sub === "rm") {
+        const boardId = pos[1];
+        const scheduleId = pos[2];
+        if (!boardId || !scheduleId) fail("usage: supi schedule rm <boardId> <scheduleId>");
+        await api(`/v1/boards/${boardId}/schedules/${scheduleId}`, { method: "DELETE" });
+        out({ deleted: scheduleId }, () => `Deleted ${scheduleId}.`);
+        return;
+      }
+
+      if (sub === "pause" || sub === "resume") {
+        const boardId = pos[1];
+        const scheduleId = pos[2];
+        if (!boardId || !scheduleId) fail(`usage: supi schedule ${sub} <boardId> <scheduleId>`);
+        out(
+          await api(`/v1/boards/${boardId}/schedules/${scheduleId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: sub === "resume" }),
+          }),
+        );
+        return;
+      }
+
+      fail(
+        "usage: supi schedule list <boardId>\n" +
+          "  supi schedule add <boardId> --title <t> --rule <r> --tz <tz> [--stage <key>] [--priority <n>] [--overlap skip|allow]\n" +
+          "  supi schedule rm <boardId> <scheduleId>\n" +
+          "  supi schedule pause <boardId> <scheduleId>\n" +
+          "  supi schedule resume <boardId> <scheduleId>",
+      );
     }
 
     case "templates": {

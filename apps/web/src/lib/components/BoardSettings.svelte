@@ -2,6 +2,7 @@
   import { Button } from '$lib/components/ui/button';
   import { renameBoard, setGithubConfig, setStages, patchStage, getProfiles, createProfile, type BoardSnapshot, type Profile, type Stage } from '$lib/api';
   import { capabilityTag } from '@superpipeline/contract';
+  import ScheduleList from '$lib/components/board/ScheduleList.svelte';
 
   let { board, onChanged }: { board: BoardSnapshot; onChanged: () => void } = $props();
 
@@ -321,6 +322,9 @@
           {#if stagesError}<p class="text-coral mt-2 text-xs leading-relaxed">{stagesError}</p>{/if}
           <div class="mt-3 flex justify-end"><Button size="sm" onclick={saveStages} disabled={busy === 'stages'}>{busy === 'stages' ? 'Saving…' : 'Save pipeline'}</Button></div>
         </section>
+
+        <!-- schedules -->
+        <ScheduleList boardId={board.boardId!} stages={board.stages} />
 
         <!-- github -->
         <section>

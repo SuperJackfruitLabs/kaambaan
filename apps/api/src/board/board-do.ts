@@ -742,6 +742,34 @@ export interface BoardStub {
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
+  createSchedule(input: {
+    title: string;
+    rule: string;
+    timezone: string;
+    overlap: 'skip' | 'allow';
+    createdBy: string;
+    spec?: JsonValue;
+    priority?: number;
+    labels?: string[];
+    stageKey?: string | null;
+    enabled?: boolean;
+  }): Promise<Result<ScheduleView>>;
+  updateSchedule(
+    id: string,
+    patch: {
+      title?: string;
+      rule?: string;
+      timezone?: string;
+      overlap?: 'skip' | 'allow';
+      spec?: JsonValue;
+      priority?: number;
+      labels?: string[];
+      stageKey?: string | null;
+      enabled?: boolean;
+    },
+  ): Promise<Result<ScheduleView>>;
+  deleteSchedule(id: string): Promise<Result<{ id: string }>>;
+  listSchedules(): Promise<ScheduleView[]>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
   setForgeSecret(secret: string): Promise<Result<{ configured: true }>>;
   handleForgeWebhook(input: {
