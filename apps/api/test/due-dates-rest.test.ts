@@ -37,6 +37,36 @@ async function readCard(tenant: string, boardId: string, cardId: string): Promis
   return (await res.json<{ card: { dueAt: string | null; archivedAt: string | null } }>()).card;
 }
 
+describe('POST /v1/boards/:id/cards — dueAt validation', () => {
+  it('400s a malformed dueAt at creation, reusing the PATCH rule', async () => {
+    const t = 'tnt_due_rest_create_bad';
+    const b = await board(t);
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'Bad due at birth', dueAt: 'next tuesday' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('INVALID_DUE_AT');
+  });
+
+  it('accepts a well-formed dueAt at creation, with no follow-up patch needed', async () => {
+    const t = 'tnt_due_rest_create_ok';
+    const b = await board(t);
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'Dated at birth', dueAt: '2026-12-01' }),
+    });
+    expect(res.status).toBe(201);
+    const created = await res.json<{ card: { id: string; dueAt: string | null } }>();
+    expect(created.card.dueAt).toBe('2026-12-01');
+    expect((await readCard(t, b, created.card.id)).dueAt).toBe('2026-12-01');
+  });
+});
+
 describe('PATCH /v1/boards/:id/cards/:cardId — dueAt validation', () => {
   it('400s a non-string dueAt instead of throwing inside the DO', async () => {
     const t = 'tnt_due_rest_num';

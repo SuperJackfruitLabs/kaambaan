@@ -72,8 +72,8 @@
   let editDesc = $state('');
   let editLabels = $state('');
   let editAC = $state('');
-  // `spec.due` was rendered on every card tile and no interface could write it: a field that
-  // appeared on the card and that a person could not fill in.
+  // `dueAt` is its own column (Task 6), not `spec.due` — two sources of truth for one date is
+  // the condition that column exists to end.
   let editDue = $state('');
   let savingCard = $state(false);
   let newRefUrl = $state('');
@@ -181,7 +181,7 @@
     editLabels = existingLabels.join(', ');
     const existingAC = Array.isArray(card.spec?.acceptanceCriteria) ? (card.spec!.acceptanceCriteria as string[]) : [];
     editAC = existingAC.join('\n');
-    editDue = typeof card.spec?.due === 'string' ? card.spec.due : '';
+    editDue = card.dueAt ?? '';
     editing = true;
   }
 
@@ -196,12 +196,15 @@
         description: editDesc,
         labels,
         acceptanceCriteria: ac,
-        // Omitted rather than set to '' when cleared, so "no due date" is the absence the tile
-        // already tests for rather than an empty string that reads as a date.
-        ...(editDue.trim() === '' ? { due: undefined } : { due: editDue.trim() }),
       };
-      if (editDue.trim() === '') delete (spec as Record<string, unknown>).due;
-      const res = await updateCard(boardId, cardId, { title: editTitle.trim(), priority: Number(editPriority) || 0, spec });
+      const res = await updateCard(boardId, cardId, {
+        title: editTitle.trim(),
+        priority: Number(editPriority) || 0,
+        spec,
+        // Empty clears it — null, not an omitted field, so "no due date" is a real write rather
+        // than a value the server never hears about.
+        dueAt: editDue.trim() === '' ? null : editDue.trim(),
+      });
       if (!res.ok) localError = `Couldn't save the card (${res.status})`;
       editing = false;
       await app.refresh();

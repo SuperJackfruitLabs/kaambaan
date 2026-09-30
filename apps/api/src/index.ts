@@ -66,6 +66,18 @@ import { listLabels, createLabel, updateLabel, deleteLabel, unknownLabelIds } fr
 
 export { BoardDO };
 
+const DUE_AT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * `due_at` drives claim order and the overdue cron sweep on a board that runs unattended
+ * (board-do.ts `claimableWhere`/`sweepBoard`), so garbage here does not fail loudly at write time
+ * — it silently misorders or mis-fires later. Only a bare date (the column's own shape) or `null`
+ * is accepted. Shared by the card PATCH route and `createCard` so there is exactly one rule.
+ */
+function isInvalidDueAt(value: unknown): boolean {
+  return value !== undefined && value !== null && (typeof value !== 'string' || !DUE_AT_RE.test(value));
+}
+
 function statusForCode(code: BoardErrorCode): number {
   switch (code) {
     case 'WIP_LIMIT':
@@ -1204,7 +1216,14 @@ export default {
           ownerUserId?: string;
           spec?: JsonValue;
           priority?: number;
+          dueAt?: string;
         };
+        if (isInvalidDueAt(body.dueAt)) {
+          return Response.json(
+            { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
+            { status: 400 },
+          );
+        }
         // The authority that accompanied the act, recorded with the card. A
         // session-cookie caller carries none, and `undefined` there means "no
         // one with permission asked for this to run" — which is refused under
@@ -1261,11 +1280,7 @@ export default {
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
         }
-        // `due_at` drives claim order and the overdue cron sweep on a board that runs unattended
-        // (board-do.ts `claimableWhere`/`sweepBoard`), so garbage here does not fail loudly at write
-        // time — it silently misorders or mis-fires later. Only a bare date (the column's own
-        // shape) or `null` is accepted.
-        if (body.dueAt !== undefined && body.dueAt !== null && (typeof body.dueAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.dueAt))) {
+        if (isInvalidDueAt(body.dueAt)) {
           return Response.json(
             { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
             { status: 400 },

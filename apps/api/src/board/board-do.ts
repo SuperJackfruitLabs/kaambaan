@@ -645,6 +645,7 @@ export interface BoardStub {
     ownerUserId: string;
     spec?: JsonValue;
     priority?: number;
+    dueAt?: string;
   }): Promise<Result<CardView>>;
   moveCard(
     cardId: string,
@@ -1097,6 +1098,12 @@ export class BoardDO extends DurableObject<Env> {
     ownerUserId: string;
     spec?: JsonValue;
     priority?: number;
+    /**
+     * Set at creation rather than requiring create-then-patch: a second round trip means a
+     * failure between the two silently drops the due date. Validated at the route (same rule as
+     * `PATCH /cards/:id`'s `dueAt`), so this DO trusts a bare `YYYY-MM-DD` string.
+     */
+    dueAt?: string;
   }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
@@ -1108,8 +1115,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant, due_at)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
       JSON.stringify(input.spec ?? {}),
@@ -1123,6 +1130,7 @@ export class BoardDO extends DurableObject<Env> {
       // moment it exists, so the creator is the principal who dispatched it.
       input.ownerUserId,
       input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
+      input.dueAt ?? null,
     );
     const card = this.mustGetCard(id);
     this.emit('card.created', { card });
@@ -2086,6 +2094,15 @@ export class BoardDO extends DurableObject<Env> {
    * does not change twice.
    */
   async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }> {
+    // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
+    // (`WHERE due_at IS NULL`) matches every card that never had a due date — i.e. most of them,
+    // forever — so running it on each five-minute tick would be a full table scan for nothing.
+    if (!this.getMeta('dueBackfillDone')) {
+      const { migrated } = await this.backfillDueDates();
+      this.setMeta('dueBackfillDone', '1');
+      if (migrated > 0) this.emit('cards.due_backfilled', { migrated });
+    }
+
     const today = nowIso.slice(0, 10); // the column is a date, so compare dates
     const rows = this.sql
       .exec(

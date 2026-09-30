@@ -139,3 +139,62 @@ describe('overdue notification', () => {
     });
   });
 });
+
+describe('sweepBoard runs the due-date backfill once per board', () => {
+  it('migrates spec.due on the first sweep, nothing on the second, and the flag survives', async () => {
+    await runInDurableObject(stubFor('due-backfill-sweep'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due9', tenantId: 'tnt_a', name: 'D9', stages: STAGES });
+      const created = await board.createCard({
+        title: 'Legacy card',
+        ownerUserId: 'usr_a',
+        spec: { due: '2026-08-01', description: 'kept' },
+      });
+      if (!created.ok) throw new Error(created.message);
+      // Simulate the pre-migration world: the column is cleared, the blob keeps the value.
+      await board.__testResetDueToSpec(created.value.id);
+
+      const before = (await board.getState()).cards[0]!;
+      expect(before.dueAt).toBeNull();
+
+      await board.sweepBoard('2026-09-30T10:00:00.000Z');
+
+      const migrated = (await board.getState()).cards[0]!;
+      expect(migrated.dueAt).toBe('2026-08-01');
+      expect((migrated.spec as Record<string, unknown>).due).toBeUndefined();
+      expect((migrated.spec as Record<string, unknown>).description).toBe('kept');
+
+      const events = await board.getEvents();
+      expect(events.filter((e) => e.type === 'cards.due_backfilled')).toHaveLength(1);
+
+      // Put another spec.due-only card in place, as if it arrived after the first sweep — the
+      // second sweep must not touch it, because the backfill has already run for this board.
+      const second = await board.createCard({
+        title: 'Also legacy',
+        ownerUserId: 'usr_a',
+        spec: { due: '2026-08-02' },
+      });
+      if (!second.ok) throw new Error(second.message);
+      await board.__testResetDueToSpec(second.value.id);
+
+      await board.sweepBoard('2026-09-30T10:05:00.000Z');
+
+      const untouched = (await board.getState()).cards.find((c) => c.id === second.value.id)!;
+      expect(untouched.dueAt).toBeNull();
+      expect((untouched.spec as Record<string, unknown>).due).toBe('2026-08-02');
+
+      const eventsAfter = await board.getEvents();
+      expect(eventsAfter.filter((e) => e.type === 'cards.due_backfilled')).toHaveLength(1);
+    });
+  });
+});
+
+describe('createCard accepts a due date directly', () => {
+  it('sets due_at from input.dueAt without a follow-up patch', async () => {
+    await runInDurableObject(stubFor('due-create'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due10', tenantId: 'tnt_a', name: 'D10', stages: STAGES });
+      const created = await board.createCard({ title: 'Dated at birth', ownerUserId: 'usr_a', dueAt: '2026-11-01' });
+      if (!created.ok) throw new Error(created.message);
+      expect(created.value.dueAt).toBe('2026-11-01');
+    });
+  });
+});

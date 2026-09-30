@@ -15,6 +15,7 @@
    */
   import { app } from '$lib/stores/app.svelte';
   import type { Card } from '$lib/api';
+  import { overdue } from '$lib/components/board/card-due';
 
   type SortKey = 'title' | 'priority' | 'state' | 'due' | 'cost';
 
@@ -32,11 +33,11 @@
     return id ? (app.agents.find((a) => a.id === id)?.name ?? id) : '';
   }
   function dueOf(c: Card): string | null {
-    return typeof c.spec?.due === 'string' ? c.spec.due : null;
+    return c.dueAt;
   }
+  const today = new Date().toISOString().slice(0, 10);
   function isOverdue(c: Card): boolean {
-    const d = dueOf(c);
-    return d !== null && c.state !== 'completed' && new Date(`${d}T23:59:59`).getTime() < Date.now();
+    return overdue(c.dueAt, c.state, today);
   }
 
   /** One comparable value per sort key. Missing values sort last however the order is flipped. */
