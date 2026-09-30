@@ -36,7 +36,7 @@ import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
-import { listExternalLinksFor, addExternalLink, removeExternalLink } from './db/card-links-external';
+import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
@@ -1329,6 +1329,16 @@ export default {
       // The DO is emptied FIRST. If that throws, the catalog row survives and the board is still
       // listed and still reachable — a delete that visibly did not happen, rather than a board
       // that vanished from the list while its contents quietly stayed.
+      //
+      // That ordering only works if the SECOND half — `deleteBoard` — cannot fail. It used to be
+      // a bare `DELETE FROM boards`, which was safe only because nothing referenced that table.
+      // Migration 0012 changed that: `card_links_external` FKs onto `boards(id)` with no `ON
+      // DELETE`, so a board named by any cross-board advisory edge started throwing here, AFTER
+      // the DO was already gone — the exact "quiet loss" this comment describes, just moved to
+      // the other half. `deleteBoard` (`db/catalog.ts`) now cleans those rows in the SAME batch as
+      // the board itself, so this call cannot fail on that FK. Whoever next adds a foreign key
+      // onto `boards(id)`: it needs the same treatment here, not a reordering of these two lines —
+      // reordering only relocates the failure window to the irreversible half.
       if (rest === '' && request.method === 'DELETE') {
         await stub.destroy();
         await deleteBoard(env.DB, tenantId, boardId);
@@ -1472,6 +1482,11 @@ export default {
       if (cardMatch && request.method === 'DELETE') {
         const result = await stub.deleteCard(cardMatch[1]!);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        // `deleteCard` cleans the DO's own same-board `card_links` in both directions, for a
+        // reason that applies identically to Task 16's cross-board advisory store: a lingering
+        // edge would point at a card that no longer exists. The DO cannot reach D1, so this is
+        // that same cleanup's other half, run here once the DO has confirmed the card existed.
+        await deleteExternalLinksForCard(env.DB, tenantId, cardMatch[1]!);
         return new Response(null, { status: 204 });
       }
 
@@ -1713,7 +1728,15 @@ export default {
         );
 
         return Response.json({
-          links: links.map((l) => ({ ...l, enforced: true as const })),
+          // `enforced` must mean what it says: true only for a same-board edge that can actually
+          // refuse a claim. `blockedWhere` has two clauses — an unresolved `blocks` edge pointing
+          // AT a card, and an open child (`parent`) pointing FROM one — so both `blocks` and
+          // `parent` genuinely enforce something; `relates` is decoration, consulted nowhere.
+          // Stamping every kind `true` unconditionally told a client a `relates` edge refuses a
+          // claim it does not — unreachable today only because of a web-side defect being fixed
+          // separately, and the whole point of this flag is that a client should never have to
+          // infer enforcement itself, including for the one kind that has none.
+          links: links.map((l) => ({ ...l, enforced: l.kind !== 'relates' })),
           externalLinks: externalLinks.map((l, i) => ({
             ...l,
             enforced: false as const,

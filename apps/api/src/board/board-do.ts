@@ -1531,9 +1531,19 @@ export class BoardDO extends DurableObject<Env> {
     if (cleanedTitles.length === 0) {
       return { ok: false, code: 'NOTHING_TO_SPLIT', message: 'every line was blank — nothing to split into' };
     }
+    // A child's owner must be a HUMAN, because `owner_user_id` is what `notify()` files
+    // gate/park/overdue notifications under and `getNotifications` reads back for the requesting
+    // human — an id nobody can sign in as leaves that feed with no recipient. On the REST/human
+    // path (no `agentId`), `actorUserId` already names the signed-in human and is used as before.
+    // On the MCP/agent path (`agentId` present — the same signal the ownership check above uses),
+    // `actorUserId` IS the calling agent's own id (`mcp/tools.ts` passes `auth.agentId` for both
+    // parameters), so the PARENT's own owner is used instead: `card` above is that parent, already
+    // fetched, and it is presumed to carry a human owner because nothing on any path can make
+    // `ownerUserId` an agent id except this one now-closed hole.
+    const childOwnerUserId = agentId ? card.ownerUserId : actorUserId;
     const children: CardView[] = [];
     for (const title of cleanedTitles) {
-      const created = await this.createChildCard(cardId, { title, ownerUserId: actorUserId });
+      const created = await this.createChildCard(cardId, { title, ownerUserId: childOwnerUserId });
       if (!created.ok) return created;
       children.push(created.value);
     }

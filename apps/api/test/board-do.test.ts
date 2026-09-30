@@ -138,4 +138,90 @@ describe('deleting a board takes its contents with it', () => {
     const after = await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: T });
     expect(after.status).toBe(404);
   });
+
+  /**
+   * Whole-branch review, Critical: migration 0012 gave `boards(id)` its first (and only) foreign
+   * key — `card_links_external.from_board_id`/`to_board_id`, no `ON DELETE` clause — and
+   * `deleteBoard` (`db/catalog.ts`) was still the bare `DELETE FROM boards` written when nothing
+   * referenced that table. The route destroys the Durable Object FIRST (deliberately, so a D1
+   * failure leaves the board visibly undeleted rather than vanished) — but a board with any
+   * cross-board advisory edge now makes the SECOND half fail on the FK, leaving the irreversible
+   * half done and the recoverable half not: a board gone from its own Durable Object, still listed
+   * in the catalog, and un-deletable on every retry (the DO is already empty, so nothing about a
+   * second attempt is any different).
+   *
+   * Confirmed by directly reproducing that exact end state against the pre-fix code before writing
+   * the fix: DELETE answered 500 (`D1_ERROR: FOREIGN KEY constraint failed`), the board was still
+   * in `GET /v1/boards`, and its own snapshot already answered 404 — listed, but gone.
+   */
+  it('deletes cleanly with a cross-board advisory edge in EACH direction, leaving no orphan', async () => {
+    const T2 = { 'X-Tenant-Id': 'tnt_destroy2', 'Content-Type': 'application/json' };
+    // `card_links_external.tenant_id` FKs to `tenants(id)` (unlike `boards.tenant_id`, which this
+    // suite's other tests already create boards without) — required so `addExternalLink` itself
+    // does not 500 on an unrelated FK before this test ever reaches the one under test.
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_destroy2', 'destroy2', 'Destroy2')`).run();
+
+    const STAGES2 = [{ key: 'todo', name: 'To do', order: 0 }];
+    const mkBoard = async (name: string) => {
+      const res = await SELF.fetch('https://api.test/v1/boards', { method: 'POST', headers: T2, body: JSON.stringify({ name, stages: STAGES2 }) });
+      return (await res.json<{ boardId: string }>()).boardId;
+    };
+    const mkCard = async (boardId: string, title: string) => {
+      const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, { method: 'POST', headers: T2, body: JSON.stringify({ title }) });
+      return (await res.json<{ card: { id: string } }>()).card.id;
+    };
+
+    const home = await mkBoard('Home');
+    const away = await mkBoard('Away');
+    const h = await mkCard(home, 'H');
+    const a = await mkCard(away, 'A');
+
+    // An edge naming `home` as the SOURCE (from_board_id = home)…
+    const out = await SELF.fetch(`https://api.test/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T2,
+      body: JSON.stringify({ fromCardId: h, toCardId: a, toBoardId: away, kind: 'blocks' }),
+    });
+    expect(out.status).toBe(201);
+    // …and one naming `home` as the TARGET (to_board_id = home) — the FK fires on either column,
+    // so a fix that only cleans one direction still leaves the board undeletable from the other.
+    const inn = await SELF.fetch(`https://api.test/v1/boards/${away}/links`, {
+      method: 'POST',
+      headers: T2,
+      body: JSON.stringify({ fromCardId: a, toCardId: h, toBoardId: home, kind: 'blocks' }),
+    });
+    expect(inn.status).toBe(201);
+
+    const del = await SELF.fetch(`https://api.test/v1/boards/${home}`, { method: 'DELETE', headers: T2 });
+
+    const { boards } = await (await SELF.fetch('https://api.test/v1/boards', { headers: T2 })).json<{ boards: Array<{ id: string }> }>();
+    const snapshotStatus = (await SELF.fetch(`https://api.test/v1/boards/${home}`, { headers: T2 })).status;
+    const orphanedRows = await env.DB
+      .prepare(`SELECT COUNT(*) AS n FROM card_links_external WHERE from_board_id = ? OR to_board_id = ?`)
+      .bind(home, home)
+      .first<{ n: number }>();
+
+    // One assertion over the whole observable end state, not the thrown error alone: a delete
+    // that "worked" by silently leaving the board listed, or by leaving a dangling advisory row
+    // behind, is just a quieter version of the same bug.
+    expect({
+      deleteStatus: del.status,
+      stillListed: boards.map((b) => b.id).includes(home),
+      snapshotStatusAfterDelete: snapshotStatus,
+      orphanedExternalLinkRows: orphanedRows?.n ?? 0,
+    }).toEqual({
+      deleteStatus: 204,
+      stillListed: false,
+      snapshotStatusAfterDelete: 404,
+      orphanedExternalLinkRows: 0,
+    });
+
+    // The OTHER board's own advisory rows are gone too — deleting home must not leave away
+    // pointing at a card_links_external row for a board that no longer exists.
+    const awayRows = await env.DB
+      .prepare(`SELECT COUNT(*) AS n FROM card_links_external WHERE from_board_id = ? OR to_board_id = ?`)
+      .bind(away, away)
+      .first<{ n: number }>();
+    expect(awayRows?.n ?? 0).toBe(0);
+  });
 });

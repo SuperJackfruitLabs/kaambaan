@@ -85,3 +85,20 @@ export async function removeExternalLink(
     .bind(tenantId, fromCardId, toCardId, kind)
     .run();
 }
+
+/**
+ * Remove every advisory edge touching `cardId`, from EITHER end. Called when a card is deleted.
+ *
+ * `deleteCard` (`board-do.ts`) already cleans same-board `card_links` in both directions for
+ * exactly this reason — a lingering `blocks` row would point at a card that no longer exists, and
+ * the drawer would render a blocker nobody can open or resolve. The Durable Object cannot reach
+ * D1, so it cannot do the same for THIS table itself; this is the other half of that cleanup,
+ * called from the route (`DELETE /v1/boards/:id/cards/:cardId`, `index.ts`) alongside `deleteCard`.
+ * Without it, the OTHER board's drawer would show `⚑ card_a1b2c3… — Blocked (advisory)` forever.
+ */
+export async function deleteExternalLinksForCard(db: D1Database, tenantId: string, cardId: string): Promise<void> {
+  await db
+    .prepare(`DELETE FROM card_links_external WHERE tenant_id = ? AND (from_card_id = ? OR to_card_id = ?)`)
+    .bind(tenantId, cardId, cardId)
+    .run();
+}

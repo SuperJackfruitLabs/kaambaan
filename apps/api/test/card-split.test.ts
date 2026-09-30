@@ -328,3 +328,59 @@ describe('splitCard is gated to the card the calling agent is working', () => {
     });
   });
 });
+
+/**
+ * Whole-branch review, Important: `superpipeline_split_card` (`mcp/tools.ts:234`) passes
+ * `auth.agentId` — an `agt_…` id — as `actorUserId`, and it used to land straight in
+ * `cards.owner_user_id`. The REST route (`index.ts`) passes the signed-in human's own id for the
+ * same parameter, so the "same contract on two wires" that route's own comment claims produced a
+ * human owner from the web and an agent owner from MCP. Concretely: `notify()` files under
+ * `owner_user_id`, `getNotifications` filters on the requesting HUMAN, so an agent-created child's
+ * gate/park/overdue notifications reached nobody's feed — the exact principle that refused an
+ * ownerless scheduled card earlier in this plan (`docs/00-vision-and-principles.md:59`).
+ *
+ * Fixed by having `splitCard` use the PARENT's own owner for a child whenever `agentId` is present
+ * (i.e. only on the MCP/agent path — the same signal `splitCard` already uses to gate ownership,
+ * see the describe block above). The REST/human path (`agentId` absent) is untouched: it keeps
+ * using the acting human, as it always has.
+ *
+ * Every test above this point hands `splitCard` the SAME literal ('usr_a') for both the parent's
+ * owner and the actor, so neither direction was ever distinguishable — these two use a DIFFERENT
+ * actor from the parent's owner specifically so the fix (or its absence) is visible.
+ */
+describe('a child\'s owner, and why the two wires now agree on it', () => {
+  it('MCP/agent path: the child is owned by the PARENT\'s owner, never the calling agent', async () => {
+    await runInDurableObject(stubFor('split-mcp-owner'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_split_mcp_owner', tenantId: 'tnt_a', name: 'SMO', stages: STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_parent' });
+      if (!p.ok) throw new Error(p.message);
+      const claim = await board.claim({ agentId: 'agt_owner', capabilities: ['writing'] });
+      if (!claim.claimed) throw new Error('expected the claim to succeed');
+
+      // Mirrors the actual MCP call site exactly: `auth.agentId` passed for BOTH `actorUserId`
+      // and `agentId` (`mcp/tools.ts:234`, `splitCard(cardId, titles, auth.agentId, auth.agentId)`).
+      const r = await board.splitCard(p.value.id, ['Write the spec'], 'agt_owner', 'agt_owner');
+      expect(r.ok).toBe(true);
+      if (!r.ok) throw new Error(r.message);
+      expect(r.value.children).toHaveLength(1);
+      expect(r.value.children[0]!.ownerUserId).toBe('usr_parent');
+      expect(r.value.children[0]!.ownerUserId).not.toBe('agt_owner');
+    });
+  });
+
+  it('REST/human path: the child is owned by the acting human, unchanged', async () => {
+    await runInDurableObject(stubFor('split-rest-owner'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_split_rest_owner', tenantId: 'tnt_a', name: 'SRO', stages: STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_parent' });
+      if (!p.ok) throw new Error(p.message);
+
+      // No `agentId` — the REST route's own call shape (`index.ts`: `stub.splitCard(cardId,
+      // titles, user?.userId ?? 'usr_dev')`) — and the acting human is deliberately NOT the
+      // parent's owner, so this proves the REST path was never touched by the fix above.
+      const r = await board.splitCard(p.value.id, ['Write the spec'], 'usr_splitting_human');
+      expect(r.ok).toBe(true);
+      if (!r.ok) throw new Error(r.message);
+      expect(r.value.children[0]!.ownerUserId).toBe('usr_splitting_human');
+    });
+  });
+});

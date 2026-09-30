@@ -566,9 +566,30 @@ export async function updateBoardStages(db: D1Database, tenantId: string, boardI
   await db.prepare(`UPDATE boards SET stages_json = ?, updated_at = datetime('now') WHERE tenant_id = ? AND id = ?`).bind(stagesJson, tenantId, boardId).run();
 }
 
-/** Remove a board from the catalog (tenant-scoped). The DO's live state is left untouched. */
+/**
+ * Remove a board from the catalog (tenant-scoped), and any cross-board advisory edges that
+ * reference it — from EITHER end. The DO's live state is left untouched; this is D1 only.
+ *
+ * Migration 0012 gave `boards(id)` its first (and, so far, only) foreign key —
+ * `card_links_external.from_board_id`/`to_board_id`, with no `ON DELETE` clause — so a bare
+ * `DELETE FROM boards` now throws whenever any advisory edge names this board, from either side.
+ * That failure lands on the SECOND half of the route's delete (`index.ts`): `stub.destroy()` runs
+ * first and cannot be undone, so a D1 delete that can still fail leaves the board's Durable Object
+ * already wiped while its catalog row survives — gone from its own contents, still listed, and
+ * undeletable on every retry, since retrying does not change the row that is blocking it.
+ *
+ * The fix is to make THIS delete unable to fail on that FK, not to reorder the route: reordering
+ * only moves the damage (a failing `destroy()` after a successful D1 delete would orphan the DO
+ * instead — billing and invisible — which is the exact failure mode the route's own ordering was
+ * written to avoid). One `db.batch`, children first, same convention as `deleteAgent` just above:
+ * either both deletes land, or neither does, so there is no window where one half succeeded and
+ * the FK could still fire on the other.
+ */
 export async function deleteBoard(db: D1Database, tenantId: string, boardId: string): Promise<void> {
-  await db.prepare(`DELETE FROM boards WHERE tenant_id = ? AND id = ?`).bind(tenantId, boardId).run();
+  await db.batch([
+    db.prepare(`DELETE FROM card_links_external WHERE tenant_id = ? AND (from_board_id = ? OR to_board_id = ?)`).bind(tenantId, boardId, boardId),
+    db.prepare(`DELETE FROM boards WHERE tenant_id = ? AND id = ?`).bind(tenantId, boardId),
+  ]);
 }
 
 /** Delete an agent and its tokens (tokens first, to satisfy the FK), tenant-scoped. */

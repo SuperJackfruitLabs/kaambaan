@@ -233,3 +233,36 @@ describe('MCP tools — add_reference', () => {
     expect((res.content as Array<{ text: string }>)[0]!.text).toContain('CARD_NOT_FOUND');
   });
 });
+
+/**
+ * Whole-branch review, Important: the full wire, not just `board.splitCard` directly (that unit
+ * coverage lives in `card-split.test.ts`). `superpipeline_split_card` used to pass `auth.agentId`
+ * as the child's `ownerUserId`, so a card split mid-run by an agent came out owned by an `agt_…`
+ * id — a construct `getNotifications` cannot resolve back to anyone's feed.
+ */
+describe('MCP tools — split_card child ownership', () => {
+  it('a sub-task created over MCP is owned by the PARENT card\'s human owner, not the calling agent', async () => {
+    const boardId = 'brd_split_owner_mcp';
+    await initBoard(AUTH, boardId, RESEARCH_PIPELINE);
+    const created = await depsFor(AUTH).boardStub(boardId).createCard({ title: 'Parent', ownerUserId: 'usr_parent_mcp' });
+    if (!created.ok) throw new Error('seed failed');
+
+    const client = await connectMcp(depsFor(AUTH));
+    const claim = toolJson(
+      await client.callTool({ name: 'superpipeline_claim_card', arguments: { boardId } }),
+    ) as { claimed: boolean };
+    expect(claim.claimed).toBe(true);
+
+    const res = await client.callTool({
+      name: 'superpipeline_split_card',
+      arguments: { boardId, cardId: created.value.id, titles: ['Write the spec'] },
+    });
+    expect(res.isError).toBeFalsy();
+    const split = toolJson(res) as { children: Array<{ ownerUserId: string }> };
+    expect(split.children).toHaveLength(1);
+    // Not `AUTH.agentId` ('agt_r'). `notify()` files under `owner_user_id`, and
+    // `getNotifications` filters on the requesting human — an agent id here means the child's
+    // gate, park and overdue notifications reach nobody's feed.
+    expect(split.children[0]!.ownerUserId).toBe('usr_parent_mcp');
+  });
+});

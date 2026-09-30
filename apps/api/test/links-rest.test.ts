@@ -202,6 +202,40 @@ describe('GET /v1/boards/:id/cards/:cardId/links', () => {
     expect(body.externalLinks[0]).toMatchObject({ fromCardId: a, toCardId: away, toBoardId: otherBid, kind: 'blocks', enforced: false });
   });
 
+  /**
+   * Whole-branch review, Minor: this route used to stamp `enforced: true` on EVERY same-board row
+   * regardless of `kind`, including `relates` — decoration that `blockedWhere` never consults.
+   * `enforced` exists so a client never has to infer whether an edge can refuse a claim; a row
+   * that lies about that defeats the one thing the flag is for. `blocks` and `parent` both
+   * genuinely enforce something (`blockedWhere`'s two clauses — an unresolved `blocks` edge, and
+   * an open child via `parent`), so only `relates` should read `false` here.
+   */
+  it('marks a same-board `relates` edge NOT enforced, unlike `blocks` and `parent`', async () => {
+    const bid = await createBoard('EnforcedKinds');
+    const a = await createCard(bid, 'A');
+    const b = await createCard(bid, 'B');
+    const c = await createCard(bid, 'C');
+
+    await SELF.fetch(`${base}/v1/boards/${bid}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: b, kind: 'relates' }),
+    });
+    await SELF.fetch(`${base}/v1/boards/${bid}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: c, kind: 'parent' }),
+    });
+
+    const res = await SELF.fetch(`${base}/v1/boards/${bid}/cards/${a}/links`, { headers: T });
+    const body = (await res.json()) as { links: Array<{ toCardId: string; kind: string; enforced: boolean }> };
+
+    const relates = body.links.find((l) => l.kind === 'relates')!;
+    const parent = body.links.find((l) => l.kind === 'parent')!;
+    expect(relates.enforced, '`relates` enforces nothing and must say so').toBe(false);
+    expect(parent.enforced, '`parent` genuinely excludes the PARENT from claim (open-child clause)').toBe(true);
+  });
+
   it('answers empty arrays for a card with no edges', async () => {
     const bid = await createBoard();
     const a = await createCard(bid, 'Lonely');

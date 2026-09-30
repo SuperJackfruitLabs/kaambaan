@@ -327,3 +327,104 @@ describe('GET /v1/boards/:id/cards/:cardId/links — the other end\'s title and 
     expect(body.externalLinks[0]!.otherCardTitle, 'must not disclose the foreign card\'s title').toBeNull();
   });
 });
+
+/**
+ * Whole-branch review, Important: `deleteCard` (`board-do.ts`) already cleans same-board
+ * `card_links` in both directions — "a lingering `blocks` row points at a card that no longer
+ * exists, and the drawer would render a blocker nobody can open or resolve" — and that reasoning
+ * applies identically to `card_links_external`. The Durable Object cannot reach D1, so the same
+ * cleanup for the advisory store belongs in the route (`DELETE /v1/boards/:id/cards/:cardId`,
+ * `index.ts`), alongside the DO call. Without it, the OTHER board's drawer shows
+ * `⚑ card_a1b2c3… — Blocked (advisory)` forever, naming a card that no longer exists.
+ */
+describe('DELETE /v1/boards/:id/cards/:cardId — cross-board advisory edges go with the card', () => {
+  it('removes an advisory edge in which the deleted card was the SOURCE (from_card_id)', async () => {
+    const home = await createBoard('CardDelHome1');
+    const away = await createBoard('CardDelAway1');
+    const h = await createCard(home, 'H');
+    const a = await createCard(away, 'A');
+
+    await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: h, toCardId: a, toBoardId: away, kind: 'blocks' }),
+    });
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', h)).toHaveLength(1);
+
+    const del = await SELF.fetch(`${base}/v1/boards/${home}/cards/${h}`, { method: 'DELETE', headers: T });
+    expect(del.status).toBe(204);
+
+    // Gone from BOTH cards' perspective — the row is deleted, not merely unreachable from one end.
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', h)).toHaveLength(0);
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', a)).toHaveLength(0);
+  });
+
+  it('removes an advisory edge in which the deleted card was the TARGET (to_card_id)', async () => {
+    const home = await createBoard('CardDelHome2');
+    const away = await createBoard('CardDelAway2');
+    const h = await createCard(home, 'H');
+    const a = await createCard(away, 'A');
+
+    await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: h, toCardId: a, toBoardId: away, kind: 'blocks' }),
+    });
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', a)).toHaveLength(1);
+
+    // Deleted from the OTHER board, over its own route — the DO that owns `h` never sees this
+    // call, so the cleanup cannot be something `h`'s own board did on `a`'s behalf.
+    const del = await SELF.fetch(`${base}/v1/boards/${away}/cards/${a}`, { method: 'DELETE', headers: T });
+    expect(del.status).toBe(204);
+
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', a)).toHaveLength(0);
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', h)).toHaveLength(0);
+  });
+
+  it('a card with no advisory edges deletes cleanly (no-op cleanup, not a failure)', async () => {
+    const home = await createBoard('CardDelHome3');
+    const h = await createCard(home, 'Lonely');
+    const del = await SELF.fetch(`${base}/v1/boards/${home}/cards/${h}`, { method: 'DELETE', headers: T });
+    expect(del.status).toBe(204);
+  });
+});
+
+/**
+ * Whole-branch review: the one behavioural test the review found missing. Every other assertion
+ * in this file checks STRUCTURE — status codes, `enforced: false`, which store a row landed in —
+ * never whether the advisory edge actually behaves as advertised. This is that check: a cross-board
+ * `blocks` edge must leave its target genuinely claimable, because D1 is never consulted on the
+ * claim path (`blockedWhere` reads only `card_links`, same-board, inside the DO). If D1 were ever
+ * wired into `claimableWhere` — the exact mistake the whole advisory design exists to prevent —
+ * this is the test that would catch it; nothing structural would.
+ */
+describe('a cross-board advisory `blocks` edge leaves its target claimable', () => {
+  it('claims the target card over the real claim route, with the advisory edge in place', async () => {
+    const home = await createBoard('ClaimableHome');
+    const away = await createBoard('ClaimableAway');
+    const h = await createCard(home, 'Blocker (advisory only)');
+    const a = await createCard(away, 'Target');
+
+    const link = await SELF.fetch(`${base}/v1/boards/${home}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: h, toCardId: a, toBoardId: away, kind: 'blocks' }),
+    });
+    expect(link.status).toBe(201);
+    const linkBody = (await link.json()) as { link: { enforced: boolean } };
+    expect(linkBody.link.enforced, 'sanity: this really is the advisory kind of edge').toBe(false);
+
+    // The real claim route — agent auth, `X-Agent-Id` — not a direct DO call, so this exercises
+    // the actual path an agent takes, including whatever `blockedWhere`/`claimableWhere` the
+    // Worker's `claims` route runs through.
+    const claim = await SELF.fetch(`${base}/v1/boards/${away}/claims`, {
+      method: 'POST',
+      headers: { ...T, 'X-Agent-Id': 'agt_claimer' },
+      body: JSON.stringify({ capabilities: ['build'] }),
+    });
+    expect(claim.status).toBe(200);
+    const claimBody = (await claim.json()) as { claimed: boolean; card?: { id: string } };
+    expect(claimBody.claimed, 'the advisory edge must not have excluded the target from claim').toBe(true);
+    expect(claimBody.card?.id).toBe(a);
+  });
+});
