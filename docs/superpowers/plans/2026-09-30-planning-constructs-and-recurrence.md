@@ -1343,6 +1343,23 @@ Branch: `feat/planning-phase2-recurrence`
 
 Restricted grammar, not cron. A cron parser is a dependency and a surface; these four forms cover maintenance cadence, and the field can hold a cron expression later without a schema change.
 
+**Task 1's spike already answered the open question, and left a consequence this task must respect.**
+`workerd` carries full ICU zone data — `Asia/Kolkata` renders `2026-01-15T00:00:00Z` as `05:30`, and an
+unknown zone throws `RangeError`. So IANA zones stand and the UTC-plus-offset fallback is not needed.
+
+But **ICU canonicalises a zone to its older alias**: `resolvedOptions().timeZone` answers
+`Asia/Calcutta` for an input of `Asia/Kolkata`. Three rules follow, and they bind this task and the
+next:
+
+1. **Validate a zone by constructing a formatter and catching `RangeError`** — never by comparing
+   strings or checking against a list.
+2. **Never compare zone strings for equality** anywhere in `recurrence.ts`.
+3. **Store and display the operator's own spelling.** Echoing `resolvedOptions().timeZone` back would
+   show someone who typed `Asia/Kolkata` a schedule reading `Asia/Calcutta`, which reads as a bug.
+
+`zonedParts` and `offsetMinutes` below already respect these — they pass the zone through to
+`Intl.DateTimeFormat` and never read the resolved spelling back. Keep it that way.
+
 **Files:**
 - Create: `apps/api/src/board/recurrence.ts`, `apps/api/test/recurrence.test.ts`
 
@@ -1449,6 +1466,31 @@ describe('nextFireAt', () => {
   it('is strictly forward: firing never returns the instant it was given', () => {
     const exact = '2026-09-30T09:00:00.000Z';
     expect(nextFireAt(mustParse('daily at 09:00'), 'UTC', exact)).not.toBe(exact);
+  });
+
+  /**
+   * The one test that defends `fromZonedWallClock`'s second pass.
+   *
+   * Without it the whole suite passes against a single-pass version, because every other case here
+   * uses Asia/Kolkata or UTC and neither observes DST. And a single pass is a natural-looking
+   * cleanup: read without its comment, the function appears to compute the same offset twice for no
+   * reason. Dropping it is silently wrong by exactly one hour, twice a year, in every DST-observing
+   * zone — in the code that decides when a scheduled card is created.
+   *
+   * 2026-03-08 is America/New_York's spring-forward. At 03:00 local, the zone is already EDT
+   * (UTC-4), so the answer is 07:00Z. A single-pass version measures the offset at its UTC guess —
+   * still EST (UTC-5) — and answers 08:00Z.
+   */
+  it('survives a spring-forward: the offset at the guess is not the offset at the answer', () => {
+    expect(nextFireAt(mustParse('daily at 03:00'), 'America/New_York', '2026-03-08T00:00:00.000Z')).toBe(
+      '2026-03-08T07:00:00.000Z',
+    );
+  });
+
+  it('refuses a zero interval, distinctly from the five-minute floor', () => {
+    const r = parseRule('every 0 days');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('at least 1');
   });
 });
 ```
@@ -1625,7 +1667,7 @@ export function nextFireAt(rule: Rule, timezone: string, afterIso: string): stri
 - [ ] **Step 4: Run the tests**
 
 Run: `cd apps/api && pnpm vitest run test/recurrence.test.ts`
-Expected: PASS, all 14.
+Expected: PASS, all 15.
 
 - [ ] **Step 5: Commit**
 
@@ -1829,7 +1871,41 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
 - [ ] **Step 4: Write CRUD**
 
+**Validate `stageKey` against `this.stages()` as well** — the same argument the rule and the timezone
+get. A stage that does not exist is worth refusing while a human is standing there to read the
+message, rather than surfacing months later as cards in the wrong lane.
+
+**Document that missed occurrences collapse to one.** `next_fire_at` advances from *now*, not from
+the missed time, so a board whose cron was down for a week produces one card rather than seven. That
+is right for maintenance work — seven identical "sweep the logs" cards help nobody — but say it in
+`fireDueSchedules`' doc comment, because it is exactly what a later reader "fixes" into a card storm.
+
+**Reject an empty `createdBy`, and an `overlap` outside `'skip' | 'allow'`.** The type says they are
+constrained; nothing checks at runtime, and the next task puts user JSON on this path. An unknown
+`overlap` silently means *allow*, which is the permissive direction.
+
+**Validate the timezone, by construction not comparison.** The plan did not say so and it must:
+
+```ts
+    // A zone is valid iff Intl accepts it. Do NOT compare against a list or against
+    // `resolvedOptions().timeZone` — ICU canonicalises `Asia/Kolkata` to `Asia/Calcutta`, so a
+    // string comparison rejects a zone that works perfectly. Task 1's spike confirmed the throw.
+    try {
+      new Intl.DateTimeFormat('en-GB', { timeZone: input.timezone });
+    } catch {
+      return { ok: false, code: 'INVALID_TIMEZONE', message: `"${input.timezone}" is not a time zone this runtime knows` };
+    }
+```
+
+Store `input.timezone` **as the operator typed it** — never the resolved spelling.
+
 `createSchedule` takes a **required** `createdBy` (the route supplies the authenticated user) — a schedule mints cards, and Principle 3 says every card has a human owner, so a schedule without one is not creatable. It validates through `parseRule` and **returns the parser's own error message** — a rule is typed by a human and the parser's message is the only useful one. It then sets `next_fire_at = nextFireAt(rule, timezone, now)`. `updateSchedule` re-parses and recomputes `next_fire_at` whenever `rule` or `timezone` changes; it must not silently keep a fire time computed from the old rule.
+
+**The schedule records its creator's authority.** Add `queued_grant TEXT` to the `schedules` table and
+accept `queuedGrant?: string[] | null` on `createSchedule`; the route passes `user.mayDispatch`.
+Creating a schedule *is* the act of authorising unattended dispatch, exactly as wiring a webhook is, so
+the authority is captured at the only moment the authoriser is present — the same reasoning
+`queued_grant` on a card already follows.
 
 - [ ] **Step 5: Write `fireDueSchedules`**
 
@@ -1886,6 +1962,14 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
       const created = await this.createCardFromTrigger({
         title: row.title as string,
         ownerUserId: row.created_by as string,
+        // The grant captured when the schedule was created. `createCardFromTrigger` falls back to
+        // `triggerGrant()`, but that meta key has exactly ONE writer in the codebase —
+        // `PUT /v1/boards/:id/github` — so a board whose operator never saved GitHub settings has
+        // null, and under enforcement the card parks in `input-required` on first claim. That state
+        // is NOT terminal, so `scheduleInstanceOpen` then reads the instance as open forever and the
+        // default `overlap: 'skip'` stops the schedule firing again: one unclaimable card, then
+        // silence. The suite cannot see it because tests run with ENFORCE_CONTROL_PAIR off.
+        queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : undefined,
         spec: { ...(JSON.parse(row.spec_json as string) as Record<string, unknown>), scheduleId: id },
       });
       if (!created.ok) {
@@ -1895,7 +1979,15 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
       }
 
       const cardId = created.value.card.id;
-      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+      // `moveCard` returns a Result and does NOT throw for the realistic failures — `UNKNOWN_STAGE`
+      // (a stage renamed or removed by `setStages` after this schedule was written) and
+      // `WIP_LIMIT`. Discarding it means the card lands in the default lane, `schedule.fired` is
+      // emitted as a success, and nothing anywhere records that the routing was dropped. That is
+      // the same silent failure this task exists to prevent, wearing a different hat.
+      if (row.stage_key) {
+        const moved = await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+        if (!moved.ok) this.emit('schedule.stage_failed', { scheduleId: id, cardId, stageKey: row.stage_key, reason: moved.code });
+      }
       if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
         await this.updateCard(cardId, {
           priority: Number(row.priority),
@@ -1903,9 +1995,17 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
         });
       }
 
+      // ⚠️ Advance an INTERVAL rule from its previous fire time, not from `nowIso`.
+      // `nowIso` is the sweep instant, always slightly after the scheduled one, and for a
+      // pure-addition interval rule that lateness is absorbed into the phase permanently: fire at
+      // 10:00:00.3 → next 10:05:00.3 → the 10:05:00.1 tick finds it not due → the card lands at
+      // 10:10. `every 5 minutes` becomes "every 5 or 10, unpredictably", drifting without bound.
+      // Clock rules (daily/weekly/monthly) recompute a wall-clock occurrence and are immune.
+      // Advance by whole intervals from the old value until past now — that keeps the phase AND
+      // still collapses a missed week into one card.
       this.sql.exec(
         `UPDATE schedules SET next_fire_at = ?, last_fired_at = ?, last_card_id = ? WHERE id = ?`,
-        nextFireAt(parsed.rule, row.timezone as string, nowIso),
+        advanceFireTime(parsed.rule, row.timezone as string, row.next_fire_at as string, nowIso),
         nowIso,
         cardId,
         id,
@@ -1930,12 +2030,30 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
 Note `scheduleInstanceOpen` treats **all four** terminal states as closed. An instance that `failed` should not wedge the schedule forever — that is the opposite of a *blocker* that failed (Task 11), and the two must not share a helper.
 
-- [ ] **Step 6: Call it from `sweepBoard`**
+- [ ] **Step 6: Call it from `sweepBoard` — in its own try/catch**
+
+⚠️ **`sweepBoard` has changed since this plan was written.** Phase 1's whole-branch review found that
+a failing backfill took the overdue sweep down with it, silently and forever, so the backfill now sits
+in its own `try/catch` and the overdue query runs regardless. **Read the current shape before editing
+it**, and apply the same reasoning to your addition: a schedule that cannot fire must not stop the
+overdue notifications for that board, or every card on it goes unnoticed because one schedule is
+broken.
 
 ```ts
-    const schedules = await this.fireDueSchedules(nowIso);
-    return { overdueNotified: rows.length, schedulesFired: schedules.fired.length };
+    // Its own try/catch, for the reason the backfill above has one: three jobs share this sweep, and
+    // a failure in any of them must not silently disable the other two. `schedulesFired` is still
+    // reported as 0 when firing failed, which is honest — nothing fired.
+    let schedulesFired = 0;
+    try {
+      schedulesFired = (await this.fireDueSchedules(nowIso)).fired.length;
+    } catch (err) {
+      this.emit('schedules.sweep_failed', { reason: String(err) });
+    }
+    return { overdueNotified: rows.length, schedulesFired };
 ```
+
+Note the failure is **emitted**, not swallowed. Phase 1's review found `scheduled()` catching with an
+empty block, so a board failing every tick was invisible everywhere; do not reintroduce that.
 
 - [ ] **Step 7: Run everything**
 
@@ -1961,7 +2079,31 @@ git commit -m "feat(schedules): recurring cards, fired from the worker cron with
 
 - [ ] **Step 1: Routes, following the existing board-subroute shape**
 
-Mirror how `/v1/boards/:id/cards` is matched in `index.ts` (`:1118`). Return the parser's message verbatim on a 400 — it is the only message that tells the author what to type instead.
+Mirror how `/v1/boards/:id/cards` is matched in `index.ts`. Return the parser's message verbatim on a
+400 — it is the only message that tells the author what to type instead.
+
+⚠️ **The CLI auth trap Phase 1 fell into — do not repeat it.** Phase 1 shipped `/v1/labels` resolving
+its caller with `resolveUser` alone, which reads session cookies and dev headers. `supi` sends a hub
+JWT that only `resolveHubUser` can read, so **every `supi label` verb 401'd** and told the person to
+run `fleet login`, which could not help. It was found only by the whole-branch review, because the
+route's own tests passed and the CLI's own tests only asserted the verb dispatched.
+
+You are adding `supi schedule` verbs against new routes. Every other CLI-reachable route falls back:
+
+```ts
+    let u = await resolveUser(request, env);
+    if (!u) u = await resolveHubUser(request, env);
+```
+
+Board subroutes already do this, so mirroring them correctly gets it right — but **verify it rather
+than assuming**, and add a test that drives the route with a hub JWT, as
+`apps/api/test/labels-hub-token.test.ts` now does. A test asserting the verb dispatches proves
+nothing about whether the request is accepted.
+
+**Validation belongs on these routes, not only in the DO.** `createSchedule`/`updateSchedule` validate
+the rule, timezone, `stageKey`, `overlap` and `createdBy` — but the DO trusts its callers by design,
+and this task is what first puts **user JSON** on that path. A non-string `rule`, or an `overlap` of
+`{}`, must answer 400 rather than reaching the DO. Phase 1 shipped exactly this hole twice.
 
 - [ ] **Step 2: The settings section**
 
@@ -1999,7 +2141,24 @@ gh pr create --title "feat: recurring cards" --body "<see plan; include Task 1's
 
 On **Recurring Maintenance** (`brd_24280cb0c7614d36`) — a board with bare stages, no instructions and zero cards, named after a capability that until now did not exist:
 
-1. Give its stages an owner capability and instructions, or the scheduled card will be created and never claimed. The board has none today.
+1. **The board's real state, checked 2026-09-30** — this plan previously said it had bare stages, which
+   was wrong. It has a five-stage pipeline with owners already set:
+
+   | stage | owner |
+   |---|---|
+   | Due | human |
+   | Running | `code` |
+   | Verify | `security` |
+   | Sign-off | human (gate) |
+   | Closed | human |
+
+   **The first stage is human-owned**, so a schedule with no `stageKey` creates a card that no agent
+   claims — correctly, by design. To prove the `queuedGrant` fallback, which is the point of this
+   check, the schedule must target the **`Running`** stage (capability `code`, which has agents).
+   Get its stage *key* — `supi board` prints display names, not keys.
+
+   What is genuinely missing is **instructions** on the stages, and a completion rule on `Verify`.
+   An agent claiming a card on a stage with no instructions has nothing telling it what the work is.
 2. Add a schedule at `every 5 minutes`, overlap `skip`.
 3. Confirm a card appears within five minutes, and that **an agent claims it** — this is the `queuedGrant` fallback working, and it is the failure that would otherwise look like "the schedule is broken".
 4. Leave the card open through the next tick. Confirm `skipCount` becomes 1 and a `schedule.skipped` event is on the log.
@@ -2298,6 +2457,26 @@ describe('a blocked card is not handed out', () => {
     });
   });
 
+  /**
+   * ⚠️ READ THIS BEFORE WRITING THE TEST — established while fixing Phase 2, 2026-09-30.
+   *
+   * **A card can never reach state `'failed'` through any implemented verb.** `board.fail()` ends the
+   * *attempt*, not the card: `endAttempt` (`board-do.ts:3468-3480`) writes `'input-required'` once the
+   * circuit breaker trips, otherwise `'submitted'`. Nothing anywhere writes `state = 'failed'` to a
+   * card row.
+   *
+   * So a test that calls `fail()` and asserts the dependent stays blocked **passes for the wrong
+   * reason** — the blocker is `submitted`, mid-retry, which `isResolved` correctly reports unresolved.
+   * It would be cited later as proof that a *failed* blocker blocks, which it never checked.
+   *
+   * Write both, and label them for what they actually are:
+   *   1. a blocker mid-retry (after `fail()`, state `submitted`) keeps the dependent blocked;
+   *   2. a blocker in a genuinely unresolved-terminal state keeps it blocked — use **`rejected`**,
+   *      which IS reachable, via a gate rejection.
+   *
+   * `isResolved`'s treatment of `'failed'` stays as specified: it is right in principle and guards
+   * against a future path that can produce it. But do not claim a test covers it when none can.
+   */
   it('STAYS blocked when the blocker fails — the whole point of the edge', async () => {
     await runInDurableObject(stubFor('enf-failed'), async (board: BoardDO) => {
       const { a, b } = await two(board, 'enffailed');
