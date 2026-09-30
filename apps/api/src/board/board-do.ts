@@ -50,11 +50,24 @@ function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined 
  * Stripped in order: a leading `-`/`*`/`<digit>.` bullet, then a `[ ]`/`[x]` checkbox, then
  * whitespace. A line that is blank before or after stripping comes back `''`, which `splitCard`
  * filters out rather than turning into an untitled card.
+ *
+ * Both marker regexes require `\s+` (one-or-more), not `\s*` (zero-or-more), after the marker —
+ * markdown's own rule is that a bullet/checkbox is followed by a SEPARATING space, and without
+ * that requirement this silently mangled caller data that merely started with a similar character:
+ * `2.0 launch plan` → `0 launch plan`, `1.5x throughput` → `5x throughput`, `-fix the bug` →
+ * `fix the bug`, `**bold title**` → `*bold title**`. None of those are bullets; a version number,
+ * a measurement, a hyphenated word and a bold marker all happen to start the same way a real
+ * bullet does, and the caller got no signal that its title had been rewritten — that mangled name
+ * is what the next agent's prompt would carry.
+ *
+ * Deliberately does NOT trim `raw` before stripping (only the final return trims): an earlier
+ * version did, and that pre-trim consumed the separating space `\s+` needs to see, so a line that
+ * was JUST a checkbox with a trailing space (`'- [ ] '`) stopped stripping to `''` — the one-space
+ * requirement above only works if that space is still there when the checkbox regex runs.
  */
 function stripListLineSyntax(raw: string): string {
-  let s = raw.trim();
-  s = s.replace(/^(?:[-*]|\d+\.)\s*/, ''); // bullet: "-", "*", or "2."
-  s = s.replace(/^\[[ xX]\]\s*/, ''); // checkbox: "[ ]" or "[x]"/"[X]"
+  let s = raw.replace(/^(?:[-*]|\d+\.)\s+/, ''); // bullet: "-", "*", or "2.", each followed by a space
+  s = s.replace(/^\[[ xX]\]\s+/, ''); // checkbox: "[ ]" or "[x]"/"[X]", followed by a space
   return s.trim();
 }
 
@@ -766,8 +779,13 @@ export interface BoardStub {
   /**
    * Split a card into several children at once, one per (non-blank) line — the agent-facing
    * decomposition tool (Task 15, spec §3.4). `actorUserId` becomes each child's `ownerUserId`.
+   *
+   * `agentId`, when supplied, must be the agent whose run currently holds `cardId`
+   * (`CardView.delegateAgentId`) or the call refuses `NOT_RUN_OWNER` — "the card you are working
+   * on" enforced, not just described. Omitted (`undefined`/`null`) for the human/REST path, which
+   * has no run to check against.
    */
-  splitCard(cardId: string, titles: string[], actorUserId: string): Promise<Result<{ children: CardView[] }>>;
+  splitCard(cardId: string, titles: string[], actorUserId: string, agentId?: string | null): Promise<Result<{ children: CardView[] }>>;
   moveCard(
     cardId: string,
     toStageKey: string,
@@ -1424,6 +1442,15 @@ export class BoardDO extends DurableObject<Env> {
    * per line), not on `addLink` directly, so it inherits that method's parentage and priority rules
    * unchanged.
    *
+   * `agentId` (present only on the MCP/agent path — see the `BoardStub` doc comment) gates this to
+   * "the card YOU are working on": without it, any `run`-scoped token could split any card in the
+   * workspace, and the consequence is worse than an ordinary unauthorized write — creating a child
+   * makes the target fail `blockedWhere`, so it drops out of `claim` and `list_work` and
+   * `advanceCard` parks it, until that child resolves. One agent could freeze another team's card
+   * indefinitely by giving it a child nobody will complete. Checked against `delegateAgentId`
+   * (who currently holds the card's active run), not `ownerUserId` — the same identity `claim`
+   * stamps onto the card and clears when the run ends.
+   *
    * All-or-nothing on the two refusals:
    *  - more than `MAX_SPLIT_CHILDREN` lines ⇒ `TOO_MANY_CHILDREN`, before anything is created.
    *    Partially creating 20 of 21 would be worse than refusing outright, because the caller could
@@ -1435,19 +1462,32 @@ export class BoardDO extends DurableObject<Env> {
    * of children. De-duplicating by title would silently drop a legitimately repeated sub-task — the
    * tool description tells the caller to call it once, and the UI confirms before a second call.
    *
-   * The all-or-nothing loop below holds by CONSTRUCTION, not by an explicit SQL transaction: a
-   * Durable Object processes one request at a time, so nothing can interleave between the
-   * `titles.length` check and the last `createChildCard` call in this same invocation. If this loop
-   * is ever refactored to await something that can yield control back to the DO's request queue
-   * mid-iteration (unlike the synchronous-per-call `sql.exec` writes here), that assumption stops
-   * holding and an explicit transaction would be needed to keep the guarantee.
+   * The loop below creates children one at a time and returns early on the first failure (line
+   * below: `if (!created.ok) return created;`), which WOULD be a partial-creation hole — k children
+   * left behind, with the caller told nothing about them — except it is unreachable today:
+   * `createChildCard`'s two failure modes beyond `NO_SUCH_CARD` (already checked above, before this
+   * loop starts) are `addLink`'s `ALREADY_HAS_PARENT` and `LINK_WOULD_CYCLE`, and both require a
+   * PRE-EXISTING edge that a brand-new leaf card — created fresh, one line above, with no links of
+   * its own yet — cannot have. This is the sentence a refactor should have to falsify: if
+   * `createChildCard` (or whatever this loop calls) ever gains a failure mode that a fresh child CAN
+   * hit, this early-return stops being merely theoretical and the loop needs to collect-then-commit
+   * or roll back what it already created.
    */
-  async splitCard(cardId: string, titles: string[], actorUserId: string): Promise<Result<{ children: CardView[] }>> {
+  async splitCard(
+    cardId: string,
+    titles: string[],
+    actorUserId: string,
+    agentId?: string | null,
+  ): Promise<Result<{ children: CardView[] }>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     }
-    if (!this.getCard(cardId)) {
+    const card = this.getCard(cardId);
+    if (!card) {
       return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${cardId}` };
+    }
+    if (agentId !== undefined && agentId !== null && card.delegateAgentId !== agentId) {
+      return { ok: false, code: 'NOT_RUN_OWNER', message: 'this card is not your active run' };
     }
     if (titles.length > MAX_SPLIT_CHILDREN) {
       return {

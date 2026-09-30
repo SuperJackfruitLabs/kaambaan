@@ -49,6 +49,28 @@ describe('splitCard', () => {
     });
   });
 
+  // Regression for a review finding on this task: the shipped regexes used `\s*` (zero-or-more),
+  // so the separating space markdown requires after a bullet/checkbox was optional — and a line
+  // that merely STARTS with a bullet-like character, but isn't one, got silently mangled. None of
+  // these four are markdown lists; every one must survive completely unchanged.
+  it('does not mangle a title that merely starts like a bullet, checkbox, or bold marker', async () => {
+    await runInDurableObject(stubFor('split-md-not-a-bullet'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitmdnotabullet');
+      const r = await board.splitCard(
+        parentId,
+        ['2.0 launch plan', '1.5x throughput', '-fix the bug', '**bold title**'],
+        'usr_a',
+      );
+      if (!r.ok) throw new Error(r.message);
+      expect(r.value.children.map((c) => c.title)).toEqual([
+        '2.0 launch plan',
+        '1.5x throughput',
+        '-fix the bug',
+        '**bold title**',
+      ]);
+    });
+  });
+
   it('ignores blank lines rather than creating untitled cards', async () => {
     await runInDurableObject(stubFor('split-blank'), async (board: BoardDO) => {
       const parentId = await parentOn(board, 'splitblank');
@@ -198,9 +220,10 @@ describe("createChildCard inherits the parent's queued_grant, so a child is clai
       await board.init({ id: 'brd_cg_ok', tenantId: 'tnt_a', name: 'CG', stages: GRANT_STAGES });
       const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a', queuedGrant: [PRINCIPAL] });
       if (!p.ok) throw new Error(p.message);
-      // Higher priority than the parent's default (0), so `claim`'s `ORDER BY priority DESC, …`
-      // picks the CHILD deterministically — isolating what's being proven (the child's own
-      // claimability) from the parent, which is also sitting in the same claimable lane.
+      // `priority: 5` is belt-and-braces, not what makes this deterministic: the moment the child
+      // exists, `blockedWhere` excludes the PARENT from `claimableWhere` (an open child blocks its
+      // parent from being claimed), so the child is already the only candidate `claim` can pick,
+      // regardless of priority ordering.
       const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a', priority: 5 });
       if (!child.ok) throw new Error(child.message);
       expect(child.value.queuedGrant).toEqual([PRINCIPAL]);
@@ -214,7 +237,10 @@ describe("createChildCard inherits the parent's queued_grant, so a child is clai
 
   // Pins the inheritance rather than just the happy path: a parent with NO grant must produce a
   // child that is STILL unclaimable — proving the child's grant tracks the parent's, not "always
-  // permitted now".
+  // permitted now". Asserts the side effect SPECIFIC to a grant refusal (the child parks
+  // `input-required`), not just `claimed === false` — a capability mismatch, a budget stop, or an
+  // uninitialised board would also produce `claimed === false` without exercising this inheritance
+  // at all, so that alone would not make this test self-supporting.
   it('a child of an ungranted parent stays unclaimable under enforcement', async () => {
     await runInDurableObject(stubFor('child-grant-none'), async (board: BoardDO) => {
       await board.init({ id: 'brd_cg_none', tenantId: 'tnt_a', name: 'CG2', stages: GRANT_STAGES });
@@ -227,6 +253,55 @@ describe("createChildCard inherits the parent's queued_grant, so a child is clai
       (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
       const claimed = await board.claim({ agentId: 'agt_worker', capabilities: ['writing'], principalId: PRINCIPAL });
       expect(claimed.claimed).toBe(false);
+      const card = (await board.getState()).cards.find((c) => c.id === child.value.id)!;
+      expect(card.state).toBe('input-required');
+    });
+  });
+});
+
+// Important 2 from review: `superpipeline_split_card` took `boardId`/`cardId` with no ownership
+// check, so any agent holding a `run`-scoped token could split ANY card in the workspace — worse
+// than an ordinary unauthorized write, because creating a child makes the target fail
+// `blockedWhere`, dropping it out of `claim`/`list_work` until that child resolves. One agent could
+// freeze another team's card indefinitely by giving it a child nobody will complete, despite the
+// tool description's "the card you are working on" and the scope-table comment's "ITS OWN card" —
+// neither was enforced. Fixed by gating on `CardView.delegateAgentId` (the agent whose run
+// currently holds the card, stamped by `claim` and cleared when the run ends) when an `agentId` is
+// supplied; the human/REST path passes none and is unaffected, matching `denyForeignRun`'s existing
+// "no identity to compare, the lease alone authorizes" shape for `DEV_AUTH`.
+describe('splitCard is gated to the card the calling agent is working', () => {
+  it('an agent can split the card its run owns', async () => {
+    await runInDurableObject(stubFor('split-owner-ok'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitownerok');
+      const claimed = await board.claim({ agentId: 'agt_owner', capabilities: ['writing'] });
+      if (!claimed.claimed) throw new Error('expected the claim to succeed');
+
+      const r = await board.splitCard(parentId, ['Write the spec'], 'usr_a', 'agt_owner');
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value.children).toHaveLength(1);
+    });
+  });
+
+  it('an agent cannot split a card owned by a different run, and no children are created', async () => {
+    await runInDurableObject(stubFor('split-owner-no'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitownerno');
+      const claimed = await board.claim({ agentId: 'agt_owner', capabilities: ['writing'] });
+      if (!claimed.claimed) throw new Error('expected the claim to succeed');
+
+      const r = await board.splitCard(parentId, ['Write the spec'], 'usr_a', 'agt_intruder');
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('NOT_RUN_OWNER');
+      // All-or-nothing, same as the other refusals: only the parent card exists.
+      expect((await board.getState()).cards).toHaveLength(1);
+    });
+  });
+
+  it('the human/REST path (no agentId) is unaffected by the ownership check', async () => {
+    await runInDurableObject(stubFor('split-owner-human'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitownerhuman');
+      // No claim at all — a person may split an unclaimed card, and passes no `agentId`.
+      const r = await board.splitCard(parentId, ['Write the spec'], 'usr_a');
+      expect(r.ok).toBe(true);
     });
   });
 });

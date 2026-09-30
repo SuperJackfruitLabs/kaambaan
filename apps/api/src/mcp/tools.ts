@@ -225,7 +225,13 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       inputSchema: { boardId: z.string(), cardId: z.string(), titles: z.array(z.string()).min(1) },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    async ({ boardId, cardId, titles }) => fromResult(await deps.boardStub(boardId).splitCard(cardId, titles, auth.agentId)),
+    // `auth.agentId` passed twice, for two different purposes: as `actorUserId` (the created
+    // children's `ownerUserId`) and as `agentId` (the ownership gate — refuses `NOT_RUN_OWNER`
+    // unless `cardId`'s current run belongs to this agent, review Important 2). Without the
+    // latter, any `run`-scoped token could split any card in the workspace, contradicting "the
+    // card you are working on" above.
+    async ({ boardId, cardId, titles }) =>
+      fromResult(await deps.boardStub(boardId).splitCard(cardId, titles, auth.agentId, auth.agentId)),
   );
 
   register(
