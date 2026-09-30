@@ -88,6 +88,16 @@ function isInvalidDueAt(value: unknown): boolean {
   return value !== undefined && value !== null && (typeof value !== 'string' || !DUE_AT_RE.test(value));
 }
 
+/**
+ * One code, one status, across the whole API. Every route that gets a `BoardErrorCode` back reads
+ * its HTTP status from here — there is no second table anywhere that answers the same code
+ * differently. A brief for Task 17a once asked for `NOT_INITIALIZED` to mean 409 on the link
+ * routes specifically, while every other route here still answers it 404: a client cannot learn
+ * "this code means X, except on these three routes where it means Y" from anything in this file,
+ * so that request was wrong and this function stayed the single source of truth. If a future route
+ * genuinely needs a code to carry a different status, that is a sign the DO should return a
+ * different code for that case, not that this switch should grow a second entry for the same one.
+ */
 function statusForCode(code: BoardErrorCode): number {
   switch (code) {
     case 'WIP_LIMIT':
@@ -147,27 +157,6 @@ function statusForCode(code: BoardErrorCode): number {
     case 'TOO_MANY_CHILDREN':
     case 'NOTHING_TO_SPLIT':
       return 400;
-  }
-}
-
-/**
- * `addLink`/`removeLink`'s own mapping (Task 17a) — kept separate from `statusForCode` above
- * because the two disagree on `NOT_INITIALIZED`. Elsewhere that code means "the board this id
- * names was never initialized", answered 404 because there is nothing to find. Here it can only
- * mean the board's own DO exists (the route already resolved it) but was never sent `init` — the
- * brief's own words, "the board exists but has no stages yet" — which is a conflict with the state
- * the caller believed in, not a missing resource, so 409 rather than 404.
- */
-function statusForLinkCode(code: BoardErrorCode): number {
-  switch (code) {
-    case 'NOT_INITIALIZED':
-    case 'LINK_WOULD_CYCLE':
-    case 'ALREADY_HAS_PARENT':
-      return 409;
-    case 'NO_SUCH_CARD':
-      return 404;
-    default:
-      return statusForCode(code);
   }
 }
 
@@ -1455,11 +1444,11 @@ export default {
         const toCardId = body.toCardId;
         if (request.method === 'POST') {
           const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
-          if (!result.ok) return Response.json({ error: result }, { status: statusForLinkCode(result.code) });
+          if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
           return Response.json({ link: result.value }, { status: 201 });
         }
         const result = await stub.removeLink(fromCardId, toCardId, kind);
-        if (!result.ok) return Response.json({ error: result }, { status: statusForLinkCode(result.code) });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
       }
 
