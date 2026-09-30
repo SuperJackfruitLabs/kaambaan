@@ -691,6 +691,7 @@ export interface BoardStub {
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
+  sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
   setGithubSecret(secret: string): Promise<Result<{ configured: true }>>;
   setForgeSecret(secret: string): Promise<Result<{ configured: true }>>;
   handleForgeWebhook(input: {
@@ -1293,7 +1294,10 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: card };
   }
 
-  async updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[] }): Promise<Result<CardView>> {
+  async updateCard(
+    cardId: string,
+    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+  ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     const sets: string[] = [];
@@ -1317,6 +1321,16 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.labels !== undefined) {
       sets.push('labels = ?');
       vals.push(JSON.stringify([...new Set(patch.labels)]));
+    }
+    if (patch.dueAt !== undefined) {
+      sets.push('due_at = ?');
+      vals.push(patch.dueAt === null ? null : patch.dueAt.trim());
+      // A changed date is a new chance to be told about it. No placeholder, so no `vals` entry.
+      sets.push('overdue_notified_at = NULL');
+    }
+    if (patch.archivedAt !== undefined) {
+      sets.push('archived_at = ?');
+      vals.push(patch.archivedAt);
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
@@ -2057,6 +2071,37 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * The per-board cron arm, called from the Worker's `scheduled()` every five minutes.
+   *
+   * It is here rather than on the DO alarm deliberately: a Durable Object has exactly one alarm and
+   * this one already serves two jobs (lease reclaim and push drain — see `scheduleReclaim`). The
+   * Worker cron already iterates every board, so this costs no new infrastructure.
+   *
+   * `schedulesFired` is always 0 until Phase 2 fills it in; it is in the shape now so the caller
+   * does not change twice.
+   */
+  async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }> {
+    const today = nowIso.slice(0, 10); // the column is a date, so compare dates
+    const rows = this.sql
+      .exec(
+        `SELECT id, title, due_at FROM cards
+          WHERE due_at IS NOT NULL AND due_at < ?
+            AND archived_at IS NULL
+            AND overdue_notified_at IS NULL
+            AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
+        today,
+      )
+      .toArray();
+
+    for (const row of rows) {
+      this.notify('overdue', row.id as string, `"${row.title as string}" was due ${row.due_at as string}`);
+      this.sql.exec(`UPDATE cards SET overdue_notified_at = ? WHERE id = ?`, nowIso, row.id as string);
+    }
+
+    return { overdueNotified: rows.length, schedulesFired: 0 };
+  }
+
+  /**
    * Queue `work.available` deliveries for a claimable card, only to configs that could actually claim
    * it (docs/05 §4): a capability stage targets configs advertising that capability; an agent-owned
    * stage targets only that agent. No pings while the board is over budget (claim would refuse).
@@ -2157,6 +2202,19 @@ export class BoardDO extends DurableObject<Env> {
     return { activities, handoff: this.parseHandoff(this.getCardHandoffJson(cardId)), gates: this.gatesForCard(cardId) };
   }
 
+  /**
+   * The WHERE fragment deciding whether a card may be handed out, shared by the claim query and the
+   * work-discovery count so the two cannot drift apart.
+   *
+   * They were independent copies of `state = 'submitted' AND current_stage_key IN (…)`. Every
+   * condition added to claim from here on — archived here, blocked and parent-with-open-children in
+   * Task 13 — has to be invisible to `list_work` as well, or the board advertises work it will not
+   * hand out. The table is aliased `c` in both callers so this fragment can qualify its columns.
+   */
+  private claimableWhere(placeholders: string): string {
+    return `c.state = 'submitted' AND c.archived_at IS NULL AND c.current_stage_key IN (${placeholders})`;
+  }
+
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
   async countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number> {
     if (!this.getMeta('boardId')) return 0;
@@ -2167,7 +2225,7 @@ export class BoardDO extends DurableObject<Env> {
     const placeholders = claimableKeys.map(() => '?').join(', ');
     return Number(
       this.sql
-        .exec(`SELECT COUNT(*) AS n FROM cards WHERE state = 'submitted' AND current_stage_key IN (${placeholders})`, ...claimableKeys)
+        .exec(`SELECT COUNT(*) AS n FROM cards c WHERE ${this.claimableWhere(placeholders)}`, ...claimableKeys)
         .one().n,
     );
   }
@@ -2303,8 +2361,8 @@ export class BoardDO extends DurableObject<Env> {
     const placeholders = claimableKeys.map(() => '?').join(', ');
     const row = this.sql
       .exec(
-        `SELECT * FROM cards WHERE state = 'submitted' AND current_stage_key IN (${placeholders})
-         ORDER BY priority DESC, created_at ASC LIMIT 1`,
+        `SELECT * FROM cards c WHERE ${this.claimableWhere(placeholders)}
+         ORDER BY c.priority DESC, (c.due_at IS NULL), c.due_at ASC, c.created_at ASC LIMIT 1`,
         ...claimableKeys,
       )
       .toArray()[0];
@@ -3315,7 +3373,7 @@ export class BoardDO extends DurableObject<Env> {
       attemptsByCard.set(r.card_id as string, Number(r.n));
     }
     return this.sql
-      .exec(`SELECT * FROM cards ORDER BY priority DESC, created_at ASC`)
+      .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
       .toArray()
       .map((r) => this.rowToCard(r, { costUsd: costByCard.get(r.id as string) ?? 0, attemptCount: attemptsByCard.get(r.id as string) ?? 0 }));
   }

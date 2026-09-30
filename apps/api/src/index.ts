@@ -1714,6 +1714,11 @@ export default {
           } catch {
             /* one board's failure is not the sweep's */
           }
+          try {
+            await boardStub(env, board.tenantId, board.id).sweepBoard(new Date().toISOString());
+          } catch {
+            /* one board's failure is not the sweep's */
+          }
         }
       })(),
     );
