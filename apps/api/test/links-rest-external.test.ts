@@ -121,6 +121,47 @@ describe('POST /v1/boards/:id/links with toBoardId', () => {
   });
 });
 
+/**
+ * The shape check on `toBoardId` runs BEFORE the `toBoardId !== boardId` comparison that decides
+ * the store. That ordering matters more than it looks: a malformed `toBoardId` that slipped past
+ * the check and got compared anyway could, depending on how the comparison and its fallback are
+ * written, end up read as "no toBoardId" — same board — and be written to the DO as an ENFORCED
+ * edge. An advisory edge that got stored as enforced by accident is exactly the lie this whole
+ * design (two stores, two badges) exists to prevent, so every one of these has to answer 400 and
+ * write to neither store, not just the ones that look obviously wrong.
+ */
+describe('POST /v1/boards/:id/links — malformed toBoardId', () => {
+  const cases: Array<[string, unknown]> = [
+    ['an empty string', ''],
+    ['a whitespace-only string', '   '],
+    ['a number', 42],
+    ['null', null],
+    ['an object', { not: 'a board id' }],
+  ];
+
+  it.each(cases)('answers 400 for toBoardId as %s, writing to neither store', async (_label, value) => {
+    const bid = await createBoard();
+    const a = await createCard(bid, 'A');
+    const b = await createCard(bid, 'B');
+
+    const res = await SELF.fetch(`${base}/v1/boards/${bid}/links`, {
+      method: 'POST',
+      headers: T,
+      body: JSON.stringify({ fromCardId: a, toCardId: b, toBoardId: value, kind: 'blocks' }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('INVALID_LINK');
+
+    // Not the DO — no enforced edge was created between a and b.
+    const listRes = await SELF.fetch(`${base}/v1/boards/${bid}/cards/${a}/links`, { headers: T });
+    const listBody = (await listRes.json()) as { links: unknown[]; externalLinks: unknown[] };
+    expect(listBody.links).toHaveLength(0);
+    // Not D1 either.
+    expect(await listExternalLinksFor(env.DB, 'tnt_links_ext', a)).toHaveLength(0);
+  });
+});
+
 describe('DELETE /v1/boards/:id/links with toBoardId', () => {
   it('removes a cross-board advisory edge from D1', async () => {
     const home = await createBoard('Home4');

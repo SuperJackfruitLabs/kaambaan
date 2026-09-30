@@ -75,6 +75,11 @@ export async function removeExternalLink(
   toCardId: string,
   kind: ExternalLinkKind,
 ): Promise<void> {
+  // Matches on (from_card_id, to_card_id, kind) alone — the board ids are not part of the WHERE.
+  // That is only safe because card ids are globally unique (`newId('card')`, `ids.ts`), never
+  // board-scoped, so a (fromCardId, toCardId, kind) triple names at most one row regardless of
+  // which boards are passed in. If card ids ever become board-scoped, this needs from_board_id and
+  // to_board_id added to the match, or a caller could remove an edge for the wrong pair of boards.
   await db
     .prepare(`DELETE FROM card_links_external WHERE tenant_id = ? AND from_card_id = ? AND to_card_id = ? AND kind = ?`)
     .bind(tenantId, fromCardId, toCardId, kind)
