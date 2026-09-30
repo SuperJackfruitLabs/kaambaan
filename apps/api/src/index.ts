@@ -1255,9 +1255,31 @@ export default {
           priority?: number;
           ownerUserId?: string;
           labels?: string[];
+          dueAt?: string | null;
+          archivedAt?: string | null;
         };
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
+        }
+        // `due_at` drives claim order and the overdue cron sweep on a board that runs unattended
+        // (board-do.ts `claimableWhere`/`sweepBoard`), so garbage here does not fail loudly at write
+        // time — it silently misorders or mis-fires later. Only a bare date (the column's own
+        // shape) or `null` is accepted.
+        if (body.dueAt !== undefined && body.dueAt !== null && (typeof body.dueAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.dueAt))) {
+          return Response.json(
+            { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
+            { status: 400 },
+          );
+        }
+        if (
+          body.archivedAt !== undefined &&
+          body.archivedAt !== null &&
+          (typeof body.archivedAt !== 'string' || Number.isNaN(Date.parse(body.archivedAt)))
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_ARCHIVED_AT', message: 'archivedAt must be null or an ISO timestamp' } },
+            { status: 400 },
+          );
         }
         // The DO does not validate label ids — it cannot reach D1 usefully on a hot path — so the
         // route checks here, before the write lands, that every id names a real label in this
@@ -1717,7 +1739,7 @@ export default {
           try {
             await boardStub(env, board.tenantId, board.id).sweepBoard(new Date().toISOString());
           } catch {
-            /* one board's failure is not the sweep's */
+            /* a failing sweep on one board must not stop the rest of the loop */
           }
         }
       })(),

@@ -655,7 +655,10 @@ export interface BoardStub {
   ): Promise<Result<CardView>>;
   /** One card, in the same projection the board snapshot carries. */
   getCardView(cardId: string): Promise<Result<CardView>>;
-  updateCard(cardId: string, patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string }): Promise<Result<CardView>>;
+  updateCard(
+    cardId: string,
+    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+  ): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
   setStages(stages: StageDef[]): Promise<Result<{ stages: StageDef[] }>>;
@@ -1324,7 +1327,9 @@ export class BoardDO extends DurableObject<Env> {
     }
     if (patch.dueAt !== undefined) {
       sets.push('due_at = ?');
-      vals.push(patch.dueAt === null ? null : patch.dueAt.trim());
+      // Validation lives at the route (`PATCH /cards/:id` in index.ts) — this DO is reachable from
+      // more than one caller, so a non-string here is stored as-is rather than crashing `.trim()`.
+      vals.push(patch.dueAt === null || typeof patch.dueAt !== 'string' ? patch.dueAt : patch.dueAt.trim());
       // A changed date is a new chance to be told about it. No placeholder, so no `vals` entry.
       sets.push('overdue_notified_at = NULL');
     }
@@ -2108,7 +2113,10 @@ export class BoardDO extends DurableObject<Env> {
    */
   private notifyWorkAvailable(cardId: string): void {
     const card = this.getCard(cardId);
-    if (!card || card.state !== 'submitted') return;
+    // Mirrors `claimableWhere`'s archived exclusion, by hand: this is a JS predicate over a
+    // `CardView`, not SQL, so it cannot call that helper — but any eligibility condition added
+    // there needs its equivalent added here too, or a push fires for work `claim` will refuse.
+    if (!card || card.state !== 'submitted' || card.archivedAt) return;
     if (this.boardOverBudget()) return;
     const stage = this.stages().find((s) => s.key === card.currentStageKey);
     if (!stage || !this.isAgentClaimable(stage)) return;

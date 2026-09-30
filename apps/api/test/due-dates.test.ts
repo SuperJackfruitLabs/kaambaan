@@ -99,6 +99,26 @@ describe('overdue notification', () => {
     });
   });
 
+  it('resets the notified flag when the due date actually changes, allowing a second notification', async () => {
+    // Unlike the case above, `updateCard` here moves an ALREADY-notified card to a new (still
+    // past) due date, so `overdue_notified_at` starts non-NULL and this exercises the reset as a
+    // reset, not as a no-op on a column that was already NULL.
+    await runInDurableObject(stubFor('due-reset'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_due8', tenantId: 'tnt_a', name: 'D8', stages: STAGES });
+      const card = await make(board, 'Overdue twice', { dueAt: '2026-09-01' });
+
+      expect((await board.sweepBoard('2026-09-30T10:00:00.000Z')).overdueNotified).toBe(1);
+
+      const u = await board.updateCard(card.id, { dueAt: '2026-09-15' });
+      if (!u.ok) throw new Error(u.message);
+
+      expect((await board.sweepBoard('2026-09-30T10:05:00.000Z')).overdueNotified).toBe(1);
+
+      const notes = (await board.getNotifications()).filter((n) => n.kind === 'overdue');
+      expect(notes).toHaveLength(2);
+    });
+  });
+
   it('says nothing about a card that is not yet due', async () => {
     await runInDurableObject(stubFor('due-future'), async (board: BoardDO) => {
       await board.init({ id: 'brd_due6', tenantId: 'tnt_a', name: 'D6', stages: STAGES });
