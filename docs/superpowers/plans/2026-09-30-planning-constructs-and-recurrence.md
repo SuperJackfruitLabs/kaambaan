@@ -2457,6 +2457,26 @@ describe('a blocked card is not handed out', () => {
     });
   });
 
+  /**
+   * ⚠️ READ THIS BEFORE WRITING THE TEST — established while fixing Phase 2, 2026-09-30.
+   *
+   * **A card can never reach state `'failed'` through any implemented verb.** `board.fail()` ends the
+   * *attempt*, not the card: `endAttempt` (`board-do.ts:3468-3480`) writes `'input-required'` once the
+   * circuit breaker trips, otherwise `'submitted'`. Nothing anywhere writes `state = 'failed'` to a
+   * card row.
+   *
+   * So a test that calls `fail()` and asserts the dependent stays blocked **passes for the wrong
+   * reason** — the blocker is `submitted`, mid-retry, which `isResolved` correctly reports unresolved.
+   * It would be cited later as proof that a *failed* blocker blocks, which it never checked.
+   *
+   * Write both, and label them for what they actually are:
+   *   1. a blocker mid-retry (after `fail()`, state `submitted`) keeps the dependent blocked;
+   *   2. a blocker in a genuinely unresolved-terminal state keeps it blocked — use **`rejected`**,
+   *      which IS reachable, via a gate rejection.
+   *
+   * `isResolved`'s treatment of `'failed'` stays as specified: it is right in principle and guards
+   * against a future path that can produce it. But do not claim a test covers it when none can.
+   */
   it('STAYS blocked when the blocker fails — the whole point of the edge', async () => {
     await runInDurableObject(stubFor('enf-failed'), async (board: BoardDO) => {
       const { a, b } = await two(board, 'enffailed');
