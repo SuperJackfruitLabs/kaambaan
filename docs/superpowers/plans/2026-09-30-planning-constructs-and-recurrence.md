@@ -3315,11 +3315,17 @@ git commit -m "feat(links): advisory cross-board edges, refused for same-board a
   | `LINK_WOULD_CYCLE` | **409** |
   | `ALREADY_HAS_PARENT` | **409** |
   | `NO_SUCH_CARD` | **404** |
-  | `NOT_INITIALIZED` | **409** — the board exists but has no stages yet |
+  | `NOT_INITIALIZED` | **404** — the shared `statusForCode` already maps it there, alongside `NO_SUCH_CARD`. Do not give one code two statuses. |
   | an unknown `kind` at the route | **400**, refused before the DO is called |
 
-  An earlier draft of this table said `CARD_NOT_FOUND`. No such code exists; the DO says
-  `NO_SUCH_CARD`, and it omitted `NOT_INITIALIZED` entirely. Both would have fallen through to a 500.
+  Add `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` to the **shared** `statusForCode` (they are absent
+  from it today, and no existing route can produce them, so it is not a behaviour change). Do not add a
+  second link-only mapping function: one code, one status, across the whole API.
+
+  Two earlier drafts of this table were wrong, both because I wrote status codes without opening
+  `statusForCode`. The first said `CARD_NOT_FOUND`, which does not exist — the DO says `NO_SUCH_CARD`.
+  The second said `NOT_INITIALIZED → 409`, which forced exactly the duplicate mapping the line above
+  forbids.
   `LinkKind` is `'blocks' | 'relates' | 'parent'` and `LinkInput` is
   `{fromCardId, toCardId, kind, createdBy?}` (`links.ts:5`, `board-do.ts:676-681`). The archive surface needs no new route — `PATCH` already validates
   `archivedAt` (`index.ts:1325-1342`).
@@ -3354,6 +3360,23 @@ A single badge covering both would sometimes lie, and a badge that sometimes lie
 
 ⚠️ Any new route here carries Phase 1's two lessons: the `resolveHubUser` fallback (or every `supi`
 verb 401s), and route-level shape validation (the Durable Object trusts its callers by design).
+
+- [ ] **Step 1d: Give Task 16's advisory store its routes and CLI too**
+
+`addExternalLink` and `removeExternalLink` (`apps/api/src/db/card-links-external.ts`) still have no
+caller. The three routes above are same-board only, and `supi link add <boardId> …` names one board.
+So the advisory store is reachable from nothing — Task 16's module in the same position Task 12's
+`addLink` was in before Step 1's routes.
+
+- `POST` / `DELETE` on the same `…/links` paths, taking a `toBoardId` alongside `toCardId`. When
+  `toBoardId` differs from the path's board, the row goes to D1 via `addExternalLink` and the response
+  says `enforced: false`; when it matches, it goes to the DO. **One route, the boundary decided by the
+  data**, so a client cannot pick the wrong store.
+- `supi link add` gains `--to-board <boardId>`, defaulting to the path board. When it is used, the CLI
+  prints that the edge is advisory and not enforced **before** it is created, for the same reason the
+  drawer dialogue must.
+
+This is server work with its own tests, so it belongs here rather than in the components task.
 
 - [ ] **Step 1c: Surface "blocked" on the card, from the SAME SQL the claim query uses**
 
