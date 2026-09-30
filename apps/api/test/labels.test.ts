@@ -108,6 +108,61 @@ describe('resolveLabelNames — the drawer input resolved against the catalogue'
   });
 });
 
+describe('resolveLabelNames — recovers when two writers race to create the same new name', () => {
+  /**
+   * `resolveLabelNames` is a per-name SELECT-then-INSERT with no locking between the two. Two
+   * concurrent callers resolving the same brand-new name in one tenant can both miss the SELECT
+   * and both attempt the INSERT; only one wins, and the loser must hand back the winner's id
+   * rather than throw.
+   *
+   * True concurrency is not reproducible deterministically in a single-threaded test, so this
+   * drives the same code path a different way: a `D1Database` wrapper makes resolveLabelNames'
+   * OWN first lookup lie and say "not found", forcing it down the INSERT path against a row that
+   * genuinely already exists (case-insensitively) in the real table — created through the
+   * ordinary `createLabel` path beforehand, standing in for "the other writer got there first".
+   * The resulting constraint violation is real, not simulated; only the stale read is faked.
+   */
+  it("returns the existing row's id instead of throwing, when the INSERT collides after a stale lookup", async () => {
+    const t = 'tnt_lbl_race';
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, 'lbl-race', 'Race')`).bind(t).run();
+
+    // Stands in for "a concurrent writer already created this name" — done through the ordinary
+    // path, under a DIFFERENT case, so the collision resolveLabelNames hits is the case-insensitive
+    // index specifically.
+    const winner = await createLabel(env.DB, t, { name: 'Urgent', colour: '#f00' });
+
+    let staleLookupConsumed = false;
+    const raceyDb = {
+      prepare(sql: string) {
+        const real = env.DB.prepare(sql);
+        if (!staleLookupConsumed && sql.includes('SELECT id FROM labels WHERE tenant_id')) {
+          return {
+            bind(...args: unknown[]) {
+              const bound = real.bind(...args);
+              return {
+                first: async <T>(): Promise<T | null> => {
+                  staleLookupConsumed = true; // only the FIRST lookup lies — the recovery lookup is real
+                  return null;
+                },
+                run: () => bound.run(),
+                all: () => bound.all(),
+              };
+            },
+          };
+        }
+        return real;
+      },
+    } as unknown as D1Database;
+
+    const ids = await resolveLabelNames(raceyDb, t, ['urgent'], 'usr_a');
+
+    expect(ids).toEqual([winner.id]);
+    // Proof no duplicate was created: exactly one row for this name, case-insensitively.
+    const rows = await listLabels(env.DB, t);
+    expect(rows.filter((l) => l.name.toLowerCase() === 'urgent')).toHaveLength(1);
+  });
+});
+
 describe('applying labels to a card', () => {
   it('stores ids and reads them back', async () => {
     const label = await createLabel(env.DB, 'tnt_lbl', { name: 'blog', colour: '#ff0' });

@@ -20,6 +20,27 @@ export interface LabelRecord {
   createdAt: string;
 }
 
+/**
+ * Is this D1's own report of a `labels` name collision — either `0010`'s original
+ * `UNIQUE (tenant_id, name)` or `0011`'s case-insensitive `labels_tenant_name_nocase` index?
+ * SQLite's constraint-failure message names the COLUMNS a violated constraint covers, not the
+ * constraint or index itself, and both of these cover the same two columns — so both produce the
+ * identical message this matches, byte for byte. Verified against the real D1/Miniflare engine in
+ * `test/labels-rest.test.ts`'s case-insensitive duplicate test, not assumed from a standalone
+ * SQLite session.
+ *
+ * Narrow on purpose: `POST /v1/labels`'s catch must convert this one failure into a 409 sentence
+ * and let everything else (a transient D1 error, anything) fall through to `unexpected(err)`
+ * unaltered, rather than mislabelling every failure as a name collision and discarding the real
+ * error — which is what an unnarrowed `catch { return 409 }` did. `resolveLabelNames` below reuses
+ * this same matcher for the same reason: a second, independent string check is a second place for
+ * the two to drift apart.
+ */
+export function isLabelNameCollision(err: unknown): boolean {
+  const message = (err as { message?: string })?.message ?? '';
+  return message.includes('UNIQUE constraint failed: labels.tenant_id, labels.name');
+}
+
 export async function listLabels(db: D1Database, tenantId: string): Promise<LabelRecord[]> {
   const { results } = await db
     .prepare(`SELECT ${COLUMNS} FROM labels WHERE tenant_id = ? ORDER BY name ASC`)
@@ -110,6 +131,15 @@ const INFERRED_LABEL_COLOUR = '#8a8a8a';
  * `labels_tenant_name_nocase`), so "Urgent" and "urgent" do not become two labels. The lookup and
  * the unique index have to agree on that, or this function is how a tenant ends up with two rows
  * that read identically to a person.
+ *
+ * The lookup-then-insert per name is not atomic, so two concurrent callers resolving the same
+ * brand-new name in one tenant can both miss the SELECT and both attempt the INSERT — only one
+ * wins. The loser does not error the caller: it catches the collision (`isLabelNameCollision`,
+ * the same matcher `POST /v1/labels` uses) and re-runs the lookup to hand back the WINNER's id,
+ * which is the row that is actually there. Refusing instead would surface as an ordinary drawer
+ * save turning into an unexplained 500 for whichever of two people typed the same new label first
+ * — rare with one person and one drawer, but real, and the new case-insensitive index makes two
+ * spellings collide where before this migration they would not have.
  */
 export async function resolveLabelNames(
   db: D1Database,
@@ -121,24 +151,39 @@ export async function resolveLabelNames(
   const wanted = names.map((n) => n.trim()).filter((n) => n !== '');
   const ids: string[] = [];
   for (const name of wanted) {
-    const existing = await db
-      .prepare(`SELECT id FROM labels WHERE tenant_id = ? AND name = ? COLLATE NOCASE`)
-      .bind(tenantId, name)
-      .first<{ id: string }>();
+    const existing = await lookupLabelId(db, tenantId, name);
     if (existing) {
-      ids.push(existing.id);
+      ids.push(existing);
       continue;
     }
     const id = newId('lbl');
-    await db
-      .prepare(
-        `INSERT INTO labels (id, tenant_id, name, colour, origin, created_by) VALUES (?, ?, ?, ?, 'inferred', ?)`,
-      )
-      .bind(id, tenantId, name, INFERRED_LABEL_COLOUR, createdBy)
-      .run();
-    ids.push(id);
+    try {
+      await db
+        .prepare(
+          `INSERT INTO labels (id, tenant_id, name, colour, origin, created_by) VALUES (?, ?, ?, ?, 'inferred', ?)`,
+        )
+        .bind(id, tenantId, name, INFERRED_LABEL_COLOUR, createdBy)
+        .run();
+      ids.push(id);
+    } catch (err) {
+      if (!isLabelNameCollision(err)) throw err;
+      // Lost the race: something else (another request, `POST /v1/labels`, another name in this
+      // same call resolving to the same spelling) created this name between our lookup and our
+      // insert. Their row is what is actually in the catalogue now — use it rather than erroring.
+      const winner = await lookupLabelId(db, tenantId, name);
+      if (!winner) throw err; // the collision was real but the row is gone again — surface the original error rather than inventing a result
+      ids.push(winner);
+    }
   }
   return ids;
+}
+
+async function lookupLabelId(db: D1Database, tenantId: string, name: string): Promise<string | null> {
+  const row = await db
+    .prepare(`SELECT id FROM labels WHERE tenant_id = ? AND name = ? COLLATE NOCASE`)
+    .bind(tenantId, name)
+    .first<{ id: string }>();
+  return row?.id ?? null;
 }
 
 /** Which of these ids do not exist in this tenant — so a card write can be refused before it lands. */

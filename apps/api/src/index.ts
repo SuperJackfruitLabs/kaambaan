@@ -62,7 +62,15 @@ import {
   listImplications,
   removeImplication,
 } from './db/implications';
-import { listLabels, createLabel, updateLabel, deleteLabel, unknownLabelIds, resolveLabelNames } from './db/labels';
+import {
+  listLabels,
+  createLabel,
+  updateLabel,
+  deleteLabel,
+  unknownLabelIds,
+  resolveLabelNames,
+  isLabelNameCollision,
+} from './db/labels';
 
 export { BoardDO };
 
@@ -180,20 +188,6 @@ async function registerStageCapabilities(
 function unexpected(err: unknown): Response {
   const message = (err as { message?: string })?.message ?? 'unexpected error';
   return Response.json({ error: { message } }, { status: 500 });
-}
-
-/**
- * Is this D1's own report of the `labels` table's `UNIQUE (tenant_id, name)` collision — the ONLY
- * constraint that table carries?
- *
- * Narrow on purpose: `POST /v1/labels`'s catch must convert this one failure into a 409 sentence
- * and let everything else (a transient D1 error, anything) fall through to `unexpected(err)`
- * unaltered, rather than mislabelling every failure as a name collision and discarding the real
- * error — which is what an unnarrowed `catch { return 409 }` did.
- */
-function isLabelNameCollision(err: unknown): boolean {
-  const message = (err as { message?: string })?.message ?? '';
-  return message.includes('UNIQUE constraint failed: labels.tenant_id, labels.name');
 }
 
 export default {

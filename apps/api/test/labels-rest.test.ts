@@ -68,6 +68,39 @@ describe('POST /v1/labels', () => {
     // The message names the trimmed name actually attempted, not the raw untrimmed body value.
     expect((await again.json<{ error: string }>()).error).toContain('"urgent"');
   });
+
+  /**
+   * The risk the brief named by name: migration 0011 added a SECOND unique index
+   * (`labels_tenant_name_nocase`) beside 0010's original `UNIQUE (tenant_id, name)`. If that new
+   * index's constraint-failure message differed from the old one, `isLabelNameCollision` would
+   * stop matching for exactly this case — a case-variant duplicate — and this request would come
+   * back 500 instead of 409.
+   *
+   * This runs against the REAL D1/Miniflare engine via `SELF.fetch`, not a standalone `sqlite3`
+   * session — the two are very likely to agree, but "very likely" is not a substitute for a test
+   * that actually exercises the code path this risk lives in.
+   */
+  it('refuses a duplicate that differs only in case as a 409 sentence, not a raw constraint failure', async () => {
+    const t = 'tnt_lbl_rest_dupe_case';
+    await insertTenant(t, 'lbl-rest-dupe-case');
+
+    const first = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'Urgent', colour: '#f00' }),
+    });
+    expect(first.status).toBe(201);
+
+    const again = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'urgent', colour: '#0f0' }), // differs only in case
+    });
+    expect(again.status).toBe(409);
+    // Not just "some 4xx" — the matcher actually fired and produced the collision sentence,
+    // rather than the request failing for an unrelated reason that happens to also be a 409.
+    expect((await again.json<{ error: string }>()).error).toContain('already exists');
+  });
 });
 
 describe('PATCH /v1/boards/:id/cards/:cardId — labels validation', () => {
