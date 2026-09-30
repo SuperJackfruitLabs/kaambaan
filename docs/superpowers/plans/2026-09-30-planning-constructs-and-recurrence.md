@@ -2119,7 +2119,24 @@ gh pr create --title "feat: recurring cards" --body "<see plan; include Task 1's
 
 On **Recurring Maintenance** (`brd_24280cb0c7614d36`) — a board with bare stages, no instructions and zero cards, named after a capability that until now did not exist:
 
-1. Give its stages an owner capability and instructions, or the scheduled card will be created and never claimed. The board has none today.
+1. **The board's real state, checked 2026-09-30** — this plan previously said it had bare stages, which
+   was wrong. It has a five-stage pipeline with owners already set:
+
+   | stage | owner |
+   |---|---|
+   | Due | human |
+   | Running | `code` |
+   | Verify | `security` |
+   | Sign-off | human (gate) |
+   | Closed | human |
+
+   **The first stage is human-owned**, so a schedule with no `stageKey` creates a card that no agent
+   claims — correctly, by design. To prove the `queuedGrant` fallback, which is the point of this
+   check, the schedule must target the **`Running`** stage (capability `code`, which has agents).
+   Get its stage *key* — `supi board` prints display names, not keys.
+
+   What is genuinely missing is **instructions** on the stages, and a completion rule on `Verify`.
+   An agent claiming a card on a stage with no instructions has nothing telling it what the work is.
 2. Add a schedule at `every 5 minutes`, overlap `skip`.
 3. Confirm a card appears within five minutes, and that **an agent claims it** — this is the `queuedGrant` fallback working, and it is the failure that would otherwise look like "the schedule is broken".
 4. Leave the card open through the next tick. Confirm `skipCount` becomes 1 and a `schedule.skipped` event is on the log.
