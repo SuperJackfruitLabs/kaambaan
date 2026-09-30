@@ -3279,7 +3279,24 @@ git commit -m "feat(links): advisory cross-board edges, refused for same-board a
 > create is half-built, and the half that is missing is the half they would use.
 - Modify: `apps/web/src/lib/components/board/CardTile.svelte` — a blocked badge, a `2/5` child counter
 - Modify: `apps/web/src/lib/components/board/BoardKanban.svelte` — a per-stage blocked count
-- Modify: `apps/web/src/lib/api.ts`
+- Modify: **`apps/api/src/index.ts`** — the link routes, which do not exist yet. Task 12 built
+  `addLink` / `removeLink` / `listLinks` on the Durable Object (`board-do.ts:2139-2199`) and gave
+  them **no HTTP surface**. Both write surfaces below — the drawer's "Add blocker" and
+  `supi link add` — call an endpoint that is not there. Add:
+
+  | route | does |
+  |---|---|
+  | `POST   /v1/boards/:boardId/links` | body `{fromCardId, toCardId, kind}` → `addLink` |
+  | `DELETE /v1/boards/:boardId/links` | same body → `removeLink` |
+  | `GET    /v1/boards/:boardId/cards/:cardId/links` | → `listLinks`, merged with Task 16's advisory rows |
+
+  Map the DO's refusals to status codes rather than letting them fall through as 500s:
+  `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` → **409**, `CARD_NOT_FOUND` → **404**,
+  an unknown `kind` → **400**. The archive surface needs no new route — `PATCH` already validates
+  `archivedAt` (`index.ts:1325-1342`).
+
+- Modify: `apps/web/src/lib/api.ts` — `addLink`, `removeLink`, `listLinks` and `archiveCard`
+  wrappers for the above, in the file's existing style
 
 - [ ] **Step 1: Two badges, never one**
 
@@ -3326,8 +3343,29 @@ gh pr create --title "feat: dependencies and sub-tasks" --body "<see plan>"
 
 On a scratch board:
 
-1. Two cards, B blocked by A, B at higher priority. An agent must claim **A**. If it claims B, the `NOT EXISTS` clause is not live.
-2. Let A **fail**. Confirm B is *still* not claimed. This is the `isResolved`-vs-`isTerminal` distinction, and it is the one bug in this plan that unit tests could pass while production is wrong.
+0. **Arrange for something to actually poll the board, or steps 1-2 cannot be run.** Phase 2's live
+   check discovered this the hard way: "an agent claims it" was unprovable because *nothing polls a
+   scratch board* — the `bridge_agents` roster points every Guild agent at the Press board. Two ways
+   out, and pick one before starting: roster an agent onto the scratch board (agentpod console →
+   **Admin → Bridge**, which takes effect within ten seconds and needs no restart), or skip the
+   bridge and claim directly over the API with an agent token. The second is less realistic but
+   touches no shared configuration — prefer it unless the point is to exercise the bridge.
+
+1. Two cards, B blocked by A, B at higher priority. The claim must return **A**. If it returns B, the `NOT EXISTS` clause is not live.
+2. **Reject** A — do not try to fail it. Confirm B is *still* not claimed. This is the
+   `isResolved`-vs-`isTerminal` distinction, and it is the one bug in this plan that unit tests
+   could pass while production is wrong.
+
+   The verb matters, and an earlier draft of this step had it wrong. Of the four terminal states the
+   contract names, **only two are reachable**: `completed` (`board-do.ts:4068`) and `rejected`
+   (`:3770`), one write site each. `failed` and `canceled` have **zero** write sites — no code path
+   in the Durable Object ever assigns them. So "let A fail" is not a hard step, it is an impossible
+   one, and an operator following it would conclude the blocker logic was broken when they could
+   not perform it.
+   `rejected` is the right probe anyway: it is precisely the state that is terminal but **not**
+   resolved (`RESOLVED_SQL = ('completed', 'canceled')`), so it is the one that proves a dead
+   blocker still blocks. Note in passing that `canceled` is half the resolved set and unreachable —
+   dead but harmless, so leave it.
 3. Give a card two children. Confirm the parent cannot advance, and that the drawer says why.
 4. From a real agent run, call `superpipeline_split_card` over MCP and confirm children appear and are claimed by the right capabilities. **This is the feature's actual purpose**; everything else is bookkeeping.
 5. Confirm the stage header's blocked count is visible on a phone-width window.
