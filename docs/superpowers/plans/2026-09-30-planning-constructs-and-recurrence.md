@@ -698,15 +698,50 @@ And in the existing `PATCH /v1/boards/:id/cards/:cardId` handler, before calling
       }
 ```
 
+- [ ] **Step 6b: Teach the test catalog about migration 0010 — without this, nothing passes**
+
+The test D1 does **not** get migrations applied by wrangler. `apps/api/test/setup.ts` runs
+`setupCatalog()` (`test/helpers/catalog.ts`) in a `beforeAll` for every test file, and that helper
+builds the schema itself. A new table is invisible to the suite until it is added there, and the
+failure is `no such table: labels` in every single labels test.
+
+Follow the file's existing shape exactly — import the real migration `?raw` and guard it with the
+`tableExists` helper that is already defined (`catalog.ts:61`):
+
+```ts
+import labels from '../../migrations/0010_labels.sql?raw';
+```
+
+and inside `setupCatalog()`, beside the other guarded migration blocks:
+
+```ts
+  if (!(await tableExists('labels'))) {
+    for (const s of statementsOf(labels)) await env.DB.prepare(s).run();
+  }
+```
+
+**Run the real migration file, do not mirror it into `STATEMENTS`.** The helper's own comment says
+why: a hand-copied mirror is how its schema drifted from `0001_catalog.sql` in the first place, and
+running the real file keeps the `UNIQUE (tenant_id, name)` constraint byte-identical to what ships.
+
+⚠️ **One consequence to know about.** Every table the helper mirrors deliberately **omits**
+`REFERENCES tenants(id)`, because the suite drives the API with dev-header tenants that have no row
+in `tenants` — a faithful FK there "would fail every request rather than test anything"
+(`catalog.ts:16-20`). Migration 0010 *does* carry that FK, and running the real file keeps it. That
+is fine for this task because its tests insert real `tenants` rows first. But **a test that reaches
+labels through the Worker with a dev-header tenant will fail on the foreign key**, and the fix is to
+insert a `tenants` row in that test — not to strip the FK from the migration.
+
 - [ ] **Step 7: Run the tests**
 
 Run: `cd apps/api && pnpm vitest run test/labels.test.ts` then `pnpm test`
-Expected: PASS. Apply the migration locally first if the suite needs it: `pnpm db:migrate:local`.
+Expected: PASS. Note the suite builds its own D1 schema via `setupCatalog` (Step 6b) — you do
+**not** need `pnpm db:migrate:local` for tests. That command is for a local `wrangler dev` session.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add apps/api/migrations/0010_labels.sql apps/api/src/db/labels.ts apps/api/src/index.ts apps/api/src/board/board-do.ts apps/api/test/labels.test.ts
+git add apps/api/migrations/0010_labels.sql apps/api/src/db/labels.ts apps/api/src/index.ts apps/api/src/board/board-do.ts apps/api/test/labels.test.ts apps/api/test/helpers/catalog.ts
 git commit -m "feat(labels): a tenant label catalogue, applied to cards by id"
 ```
 
