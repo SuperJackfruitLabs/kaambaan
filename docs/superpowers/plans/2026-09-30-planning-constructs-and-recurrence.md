@@ -792,6 +792,8 @@ function stubFor(name: string): DurableObjectStub<BoardDO> {
   return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
 }
 
+// `ClaimResult` is `{ claimed: true; runId; leaseEpoch; card: CardView; stage; handoff } | { claimed: false }`
+// — the claimed card is `claim.card.id`. There is no `claim.cardId`.
 async function make(board: BoardDO, title: string, patch: { priority?: number; dueAt?: string }): Promise<CardView> {
   const r = await board.createCard({ title, ownerUserId: 'usr_a', priority: patch.priority ?? 0 });
   if (!r.ok) throw new Error(r.message);
@@ -811,8 +813,8 @@ describe('due dates in claim order', () => {
       const sooner = await make(board, 'Sooner', { dueAt: '2026-10-01' });
       const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!claim.claimed) throw new Error('expected a claim');
-      expect(claim.cardId).toBe(sooner.id);
-      expect(claim.cardId).not.toBe(later.id);
+      expect(claim.card.id).toBe(sooner.id);
+      expect(claim.card.id).not.toBe(later.id);
     });
   });
 
@@ -823,7 +825,7 @@ describe('due dates in claim order', () => {
       const urgent = await make(board, 'No due date, high priority', { priority: 5 });
       const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!claim.claimed) throw new Error('expected a claim');
-      expect(claim.cardId).toBe(urgent.id);
+      expect(claim.card.id).toBe(urgent.id);
     });
   });
 
@@ -834,7 +836,7 @@ describe('due dates in claim order', () => {
       const dated = await make(board, 'Dated', { dueAt: '2027-01-01' });
       const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!claim.claimed) throw new Error('expected a claim');
-      expect(claim.cardId).toBe(dated.id);
+      expect(claim.card.id).toBe(dated.id);
     });
   });
 
@@ -2132,7 +2134,7 @@ describe('a blocked card is not handed out', () => {
       await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
       const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!claim.claimed) throw new Error('expected a claim');
-      expect(claim.cardId).toBe(a.id);
+      expect(claim.card.id).toBe(a.id);
     });
   });
 
@@ -2156,11 +2158,11 @@ describe('a blocked card is not handed out', () => {
       await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
       const c = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!c.claimed) throw new Error('expected a claim');
-      expect(c.cardId).toBe(a.id);
+      expect(c.card.id).toBe(a.id);
       await board.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'done' } });
       const next = await board.claim({ agentId: 'agt_w2', capabilities: ['writing'] });
       if (!next.claimed) throw new Error('expected b to be claimable now');
-      expect(next.cardId).toBe(b.id);
+      expect(next.card.id).toBe(b.id);
     });
   });
 
@@ -2182,7 +2184,7 @@ describe('a blocked card is not handed out', () => {
       await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'relates' });
       const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!claim.claimed) throw new Error('expected a claim');
-      expect(claim.cardId).toBe(b.id);
+      expect(claim.card.id).toBe(b.id);
     });
   });
 });
@@ -2199,7 +2201,7 @@ describe('a parent does not advance past an open child', () => {
 
       const c = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!c.claimed) throw new Error('expected the child to be claimable');
-      expect(c.cardId).toBe(child.id);
+      expect(c.card.id).toBe(child.id);
       await board.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'child done' } });
 
       const allowed = await board.moveCard(parent.id, 'ship', 'usr_a');
