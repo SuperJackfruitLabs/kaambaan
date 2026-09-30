@@ -1343,6 +1343,23 @@ Branch: `feat/planning-phase2-recurrence`
 
 Restricted grammar, not cron. A cron parser is a dependency and a surface; these four forms cover maintenance cadence, and the field can hold a cron expression later without a schema change.
 
+**Task 1's spike already answered the open question, and left a consequence this task must respect.**
+`workerd` carries full ICU zone data — `Asia/Kolkata` renders `2026-01-15T00:00:00Z` as `05:30`, and an
+unknown zone throws `RangeError`. So IANA zones stand and the UTC-plus-offset fallback is not needed.
+
+But **ICU canonicalises a zone to its older alias**: `resolvedOptions().timeZone` answers
+`Asia/Calcutta` for an input of `Asia/Kolkata`. Three rules follow, and they bind this task and the
+next:
+
+1. **Validate a zone by constructing a formatter and catching `RangeError`** — never by comparing
+   strings or checking against a list.
+2. **Never compare zone strings for equality** anywhere in `recurrence.ts`.
+3. **Store and display the operator's own spelling.** Echoing `resolvedOptions().timeZone` back would
+   show someone who typed `Asia/Kolkata` a schedule reading `Asia/Calcutta`, which reads as a bug.
+
+`zonedParts` and `offsetMinutes` below already respect these — they pass the zone through to
+`Intl.DateTimeFormat` and never read the resolved spelling back. Keep it that way.
+
 **Files:**
 - Create: `apps/api/src/board/recurrence.ts`, `apps/api/test/recurrence.test.ts`
 
@@ -1828,6 +1845,21 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 ```
 
 - [ ] **Step 4: Write CRUD**
+
+**Validate the timezone, by construction not comparison.** The plan did not say so and it must:
+
+```ts
+    // A zone is valid iff Intl accepts it. Do NOT compare against a list or against
+    // `resolvedOptions().timeZone` — ICU canonicalises `Asia/Kolkata` to `Asia/Calcutta`, so a
+    // string comparison rejects a zone that works perfectly. Task 1's spike confirmed the throw.
+    try {
+      new Intl.DateTimeFormat('en-GB', { timeZone: input.timezone });
+    } catch {
+      return { ok: false, code: 'INVALID_TIMEZONE', message: `"${input.timezone}" is not a time zone this runtime knows` };
+    }
+```
+
+Store `input.timezone` **as the operator typed it** — never the resolved spelling.
 
 `createSchedule` takes a **required** `createdBy` (the route supplies the authenticated user) — a schedule mints cards, and Principle 3 says every card has a human owner, so a schedule without one is not creatable. It validates through `parseRule` and **returns the parser's own error message** — a rule is typed by a human and the parser's message is the only useful one. It then sets `next_fire_at = nextFireAt(rule, timezone, now)`. `updateSchedule` re-parses and recomputes `next_fire_at` whenever `rule` or `timezone` changes; it must not silently keep a fire time computed from the old rule.
 
