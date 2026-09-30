@@ -32,7 +32,8 @@ export async function addExternalLink(
       'Both cards are on the same board, so this edge belongs in the board\'s own card_links where it is enforced. Storing it here would show a badge that refuses nothing.' };
   }
   if (edge.from.cardId === edge.to.cardId) {
-    return { ok: false, code: 'SELF_EDGE', message: 'A card cannot block itself.' };
+    return { ok: false, code: 'SELF_EDGE', message:
+      'A card cannot link to itself — an edge is a relationship between two cards, and there is no alternative form of this one to store; it is simply not a fact.' };
   }
   // Both boards must exist AND belong to this tenant. One query, so a caller naming a board it
   // cannot see is refused identically to one naming a board that does not exist.

@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
-import { addExternalLink, listExternalLinksFor } from '../src/db/card-links-external';
+import { addExternalLink, listExternalLinksFor, removeExternalLink } from '../src/db/card-links-external';
 
 const A = { boardId: 'brd_press', cardId: 'card_aaaaaaaaaaaaaaaa' };
 const B = { boardId: 'brd_releases', cardId: 'card_bbbbbbbbbbbbbbbb' };
@@ -83,5 +83,53 @@ describe('cross-board edges', () => {
       (l) => l.kind === 'relates',
     );
     expect(found).toHaveLength(1);
+  });
+});
+
+describe('removeExternalLink', () => {
+  // Fresh card ids on the same, already-fixtured boards — so ownership/FK are already satisfied,
+  // and these rows don't collide with the edges the suite above already created on A/B.
+  const C = { boardId: A.boardId, cardId: 'card_eeeeeeeeeeeeeeee' };
+  const D = { boardId: B.boardId, cardId: 'card_ffffffffffffffff' };
+
+  it('removes an edge: listExternalLinksFor no longer returns it afterward', async () => {
+    await addExternalLink(env.DB, 'tnt_x', { from: C, to: D, kind: 'blocks' });
+    expect(
+      (await listExternalLinksFor(env.DB, 'tnt_x', D.cardId)).filter(
+        (l) => l.fromCardId === C.cardId && l.toCardId === D.cardId && l.kind === 'blocks',
+      ),
+    ).toHaveLength(1);
+
+    await removeExternalLink(env.DB, 'tnt_x', C.cardId, D.cardId, 'blocks');
+
+    expect(
+      (await listExternalLinksFor(env.DB, 'tnt_x', D.cardId)).filter(
+        (l) => l.fromCardId === C.cardId && l.toCardId === D.cardId && l.kind === 'blocks',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('is tenant-scoped: removing with a DIFFERENT tenant id leaves the row untouched', async () => {
+    // The tenant predicate on the delete is the part worth proving — a missing one would be a
+    // cross-tenant WRITE (tnt_y deleting a row it cannot even see), which is worse than a
+    // cross-tenant read.
+    await addExternalLink(env.DB, 'tnt_x', { from: C, to: D, kind: 'relates' });
+
+    await removeExternalLink(env.DB, 'tnt_y', C.cardId, D.cardId, 'relates');
+
+    expect(
+      (await listExternalLinksFor(env.DB, 'tnt_x', D.cardId)).filter(
+        (l) => l.fromCardId === C.cardId && l.toCardId === D.cardId && l.kind === 'relates',
+      ),
+    ).toHaveLength(1);
+
+    // Clean up with the correct tenant so this row doesn't leak into later assertions.
+    await removeExternalLink(env.DB, 'tnt_x', C.cardId, D.cardId, 'relates');
+  });
+
+  it('removing a triple that was never added does not throw — idempotent delete', async () => {
+    await expect(
+      removeExternalLink(env.DB, 'tnt_x', 'card_never_added_1', 'card_never_added_2', 'blocks'),
+    ).resolves.toBeUndefined();
   });
 });
