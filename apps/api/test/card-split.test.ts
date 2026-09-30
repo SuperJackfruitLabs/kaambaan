@@ -1,5 +1,5 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { BoardDO, type BoardInit } from '../src/board/board-do';
 
 const STAGES: BoardInit['stages'] = [
@@ -171,5 +171,62 @@ describe('POST /v1/boards/:id/cards/:cardId/split — REST', () => {
     });
     expect(res.status).toBe(400);
     expect(JSON.stringify(await res.json())).toContain('TOO_MANY_CHILDREN');
+  });
+});
+
+// `createChildCard` inherits the parent's `queued_grant` — the fix for a bug this task's own
+// self-review surfaced: without it, every child is created with `queued_grant = NULL`, and under
+// `ENFORCE_CONTROL_PAIR` (production's default — `wrangler.jsonc`; the suite defaults it off) a
+// null grant is unconditionally unclaimable (`grantPermitsAgent(null, …)` in `auth/grant-match.ts`).
+// That would make `splitCard`'s tool description false in production: "Each becomes a real card
+// that can be claimed separately." These tests exercise enforcement genuinely ON — the reason the
+// bug was invisible to `pnpm test` in the first place — following `control-pair-claim.test.ts`'s
+// pattern of toggling `ENFORCE_CONTROL_PAIR` per test and clearing it after.
+//
+// `board.claim({ principalId })` is called directly (DO layer, no REST/JWT) — passing `principalId`
+// explicitly bypasses `principalIdFor`'s D1 lookup, so no `agents` row needs registering for this.
+const GRANT_STAGES: BoardInit['stages'] = [{ key: 'draft', name: 'Draft', order: 0, ownerKind: 'capability', owner: 'writing' }];
+const PRINCIPAL = 'prn_0000000000000000cg01';
+
+describe("createChildCard inherits the parent's queued_grant, so a child is claimable under enforcement", () => {
+  afterEach(() => {
+    delete (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR;
+  });
+
+  it('a child of a granted parent is itself claimable once enforcement is on', async () => {
+    await runInDurableObject(stubFor('child-grant-ok'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_cg_ok', tenantId: 'tnt_a', name: 'CG', stages: GRANT_STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a', queuedGrant: [PRINCIPAL] });
+      if (!p.ok) throw new Error(p.message);
+      // Higher priority than the parent's default (0), so `claim`'s `ORDER BY priority DESC, …`
+      // picks the CHILD deterministically — isolating what's being proven (the child's own
+      // claimability) from the parent, which is also sitting in the same claimable lane.
+      const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a', priority: 5 });
+      if (!child.ok) throw new Error(child.message);
+      expect(child.value.queuedGrant).toEqual([PRINCIPAL]);
+
+      (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+      const claimed = await board.claim({ agentId: 'agt_worker', capabilities: ['writing'], principalId: PRINCIPAL });
+      expect(claimed.claimed).toBe(true);
+      if (claimed.claimed) expect(claimed.card.id).toBe(child.value.id);
+    });
+  });
+
+  // Pins the inheritance rather than just the happy path: a parent with NO grant must produce a
+  // child that is STILL unclaimable — proving the child's grant tracks the parent's, not "always
+  // permitted now".
+  it('a child of an ungranted parent stays unclaimable under enforcement', async () => {
+    await runInDurableObject(stubFor('child-grant-none'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_cg_none', tenantId: 'tnt_a', name: 'CG2', stages: GRANT_STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a' }); // no queuedGrant
+      if (!p.ok) throw new Error(p.message);
+      const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a', priority: 5 });
+      if (!child.ok) throw new Error(child.message);
+      expect(child.value.queuedGrant).toBeNull();
+
+      (env as unknown as Record<string, unknown>).ENFORCE_CONTROL_PAIR = 'true';
+      const claimed = await board.claim({ agentId: 'agt_worker', capabilities: ['writing'], principalId: PRINCIPAL });
+      expect(claimed.claimed).toBe(false);
+    });
   });
 });

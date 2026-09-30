@@ -1376,14 +1376,24 @@ export class BoardDO extends DurableObject<Env> {
 
   /**
    * Split a card into a sub-task (spec §3.4, Task 14 / 15). A real, independently claimable card —
-   * built on `createCard` (so it gets its own `queuedGrant` and is claimable the moment it exists)
-   * plus a `parent` edge (`addLink`), not a lighter-weight "checklist item" type.
+   * built on `createCard` plus a `parent` edge (`addLink`), not a lighter-weight "checklist item"
+   * type.
    *
    * Inherits `priority` (unless the caller overrides it) because a sub-task of an urgent card is
    * itself urgent. Deliberately does NOT inherit `labels` or `dueAt`: a label describes what a card
    * IS, not what its parent is, and a sub-task's own deadline is not its parent's — Linear inherits
    * neither either. `project_id`/`milestone_id` are not inherited because this board model has no
    * such columns to inherit from.
+   *
+   * ALSO inherits `queuedGrant` — not optional, not overridable by the caller. The parent's grant
+   * IS the authority under which this work exists, the same reasoning `moveCard` already applies
+   * when it preserves `queued_grant` across a re-queue. Before this, a child was created with
+   * `queued_grant = NULL` — under `ENFORCE_CONTROL_PAIR` that made EVERY child unclaimable, because
+   * `grantPermitsAgent(null, …)` is unconditionally false, which silently broke the promise
+   * `splitCard`'s tool description makes ("each becomes a real card that can be claimed
+   * separately"). Phase 2 shipped the identical bug for scheduled cards (`triggerGrant()` null on a
+   * board that had never saved GitHub settings); the fix there was the same shape — record and
+   * carry forward the authorising grant rather than leaving a creation path to default to none.
    */
   async createChildCard(
     parentCardId: string,
@@ -1399,6 +1409,7 @@ export class BoardDO extends DurableObject<Env> {
       ownerUserId: input.ownerUserId,
       spec: input.spec,
       priority: input.priority ?? parent.priority,
+      queuedGrant: parent.queuedGrant,
     });
     if (!created.ok) return created;
     const linked = await this.addLink({ fromCardId: parentCardId, toCardId: created.value.id, kind: 'parent' });
@@ -1423,6 +1434,13 @@ export class BoardDO extends DurableObject<Env> {
    * Deliberately NOT idempotent: calling this twice with the same titles creates two separate sets
    * of children. De-duplicating by title would silently drop a legitimately repeated sub-task — the
    * tool description tells the caller to call it once, and the UI confirms before a second call.
+   *
+   * The all-or-nothing loop below holds by CONSTRUCTION, not by an explicit SQL transaction: a
+   * Durable Object processes one request at a time, so nothing can interleave between the
+   * `titles.length` check and the last `createChildCard` call in this same invocation. If this loop
+   * is ever refactored to await something that can yield control back to the DO's request queue
+   * mid-iteration (unlike the synchronous-per-call `sql.exec` writes here), that assumption stops
+   * holding and an explicit transaction would be needed to keep the guarantee.
    */
   async splitCard(cardId: string, titles: string[], actorUserId: string): Promise<Result<{ children: CardView[] }>> {
     if (!this.getMeta('boardId')) {
