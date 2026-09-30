@@ -2251,7 +2251,16 @@ describe('wouldCycle', () => {
   });
 
   it('terminates on an existing cycle instead of hanging', () => {
+    // ⚠️ This case alone does NOT prove termination: `c → d` starts a walk that never reaches the
+    // a↔b cycle, so it returns false without the seen-set doing anything. Keep it, but the next
+    // case is the one that earns the claim.
     expect(wouldCycle([link('a', 'b'), link('b', 'a')], link('c', 'd'))).toBe(false);
+  });
+
+  it('terminates when the walk ENTERS an existing cycle — the case that proves the seen-set', () => {
+    // `x → a` walks into a↔b. Without the seen-set this revisits `a` forever; with it, the second
+    // visit is skipped and the walk ends. Found by review: the case above passes either way.
+    expect(wouldCycle([link('a', 'b'), link('b', 'a')], link('x', 'a'))).toBe(false);
   });
 });
 ```
