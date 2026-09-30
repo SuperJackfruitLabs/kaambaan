@@ -127,4 +127,51 @@ describe('schedules', () => {
       expect((await board.claim({ agentId: 'agt_w', capabilities: ['writing'] })).claimed).toBe(true);
     });
   });
+
+  // The discriminating version of the test above (board-triggers.test.ts:122's pattern): a card
+  // born from `createCard` would carry `queuedGrant: null` regardless of the board's standing
+  // grant, so this fails if `fireDueSchedules` is ever changed to call `createCard` instead of
+  // `createCardFromTrigger` — no ENFORCE_CONTROL_PAIR and no principal mapping required to see it.
+  it('stamps the board\'s standing grant onto a card a schedule fires', async () => {
+    const GRANT = ['prn_0123456789abcdef0123'];
+    await runInDurableObject(stubFor('sch-grant'), async (board: BoardDO) => {
+      await boardWithSchedule(board, 'schgrant');
+      await board.setGithubConfig({ triggerGrant: GRANT });
+      await board.fireDueSchedules('2099-01-01T10:00:00.000Z');
+      expect((await board.getState()).cards[0]!.queuedGrant).toEqual(GRANT);
+    });
+  });
+
+  it('a schedule whose stage no longer exists still creates the card, and says so on the event log', async () => {
+    await runInDurableObject(stubFor('sch-stagegone'), async (board: BoardDO) => {
+      const withReview: BoardInit['stages'] = [
+        ...STAGES,
+        { key: 'review', name: 'Review', order: 1, ownerKind: 'capability', owner: 'writing' },
+      ];
+      await board.init({ id: 'brd_stagegone', tenantId: 'tnt_a', name: 'SG', stages: withReview });
+      const r = await board.createSchedule({
+        title: 'Sweep the logs',
+        rule: 'daily at 09:00',
+        timezone: 'UTC',
+        overlap: 'skip',
+        createdBy: 'usr_a',
+        stageKey: 'review',
+      });
+      if (!r.ok) throw new Error(r.message);
+
+      // The stage the schedule targets is removed after the schedule was written — `setStages`
+      // only refuses to remove a stage still holding cards, and no card has reached "review" yet.
+      const removed = await board.setStages([withReview[0]!]);
+      if (!removed.ok) throw new Error(removed.message);
+
+      const result = await board.fireDueSchedules('2099-01-01T10:00:00.000Z');
+      expect(result.fired).toEqual([r.value.id]);
+
+      const cards = (await board.getState()).cards;
+      expect(cards).toHaveLength(1); // still created, despite the dropped routing
+
+      const events = await board.getEvents(50);
+      expect(events.some((e) => e.type === 'schedule.stage_failed')).toBe(true);
+    });
+  });
 });

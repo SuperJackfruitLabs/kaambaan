@@ -128,6 +128,7 @@ function statusForCode(code: BoardErrorCode): number {
       return 400;
     case 'INVALID_RULE':
     case 'INVALID_TIMEZONE':
+    case 'INVALID_SCHEDULE':
       return 400;
   }
 }

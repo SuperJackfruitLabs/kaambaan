@@ -676,7 +676,8 @@ export type BoardErrorCode =
   | 'BUDGET_EXCEEDED'
   | 'INVALID_RULE'
   | 'INVALID_TIMEZONE'
-  | 'SCHEDULE_NOT_FOUND';
+  | 'SCHEDULE_NOT_FOUND'
+  | 'INVALID_SCHEDULE';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -2224,6 +2225,13 @@ export class BoardDO extends DurableObject<Env> {
    * Never compare it against a list, or against `resolvedOptions().timeZone` — ICU canonicalises
    * `Asia/Kolkata` to `Asia/Calcutta`, so a string comparison rejects zones that work perfectly
    * (Task 1's spike). The operator's own spelling is what gets stored.
+   *
+   * `stageKey`, `overlap` and `createdBy` are all refused here too, on the same argument as the
+   * rule and the timezone: a human is standing right here, reading the response, which is the
+   * only moment any of this is cheap to fix. A `stageKey` naming no stage on this board would
+   * otherwise surface months later as cards silently landing in the default lane; an `overlap`
+   * outside `'skip' | 'allow'` would otherwise be read by `fireDueSchedules`'s `=== 'skip'` check
+   * as *allow* — the permissive direction, and the wrong one to fail open into.
    */
   async createSchedule(input: {
     title: string;
@@ -2246,6 +2254,18 @@ export class BoardDO extends DurableObject<Env> {
       new Intl.DateTimeFormat('en-GB', { timeZone: input.timezone });
     } catch {
       return { ok: false, code: 'INVALID_TIMEZONE', message: `"${input.timezone}" is not a time zone this runtime knows` };
+    }
+
+    if (input.stageKey && !this.stages().some((s) => s.key === input.stageKey)) {
+      return { ok: false, code: 'UNKNOWN_STAGE', message: `unknown stage: ${input.stageKey}` };
+    }
+
+    if (input.overlap !== 'skip' && input.overlap !== 'allow') {
+      return { ok: false, code: 'INVALID_SCHEDULE', message: `overlap must be "skip" or "allow", not "${String(input.overlap)}"` };
+    }
+
+    if (typeof input.createdBy !== 'string' || input.createdBy.trim() === '') {
+      return { ok: false, code: 'INVALID_SCHEDULE', message: 'createdBy is required — a schedule mints cards with no human present at fire time, so it needs a recorded human owner up front' };
     }
 
     const id = newId('sch');
@@ -2318,6 +2338,14 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
+    if (patch.stageKey && !this.stages().some((s) => s.key === patch.stageKey)) {
+      return { ok: false, code: 'UNKNOWN_STAGE', message: `unknown stage: ${patch.stageKey}` };
+    }
+
+    if (patch.overlap !== undefined && patch.overlap !== 'skip' && patch.overlap !== 'allow') {
+      return { ok: false, code: 'INVALID_SCHEDULE', message: `overlap must be "skip" or "allow", not "${String(patch.overlap)}"` };
+    }
+
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (patch.title !== undefined) { sets.push('title = ?'); vals.push(patch.title); }
@@ -2367,6 +2395,11 @@ export class BoardDO extends DurableObject<Env> {
    * Idempotent by construction: `next_fire_at` advances in the same call that creates the card, so
    * a double tick finds nothing due. If the create throws, `next_fire_at` is left alone and the next
    * tick retries — at-least-once, which for a maintenance card is the right way round.
+   *
+   * Missed occurrences collapse to one: `next_fire_at` is always computed from `nowIso` — the
+   * instant this runs — never from the missed time itself. A board whose cron was down for a week
+   * produces one "sweep the logs" card when it comes back, not seven. That is the right shape for
+   * maintenance work, and is exactly what a later reader "fixes" into a card storm — leave it alone.
    */
   async fireDueSchedules(nowIso: string): Promise<{ fired: string[]; skipped: string[] }> {
     const due = this.sql
@@ -2419,7 +2452,15 @@ export class BoardDO extends DurableObject<Env> {
       }
 
       const cardId = created.value.card.id;
-      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+      // `moveCard` returns a Result and does NOT throw for the realistic failures — `UNKNOWN_STAGE`
+      // (a stage renamed or removed by `setStages` after this schedule was written) and
+      // `WIP_LIMIT`. Discarding it means the card lands in the default lane, `schedule.fired` is
+      // emitted as a success, and nothing anywhere records that the routing was dropped. That is
+      // the same silent failure this task exists to prevent, wearing a different hat.
+      if (row.stage_key) {
+        const moved = await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+        if (!moved.ok) this.emit('schedule.stage_failed', { scheduleId: id, cardId, stageKey: row.stage_key, reason: moved.code });
+      }
       if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
         await this.updateCard(cardId, {
           priority: Number(row.priority),
