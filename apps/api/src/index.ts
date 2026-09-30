@@ -106,6 +106,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'GATE_NOT_FOUND':
     case 'ELICITATION_NOT_FOUND':
     case 'SCHEDULE_NOT_FOUND':
+    case 'NO_SUCH_CARD':
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
@@ -130,6 +131,11 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_TIMEZONE':
     case 'INVALID_SCHEDULE':
       return 400;
+    // A conflict with the graph the caller believed in, not a malformed request: the same payload
+    // succeeds once the cycle is avoided or the existing parent edge is removed first.
+    case 'LINK_WOULD_CYCLE':
+    case 'ALREADY_HAS_PARENT':
+      return 409;
   }
 }
 

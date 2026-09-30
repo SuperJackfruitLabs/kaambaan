@@ -15,6 +15,7 @@ import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
 import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
+import { wouldCycle, type LinkKind, type LinkRow } from './links';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -601,6 +602,22 @@ export interface ReferenceInput {
   lastSyncedAt?: string;
 }
 
+/** A stored edge (spec §3.4) — `LinkRow` plus the provenance columns the DO adds. */
+export interface LinkView {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdAt: string;
+  createdBy: string | null;
+}
+
+export interface LinkInput {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdBy?: string | null;
+}
+
 export interface BoardSnapshot {
   boardId: string | null;
   tenantId: string | null;
@@ -683,7 +700,10 @@ export type BoardErrorCode =
   | 'INVALID_RULE'
   | 'INVALID_TIMEZONE'
   | 'SCHEDULE_NOT_FOUND'
-  | 'INVALID_SCHEDULE';
+  | 'INVALID_SCHEDULE'
+  | 'NO_SUCH_CARD'
+  | 'LINK_WOULD_CYCLE'
+  | 'ALREADY_HAS_PARENT';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -731,6 +751,10 @@ export interface BoardStub {
   release(input: RunVerbInput & { reason?: string }): Promise<Result<CardView>>;
   submitForReview(input: RunVerbInput & { output?: JsonValue }): Promise<Result<CardView>>;
   addReference(input: ReferenceInput): Promise<Result<ReferenceView>>;
+  /** Dependencies and sub-task containment (spec §3.4) — one table, told apart by `kind`. */
+  addLink(input: LinkInput): Promise<Result<LinkView>>;
+  removeLink(fromCardId: string, toCardId: string, kind: LinkKind): Promise<Result<{ ok: true }>>;
+  listLinks(cardId: string): Promise<LinkView[]>;
   setBudget(input: { boardUsdCap?: number | null; cardUsdCap?: number | null }): Promise<Result<{ ok: true }>>;
   getUsage(opts?: { window?: string }): Promise<UsageSummary>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
@@ -1149,6 +1173,23 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_card ON card_references(card_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_external ON card_references(external_id)`);
+    // Dependencies AND sub-task containment, in one table (spec §3.4). Same-board only: an edge
+    // that may refuse a claim has to be strongly consistent, which means inside this DO.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS card_links (
+        from_card_id TEXT NOT NULL,
+        to_card_id   TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        created_by   TEXT,
+        PRIMARY KEY (from_card_id, to_card_id, kind)
+      )`,
+    );
+    // A card has at most one parent.
+    this.sql.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS card_links_one_parent ON card_links (to_card_id) WHERE kind = 'parent'`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_to ON card_links(to_card_id, kind)`);
     // Inbound webhook delivery dedup (docs/06 §3): GitHub may redeliver the same X-GitHub-Delivery.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS webhook_deliveries (delivery_id TEXT PRIMARY KEY, received_at TEXT NOT NULL)`,
@@ -1541,13 +1582,17 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: card };
   }
 
-  /** Delete a card and everything scoped to it (references, runs, activities, gates, usage, notifications). */
+  /** Delete a card and everything scoped to it (references, runs, activities, gates, usage, notifications, links). */
   async deleteCard(cardId: string): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
     for (const t of ['usage_records', 'activities', 'runs', 'gates', 'elicitations', 'card_references', 'notifications']) {
       this.sql.exec(`DELETE FROM ${t} WHERE card_id = ?`, cardId);
     }
+    // Both directions. A deleted card's edges must go with it: a lingering `blocks` row points at a
+    // card that no longer exists, and the drawer would render a blocker nobody can open or resolve.
+    // `card_links` is keyed on two columns, so it cannot join the single-column loop above.
+    this.sql.exec(`DELETE FROM card_links WHERE from_card_id = ? OR to_card_id = ?`, cardId, cardId);
     this.sql.exec(`DELETE FROM cards WHERE id = ?`, cardId);
     this.emit('card.deleted', { cardId });
     return { ok: true, value: { ok: true } };
@@ -1841,6 +1886,87 @@ export class BoardDO extends DurableObject<Env> {
     const ref = this.mustGetReference(id);
     this.emit('reference.added', { reference: ref });
     return { ok: true, value: ref };
+  }
+
+  /**
+   * Declare an edge between two cards on this board (spec §3.4). `blocks` and `parent` both order
+   * work and so can deadlock; `relates` is decoration and is exempt from both checks below.
+   *
+   * Idempotent on the primary key: re-declaring the exact same (from, to, kind) is a no-op, not an
+   * error — the same reasoning as `addImplication` (`db/implications.ts`).
+   *
+   * Refusals are one distinct code per reason, not a generic one, because a caller needs to know
+   * what to do next: `NO_SUCH_CARD` (either end is missing), `ALREADY_HAS_PARENT` (a card may have
+   * at most one `parent` edge pointing at it — enforced again by `card_links_one_parent` for any
+   * caller that reaches the table directly), `LINK_WOULD_CYCLE` (this edge would close a loop among
+   * the ordering kinds — see `links.ts#wouldCycle`).
+   */
+  async addLink(input: LinkInput): Promise<Result<LinkView>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    if (!this.getCardRow(input.fromCardId)) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${input.fromCardId}` };
+    }
+    if (!this.getCardRow(input.toCardId)) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${input.toCardId}` };
+    }
+    if (input.kind === 'parent') {
+      const existingParent = this.sql
+        .exec(`SELECT from_card_id FROM card_links WHERE to_card_id = ? AND kind = 'parent'`, input.toCardId)
+        .toArray()[0];
+      if (existingParent && (existingParent.from_card_id as string) !== input.fromCardId) {
+        return {
+          ok: false,
+          code: 'ALREADY_HAS_PARENT',
+          message: `card ${input.toCardId} already has a parent (${existingParent.from_card_id as string})`,
+        };
+      }
+    }
+    const candidate: LinkRow = { fromCardId: input.fromCardId, toCardId: input.toCardId, kind: input.kind };
+    if (wouldCycle(this.allLinks(), candidate)) {
+      return {
+        ok: false,
+        code: 'LINK_WOULD_CYCLE',
+        message: `linking ${input.fromCardId} -> ${input.toCardId} (${input.kind}) would close a cycle`,
+      };
+    }
+    const now = this.now();
+    this.sql.exec(
+      `INSERT INTO card_links (from_card_id, to_card_id, kind, created_at, created_by)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (from_card_id, to_card_id, kind) DO NOTHING`,
+      input.fromCardId,
+      input.toCardId,
+      input.kind,
+      now,
+      input.createdBy ?? null,
+    );
+    const link = this.mustGetLink(input.fromCardId, input.toCardId, input.kind);
+    this.emit('link.added', { link });
+    return { ok: true, value: link };
+  }
+
+  /** Remove an edge. Deleting a link that does not exist is not an error — the end state is what was asked for. */
+  async removeLink(fromCardId: string, toCardId: string, kind: LinkKind): Promise<Result<{ ok: true }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    this.sql.exec(`DELETE FROM card_links WHERE from_card_id = ? AND to_card_id = ? AND kind = ?`, fromCardId, toCardId, kind);
+    this.emit('link.removed', { fromCardId, toCardId, kind });
+    return { ok: true, value: { ok: true } };
+  }
+
+  /** Every edge touching `cardId`, either as source or target — what the drawer renders. */
+  async listLinks(cardId: string): Promise<LinkView[]> {
+    return this.sql
+      .exec(
+        `SELECT * FROM card_links WHERE from_card_id = ? OR to_card_id = ? ORDER BY created_at ASC`,
+        cardId,
+        cardId,
+      )
+      .toArray()
+      .map((r) => this.rowToLink(r));
   }
 
   /** Store/rotate this board's GitHub webhook secret (docs/06 §3, §6). */
@@ -4032,6 +4158,36 @@ export class BoardDO extends DurableObject<Env> {
       .exec(`SELECT * FROM card_references ORDER BY created_at ASC`)
       .toArray()
       .map((r) => this.rowToReference(r));
+  }
+
+  private rowToLink(row: Row): LinkView {
+    return {
+      fromCardId: row.from_card_id as string,
+      toCardId: row.to_card_id as string,
+      kind: row.kind as LinkKind,
+      createdAt: row.created_at as string,
+      createdBy: (row.created_by as string | null) ?? null,
+    };
+  }
+
+  private mustGetLink(fromCardId: string, toCardId: string, kind: LinkKind): LinkView {
+    const row = this.sql
+      .exec(`SELECT * FROM card_links WHERE from_card_id = ? AND to_card_id = ? AND kind = ?`, fromCardId, toCardId, kind)
+      .toArray()[0];
+    if (!row) throw new Error(`invariant violation: link ${fromCardId}->${toCardId} (${kind}) missing immediately after write`);
+    return this.rowToLink(row);
+  }
+
+  /** Every edge on the board, as the pure `wouldCycle` predicate wants them — no DO-specific shape. */
+  private allLinks(): LinkRow[] {
+    return this.sql
+      .exec(`SELECT from_card_id, to_card_id, kind FROM card_links`)
+      .toArray()
+      .map((r) => ({
+        fromCardId: r.from_card_id as string,
+        toCardId: r.to_card_id as string,
+        kind: r.kind as LinkKind,
+      }));
   }
 
   private getScheduleRow(id: string): Row | null {
