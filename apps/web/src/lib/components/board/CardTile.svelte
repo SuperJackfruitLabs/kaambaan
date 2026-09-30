@@ -8,13 +8,19 @@
   import { Button } from '$lib/components/ui/button';
   import { overdue } from './card-due';
   import { enforcedBadge } from './card-blocked';
-  import { childCounter, countChildren } from './card-children';
+  import { childCounter } from './card-children';
 
   interface Props {
     card: Card;
+    /**
+     * Every card's child count, by parent id — built ONCE in `BoardKanban` and handed to every
+     * tile, rather than each tile scanning the whole board's card list itself (O(n²) across a
+     * board with many cards). See `card-children.ts#childCountsByParent`.
+     */
+    childCounts: Map<string, number>;
   }
 
-  const { card }: Props = $props();
+  const { card, childCounts }: Props = $props();
 
   // Gate is reactive — reads from app store
   const gate = $derived(app.gateForCard(card.id));
@@ -38,15 +44,15 @@
    * (Task 17c). Never re-derived from anything else here: a badge computed independently of it is
    * a badge that can eventually disagree with `claim_card`. The tile never shows the cross-board
    * `⚑ Blocked (advisory)` badge — that reads `externalLinks`, which nothing on the board grid
-   * fetches per-tile; it lives in the drawer's Blockers section instead, where the data is already
+   * fetches per-tile; it lives in the drawer's Links section instead, where the data is already
    * being fetched.
    *
-   * `children` pairs `openChildCount` (server-computed) with a sibling count taken from the
-   * board's own card list — a card with open children is never "Blocked by" anything, so the two
-   * badges can both be present and never fight over which one to show.
+   * `children` pairs `openChildCount` (server-computed) with a sibling count looked up from
+   * `childCounts` (the `Props` above) — a card with open children is never "Blocked by" anything,
+   * so the two badges can both be present and never fight over which one to show.
    */
   const blocked = $derived(enforcedBadge(card.blockedBy));
-  const totalChildren = $derived(countChildren(app.board?.cards ?? [], card.id));
+  const totalChildren = $derived(childCounts.get(card.id) ?? 0);
   const children = $derived(childCounter(card.openChildCount, totalChildren));
 
   // Reference chip helpers (ported from page.svelte)

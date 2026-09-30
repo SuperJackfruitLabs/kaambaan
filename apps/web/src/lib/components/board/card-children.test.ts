@@ -1,19 +1,27 @@
 import { describe, it, expect } from 'vitest';
-import { childCounter, countChildren } from './card-children';
+import { childCounter, childCountsByParent } from './card-children';
 
-describe('countChildren', () => {
-  it('counts cards whose parentCardId names this card', () => {
+describe('childCountsByParent', () => {
+  it('counts every card once, by its own parentCardId, in a single pass — the Map a tile then does an O(1) lookup against', () => {
     const cards = [
-      { parentCardId: 'parent' },
-      { parentCardId: 'parent' },
-      { parentCardId: null },
-      { parentCardId: 'someone-else' },
+      { id: 'c1', parentCardId: 'parent' },
+      { id: 'c2', parentCardId: 'parent' },
+      { id: 'c3', parentCardId: null },
+      { id: 'c4', parentCardId: 'someone-else' },
     ];
-    expect(countChildren(cards, 'parent')).toBe(2);
+    const counts = childCountsByParent(cards);
+    expect(counts.get('parent')).toBe(2);
+    expect(counts.get('someone-else')).toBe(1);
+    expect(counts.has('c3')).toBe(false); // no card names c3 as a parent
   });
 
-  it('is zero for a card with no children', () => {
-    expect(countChildren([{ parentCardId: null }], 'parent')).toBe(0);
+  it('gives an empty Map for a board with no parent/child edges at all', () => {
+    expect(childCountsByParent([{ parentCardId: null }]).size).toBe(0);
+  });
+
+  it('a card absent from the Map means zero children — callers use `.get(id) ?? 0`, never assume presence', () => {
+    const counts = childCountsByParent([{ parentCardId: null }]);
+    expect(counts.get('c1')).toBeUndefined();
   });
 });
 

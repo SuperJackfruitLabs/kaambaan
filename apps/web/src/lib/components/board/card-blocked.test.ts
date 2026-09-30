@@ -45,7 +45,7 @@ describe('advisoryBadge', () => {
   });
 
   it('still reads as one coherent sentence when the title falls back to a card id', () => {
-    // `blockerRows` is what actually falls back to the id when `otherCardTitle` is null — this
+    // `buildLinkGroups` (link-groups.ts) is what actually falls back to the id when `otherCardTitle` is null — this
     // just proves `advisoryBadge` treats a card id exactly like any other title string, rather
     // than needing to know the difference.
     const badge = advisoryBadge('card_x7f2', 'Design board');

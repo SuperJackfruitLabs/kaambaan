@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard, splitCard } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard, unarchiveCard, splitCard } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -611,7 +611,7 @@ describe('listLinks', () => {
     expect(result.externalLinks).toHaveLength(1);
     expect(result.externalLinks[0]!.enforced).toBe(false);
     // 17b follow-up: the route resolves the other end's title/board name per row, typed here so
-    // a consumer (`blockerRows`) doesn't have to fall back to a bare id in the common case.
+    // a consumer (`buildLinkGroups`) doesn't have to fall back to a bare id in the common case.
     expect(result.externalLinks[0]!.otherCardTitle).toBe('Fix the layout');
     expect(result.externalLinks[0]!.otherBoardName).toBe('Design board');
   });
@@ -665,6 +665,26 @@ describe('archiveCard', () => {
     const body = JSON.parse(init?.body as string) as { archivedAt: string };
     expect(typeof body.archivedAt).toBe('string');
     expect(Number.isNaN(Date.parse(body.archivedAt))).toBe(false);
+  });
+});
+
+/**
+ * Whole-branch review, Minor: un-archiving named as one of three recoveries for a parent parked by
+ * an archived child (`board-do.ts:3347`) — the other two had surfaces, this one didn't, so an
+ * archived card was a one-way door through the web app even though the route/DO already accept
+ * `archivedAt: null`.
+ */
+describe('unarchiveCard', () => {
+  it('PATCHes archivedAt to null, clearing it rather than sending a fresh timestamp', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ card: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await unarchiveCard('brd_1', 'card_a');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/boards/brd_1/cards/card_a');
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(init?.body as string)).toEqual({ archivedAt: null });
   });
 });
 

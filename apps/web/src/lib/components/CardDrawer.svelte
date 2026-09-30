@@ -13,7 +13,9 @@
     resolveGate,
     answerElicitation,
     archiveCard,
+    unarchiveCard,
     addLink,
+    removeLink,
     listLinks,
     splitCard,
     getBoard,
@@ -27,7 +29,7 @@
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
-  import { blockerRows } from '$lib/components/blocker-rows';
+  import { buildLinkGroups, type RemoveArgs } from '$lib/components/link-groups';
   import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
 
   // ---- derived from store ----
@@ -86,14 +88,21 @@
   let cardLinks = $state<CardLinks>({ links: [], externalLinks: [] });
 
   /**
-   * Blocker rows for the Blockers section — never one badge covering both kinds (Step 1). Enforced
-   * rows come from `card.blockedBy` (the same field the tile's ⛔ badge reads); advisory rows come
-   * from `cardLinks.externalLinks`, told apart by the `⚑` badge rather than anything guessed from
-   * board ids. The advisory title/board name are resolved server-side (`otherCardTitle`/
-   * `otherBoardName`, the 17b follow-up) and read straight off each row — no client-side lookup
-   * against `app.boards` needed here any more.
+   * Every edge this card has, grouped so the meanings stay distinct (whole-branch review,
+   * Important finding): rendering only `blockedBy` left a `relates` edge, or an outgoing `blocks`
+   * edge, creatable through the very dialogue below and visible NOWHERE — no row, no error, no way
+   * to know it existed or to remove it. `buildLinkGroups` (`$lib/components/link-groups`) is the
+   * one place that reads `cardLinks.links`/`cardLinks.externalLinks` for display; nothing here
+   * re-derives which edges mean what.
    */
-  const blockers = $derived(card ? blockerRows(card.id, card.blockedBy, cardLinks.externalLinks) : []);
+  const linkGroups = $derived(
+    card && boardId
+      ? buildLinkGroups(boardId, card.id, card.blockedBy, cardLinks.links, cardLinks.externalLinks, (id) => app.cardById(id)?.title ?? id)
+      : { blockedBy: [], blocks: [], relates: [], advisory: [] },
+  );
+  const hasAnyLink = $derived(
+    linkGroups.blockedBy.length > 0 || linkGroups.blocks.length > 0 || linkGroups.relates.length > 0 || linkGroups.advisory.length > 0,
+  );
 
   // ---- edit state ----
   let editing = $state(false);
@@ -345,6 +354,30 @@
     }
   }
 
+  /**
+   * Un-archive: whole-branch review, Minor. `board-do.ts:3347` names un-archiving as one of THREE
+   * recoveries for a parent parked by an archived child; the other two already had a surface here
+   * and this one didn't, so an archived card was a one-way door through the web app even though
+   * the route/DO have always accepted `archivedAt: null`. Does not close the drawer — unlike
+   * archiving, un-archiving does not drop the card out of the CURRENT view (`passesArchivedFilter`
+   * shows an archived card either way once "show archived" is on, which is how this drawer was
+   * reached in the first place).
+   */
+  async function onUnarchiveCard(): Promise<void> {
+    if (!boardId || !cardId) return;
+    archiving = true;
+    try {
+      const res = await unarchiveCard(boardId, cardId);
+      if (res.ok) {
+        await app.refresh();
+      } else {
+        localError = `Couldn't un-archive the card (${res.status})`;
+      }
+    } finally {
+      archiving = false;
+    }
+  }
+
   // ---- sub-tasks (Step 1b) ----
   // "Add sub-task" reuses Task 15's split (one title in, one child out) rather than
   // createCard + addLink('parent'): createCard's wrapper discards its response body, so it
@@ -442,6 +475,36 @@
       if (cardId && boardId) void refreshDrawer(cardId, boardId);
     } finally {
       addingBlocker = false;
+    }
+  }
+
+  // ---- remove a link (whole-branch review, Important) ----
+  // Every group rendered below (`linkGroups`) carries a `remove` field that is EXACTLY the
+  // argument tuple `removeLink` takes — computed once, in `buildLinkGroups`, from the edge's own
+  // stored from/to/board ids, never reconstructed here. For an advisory row that means `boardId`
+  // is the edge's OWN `fromBoardId` (which may not be THIS card's board at all) and `toBoardId`
+  // names the other side — the same asymmetric contract `submitAddBlocker` already follows for
+  // creation, so removal targets the same store creation would have written to.
+  let removingKeys = $state(new Set<string>());
+  let linksError = $state<string | null>(null);
+
+  async function onRemoveLink(args: RemoveArgs, key: string): Promise<void> {
+    if (removingKeys.has(key)) return;
+    removingKeys = new Set(removingKeys).add(key);
+    linksError = null;
+    try {
+      const res = await removeLink(args.boardId, args.fromCardId, args.toCardId, args.kind, args.toBoardId);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        linksError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      await app.refresh();
+      if (cardId && boardId) void refreshDrawer(cardId, boardId);
+    } finally {
+      const next = new Set(removingKeys);
+      next.delete(key);
+      removingKeys = next;
     }
   }
 
@@ -974,30 +1037,95 @@
         {/if}
 
         <!--
-          Blockers (Step 1/1b) — same-board (⛔ enforced) and cross-board (⚑ advisory) never share
-          a row style. `blockers` (script, above) is built from `card.blockedBy` +
-          `cardLinks.externalLinks`, never re-derived from card state here.
+          Links (whole-branch review, Important finding) — EVERY edge this card has, in four
+          groups that never share a row style, because a person could otherwise create a `relates`
+          edge or an outgoing `blocks` edge through the dialogue below and never see it rendered
+          anywhere: what blocks this card (enforced, ⛔), what this card blocks, what it merely
+          relates to, and the advisory cross-board ones — each with its own "remove" control, since
+          `removeLink` (Task 17a) had shipped with zero callers in this app.
         -->
         <section class="sec">
-          <div class="sec-h eyebrow">blockers</div>
-          {#if blockers.length > 0}
+          <div class="sec-h eyebrow">links</div>
+
+          {#if linkGroups.blockedBy.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocked by</div>
             <div class="mb-2.5 space-y-1.5">
-              {#each blockers as row (row.boardId ?? 'same' + row.cardId)}
-                <div
-                  class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]"
-                  title={row.badge.tooltip}
-                >
-                  <span class={row.badge.glyph === '⛔' ? 'blk-pill' : 'blk-pill blk-pill-advisory'}>{row.badge.glyph}</span>
+              {#each linkGroups.blockedBy as row (row.cardId)}
+                {@const key = `blockedBy:${row.cardId}`}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]" title={row.badge.tooltip}>
+                  <span class="blk-pill">{row.badge.glyph}</span>
                   <span class="min-w-0 flex-1 truncate">{row.title}</span>
-                  <span class="text-muted-foreground shrink-0">{row.badge.label}</span>
+                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
                 </div>
               {/each}
             </div>
-          {:else}
-            <p class="text-muted-foreground mb-2.5 text-xs">Nothing is blocking this card.</p>
           {/if}
 
-          <Button size="sm" variant="outline" onclick={openAddBlocker}>Add blocker</Button>
+          {#if linkGroups.blocks.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocks</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.blocks as row (row.cardId)}
+                {@const key = `blocks:${row.cardId}`}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.relates.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">relates to</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.relates as row (row.cardId)}
+                {@const key = `relates:${row.cardId}`}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.advisory.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">advisory (other boards)</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.advisory as row (row.boardId + ':' + row.cardId + ':' + row.kind)}
+                {@const key = `advisory:${row.boardId}:${row.cardId}:${row.kind}`}
+                <div
+                  class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]"
+                  title={row.badge?.tooltip ?? `${row.relation === 'blocks' ? 'Blocks' : 'Relates to'} ${row.title} on another board — advisory, not enforced`}
+                >
+                  {#if row.badge}
+                    <span class="blk-pill blk-pill-advisory">{row.badge.glyph}</span>
+                  {/if}
+                  <span class="min-w-0 flex-1 truncate">
+                    {row.title}
+                    {#if row.relation !== 'blocked-by'}<span class="text-muted-foreground">· {row.relation}</span>{/if}
+                  </span>
+                  <button onclick={() => void onRemoveLink(row.remove, key)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if !hasAnyLink}
+            <p class="text-muted-foreground mb-2.5 text-xs">No links on this card.</p>
+          {/if}
+
+          {#if linksError}
+            <p role="alert" class="text-coral mono mb-2.5 text-[11px]">{linksError}</p>
+          {/if}
+
+          <Button size="sm" variant="outline" onclick={openAddBlocker}>Add link</Button>
 
           {#if addBlockerOpen}
             <div class="bg-inset border-border mt-2.5 space-y-2 rounded-[8px] border p-3 text-xs">
@@ -1339,11 +1467,17 @@
           </div>
         </section>
 
-        <!-- archive / delete -->
+        <!-- archive / un-archive / delete -->
         <div class="border-border/60 flex gap-3 border-t pt-4">
-          <button onclick={() => void onArchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
-            {archiving ? 'Archiving…' : 'Archive card'}
-          </button>
+          {#if card.archivedAt}
+            <button onclick={() => void onUnarchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
+              {archiving ? 'Un-archiving…' : 'Archived — un-archive'}
+            </button>
+          {:else}
+            <button onclick={() => void onArchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
+              {archiving ? 'Archiving…' : 'Archive card'}
+            </button>
+          {/if}
           <button onclick={onDeleteCard} class="text-muted-foreground hover:text-coral text-xs">Delete card</button>
         </div>
       </div>

@@ -4,6 +4,7 @@
   import CardTile from './CardTile.svelte';
   import StageStepper from '$lib/components/plan/StageStepper.svelte';
   import { blockedCountInStage } from './board-counts';
+  import { childCountsByParent } from './card-children';
 
   /** The lane scroller, so the stepper can observe which lane is on screen and scroll to one. */
   let scroller = $state<HTMLElement | null>(null);
@@ -14,6 +15,16 @@
   function cardsInStage(stageKey: string) {
     return app.filteredCards().filter((c) => c.currentStageKey === stageKey);
   }
+
+  /**
+   * Every card's child count, by parent id — built ONCE per render here, not once per tile.
+   *
+   * A tile used to scan `app.board.cards` itself (`cards.filter(c => c.parentCardId === id)`)
+   * inside its own `$derived`, which is O(n) work repeated for every one of the n tiles on the
+   * board — O(n²) overall. Computed once and handed down, same fix the server side already made
+   * with `rowToCard`'s `pre` argument (Task 14) and for the same reason.
+   */
+  const childCounts = $derived(childCountsByParent(app.board?.cards ?? []));
 </script>
 
 {#if app.board}
@@ -104,7 +115,7 @@
             </div>
           {/if}
           {#each cards as card (card.id)}
-            <CardTile {card} />
+            <CardTile {card} {childCounts} />
           {/each}
         </div>
       </section>

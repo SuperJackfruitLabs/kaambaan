@@ -538,17 +538,32 @@ export function archiveCard(boardId: string, cardId: string): Promise<Response> 
   return updateCard(boardId, cardId, { archivedAt: new Date().toISOString() });
 }
 
+/**
+ * Un-archive a card: `PATCH archivedAt` to `null`. Whole-branch review, Minor: `board-do.ts:3347`
+ * names un-archiving as one of three recoveries for a parent parked by an archived child — the
+ * other two already had a surface, this one didn't, making an archived card a one-way door through
+ * the web app even though the route/DO have always accepted `archivedAt: null`.
+ */
+export function unarchiveCard(boardId: string, cardId: string): Promise<Response> {
+  return updateCard(boardId, cardId, { archivedAt: null });
+}
+
 /** Dependencies and sub-task containment (spec §3.4) — one table on the DO, told apart by `kind`. */
 export type LinkKind = 'blocks' | 'relates' | 'parent';
 
-/** A same-board edge (Task 12's `card_links`, read on the claim path — this one is enforced). */
+/**
+ * A same-board edge (Task 12's `card_links`, read on the claim path). NOT always enforced: the
+ * route stamps `enforced: kind !== 'relates'` (whole-branch review fix, commit `166abfe`) — a
+ * `relates` edge is decoration, consulted nowhere `blockedWhere` looks, so it reads `false` here
+ * exactly like a cross-board `ExternalLink` does, even though it lives in the same-board store.
+ */
 export interface Link {
   fromCardId: string;
   toCardId: string;
   kind: LinkKind;
   createdAt: string;
   createdBy: string | null;
-  enforced: true;
+  enforced: boolean;
 }
 
 /**

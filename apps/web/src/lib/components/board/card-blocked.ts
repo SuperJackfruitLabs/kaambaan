@@ -40,10 +40,11 @@ export function enforcedBadge(blockedBy: EnforcedBlocker[]): BlockedBadge | null
  * claim query on this board cannot see another board's rows at all.
  *
  * `title` is a plain string, not `string | null` — the null case (the server could not resolve the
- * other card's title, `GET .../links`'s `otherCardTitle`) is a real state, but it is `blockerRows`'
- * job to decide the fallback (the card id), not this function's. By the time a title reaches here
- * it is always something to show; `advisoryBadge` cannot tell a real title from an id and does not
- * need to — either way the tooltip reads as one full sentence, never "Blocked by  on Board".
+ * other card's title, `GET .../links`'s `otherCardTitle`) is a real state, but it is
+ * `link-groups.ts#buildLinkGroups`' job to decide the fallback (the card id), not this function's.
+ * By the time a title reaches here it is always something to show; `advisoryBadge` cannot tell a
+ * real title from an id and does not need to — either way the tooltip reads as one full sentence,
+ * never "Blocked by  on Board".
  */
 export function advisoryBadge(title: string, boardName: string | null): BlockedBadge {
   const onBoard = boardName ? ` on ${boardName}` : '';
