@@ -21,6 +21,7 @@ describe('MCP tools — registration', () => {
       'superpipeline_list_work',
       'superpipeline_post_activity',
       'superpipeline_release',
+      'superpipeline_split_card',
       'superpipeline_submit_for_review',
     ]);
     expect(byName.get('superpipeline_list_work')!.annotations).toMatchObject({ readOnlyHint: true, idempotentHint: true });

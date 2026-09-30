@@ -140,6 +140,11 @@ function statusForCode(code: BoardErrorCode): number {
     // caller believed in, not a malformed request.
     case 'CARD_BLOCKED':
       return 409;
+    // Malformed requests: too many lines, or nothing usable once stripped. The same payload will
+    // never succeed unless the caller changes it, unlike the conflict codes above.
+    case 'TOO_MANY_CHILDREN':
+    case 'NOTHING_TO_SPLIT':
+      return 400;
   }
 }
 
@@ -1380,6 +1385,26 @@ export default {
         const result = await stub.deleteCard(cardMatch[1]!);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return new Response(null, { status: 204 });
+      }
+
+      // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
+      // per (non-blank) line (Task 15, spec §3.4). A human/web route: the agent path reaches
+      // `splitCard` through `superpipeline_split_card` (scope `run`) instead, calling the same DO
+      // method directly — this route and that tool are the same contract on two wires.
+      const splitMatch = rest.match(/^cards\/([^/]+)\/split$/);
+      if (splitMatch && request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { titles?: unknown } | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        // Shape-checked here — the DO trusts its callers by design — so a malformed body answers
+        // 400 rather than reaching `splitCard` and failing in a way that points at the wrong layer.
+        if (!Array.isArray(body.titles) || body.titles.some((t) => typeof t !== 'string')) {
+          return Response.json({ error: { message: '`titles` is required and must be an array of strings.' } }, { status: 400 });
+        }
+        const result = await stub.splitCard(splitMatch[1]!, body.titles as string[], user?.userId ?? 'usr_dev');
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ children: result.value.children }, { status: 201 });
       }
 
       // PUT /v1/boards/:id/cards/:cardId/references — idempotent reference upsert (docs/06 §1)

@@ -44,7 +44,7 @@ export interface McpAuth {
  * Reads are unscoped, for the reason `requiredScope` gives about `gates/pending`: they name nobody
  * and carry no authority.
  */
-const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
+export const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
   superpipeline_claim_card: 'claim',
   superpipeline_heartbeat: 'run',
   superpipeline_post_activity: 'run',
@@ -54,6 +54,11 @@ const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
   superpipeline_release: 'run',
   superpipeline_fail: 'run',
   superpipeline_add_reference: 'run',
+  // Decomposition is something an agent does to ITS OWN card mid-run — not the roster credential
+  // that takes work off the board. `run` is exactly the credential a dispatched agent holds for
+  // the one card it is working (Task 15); `claim` would hand the power to manufacture more work to
+  // the thing whose only job is taking it.
+  superpipeline_split_card: 'run',
 };
 
 export interface ToolDeps {
@@ -208,6 +213,19 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
           resolveReferenceInput({ cardId, url, provider, sourceType, title, subtitle, externalId, metadata, addedBy: 'agent' }),
         ),
       ),
+  );
+
+  register(
+    'superpipeline_split_card',
+    {
+      description:
+        'Split the card you are working on into sub-cards, one per line, when the work has independent ' +
+        'parts that different capabilities should pick up. Each becomes a real card that can be claimed ' +
+        'separately. Your card will not advance until all of them are resolved.',
+      inputSchema: { boardId: z.string(), cardId: z.string(), titles: z.array(z.string()).min(1) },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ boardId, cardId, titles }) => fromResult(await deps.boardStub(boardId).splitCard(cardId, titles, auth.agentId)),
   );
 
   register(

@@ -42,6 +42,25 @@ function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined 
   return rest;
 }
 
+/**
+ * Turn one pasted/typed line into a title, the way `splitCard` (Task 15) does for every line it is
+ * given. The input is whatever a human or an agent pasted — often a markdown checklist — so
+ * `- [ ] Write the spec` must not become a card titled `- [ ] Write the spec`.
+ *
+ * Stripped in order: a leading `-`/`*`/`<digit>.` bullet, then a `[ ]`/`[x]` checkbox, then
+ * whitespace. A line that is blank before or after stripping comes back `''`, which `splitCard`
+ * filters out rather than turning into an untitled card.
+ */
+function stripListLineSyntax(raw: string): string {
+  let s = raw.trim();
+  s = s.replace(/^(?:[-*]|\d+\.)\s*/, ''); // bullet: "-", "*", or "2."
+  s = s.replace(/^\[[ xX]\]\s*/, ''); // checkbox: "[ ]" or "[x]"/"[X]"
+  return s.trim();
+}
+
+/** The most children one `splitCard` call may create — see its doc comment. */
+const MAX_SPLIT_CHILDREN = 20;
+
 /** How long an agent may go without a heartbeat before its run is reclaimed (docs/08 §3, ⚠️ OPEN). */
 const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
 /** Consecutive failed/reclaimed runs before a card auto-blocks for a human (docs/08 §4, ⚠️ OPEN). */
@@ -721,7 +740,9 @@ export type BoardErrorCode =
   | 'NO_SUCH_CARD'
   | 'LINK_WOULD_CYCLE'
   | 'ALREADY_HAS_PARENT'
-  | 'CARD_BLOCKED';
+  | 'CARD_BLOCKED'
+  | 'TOO_MANY_CHILDREN'
+  | 'NOTHING_TO_SPLIT';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -742,6 +763,11 @@ export interface BoardStub {
     parentCardId: string,
     input: { title: string; ownerUserId: string; spec?: JsonValue; priority?: number },
   ): Promise<Result<CardView>>;
+  /**
+   * Split a card into several children at once, one per (non-blank) line — the agent-facing
+   * decomposition tool (Task 15, spec §3.4). `actorUserId` becomes each child's `ownerUserId`.
+   */
+  splitCard(cardId: string, titles: string[], actorUserId: string): Promise<Result<{ children: CardView[] }>>;
   moveCard(
     cardId: string,
     toStageKey: string,
@@ -1378,6 +1404,51 @@ export class BoardDO extends DurableObject<Env> {
     const linked = await this.addLink({ fromCardId: parentCardId, toCardId: created.value.id, kind: 'parent' });
     if (!linked.ok) return { ok: false, code: linked.code, message: linked.message };
     return { ok: true, value: this.mustGetCard(created.value.id) };
+  }
+
+  /**
+   * Split a card into several children at once — the tool that makes the parent/child construct
+   * worth having (Task 15, spec §3.4): an agent decomposing the card it is working on into pieces
+   * different capabilities can pick up in parallel, mid-run. Built on `createChildCard` (one call
+   * per line), not on `addLink` directly, so it inherits that method's parentage and priority rules
+   * unchanged.
+   *
+   * All-or-nothing on the two refusals:
+   *  - more than `MAX_SPLIT_CHILDREN` lines ⇒ `TOO_MANY_CHILDREN`, before anything is created.
+   *    Partially creating 20 of 21 would be worse than refusing outright, because the caller could
+   *    not tell which of its lines had succeeded.
+   *  - every line blank (before or after stripping) ⇒ `NOTHING_TO_SPLIT`, rather than silently
+   *    succeeding with an empty `children` array.
+   *
+   * Deliberately NOT idempotent: calling this twice with the same titles creates two separate sets
+   * of children. De-duplicating by title would silently drop a legitimately repeated sub-task — the
+   * tool description tells the caller to call it once, and the UI confirms before a second call.
+   */
+  async splitCard(cardId: string, titles: string[], actorUserId: string): Promise<Result<{ children: CardView[] }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    if (!this.getCard(cardId)) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${cardId}` };
+    }
+    if (titles.length > MAX_SPLIT_CHILDREN) {
+      return {
+        ok: false,
+        code: 'TOO_MANY_CHILDREN',
+        message: `a card may be split into at most ${MAX_SPLIT_CHILDREN} children in one call, not ${titles.length}`,
+      };
+    }
+    const cleanedTitles = titles.map(stripListLineSyntax).filter((t) => t.length > 0);
+    if (cleanedTitles.length === 0) {
+      return { ok: false, code: 'NOTHING_TO_SPLIT', message: 'every line was blank — nothing to split into' };
+    }
+    const children: CardView[] = [];
+    for (const title of cleanedTitles) {
+      const created = await this.createChildCard(cardId, { title, ownerUserId: actorUserId });
+      if (!created.ok) return created;
+      children.push(created.value);
+    }
+    return { ok: true, value: { children } };
   }
 
   /**
