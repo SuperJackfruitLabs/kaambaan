@@ -3158,6 +3158,27 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * `cardId`'s open children (via the `parent` edge), id and title, oldest first — for the
+   * deferred-advance park notification (`advanceCard`). A card can be "open" here forever without
+   * ever resolving: `rejected` is deliberately outside `RESOLVED_SQL` (a rejected blocker must keep
+   * blocking, same reasoning as a failed one), and an archived child is excluded from `claimableWhere`
+   * so it can never be claimed to completion either. Both are recoverable with existing verbs
+   * (delete the child, `removeLink` it, un-archive and finish it), but neither is visible from the
+   * parked parent alone — hence naming the children, not just the count.
+   */
+  private openChildren(cardId: string): { id: string; title: string }[] {
+    return this.sql
+      .exec(
+        `SELECT ch.id, ch.title FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+           WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
+           ORDER BY ch.created_at ASC`,
+        cardId,
+      )
+      .toArray()
+      .map((r) => ({ id: r.id as string, title: r.title as string }));
+  }
+
+  /**
    * How many unresolved blockers (via the `blocks` edge, `cardId` as target) `cardId` has. Used
    * only to decide whether `moveCard`'s human-override notification fires — a `blocks` edge never
    * refuses the move itself.
@@ -3893,6 +3914,19 @@ export class BoardDO extends DurableObject<Env> {
         cardId,
       );
       this.emit('card.advance_deferred', { cardId, openChildren });
+      // A human has no other way to learn this happened: unlike `moveCard`'s `CARD_BLOCKED`
+      // refusal (Task 13), nothing here rejects anything the owner did, so there is no error to
+      // see. Some open children never resolve on their own (`openChildren`'s own comment) and the
+      // recovery is an existing verb, not automatic — so name them, not just the count, or the
+      // owner has a parked card and nothing explaining why.
+      this.notify(
+        'advance-deferred',
+        cardId,
+        `waiting on ${openChildren} sub-task${openChildren === 1 ? '' : 's'}: ` +
+          this.openChildren(cardId)
+            .map((c) => `${c.title} (${c.id})`)
+            .join(', '),
+      );
       return;
     }
     const stages = this.stages();
@@ -3964,6 +3998,14 @@ export class BoardDO extends DurableObject<Env> {
    * `pending_advance_json` before calling `advanceCard` (rather than after) means a parent that
    * turns out to have open children again by the time the replay runs — not reachable via either
    * caller today, but defensive against a future one — cannot re-defer onto a stale record.
+   *
+   * That clear-before-call ordering has a cost: `advanceCard`'s `idx === -1` guard (stored
+   * `fromStageKey` not found in the board's current stage list) returns silently, and by then the
+   * record is already gone — so if that guard were ever hit here, the parent would be stranded with
+   * nothing left to recheck. Not reachable today — `setStages` refuses to remove a stage holding any
+   * card, `countInStage` counts every state so a parked card still holds its stage, and nothing ever
+   * moves a parked card's `current_stage_key` — but that safety rests on those three facts staying
+   * true elsewhere in this file, not on anything local to this method.
    */
   private resumeParentAdvanceIfFree(parentId: string): void {
     const row = this.sql.exec(`SELECT pending_advance_json FROM cards WHERE id = ?`, parentId).toArray()[0];
@@ -4406,8 +4448,10 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   private allCards(): CardView[] {
-    // Precompute per-card cost + attempt count in two grouped queries instead of N point queries —
-    // allCards() feeds every snapshot, which is the live-feed hot path.
+    // Precompute per-card cost + attempt count in grouped queries instead of N point queries —
+    // allCards() feeds every snapshot, which is the live-feed hot path. Task 14's three child-card
+    // fields (`parentCardId`, `openChildCount`, the cost half of `costUsdRollup`) joined this same
+    // batch rather than adding three more point queries per card back onto `rowToCard`.
     const costByCard = new Map<string, number>();
     for (const r of this.sql.exec(`SELECT card_id, COALESCE(SUM(cost_usd), 0) AS c FROM usage_records GROUP BY card_id`).toArray()) {
       costByCard.set(r.card_id as string, Number(r.c));
@@ -4416,17 +4460,67 @@ export class BoardDO extends DurableObject<Env> {
     for (const r of this.sql.exec(`SELECT card_id, COUNT(*) AS n FROM runs GROUP BY card_id`).toArray()) {
       attemptsByCard.set(r.card_id as string, Number(r.n));
     }
+    // Child → parent, over every `parent` edge on the board — one row per child, so a direct map.
+    const parentByChild = new Map<string, string>();
+    for (const r of this.sql.exec(`SELECT to_card_id, from_card_id FROM card_links WHERE kind = 'parent'`).toArray()) {
+      parentByChild.set(r.to_card_id as string, r.from_card_id as string);
+    }
+    // Parent → its open-child count, the same rule `openChildCount` asks per-card, grouped instead.
+    const openChildCountByParent = new Map<string, number>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.from_card_id AS parent_id, COUNT(*) AS n FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+           WHERE l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL} GROUP BY l.from_card_id`,
+      )
+      .toArray()) {
+      openChildCountByParent.set(r.parent_id as string, Number(r.n));
+    }
+    // Parent → its children's summed cost, the same query `childrenCost` runs per-card, grouped.
+    const childrenCostByParent = new Map<string, number>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.from_card_id AS parent_id, COALESCE(SUM(u.cost_usd), 0) AS c FROM card_links l
+           JOIN usage_records u ON u.card_id = l.to_card_id
+          WHERE l.kind = 'parent' GROUP BY l.from_card_id`,
+      )
+      .toArray()) {
+      childrenCostByParent.set(r.parent_id as string, Number(r.c));
+    }
     return this.sql
       .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
       .toArray()
-      .map((r) => this.rowToCard(r, { costUsd: costByCard.get(r.id as string) ?? 0, attemptCount: attemptsByCard.get(r.id as string) ?? 0 }));
+      .map((r) => {
+        const id = r.id as string;
+        return this.rowToCard(r, {
+          costUsd: costByCard.get(id) ?? 0,
+          attemptCount: attemptsByCard.get(id) ?? 0,
+          parentCardId: parentByChild.get(id) ?? null,
+          openChildCount: openChildCountByParent.get(id) ?? 0,
+          childrenCost: childrenCostByParent.get(id) ?? 0,
+        });
+      });
   }
 
-  private rowToCard(row: Row, pre?: { costUsd: number; attemptCount: number }): CardView {
+  private rowToCard(
+    row: Row,
+    pre?: {
+      costUsd: number;
+      attemptCount: number;
+      parentCardId: string | null;
+      openChildCount: number;
+      childrenCost: number;
+    },
+  ): CardView {
     const id = row.id as string;
     const costUsd = pre?.costUsd ?? this.cardCost(id);
     const cardCap = this.budgetCap('budgetCardUsdCap');
     const attemptCount = pre?.attemptCount ?? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM runs WHERE card_id = ?`, id).one().n);
+    // `pre` (not `??`) for these three: `parentCardId` is legitimately `null` for most cards, and
+    // `??` would treat a batched `null` as "missing" and re-query — still correct, just defeating
+    // the batch it's here to avoid.
+    const parentCardId = pre ? pre.parentCardId : this.parentIdOf(id);
+    const openChildCount = pre ? pre.openChildCount : this.openChildCount(id);
+    const childrenCost = pre ? pre.childrenCost : this.childrenCost(id);
     return {
       id,
       title: row.title as string,
@@ -4449,13 +4543,13 @@ export class BoardDO extends DurableObject<Env> {
       // chip appears exactly when billing stops.
       overBudget: cardCap !== null && costUsd >= cardCap,
       attemptCount,
-      parentCardId: this.parentIdOf(id),
-      openChildCount: this.openChildCount(id),
+      parentCardId,
+      openChildCount,
       // Own cost plus one level of children. One level, not recursive: nesting deeper than one is
       // not a shape this board model encourages, and an unbounded walk inside `rowToCard` would run
       // on every card of every board read. NOT folded into `costUsd` above — see that field's own
       // comment on `CardView` and `childrenCost`'s, below `cardCost`.
-      costUsdRollup: costUsd + this.childrenCost(id),
+      costUsdRollup: costUsd + childrenCost,
     };
   }
 

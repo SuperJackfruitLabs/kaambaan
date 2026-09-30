@@ -11,6 +11,14 @@ const TWO_STAGES: BoardInit['stages'] = [
   { key: 'ship', name: 'Ship', order: 1, ownerKind: 'capability', owner: 'writing' },
 ];
 
+// draft (agent) → review (human approval gate) — lets a CHILD reach 'rejected', the one genuinely
+// terminal-but-unresolved state a card can reach today (see links-enforcement.test.ts's note on
+// GATED_STAGES for why this is the only way there without a verb that writes 'failed' directly).
+const GATED_STAGES: BoardInit['stages'] = [
+  { key: 'draft', name: 'Draft', order: 0, ownerKind: 'capability', owner: 'writing' },
+  { key: 'review', name: 'Review', order: 1, ownerKind: 'human', gate: 'approval' },
+];
+
 function stubFor(name: string): DurableObjectStub<BoardDO> {
   return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
 }
@@ -268,6 +276,68 @@ describe('the deferred advance', () => {
       const finalParent = (await board.getState()).cards.find((c) => c.id === p.value.id)!;
       expect(finalParent.openChildCount).toBe(0);
       expect(finalParent.state).toBe('completed'); // resumed, not stranded
+    });
+  });
+
+  // Unlike `moveCard`'s `CARD_BLOCKED` refusal (Task 13), the park is not a refusal of anything the
+  // owner did — there is no error surface for them to see it on. Only `notify()` tells them.
+  it('notifies the owner, naming the blocking children, the moment it parks', async () => {
+    await runInDurableObject(stubFor('sub-defer-notify'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_sdn', tenantId: 'tnt_a', name: 'SDN', stages: STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_owner' });
+      if (!p.ok) throw new Error(p.message);
+      const cParent = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!cParent.claimed) throw new Error('expected the parent to be claimable');
+      const child = await board.createChildCard(p.value.id, { title: 'Sub-task one', ownerUserId: 'usr_a' });
+      if (!child.ok) throw new Error(child.message);
+
+      await board.complete({ runId: cParent.runId, leaseEpoch: cParent.leaseEpoch, handoff: { summary: 'split' } });
+
+      const notifications = await board.getNotifications({ userId: 'usr_owner' });
+      const parked = notifications.find((n) => n.kind === 'advance-deferred' && n.cardId === p.value.id);
+      expect(parked).toBeDefined();
+      expect(parked!.body).toContain('1 sub-task');
+      expect(parked!.body).toContain('Sub-task one');
+      expect(parked!.body).toContain(child.value.id);
+    });
+  });
+
+  // The motivating case: a REJECTED child is deliberately outside `RESOLVED_SQL` (the same rule
+  // that keeps a rejected `blocks` edge blocking forever), so `openChildCount` never reaches zero on
+  // its own and the parent never auto-resumes. It is still recoverable (delete the child, unlink
+  // it, or — not applicable to a rejected card — finish it), but nothing makes that obvious except
+  // the park notification itself.
+  it('parks indefinitely (by design) when the child is rejected, but still tells the owner why', async () => {
+    await runInDurableObject(stubFor('sub-defer-rejected-child'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_sdrc', tenantId: 'tnt_a', name: 'SDRC', stages: GATED_STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_owner' });
+      if (!p.ok) throw new Error(p.message);
+      const cParent = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!cParent.claimed) throw new Error('expected the parent to be claimable');
+      const child = await board.createChildCard(p.value.id, { title: 'Doomed sub-task', ownerUserId: 'usr_a' });
+      if (!child.ok) throw new Error(child.message);
+      await board.complete({ runId: cParent.runId, leaseEpoch: cParent.leaseEpoch, handoff: { summary: 'split' } });
+
+      // Drive the child to 'rejected': complete its 'draft' stage (opens the review gate), then
+      // reject.
+      const cChild = await board.claim({ agentId: 'agt_w2', capabilities: ['writing'] });
+      if (!cChild.claimed) throw new Error('expected the child to be claimable');
+      await board.complete({ runId: cChild.runId, leaseEpoch: cChild.leaseEpoch, handoff: { summary: 'child drafted' } });
+      const gate = (await board.getState()).gates.find((g) => g.cardId === child.value.id);
+      if (!gate) throw new Error('expected a review gate on the child');
+      const rejected = await board.resolveGate({ gateId: gate.id, decision: 'reject', decidedBy: 'usr_reviewer' });
+      expect(rejected.ok).toBe(true);
+      if (rejected.ok) expect(rejected.value.state).toBe('rejected');
+
+      // The child is terminal but never "resolved" — the parent stays parked, not stranded silently:
+      // it was already told, at park time, exactly what it is waiting on.
+      const finalParent = (await board.getState()).cards.find((c) => c.id === p.value.id)!;
+      expect(finalParent.state).toBe('input-required');
+      expect(finalParent.openChildCount).toBe(1);
+      const notifications = await board.getNotifications({ userId: 'usr_owner' });
+      const parked = notifications.find((n) => n.kind === 'advance-deferred' && n.cardId === p.value.id);
+      expect(parked).toBeDefined();
+      expect(parked!.body).toContain('Doomed sub-task');
     });
   });
 });
