@@ -3353,7 +3353,9 @@ Run: `cd apps/web && pnpm check && pnpm test`
 
 ```bash
 git push -u origin feat/planning-phase3-links
-gh pr create --title "feat: dependencies and sub-tasks" --body "<see plan>"
+gh pr create --title "feat: dependencies and sub-tasks" --body-file /dev/stdin <<'BODY'
+# write the body from THIS task's text: what shipped, the two badge kinds, and the live-check results
+BODY
 ```
 
 - [ ] **Step 4: THE LIVE CHECK**
@@ -3399,7 +3401,31 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 
 **Files:**
 - Create: `apps/api/migrations/0013_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
-- Test: `apps/api/test/projects.test.ts` (create)
+- Modify: **`apps/api/src/index.ts`** — the project and milestone CRUD routes. Without them Task 20's
+  `supi project list|add|show|rm`, `supi milestone add|rm`, and the Projects view's own "new project"
+  and "add milestone" controls all call endpoints that do not exist:
+
+  | route | does |
+  |---|---|
+  | `GET    /v1/projects` | list the tenant's projects |
+  | `POST   /v1/projects` | create; body `{name, description?, targetDate?, leadUserId?}` |
+  | `GET    /v1/projects/:id` | one project with its milestones in `sortOrder` |
+  | `PATCH  /v1/projects/:id` | `name`, `description`, `targetDate`, `state`, `health`, `leadUserId` |
+  | `DELETE /v1/projects/:id` | delete; milestones cascade (`ON DELETE CASCADE`) |
+  | `POST   /v1/projects/:id/milestones` | create; body `{name, targetDate?, sortOrder?}` |
+  | `DELETE /v1/milestones/:id` | delete one milestone |
+
+  Validate `targetDate` with the **same** `^\d{4}-\d{2}-\d{2}$` validator Task 5 added, reused not
+  rewritten, and `state`/`health` against the same unions the module exports. `GET /v1/projects/:id/rollup`
+  belongs to Task 19, not here.
+
+  **Why this is in Task 18 rather than Task 20.** This plan has now shipped two modules whose callers
+  were specified before their routes were: Task 12's `addLink` reached Task 17 with no HTTP surface,
+  and this would have been the same mistake a third time. A D1 module and the routes that expose it
+  belong to one task, so a reviewer who can reject one can reject both.
+- Test: `apps/api/test/projects.test.ts` (create), `apps/api/test/projects-rest.test.ts` (create) —
+  route-level tests following `labels-rest.test.ts`, including a `targetDate` rejection and a
+  cross-tenant read returning 404 rather than another tenant's project
 
 **Interfaces:**
 - Produces:
@@ -3768,7 +3794,9 @@ Add a short section on what stops a card advancing: an open child, and (for a cl
 git add docs/
 git commit -m "docs: record what shipped, decline cycles, and correct two stale claims in 13"
 git push -u origin feat/planning-phase4-projects
-gh pr create --title "feat: projects and milestones" --body "<see plan>"
+gh pr create --title "feat: projects and milestones" --body-file /dev/stdin <<'BODY'
+# write the body from THIS task's text: the rollup's staleness contract, and the live-check results
+BODY
 ```
 
 Then, live:
