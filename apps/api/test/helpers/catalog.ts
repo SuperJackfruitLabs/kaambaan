@@ -7,6 +7,7 @@ import userExternalMapping from '../../migrations/0008_user_external_mapping.sql
 import tenantForgeHost from '../../migrations/0009_tenant_forge_host.sql?raw';
 import labels from '../../migrations/0010_labels.sql?raw';
 import labelsOrigin from '../../migrations/0011_labels_origin.sql?raw';
+import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -109,5 +110,12 @@ export async function setupCatalog(): Promise<void> {
   // ALTER-TABLE migration mirrored above.
   if (!(await tableHasColumn('labels', 'origin'))) {
     for (const s of statementsOf(labelsOrigin)) await env.DB.prepare(s).run();
+  }
+  // 0012's `card_links_external` keeps its `REFERENCES boards(id)`/`REFERENCES tenants(id)` FKs and
+  // its `from_card_id <> to_card_id` CHECK — the real migration file is run as-is (see the module
+  // comment on `labels` above), which is the point: `test/card-links-external.test.ts` asserts that
+  // behaviour, and `boards` already exists in this catalogue so the FK is satisfiable.
+  if (!(await tableExists('card_links_external'))) {
+    for (const s of statementsOf(cardLinksExternal)) await env.DB.prepare(s).run();
   }
 }
