@@ -210,3 +210,77 @@ describe('a parent does not advance past an open child', () => {
     });
   });
 });
+
+// Shape follows test/board-push.test.ts:14 — register, act, read getPushDeliveries().
+describe('the third eligibility site: push notifications respect the blocked rule', () => {
+  const HOOK = 'https://agent.example/hook';
+
+  it('does not queue a work.available delivery for a blocked card', async () => {
+    await runInDurableObject(stubFor('enf-push-blocked'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_enfpushblocked', tenantId: 'tnt_a', name: 'EPB', stages: STAGES });
+      const reg = await board.registerPushConfig({ agentId: 'agt_w', url: HOOK, token: 's', capabilities: ['writing'], events: ['work.available'] });
+      expect(reg.ok).toBe(true);
+
+      const aR = await board.createCard({ title: 'Blocker', ownerUserId: 'usr_a' }); // delivery #1
+      const bR = await board.createCard({ title: 'Blocked', ownerUserId: 'usr_a' }); // delivery #2 (not blocked yet)
+      if (!aR.ok || !bR.ok) throw new Error('setup failed');
+      const a = aR.value;
+      const b = bR.value;
+
+      // Claim both (a first — created first, same priority — then b) so each has a live run, then
+      // link them: a now blocks b while a is `working` (unresolved either way).
+      const ca = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!ca.claimed || ca.card.id !== a.id) throw new Error('expected to claim a first');
+      const cb = await board.claim({ agentId: 'agt_w2', capabilities: ['writing'] });
+      if (!cb.claimed || cb.card.id !== b.id) throw new Error('expected to claim b next');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      expect(await board.getPushDeliveries()).toHaveLength(2); // unchanged by addLink itself
+
+      // Failing b's run re-queues it (`endAttempt` -> `notifyWorkAvailable`) — this is the exact
+      // path `test/board-push.test.ts`'s `'re-notifies when a failed run returns the card to the
+      // queue'` test exercises for an UNblocked card. Here `b` is blocked (by `a`, still
+      // `working`), so `isHeldBack` must suppress the re-queue ping — no third delivery.
+      await board.fail({ runId: cb.runId, leaseEpoch: cb.leaseEpoch, reason: 'retry' });
+      expect(await board.getPushDeliveries()).toHaveLength(2);
+    });
+  });
+
+  it('fans out work.available to a dependent once its blocker genuinely resolves', async () => {
+    await runInDurableObject(stubFor('enf-push-fanout'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_enfpushfanout', tenantId: 'tnt_a', name: 'EPF', stages: STAGES });
+
+      // Cards created, and linked, BEFORE the push config is registered — so neither creation
+      // queues a delivery, and the only `work.available` pings that can appear are the ones this
+      // test is actually about (`b`'s creation would otherwise queue one of its own, since it
+      // isn't blocked until the link below exists, which would pollute `forB()`'s count).
+      const aR = await board.createCard({ title: 'Blocker', ownerUserId: 'usr_a' });
+      const bR = await board.createCard({ title: 'Blocked', ownerUserId: 'usr_a' });
+      if (!aR.ok || !bR.ok) throw new Error('setup failed');
+      const a = aR.value;
+      const b = bR.value;
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      await board.registerPushConfig({ agentId: 'agt_w', url: HOOK, token: 's', capabilities: ['writing'], events: ['work.available'] });
+
+      const forB = async () =>
+        (await board.getPushDeliveries()).filter((d) => (JSON.parse(d.body) as { cardId: string }).cardId === b.id);
+
+      // `a` must reach the true terminal `completed` state (STAGES has two stages — see the note on
+      // the 'unblocks once the blocker completes' test above for why one `complete()` is not enough).
+      const c1 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c1.claimed || c1.card.id !== a.id) throw new Error('expected to claim a');
+      await board.complete({ runId: c1.runId, leaseEpoch: c1.leaseEpoch, handoff: { summary: 'drafted' } });
+      // `a` re-enters the queue at `ship`, still unresolved — nothing should fire for `b` yet.
+      expect(await forB()).toHaveLength(0);
+
+      const c2 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c2.claimed || c2.card.id !== a.id) throw new Error('expected to claim a again, on ship');
+      await board.complete({ runId: c2.runId, leaseEpoch: c2.leaseEpoch, handoff: { summary: 'shipped' } });
+
+      // `a` is now genuinely `completed` — `b` must be pinged directly, not merely discoverable on
+      // the next `list_work` poll. Without the fan-out, `notifyWorkAvailable` is only ever called
+      // for the card that just changed (`a`), never for `a`'s dependents, so this assertion is
+      // exactly what fails without it.
+      expect(await forB()).toHaveLength(1);
+    });
+  });
+});

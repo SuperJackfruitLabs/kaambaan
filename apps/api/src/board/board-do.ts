@@ -1191,6 +1191,10 @@ export class BoardDO extends DurableObject<Env> {
       `CREATE UNIQUE INDEX IF NOT EXISTS card_links_one_parent ON card_links (to_card_id) WHERE kind = 'parent'`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_to ON card_links(to_card_id, kind)`);
+    // The mirror of idx_card_links_to: the `parent` clause in `blockedWhere`/`openChildCount` (and
+    // `notifyDependents`'s `blocks` fan-out) both filter on `from_card_id`, unindexed until now.
+    // Negligible with today's card counts; Task 15 starts creating children in bulk.
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_from ON card_links(from_card_id, kind)`);
     // Inbound webhook delivery dedup (docs/06 §3): GitHub may redeliver the same X-GitHub-Delivery.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS webhook_deliveries (delivery_id TEXT PRIMARY KEY, received_at TEXT NOT NULL)`,
@@ -1480,7 +1484,10 @@ export class BoardDO extends DurableObject<Env> {
       return {
         ok: false,
         code: 'CARD_BLOCKED',
-        message: `${openChildren} sub-task${openChildren === 1 ? '' : 's'} still open`,
+        // Direction-agnostic wording: this refusal applies to ANY move, forward or backward (e.g.
+        // pulling a parent back to an earlier stage for rework), so it must not read as "you can't
+        // finish yet" — it is simply a fact about the card, regardless of which way it is moving.
+        message: `card has ${openChildren} open sub-task${openChildren === 1 ? '' : 's'}`,
       };
     }
     const unresolvedBlockers = this.unresolvedBlockerCount(cardId);
@@ -2970,18 +2977,29 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * The one spelling of "resolved", as SQL — interpolated into every WHERE clause below that asks
+   * it (`blockedWhere`'s two conditions, `openChildCount`, `unresolvedBlockerCount`), so the rule
+   * has a single place to change instead of four string literals that could drift independently.
+   *
+   * A blocker/child is resolved only when it is `completed` or `canceled` — **not** all four
+   * terminal states. `TERMINAL_STATES` also contains `rejected` and `failed`; either must keep its
+   * dependent blocked, or the edge does nothing in the situation it exists for. This is the SQL
+   * form of `isResolved` (`links.ts`) — that function is its JS twin (currently unused in this DO,
+   * since every check here is a SQL WHERE clause, not a JS predicate), kept for parity and for any
+   * future caller that needs the rule outside SQL. Do not widen this to `isTerminal()` or the four
+   * terminal states — the `'keeps the dependent blocked while the blocker is rejected…'` test in
+   * `links-enforcement.test.ts` exists to catch exactly that (the mid-retry test does not: a
+   * mid-retry blocker is `submitted`, which is unresolved under either rule, so it can't tell the
+   * two apart).
+   */
+  private static readonly RESOLVED_SQL = "('completed', 'canceled')";
+
+  /**
    * Whether nothing holds `c` back from being handed out: no unresolved blocker (`blocks`), and no
    * open child (`parent`). Parameterless and correlated on the alias `c`, so it composes directly
    * into `claimableWhere`'s SELECT and into `isHeldBack`'s single-card check below, without either
    * restating the rule. TRUE means eligible — `claimableWhere` ANDs it straight into its WHERE
    * clause, and `isHeldBack` inverts the question to ask it about one card.
-   *
-   * A blocker is resolved only when it is `completed` or `canceled` — **not** all four terminal
-   * states. `TERMINAL_STATES` also contains `rejected` and `failed`; a blocker in either of those
-   * must keep its dependent blocked, or the edge does nothing in the situation it exists for. This
-   * is the SQL form of `isResolved` (`links.ts`) inlined, not a rewrite of it — do not widen it to
-   * `isTerminal()` or the four terminal states (`enf-rejected`/mid-retry tests in
-   * `links-enforcement.test.ts` exist to catch exactly that).
    *
    * One definition, three readers — the claim query (via `claimableWhere`), the discovery count
    * (`countReadyForCapabilities`, which calls `claimableWhere` too), and `notifyWorkAvailable`'s JS
@@ -2992,13 +3010,13 @@ export class BoardDO extends DurableObject<Env> {
         SELECT 1 FROM card_links l
           JOIN cards b ON b.id = l.from_card_id
          WHERE l.to_card_id = c.id AND l.kind = 'blocks'
-           AND b.state NOT IN ('completed', 'canceled')
+           AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
       )
       AND NOT EXISTS (
         SELECT 1 FROM card_links l
           JOIN cards ch ON ch.id = l.to_card_id
          WHERE l.from_card_id = c.id AND l.kind = 'parent'
-           AND ch.state NOT IN ('completed', 'canceled')
+           AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
       )`;
   }
 
@@ -3011,6 +3029,29 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * Every card this one directly holds back: the cards it blocks (`blocks`, this card as source),
+   * and its own parent, if it has one (`parent`, this card as the child/target) — a parent may now
+   * have lost its last open child. Called once a card reaches a genuinely resolved state
+   * (`completed`/`canceled`), to re-issue `work.available` pings that `notifyWorkAvailable`
+   * correctly suppressed while this card was still open. Without this fan-out, a push-subscribed
+   * agent waiting on a dependent never hears that it unblocked — only `list_work` polling would
+   * ever find it, which is the same shape of silent gap Phase 1 fixed for the archived exclusion.
+   *
+   * `notifyWorkAvailable` re-checks eligibility itself (`isHeldBack`, stage ownership, budget), so
+   * calling it here for a card that is STILL blocked by something else (e.g. a second unresolved
+   * blocker) is safe — it just no-ops.
+   */
+  private notifyDependents(cardId: string): void {
+    for (const row of this.sql.exec(`SELECT to_card_id FROM card_links WHERE from_card_id = ? AND kind = 'blocks'`, cardId).toArray()) {
+      this.notifyWorkAvailable(row.to_card_id as string);
+    }
+    const parent = this.sql
+      .exec(`SELECT from_card_id FROM card_links WHERE to_card_id = ? AND kind = 'parent'`, cardId)
+      .toArray()[0];
+    if (parent) this.notifyWorkAvailable(parent.from_card_id as string);
+  }
+
+  /**
    * How many of `cardId`'s children (via the `parent` edge, `cardId` as source) are still
    * unresolved. Used only by `moveCard`'s advance refusal — deliberately NOT `blockedWhere()`,
    * which also folds in the `blocks` condition that `moveCard` must NOT refuse on (Principle 3).
@@ -3020,7 +3061,7 @@ export class BoardDO extends DurableObject<Env> {
       this.sql
         .exec(
           `SELECT COUNT(*) AS n FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
-            WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ('completed', 'canceled')`,
+            WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}`,
           cardId,
         )
         .one().n,
@@ -3037,7 +3078,7 @@ export class BoardDO extends DurableObject<Env> {
       this.sql
         .exec(
           `SELECT COUNT(*) AS n FROM card_links l JOIN cards b ON b.id = l.from_card_id
-            WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ('completed', 'canceled')`,
+            WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
           cardId,
         )
         .one().n,
@@ -3744,6 +3785,14 @@ export class BoardDO extends DurableObject<Env> {
         cardId,
       );
       this.emit('card.completed', { cardId });
+      // This card just became genuinely resolved (Task 13's rule: `completed`/`canceled` only) —
+      // anything it held back may now be claimable. `notifyWorkAvailable` alone only ever fires for
+      // the card that just changed, never for its dependents, so without this fan-out a
+      // push-subscribed agent waiting on a blocked card never hears it unblocked; only `list_work`
+      // polling would find it. Any FUTURE path that writes `state = 'completed'` or `'canceled'` to
+      // a card needs this same call — there is no `'canceled'`-writing verb today, so this is the
+      // only site, but that will not stay true.
+      this.notifyDependents(cardId);
       return;
     }
     const gated = next.gate === 'approval' && !this.isAgentClaimable(next);

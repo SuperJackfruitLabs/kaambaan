@@ -20,6 +20,13 @@ const ORDERING: ReadonlySet<LinkKind> = new Set<LinkKind>(['blocks', 'parent']);
  * `rejected` and `failed`, and a blocker that failed is precisely the case where the dependent card
  * must stay blocked — otherwise the edge does nothing in the only situation anyone added it for.
  * There is a test asserting the two disagree, on purpose.
+ *
+ * This is the JS twin of `BoardDO.RESOLVED_SQL` (`board-do.ts`) — the SQL literal `('completed',
+ * 'canceled')` interpolated into every card_links WHERE clause that asks this question. The SQL
+ * copy is the live rule: every check in the DO today (`blockedWhere`, `openChildCount`,
+ * `unresolvedBlockerCount`) is a WHERE clause, not a JS predicate, so this function is currently
+ * unreferenced outside its own test. Keep both in sync if either changes, and prefer wiring this
+ * one in rather than writing a third JS copy, if a genuine JS-side caller ever needs it.
  */
 export function isResolved(state: string): boolean {
   return state === 'completed' || state === 'canceled';
