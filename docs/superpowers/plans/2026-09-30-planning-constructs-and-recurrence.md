@@ -3376,6 +3376,22 @@ So the advisory store is reachable from nothing — Task 16's module in the same
   prints that the edge is advisory and not enforced **before** it is created, for the same reason the
   drawer dialogue must.
 
+The D1 module's refusal codes are a **different code space** from the DO's `BoardErrorCode`, so they get
+their own small mapping. That is not the duplicate-mapping mistake Step 1's table warns about: there the
+*same* code was being given two statuses. Here these codes appear in exactly one place.
+
+| code | status | why |
+|---|---|---|
+| `FOREIGN_BOARD` | **404** | The board exists but belongs to another tenant. 404, not 403 — a 403 confirms it exists, which is a tenant-isolation leak by status code. |
+| `PARENT_MUST_BE_SAME_BOARD` | **400** | The same payload can never succeed; the caller must change it. Same reasoning as `TOO_MANY_CHILDREN`. |
+| `SELF_EDGE` | **400** | Likewise. |
+| `BAD_KIND` | **400** | Refused at the route before the module, like the DO arm's unknown `kind`. |
+| `SAME_BOARD_EDGE` | **500** | Unreachable by construction — the route sends same-board edges to the DO, so the module can only see this if the routing logic is broken. Defence in depth: keep the check, and if it ever fires, that is a bug in the route, not a client error. |
+
+That last row is the interesting one. Two stores that can each hold the same edge is how an enforced rule
+quietly stops being enforced, so the module keeps refusing same-board edges even though the route should
+never hand it one — and the status says "our fault", because it would be.
+
 This is server work with its own tests, so it belongs here rather than in the components task.
 
 - [ ] **Step 1c: Surface "blocked" on the card, from the SAME SQL the claim query uses**
