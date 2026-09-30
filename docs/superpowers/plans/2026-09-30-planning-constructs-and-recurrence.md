@@ -1871,6 +1871,19 @@ Beside the other `CREATE TABLE IF NOT EXISTS` statements in `board-do.ts`:
 
 - [ ] **Step 4: Write CRUD**
 
+**Validate `stageKey` against `this.stages()` as well** — the same argument the rule and the timezone
+get. A stage that does not exist is worth refusing while a human is standing there to read the
+message, rather than surfacing months later as cards in the wrong lane.
+
+**Document that missed occurrences collapse to one.** `next_fire_at` advances from *now*, not from
+the missed time, so a board whose cron was down for a week produces one card rather than seven. That
+is right for maintenance work — seven identical "sweep the logs" cards help nobody — but say it in
+`fireDueSchedules`' doc comment, because it is exactly what a later reader "fixes" into a card storm.
+
+**Reject an empty `createdBy`, and an `overlap` outside `'skip' | 'allow'`.** The type says they are
+constrained; nothing checks at runtime, and the next task puts user JSON on this path. An unknown
+`overlap` silently means *allow*, which is the permissive direction.
+
 **Validate the timezone, by construction not comparison.** The plan did not say so and it must:
 
 ```ts
@@ -1952,7 +1965,15 @@ Store `input.timezone` **as the operator typed it** — never the resolved spell
       }
 
       const cardId = created.value.card.id;
-      if (row.stage_key) await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+      // `moveCard` returns a Result and does NOT throw for the realistic failures — `UNKNOWN_STAGE`
+      // (a stage renamed or removed by `setStages` after this schedule was written) and
+      // `WIP_LIMIT`. Discarding it means the card lands in the default lane, `schedule.fired` is
+      // emitted as a success, and nothing anywhere records that the routing was dropped. That is
+      // the same silent failure this task exists to prevent, wearing a different hat.
+      if (row.stage_key) {
+        const moved = await this.moveCard(cardId, row.stage_key as string, row.created_by as string);
+        if (!moved.ok) this.emit('schedule.stage_failed', { scheduleId: id, cardId, stageKey: row.stage_key, reason: moved.code });
+      }
       if (Number(row.priority) !== 0 || (row.labels as string) !== '[]') {
         await this.updateCard(cardId, {
           priority: Number(row.priority),
