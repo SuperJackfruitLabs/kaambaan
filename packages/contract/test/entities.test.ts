@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Agent, Board, Card, Reference, Tenant } from '../src';
+import { Agent, Board, Card, Reference, Stage, Tenant } from '../src';
 
 describe('entity schemas', () => {
   it('parses a board with a pipeline and applies stage defaults', () => {
@@ -57,6 +57,46 @@ describe('entity schemas', () => {
     });
     expect(ok.success).toBe(true);
     expect(Reference.safeParse({ id: 'ref_abc123' }).success).toBe(false);
+  });
+
+  it('carries the completion requirement the Board DO already enforces', () => {
+    const parsed = Stage.parse({
+      key: 'publish',
+      name: 'Publish',
+      order: 0,
+      ownerKind: 'capability',
+      owner: 'code',
+      completion: { handoff: ['url'], reference: { provider: 'forge', sourceType: 'commit' } },
+    });
+    expect(parsed.completion).toEqual({
+      handoff: ['url'],
+      reference: { provider: 'forge', sourceType: 'commit' },
+    });
+  });
+
+  it('leaves completion absent on a stage that declares no rule', () => {
+    const parsed = Stage.parse({ key: 'draft', name: 'Draft', order: 0, ownerKind: 'human' });
+    expect(parsed.completion).toBeUndefined();
+  });
+
+  it('no longer declares currentTaskId on a card, because Task is not implemented', () => {
+    // docs/01 warns that Task has no table and no id is ever minted. A contract field for a
+    // record that cannot exist is a trap for anyone writing a client against it.
+    expect('currentTaskId' in Card.shape).toBe(false);
+  });
+
+  it('leaves archivedAt absent on a fresh card', () => {
+    const card = Card.parse({
+      id: 'card_0000000000000001',
+      boardId: 'brd_0000000000000001',
+      tenantId: 'tnt_0000000000000001',
+      contextId: 'ctx_0000000000000001',
+      title: 'A card',
+      ownerUserId: 'usr_0000000000000001',
+      currentStageKey: 'draft',
+      createdAt: '2026-09-30T00:00:00.000Z',
+    });
+    expect(card.archivedAt).toBeUndefined();
   });
 });
 
