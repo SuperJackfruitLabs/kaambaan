@@ -368,9 +368,20 @@ the next tick retries.
 `board-do.ts:819`) so the skip is **visible on the audit log rather than silent**. A
 schedule quietly skipping for a month is the failure mode to design against.
 
-**Timezone** uses `Intl.DateTimeFormat` with an IANA zone. ⚠️ To verify in the plan's first
-task: timezone support in `workerd`'s ICU build. If it is absent, the fallback is UTC-only
-plus a fixed offset field, and that changes the UI.
+**Timezone** uses `Intl.DateTimeFormat` with an IANA zone. **Verified 2026-09-30** (plan Task 1,
+commit `4e3aa46`): `workerd` carries full ICU zone data — `Asia/Kolkata` renders
+`2026-01-15T00:00:00Z` as `05:30`, and an unknown zone throws `RangeError`. The probe runs inside the
+Workers runtime rather than host Node, via `@cloudflare/vitest-pool-workers`. So the `timezone TEXT`
+column stands and the UTC-plus-offset fallback is not needed.
+
+**One consequence the probe surfaced.** ICU **canonicalises** a zone to its older alias:
+`resolvedOptions().timeZone` answers `Asia/Calcutta` for an input of `Asia/Kolkata`. Therefore:
+
+1. Validate a zone by **constructing a formatter and catching `RangeError`** — never by comparing
+   strings or checking against a list.
+2. **Store and display the operator's own spelling.** Echoing `resolvedOptions().timeZone` back would
+   show someone who typed `Asia/Kolkata` a schedule reading `Asia/Calcutta`, which reads as a bug.
+3. Never compare zone strings for equality anywhere in `recurrence.ts`.
 
 UI: a Schedules section in the existing `/b/[boardId]/settings`.
 
@@ -391,7 +402,9 @@ UI: a Schedules section in the existing `/b/[boardId]/settings`.
    needs an index of which boards hold which project's cards.
 3. **Applied labels as a JSON array** have no relational integrity. Accepted, with
    permissive reads.
-4. **`Intl` timezone support in workerd** is assumed, not verified (§3.7).
+4. ~~**`Intl` timezone support in workerd** is assumed, not verified.~~ **Closed 2026-09-30** —
+   verified present (§3.7). A smaller risk replaced it: zone **aliasing**, which is a display and
+   validation concern rather than a schema one. See §3.7's three rules.
 5. **Two edge stores** (DO + D1) is a real cost, justified only by the claim-path invariant.
    If that invariant is ever abandoned, collapse them.
 

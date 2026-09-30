@@ -2230,9 +2230,12 @@ describe('child cards', () => {
 
       const c = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
       if (!c.claimed) throw new Error('expected a claim');
+      // `UsageInput` is `{ model?, inputTokens?, outputTokens?, costUsd? }` (board-do.ts:385) —
+      // NOT ACP's `{ used, size, cost }`. The two are easy to confuse because the bridge translates
+      // between them; the DO only ever sees this shape.
       await board.postActivity({
         runId: c.runId, leaseEpoch: c.leaseEpoch, type: 'thought', body: 'working',
-        usage: { used: 1000, size: 200000, cost: 0.25 },
+        usage: { inputTokens: 1000, outputTokens: 200, costUsd: 0.25 },
       });
 
       const cards = (await board.getState()).cards;
