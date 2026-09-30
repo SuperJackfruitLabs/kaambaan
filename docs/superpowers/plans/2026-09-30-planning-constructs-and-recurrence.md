@@ -1467,6 +1467,31 @@ describe('nextFireAt', () => {
     const exact = '2026-09-30T09:00:00.000Z';
     expect(nextFireAt(mustParse('daily at 09:00'), 'UTC', exact)).not.toBe(exact);
   });
+
+  /**
+   * The one test that defends `fromZonedWallClock`'s second pass.
+   *
+   * Without it the whole suite passes against a single-pass version, because every other case here
+   * uses Asia/Kolkata or UTC and neither observes DST. And a single pass is a natural-looking
+   * cleanup: read without its comment, the function appears to compute the same offset twice for no
+   * reason. Dropping it is silently wrong by exactly one hour, twice a year, in every DST-observing
+   * zone — in the code that decides when a scheduled card is created.
+   *
+   * 2026-03-08 is America/New_York's spring-forward. At 03:00 local, the zone is already EDT
+   * (UTC-4), so the answer is 07:00Z. A single-pass version measures the offset at its UTC guess —
+   * still EST (UTC-5) — and answers 08:00Z.
+   */
+  it('survives a spring-forward: the offset at the guess is not the offset at the answer', () => {
+    expect(nextFireAt(mustParse('daily at 03:00'), 'America/New_York', '2026-03-08T00:00:00.000Z')).toBe(
+      '2026-03-08T07:00:00.000Z',
+    );
+  });
+
+  it('refuses a zero interval, distinctly from the five-minute floor', () => {
+    const r = parseRule('every 0 days');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('at least 1');
+  });
 });
 ```
 
@@ -1642,7 +1667,7 @@ export function nextFireAt(rule: Rule, timezone: string, afterIso: string): stri
 - [ ] **Step 4: Run the tests**
 
 Run: `cd apps/api && pnpm vitest run test/recurrence.test.ts`
-Expected: PASS, all 14.
+Expected: PASS, all 15.
 
 - [ ] **Step 5: Commit**
 
