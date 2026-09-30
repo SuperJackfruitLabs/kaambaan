@@ -2803,13 +2803,60 @@ style — one query, `COALESCE(SUM(...), 0)`:
 > `board-do.ts:2320` to decide whether to stop handing out work; widening it to include children
 > would silently move that gate. The two functions stay separate for that reason.
 
-- [ ] **Step 3: Run and commit**
+- [ ] **Step 3: The deferred advance — promoted here by Task 13's review**
+
+Task 13 guarded `moveCard` but **not `advanceCard`**, the automatic advance on `complete` and on gate
+approval. That was the right place to stop — `advanceCard` returns `void`, is called after the run has
+already ended and its side effects committed, so a `Result` refusal is impossible there and every
+obvious substitute invents untested recovery. But the gap is load-bearing and it is yours:
+
+- **It sits on Task 15's main path.** `superpipeline_split_card` is `run`-scoped — held by an agent
+  that has already claimed the card — and its tool description promises *"Your card will not advance
+  until all of them are resolved."* With only `moveCard` guarded, that sentence is false on the agent
+  path from the day it ships.
+- **It leaks past the parent.** If the parent is on its last stage, `advanceCard` writes
+  `state = 'completed'` outright, so anything blocked *by* the parent unblocks while the parent's
+  subtree is still open. Containment is not merely skipped — it is erased for the neighbours too.
+- **It inverts the intended asymmetry**: the refusal falls on the human and the exemption on the
+  agent, which is backwards.
+
+**The answer is a deferred advance, not a refusal.** `complete()` must still succeed — the agent did
+its stage, the run has to end and the lease has to release. What is withheld is the *advance*.
+
+Three options, two of which are traps:
+
+| | |
+|---|---|
+| park `submitted` in the current stage | ❌ unclaimable while children are open, then handed back to an agent to **redo stage work already done** |
+| refuse from `complete()` | ❌ the run stays open, the lease heartbeats out, the card is reclaimed, the work is redone — the hot-loop this phase exists to prevent |
+| **park non-claimable, re-trigger on the last child** | ✅ |
+
+So:
+
+1. Add `pending_advance_json TEXT` to `cards` (guarded `ALTER`). When `advanceCard` is reached for a
+   card with open children, it stores what it *would* have done — the from-stage and the handoff —
+   and parks the card instead.
+2. Park it in `input-required` **in its current stage**. That state is not claimable, so nothing
+   redoes the work. It normally means "a human must act", which is not quite true here — so
+   `openChildCount > 0` is what the UI reads to say *"waiting on 3 sub-tasks"* rather than showing a
+   gate (Task 17). Reusing the state avoids adding one to an A2A-aligned `TaskState`; say so in a
+   comment, because the next reader will wonder.
+3. **The trigger.** In `advanceCard`'s `completed` branch and on the cancel path, after resolving a
+   card, check whether it was the *last* open child of a parent carrying a `pending_advance_json`.
+   If so, perform that parent's deferred advance with the stored handoff and clear the column.
+
+Tests: a parent that splits mid-run and completes does **not** advance and is **not** claimable; the
+last child resolving advances it with the handoff intact; a parent on its last stage does **not** reach
+`completed` while children are open, and nothing blocked by it unblocks; and a parent whose children
+were already resolved before it completed advances immediately, as today.
+
+- [ ] **Step 4: Run and commit**
 
 Run: `cd apps/api && pnpm vitest run test/sub-cards.test.ts && pnpm test`
 
 ```bash
 git add apps/api/src/board/board-do.ts apps/api/test/sub-cards.test.ts
-git commit -m "feat(sub-tasks): child cards with inheritance and a non-destructive cost rollup"
+git commit -m "feat(sub-tasks): child cards, a non-destructive cost rollup, and the deferred advance"
 ```
 
 ---
