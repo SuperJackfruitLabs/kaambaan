@@ -270,6 +270,11 @@ export interface CardView {
   queuedBy: string | null;
   /** What the queuer was permitted to dispatch, as granted when they queued it. */
   queuedGrant: string[] | null;
+  /** Applied label ids; the catalogue lives in D1 (`src/db/labels.ts`). */
+  labels: string[];
+  /** ISO date (no time), or null. */
+  dueAt: string | null;
+  archivedAt: string | null;
   currentStageKey: string;
   state: TaskState;
   delegateAgentId: string | null;
@@ -949,6 +954,40 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /** Applied label ids (D1 catalogue, migration 0010). JSON array; ids, not names. */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * A due date, promoted out of `spec.due`.
+     *
+     * A date, not a timestamp — that is what the UI has always written, and inventing a time of
+     * day would make every existing value wrong by up to a day.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN due_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * When the owner was last told this card is overdue. Internal to the sweep and deliberately
+     * absent from `CardView`: a five-minute cron tick with nothing to remember would notify on
+     * every tick forever.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN overdue_notified_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    /** Archived cards stay on the board's record and leave its working set. */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN archived_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_due_at ON cards(due_at)`);
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS notifications (
@@ -1085,6 +1124,46 @@ export class BoardDO extends DurableObject<Env> {
     this.emit('card.created', { card });
     this.notifyWorkAvailable(id);
     return { ok: true, value: card };
+  }
+
+  /**
+   * Move `spec.due` onto the `due_at` column, once per board.
+   *
+   * Idempotent, and it *removes* the key from the spec rather than leaving a copy: two sources of
+   * truth for one date is the condition this column exists to end. See the spec's §3.3 note — this
+   * also takes the due date out of the agent prompt, which is intended, not a regression.
+   */
+  async backfillDueDates(): Promise<{ migrated: number }> {
+    const rows = this.sql.exec(`SELECT id, spec_json FROM cards WHERE due_at IS NULL`).toArray();
+    let migrated = 0;
+    for (const row of rows) {
+      let spec: Record<string, unknown>;
+      try {
+        spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+      } catch {
+        continue; // an unparseable spec is not this migration's problem to fix
+      }
+      const due = spec.due;
+      if (typeof due !== 'string' || due.trim() === '') continue;
+      delete spec.due;
+      this.sql.exec(
+        `UPDATE cards SET due_at = ?, spec_json = ?, updated_at = ? WHERE id = ?`,
+        due.trim(),
+        JSON.stringify(spec),
+        this.now(),
+        row.id as string,
+      );
+      migrated += 1;
+    }
+    return { migrated };
+  }
+
+  /** Test-only: put a due date back in the spec and clear the column, to rehearse the migration. */
+  async __testResetDueToSpec(cardId: string): Promise<void> {
+    const row = this.sql.exec(`SELECT spec_json, due_at FROM cards WHERE id = ?`, cardId).one();
+    const spec = JSON.parse(row.spec_json as string) as Record<string, unknown>;
+    if (row.due_at) spec.due = row.due_at as string;
+    this.sql.exec(`UPDATE cards SET due_at = NULL, spec_json = ? WHERE id = ?`, JSON.stringify(spec), cardId);
   }
 
   /**
@@ -3249,6 +3328,9 @@ export class BoardDO extends DurableObject<Env> {
       ownerUserId: row.owner_user_id as string,
       queuedBy: (row.queued_by as string | null) ?? null,
       queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
+      labels: row.labels ? (JSON.parse(row.labels as string) as string[]) : [],
+      dueAt: (row.due_at as string | null) ?? null,
+      archivedAt: (row.archived_at as string | null) ?? null,
       currentStageKey: row.current_stage_key as string,
       state: row.state as TaskState,
       delegateAgentId: (row.delegate_agent_id as string | null) ?? null,
