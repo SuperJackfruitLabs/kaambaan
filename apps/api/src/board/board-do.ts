@@ -374,6 +374,24 @@ export interface CardView {
    * this card itself spent". Task 14.
    */
   costUsdRollup: number;
+  /**
+   * Is this card held back by an unresolved same-board `blocks` edge — the enforced kind?
+   *
+   * Derived from the SAME `blockedWhere()` fragment the claim query uses (`unresolvedBlockerExists`,
+   * Task 17), never from a second expression that means the same thing today. A badge computed
+   * independently is a badge that will eventually disagree with the claim query, and the
+   * disagreement is invisible: the UI says "Blocked" while `claim_card` hands the card out, or the
+   * reverse. This plan has already had one claim/discovery divergence from exactly that cause.
+   *
+   * An array rather than a boolean because the tooltip has to name the blocker ("Blocked by
+   * *Title*"), and a count alone would send the drawer back for another round trip.
+   *
+   * Only the `blocks` half of `blockedWhere()` — an open child (the `parent` half) is a different
+   * fact with a different badge, already carried as `openChildCount`. Cross-board advisory edges
+   * (Task 16) are never in here either: they block nothing, and this field name is exactly how a
+   * client would end up rendering the enforced badge for an advisory edge.
+   */
+  blockedBy: Array<{ cardId: string; title: string }>;
 }
 
 /** A registered push subscription (A2A PushNotificationConfig, docs/05 §4). */
@@ -3212,6 +3230,36 @@ export class BoardDO extends DurableObject<Env> {
   private static readonly RESOLVED_SQL = "('completed', 'canceled')";
 
   /**
+   * An unresolved `blocks` edge pointing at `c.id` — the enforced dependency. Correlated on the
+   * alias `c`, so it only composes where the cards table is aliased `c` (`blockedWhere`,
+   * `isHeldBack`). Extracted (Task 17) so `CardView.blockedBy`'s batch query can select the same
+   * blocker rows this EXISTS clause tests for, instead of restating the predicate.
+   */
+  private unresolvedBlockerExists(): string {
+    return `EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards b ON b.id = l.from_card_id
+         WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+           AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
+      )`;
+  }
+
+  /**
+   * An unresolved child of `c.id` (the `parent` edge) — surfaced to readers as `openChildCount`,
+   * never as a `blockedBy` entry: it is a different fact with a different badge. Extracted (Task 17)
+   * alongside `unresolvedBlockerExists` so `blockedWhere` composes from two named fragments instead
+   * of two inline `NOT EXISTS` clauses.
+   */
+  private openChildExists(): string {
+    return `EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards ch ON ch.id = l.to_card_id
+         WHERE l.from_card_id = c.id AND l.kind = 'parent'
+           AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
+      )`;
+  }
+
+  /**
    * Whether nothing holds `c` back from being handed out: no unresolved blocker (`blocks`), and no
    * open child (`parent`). Parameterless and correlated on the alias `c`, so it composes directly
    * into `claimableWhere`'s SELECT and into `isHeldBack`'s single-card check below, without either
@@ -3220,21 +3268,12 @@ export class BoardDO extends DurableObject<Env> {
    *
    * One definition, three readers — the claim query (via `claimableWhere`), the discovery count
    * (`countReadyForCapabilities`, which calls `claimableWhere` too), and `notifyWorkAvailable`'s JS
-   * gate, which reaches it through `isHeldBack` rather than mirroring the SQL by hand.
+   * gate, which reaches it through `isHeldBack` rather than mirroring the SQL by hand. A fourth
+   * reader, `CardView.blockedBy`, reuses `unresolvedBlockerExists`'s predicate directly rather than
+   * this composed form — it needs the `blocks` half only, never the `parent` half.
    */
   private blockedWhere(): string {
-    return `NOT EXISTS (
-        SELECT 1 FROM card_links l
-          JOIN cards b ON b.id = l.from_card_id
-         WHERE l.to_card_id = c.id AND l.kind = 'blocks'
-           AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM card_links l
-          JOIN cards ch ON ch.id = l.to_card_id
-         WHERE l.from_card_id = c.id AND l.kind = 'parent'
-           AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
-      )`;
+    return `NOT ${this.unresolvedBlockerExists()} AND NOT ${this.openChildExists()}`;
   }
 
   /** The same rule, asked about one card, for callers that are not a SELECT over the stage set. */
@@ -3335,6 +3374,24 @@ export class BoardDO extends DurableObject<Env> {
         )
         .one().n,
     );
+  }
+
+  /**
+   * `cardId`'s unresolved blockers (the `blocks` edge, `cardId` as target), id and title — the same
+   * `kind = 'blocks'` + `RESOLVED_SQL` predicate as `unresolvedBlockerExists()`, as a SELECT rather
+   * than an EXISTS, for `CardView.blockedBy`'s single-card fallback (`rowToCard`, no `pre`). The
+   * batched board read (`allCards`) asks this same question in one grouped query instead of calling
+   * this once per card — see the note on `blockersByCard` there.
+   */
+  private blockersOf(cardId: string): Array<{ cardId: string; title: string }> {
+    return this.sql
+      .exec(
+        `SELECT b.id, b.title FROM card_links l JOIN cards b ON b.id = l.from_card_id
+          WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+        cardId,
+      )
+      .toArray()
+      .map((r) => ({ cardId: r.id as string, title: r.title as string }));
   }
 
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
@@ -4628,6 +4685,23 @@ export class BoardDO extends DurableObject<Env> {
       .toArray()) {
       childrenCostByParent.set(r.parent_id as string, Number(r.c));
     }
+    // Blocked card → its unresolved blockers (id, title), grouped — Task 17's `CardView.blockedBy`,
+    // the same `kind = 'blocks'` + `RESOLVED_SQL` predicate `unresolvedBlockerExists()` tests for,
+    // as a SELECT instead of an EXISTS, run once for the whole board rather than once per card
+    // (`blockersOf`'s per-card version exists only for `rowToCard`'s single-card fallback below).
+    const blockersByCard = new Map<string, Array<{ cardId: string; title: string }>>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.to_card_id AS blocked_id, b.id AS blocker_id, b.title AS blocker_title
+           FROM card_links l JOIN cards b ON b.id = l.from_card_id
+          WHERE l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+      )
+      .toArray()) {
+      const blockedId = r.blocked_id as string;
+      const list = blockersByCard.get(blockedId) ?? [];
+      list.push({ cardId: r.blocker_id as string, title: r.blocker_title as string });
+      blockersByCard.set(blockedId, list);
+    }
     return this.sql
       .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
       .toArray()
@@ -4639,6 +4713,7 @@ export class BoardDO extends DurableObject<Env> {
           parentCardId: parentByChild.get(id) ?? null,
           openChildCount: openChildCountByParent.get(id) ?? 0,
           childrenCost: childrenCostByParent.get(id) ?? 0,
+          blockedBy: blockersByCard.get(id) ?? [],
         });
       });
   }
@@ -4651,18 +4726,24 @@ export class BoardDO extends DurableObject<Env> {
       parentCardId: string | null;
       openChildCount: number;
       childrenCost: number;
+      blockedBy: Array<{ cardId: string; title: string }>;
     },
   ): CardView {
     const id = row.id as string;
     const costUsd = pre?.costUsd ?? this.cardCost(id);
     const cardCap = this.budgetCap('budgetCardUsdCap');
     const attemptCount = pre?.attemptCount ?? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM runs WHERE card_id = ?`, id).one().n);
-    // `pre` (not `??`) for these three: `parentCardId` is legitimately `null` for most cards, and
+    // `pre` (not `??`) for these four: `parentCardId` is legitimately `null` for most cards, and
     // `??` would treat a batched `null` as "missing" and re-query — still correct, just defeating
-    // the batch it's here to avoid.
+    // the batch it's here to avoid. `blockedBy` joins this group for the same reason from the other
+    // direction: an unblocked card's real, batched answer is `[]`, and testing the array itself
+    // (its length, or `pre?.blockedBy ?? fallback`) risks mistaking that legitimate empty answer for
+    // a missing one. Branching on `pre` — the presence of the whole precomputed object, never the
+    // field's own value — is the one test that can't make that mistake for any of the four.
     const parentCardId = pre ? pre.parentCardId : this.parentIdOf(id);
     const openChildCount = pre ? pre.openChildCount : this.openChildCount(id);
     const childrenCost = pre ? pre.childrenCost : this.childrenCost(id);
+    const blockedBy = pre ? pre.blockedBy : this.blockersOf(id);
     return {
       id,
       title: row.title as string,
@@ -4692,6 +4773,7 @@ export class BoardDO extends DurableObject<Env> {
       // on every card of every board read. NOT folded into `costUsd` above — see that field's own
       // comment on `CardView` and `childrenCost`'s, below `cardCost`.
       costUsdRollup: costUsd + childrenCost,
+      blockedBy,
     };
   }
 

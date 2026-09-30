@@ -20,6 +20,23 @@ function stubFor(name: string): DurableObjectStub<BoardDO> {
   return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
 }
 
+/**
+ * Wraps the DO's private `sql.exec` to record every query text from here forward. `sql` is a
+ * private instance field (`this.sql = ctx.storage.sql`), not a prototype method, so reassigning it
+ * is an ordinary JS monkeypatch — verified against the live `cloudflare:test` DO instance, not a
+ * mock. Returns a reader that can be reset between checkpoints.
+ */
+function watchSqlExec(board: BoardDO): { queries: () => string[]; reset: () => void } {
+  const target = (board as unknown as { sql: { exec: (...a: unknown[]) => unknown } }).sql;
+  const orig = target.exec.bind(target);
+  let log: string[] = [];
+  target.exec = (...args: unknown[]) => {
+    log.push(String(args[0]));
+    return orig(...args);
+  };
+  return { queries: () => log, reset: () => { log = []; } };
+}
+
 async function two(board: BoardDO, name: string) {
   await board.init({ id: `brd_${name}`, tenantId: 'tnt_a', name, stages: STAGES });
   const a = await board.createCard({ title: 'Blocker', ownerUserId: 'usr_a' });
@@ -281,6 +298,131 @@ describe('the third eligibility site: push notifications respect the blocked rul
       // for the card that just changed (`a`), never for `a`'s dependents, so this assertion is
       // exactly what fails without it.
       expect(await forB()).toHaveLength(1);
+    });
+  });
+});
+
+describe('CardView.blockedBy', () => {
+  it('reports an unresolved same-board blocker, with its title', async () => {
+    await runInDurableObject(stubFor('blockedby-unresolved'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'bbunresolved');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      const bCard = (await board.getState()).cards.find((c) => c.id === b.id)!;
+      expect(bCard.blockedBy).toEqual([{ cardId: a.id, title: 'Blocker' }]);
+    });
+  });
+
+  it('is empty once the blocker reaches a genuinely resolved state (completed)', async () => {
+    await runInDurableObject(stubFor('blockedby-completed'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'bbcompleted');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      // Drive `a` through both stages to genuinely `completed` — STAGES has two stages, and
+      // finishing only the first leaves it `submitted` on `ship`, still unresolved (see the
+      // 'unblocks once the blocker completes' test above for the same two-step shape).
+      const c1 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c1.claimed || c1.card.id !== a.id) throw new Error('expected to claim a first');
+      await board.complete({ runId: c1.runId, leaseEpoch: c1.leaseEpoch, handoff: { summary: 'drafted' } });
+      const c2 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c2.claimed || c2.card.id !== a.id) throw new Error('expected to claim a again, on ship');
+      const completed = await board.complete({ runId: c2.runId, leaseEpoch: c2.leaseEpoch, handoff: { summary: 'shipped' } });
+      if (!completed.ok) throw new Error('complete should not itself be refused');
+      expect(completed.value.state).toBe('completed');
+
+      const bCard = (await board.getState()).cards.find((c) => c.id === b.id)!;
+      expect(bCard.blockedBy).toEqual([]);
+    });
+  });
+
+  it('still reports a `rejected` blocker — rejected is terminal but not resolved', async () => {
+    await runInDurableObject(stubFor('blockedby-rejected'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_bbrejected', tenantId: 'tnt_a', name: 'BBR', stages: GATED_STAGES });
+      const aR = await board.createCard({ title: 'Blocker', ownerUserId: 'usr_a' });
+      const bR = await board.createCard({ title: 'Blocked', ownerUserId: 'usr_a' });
+      if (!aR.ok || !bR.ok) throw new Error('setup failed');
+      const a = aR.value;
+      const b = bR.value;
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+
+      const c = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c.claimed || c.card.id !== a.id) throw new Error('expected a to be claimed first (b is blocked)');
+      await board.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'drafted' } });
+      const gates = (await board.getState()).gates.filter((g) => g.cardId === a.id && g.status === 'pending');
+      if (gates.length !== 1) throw new Error(`expected one pending gate on a, got ${gates.length}`);
+      const resolved = await board.resolveGate({ gateId: gates[0]!.id, decision: 'reject', decidedBy: 'usr_reviewer' });
+      if (!resolved.ok) throw new Error('resolveGate should not itself be refused');
+      expect(resolved.value.state).toBe('rejected');
+
+      const bCard = (await board.getState()).cards.find((c) => c.id === b.id)!;
+      expect(bCard.blockedBy).toEqual([{ cardId: a.id, title: 'Blocker' }]);
+    });
+  });
+
+  it('an open child is NOT a blocker — blockedBy stays empty while openChildCount is not', async () => {
+    await runInDurableObject(stubFor('blockedby-openchild'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_bboc', tenantId: 'tnt_a', name: 'BBOC', stages: STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a' });
+      if (!p.ok) throw new Error(p.message);
+      const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a' });
+      if (!child.ok) throw new Error(child.message);
+
+      const parent = (await board.getState()).cards.find((c) => c.id === p.value.id)!;
+      expect(parent.openChildCount).toBe(1);
+      expect(parent.blockedBy).toEqual([]);
+    });
+  });
+
+  it('a single-card read (e.g. right after claim) agrees with the batched board read', async () => {
+    await runInDurableObject(stubFor('blockedby-single'), async (board: BoardDO) => {
+      const { a, b } = await two(board, 'bbsingle');
+      await board.addLink({ fromCardId: a.id, toCardId: b.id, kind: 'blocks' });
+      // `a` itself is unblocked (nothing blocks it) — claim returns it via the single-card fallback
+      // path in `rowToCard` (no `pre`), which must report the same shape as the batched path: `[]`.
+      const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!claim.claimed) throw new Error('expected a claim');
+      expect(claim.card.id).toBe(a.id);
+      expect(claim.card.blockedBy).toEqual([]);
+    });
+  });
+
+  it('is computed once per board read, not once per card (the batched path does not regress to N+1)', async () => {
+    // A straight count of every `sql.exec` call during `getState()` is NOT usable here: rowToCard
+    // already runs one unrelated per-card `SELECT v FROM meta …` (the budget-cap read), a
+    // pre-existing N+1 outside this task's scope, so the raw total already scales with card count
+    // for reasons that have nothing to do with `blockedBy`. Instead, watch for the ONE query shape
+    // `blockedBy`'s batch query must have — it selects `blocker_id`/`blocker_title` for every
+    // unresolved `blocks` edge on the board in a single unparameterised SELECT, unlike the
+    // single-card fallback (`blockersOf`, `WHERE l.to_card_id = ?`) — and assert it appears exactly
+    // once per `getState()` call, regardless of how many cards or `blocks` edges exist. A per-card
+    // `blockedBy` query would instead make this count scale with the card count.
+    const isBlockedByBatchQuery = (sql: string) => sql.includes('blocker_id');
+
+    await runInDurableObject(stubFor('blockedby-scale'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_bbscale', tenantId: 'tnt_a', name: 'BBS', stages: STAGES });
+      const a1 = await board.createCard({ title: 'A1', ownerUserId: 'usr_a' });
+      const b1 = await board.createCard({ title: 'B1', ownerUserId: 'usr_a' });
+      if (!a1.ok || !b1.ok) throw new Error('setup failed');
+      await board.addLink({ fromCardId: a1.value.id, toCardId: b1.value.id, kind: 'blocks' });
+
+      const watch = watchSqlExec(board);
+      await board.getState();
+      const small = watch.queries().filter(isBlockedByBatchQuery).length;
+      expect(small).toBe(1);
+
+      // Grow the board by an order of magnitude — more cards, more `blocks` edges.
+      watch.reset();
+      for (let i = 0; i < 10; i++) {
+        const x = await board.createCard({ title: `X${i}`, ownerUserId: 'usr_a' });
+        const y = await board.createCard({ title: `Y${i}`, ownerUserId: 'usr_a' });
+        if (!x.ok || !y.ok) throw new Error('setup failed');
+        await board.addLink({ fromCardId: x.value.id, toCardId: y.value.id, kind: 'blocks' });
+      }
+
+      watch.reset();
+      await board.getState();
+      const large = watch.queries().filter(isBlockedByBatchQuery).length;
+
+      expect(large).toBe(1);
+      expect(large).toBe(small);
     });
   });
 });

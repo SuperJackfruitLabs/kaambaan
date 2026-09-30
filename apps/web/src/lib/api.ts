@@ -107,6 +107,14 @@ export interface Card {
   labels: string[];
   dueAt: string | null;
   archivedAt: string | null;
+  /**
+   * Unresolved same-board `blocks` edges holding this card back — the enforced kind, derived
+   * server-side from the same predicate the claim query uses (`CardView.blockedBy`, Task 17c).
+   * Empty when nothing blocks the card, including when it only has an open child (that is
+   * `openChildCount`'s fact, not this one) or only cross-board advisory blockers (Task 16, not
+   * enforced, carried separately by the links route).
+   */
+  blockedBy: Array<{ cardId: string; title: string }>;
 }
 
 /** One entry in the tenant's label catalogue (migration 0010). */
