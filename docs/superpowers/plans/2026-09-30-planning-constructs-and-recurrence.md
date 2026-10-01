@@ -3747,7 +3747,14 @@ const STAGES: BoardInit['stages'] = [
 ];
 
 function stubFor(name: string): DurableObjectStub<BoardDO> {
-  return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
+  // `${tenantId}:${boardId}`, NOT the bare name every other task's helper uses — and this is the one
+  // task where that difference is load-bearing. Those tasks drive the DO directly, so any stable name
+  // works. `computeRollup` reaches boards through the production `boardStub(env, tenantId, boardId)`,
+  // which hashes `${tenantId}:${boardId}`; a bare name addresses a DIFFERENT physical Durable Object,
+  // so the test would seed one object and the rollup would read an empty one — and report 0 rather
+  // than fail, which is the shape of wrong answer this whole task is about. Same reason
+  // `agent-run-identity.test.ts` and `control-pair-claim.test.ts` already hash the pair.
+  return env.BOARD_DO.get(env.BOARD_DO.idFromName(`tnt_r:brd_${name}`)) as unknown as DurableObjectStub<BoardDO>;
 }
 
 /** Register a board in the catalog so `listAllBoards` finds it, then seed it into the project. */
