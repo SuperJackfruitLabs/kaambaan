@@ -7,6 +7,16 @@ const STAGES: BoardInit['stages'] = [
   { key: 'draft', name: 'Draft', order: 0, ownerKind: 'capability', owner: 'writing' },
 ];
 
+// research (agent) -> review (human approval gate) -> ship (agent) — the only way to drive a card
+// to a genuinely unresolved-terminal state ('rejected') without a verb that writes 'failed'
+// directly (nothing does). Same shape as `links-enforcement.test.ts`'s `GATED_STAGES`, duplicated
+// here rather than imported since nothing else in this file needs a gate.
+const GATED_STAGES: BoardInit['stages'] = [
+  { key: 'research', name: 'Research', order: 0, ownerKind: 'capability', owner: 'writing' },
+  { key: 'review', name: 'Review', order: 1, ownerKind: 'human', gate: 'approval' },
+  { key: 'ship', name: 'Ship', order: 2, ownerKind: 'capability', owner: 'writing' },
+];
+
 // Tenant-prefixed, unlike most of this suite's `stubFor` helpers (which address a DO by its bare
 // name because nothing else in those files ever has to find the same instance a different route
 // would). This one does: `computeRollup` reaches each board through the real `boardStub(env,
@@ -58,27 +68,64 @@ describe('project rollup', () => {
   });
 
   it('counts a card done only when RESOLVED, not merely terminal', async () => {
+    // `board.fail(...)` cannot exercise this rule: it lands a card on `submitted` (mid-retry,
+    // per `endAttempt`), which is unresolved under EITHER predicate (`RESOLVED_SQL` or the four
+    // `TERMINAL_STATES`), so it can't tell the two apart — exactly the trap `board-do.ts`'s
+    // `RESOLVED_SQL` comment names and `links-enforcement.test.ts`'s "blocker is rejected" test
+    // avoids. `rejected`, reached via a real gate rejection, is the only reachable state that is
+    // terminal but not resolved, so that's the path driven here.
     const p = await createProject(env.DB, 'tnt_r', { name: 'resolved-only' });
-    await seedBoard('rollC', p.id, ['Will fail', 'Will finish']);
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_rollC', 'tnt_r', 'rollC', '[]')`,
+    ).run();
 
     await runInDurableObject(stubFor('rollC'), async (board: BoardDO) => {
-      const first = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
-      if (!first.claimed) throw new Error('expected a claim');
-      await board.fail({ runId: first.runId, leaseEpoch: first.leaseEpoch, reason: 'nope' });
+      await board.init({ id: 'brd_rollC', tenantId: 'tnt_r', name: 'rollC', stages: GATED_STAGES });
+      const rejR = await board.createCard({ title: 'Will be rejected', ownerUserId: 'usr_a' });
+      const doneR = await board.createCard({ title: 'Will finish', ownerUserId: 'usr_a' });
+      if (!rejR.ok || !doneR.ok) throw new Error('setup failed');
+      await board.updateCard(rejR.value.id, { projectId: p.id });
+      await board.updateCard(doneR.value.id, { projectId: p.id });
 
-      const second = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
-      if (!second.claimed) throw new Error('expected a second claim');
-      await board.complete({
-        runId: second.runId,
-        leaseEpoch: second.leaseEpoch,
-        handoff: { summary: 'ok' },
-      });
+      // Drive the first card onto the review gate, then reject it.
+      const c1 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c1.claimed || c1.card.id !== rejR.value.id) {
+        throw new Error('expected to claim the reject-bound card first');
+      }
+      await board.complete({ runId: c1.runId, leaseEpoch: c1.leaseEpoch, handoff: { summary: 'drafted' } });
+      const gates1 = (await board.getState()).gates.filter((g) => g.cardId === rejR.value.id && g.status === 'pending');
+      if (gates1.length !== 1) throw new Error(`expected one pending gate on the reject-bound card, got ${gates1.length}`);
+      const rejected = await board.resolveGate({ gateId: gates1[0]!.id, decision: 'reject', decidedBy: 'usr_reviewer' });
+      if (!rejected.ok) throw new Error('resolveGate should not itself be refused');
+      // The state this test actually drives — asserted, not assumed.
+      expect(rejected.value.state).toBe('rejected');
+
+      // Drive the second card all the way to genuinely `completed`: research -> gate approve ->
+      // ship -> complete. A single `complete()` would leave it `submitted` on `ship`, which would
+      // make this test unable to distinguish the two rules just as `fail()` did.
+      const c2 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c2.claimed || c2.card.id !== doneR.value.id) {
+        throw new Error('expected to claim the finish-bound card');
+      }
+      await board.complete({ runId: c2.runId, leaseEpoch: c2.leaseEpoch, handoff: { summary: 'drafted' } });
+      const gates2 = (await board.getState()).gates.filter((g) => g.cardId === doneR.value.id && g.status === 'pending');
+      if (gates2.length !== 1) throw new Error(`expected one pending gate on the finish-bound card, got ${gates2.length}`);
+      const approved = await board.resolveGate({ gateId: gates2[0]!.id, decision: 'approve', decidedBy: 'usr_reviewer' });
+      if (!approved.ok) throw new Error('resolveGate should not itself be refused');
+      const c3 = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!c3.claimed || c3.card.id !== doneR.value.id) {
+        throw new Error('expected to claim the finish-bound card again, on ship');
+      }
+      const completed = await board.complete({ runId: c3.runId, leaseEpoch: c3.leaseEpoch, handoff: { summary: 'shipped' } });
+      if (!completed.ok) throw new Error('complete should not itself be refused');
+      expect(completed.value.state).toBe('completed');
     });
 
     const r = await computeRollup(env.DB, env, 'tnt_r', p.id);
     expect(r.cardsTotal).toBe(2);
-    // The failed card is terminal but NOT done. Counting it as done would report a project
-    // complete while half its work failed — the same trap as Task 12's isResolved/isTerminal.
+    // The rejected card is terminal but NOT resolved. Counting it as done would report a project
+    // complete while part of its work was declined — the same trap as Task 12's
+    // isResolved/isTerminal, and the one `projectSummary`'s own RESOLVED_SQL comment names.
     expect(r.cardsDone).toBe(1);
   });
 

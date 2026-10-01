@@ -195,6 +195,19 @@ export const Card = z.object({
    * key) does not reject it.
    */
   archivedAt: z.string().nullable().optional(),
+  /**
+   * The project this card belongs to, or `null` when it does not — a persistent `cards` column
+   * (`CardView.projectId`, `apps/api/src/board/board-do.ts`'s `rowToCard`), always `string |
+   * null`, never `undefined`. A dangling id (the project was deleted) is read as-is; nothing
+   * here validates existence or ownership.
+   */
+  projectId: z.string().nullable().optional(),
+  /**
+   * The milestone within `projectId` this card belongs to, or `null`. Same shape as `projectId`
+   * — a persistent column, not derived, and never present without a non-null `projectId` (the
+   * API refuses a patch that would make that pair inconsistent).
+   */
+  milestoneId: z.string().nullable().optional(),
   ...timestamps,
 });
 export type Card = z.infer<typeof Card>;

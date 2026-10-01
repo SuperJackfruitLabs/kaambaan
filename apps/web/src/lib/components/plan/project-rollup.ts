@@ -40,3 +40,32 @@ export function progressPct(rollup: Pick<ProjectRollup, 'cardsTotal' | 'cardsDon
   if (rollup.cardsTotal <= 0) return 0;
   return Math.min(100, Math.round((rollup.cardsDone / rollup.cardsTotal) * 100));
 }
+
+/** `$1234.56` */
+function fmtUsd(n: number): string {
+  return `$${n.toFixed(2)}`;
+}
+
+type RollupHeadlineInput = Pick<
+  ProjectRollup,
+  'cardsTotal' | 'cardsDone' | 'costUsd' | 'cardsOverdue' | 'computedAt' | 'partial' | 'boardsUnanswered'
+>;
+
+/**
+ * The entire rollup headline — cards done, cost, overdue count, and `formatAsOf`'s provenance —
+ * composed into ONE string, so a template has exactly one interpolation to render it through.
+ *
+ * Before this existed, the obligation that no rollup figure render without `formatAsOf` beside it
+ * was held by review alone: the template called `formatAsOf(rollup)` as a SEPARATE interpolation
+ * from `{rollup.cardsDone}/{rollup.cardsTotal}` and `fmtUsd(rollup.costUsd)`, so an edit that
+ * dropped just the `formatAsOf` call left every figure still rendering and every test green — this
+ * project's Vitest config cannot import a `.svelte` file, so nothing could catch it at runtime.
+ * Collapsing all four numbers into one return value removes that degree of freedom: there is no
+ * longer anywhere in `ProjectView.svelte` a rollup figure that isn't part of the same string as
+ * its provenance, and this function is the one place that string is built, so it is the one place
+ * a test can hold the property.
+ */
+export function rollupHeadline(rollup: RollupHeadlineInput): string {
+  const overdue = rollup.cardsOverdue > 0 ? ` · ${rollup.cardsOverdue} overdue` : '';
+  return `${rollup.cardsDone}/${rollup.cardsTotal} cards done · ${fmtUsd(rollup.costUsd)} · ${formatAsOf(rollup)}${overdue}`;
+}

@@ -53,8 +53,14 @@ Card ──< Task (one per stage / rework, A2A-immutable) ──< Run (one per a
 > project id (`apps/api/src/db/projects.ts`). And the read path for advisory link titles
 > (`getOtherCardTitle`, `apps/api/src/index.ts`) needed it again — resolving a title for a board
 > outside the tenant would disclose more than the `404` the write-side guard already answers with.
-> Three separate tasks found this independently; every D1 read and write in this codebase starts
-> `tenant_id = ?` first, and this is why. See
+> Three separate tasks found this independently; every D1 read and write that answers a tenant's
+> request starts `tenant_id = ?` first, and this is why. The exceptions are deliberate, global
+> walks, not oversights: `listAllBoards` (`db/catalog.ts`) and `listAllProjects`
+> (`db/projects.ts`) scan every tenant in the deployment, for the cron sweep and the rollup fan-out
+> respectively — which is exactly why `computeRollup` (`db/projects.ts`) filters the boards
+> `listAllBoards` returns down to the caller's tenant **before** touching a single board stub. That
+> filter is the single most load-bearing line in the Project rollup: without it, `listAllBoards`'s
+> lack of a `tenant_id = ?` would leak another tenant's cards into the total. See
 > [13 §7](./13-linear-parity-program.md#7-parked-findings-from-implementation-2026-09-30-planning-constructs-and-recurrence)
 > for the reviews that found it.
 
@@ -174,6 +180,8 @@ The durable unit of work. Fields:
 - `references[]` — external links (see below)
 - `dueAt` — a due date (`YYYY-MM-DD`), or `null`; feeds claim order (behind priority) and the
   overdue cron sweep
+- `projectId`, `milestoneId` — the Project/Milestone this card belongs to, or `null`; read straight
+  off the row, never validated for existence (see Project/Milestone below)
 - timestamps, `archivedAt`
 
 ### Task *(A2A-aligned)* — **⚠️ not implemented**

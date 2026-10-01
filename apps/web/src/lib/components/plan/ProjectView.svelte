@@ -3,10 +3,12 @@
    * Projects — the view, not the catalogue. Per project: name, state, health, target date, a
    * progress bar from `cardsDone / cardsTotal`, cost, and its milestones in `sortOrder` (Step 1).
    *
-   * Every rollup number on this screen carries its own "as of" line (`formatAsOf`,
-   * `./project-rollup.ts`) — Step 2's obligation, which no type can enforce on its own: a cross-
-   * board total is stale the moment it returns, and a partial one is an admission the server
-   * already made that this view must not bury.
+   * Every rollup number on this screen carries its own "as of" line, via `rollupHeadline`
+   * (`./project-rollup.ts`) — Step 2's obligation. `rollupHeadline` composes the cards/cost/
+   * overdue figures and their as-of provenance into one string, rendered through one
+   * interpolation below, so there is no template-level way to keep a figure while dropping its
+   * provenance: a cross-board total is stale the moment it returns, and a partial one is an
+   * admission the server already made that this view must not bury.
    */
   import { app } from '$lib/stores/app.svelte';
   import {
@@ -23,7 +25,7 @@
     type ProjectRollup,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
-  import { formatAsOf, progressPct } from './project-rollup';
+  import { progressPct, rollupHeadline } from './project-rollup';
 
   let projects = $state<Project[]>([]);
   let milestonesByProject = $state<Map<string, Milestone[]>>(new Map());
@@ -159,9 +161,6 @@
   }
 
   // ---- display helpers ----
-  function fmtUsd(n: number): string {
-    return `$${n.toFixed(2)}`;
-  }
   function fmtDate(d: string | null): string | null {
     if (!d) return null;
     try {
@@ -247,22 +246,17 @@
 
         <!--
           Rollup. NEVER a number with no provenance beside it (Step 2) — `rollupErr` renders
-          instead of a fabricated 0/0, `rollup` renders the bar and cost ONLY alongside
-          `formatAsOf`, which already carries the partial notice when the server admitted one.
+          instead of a fabricated 0/0, and `rollup` renders through `rollupHeadline`, which bakes
+          every figure into the same string as its as-of provenance: there is no separate
+          interpolation here for a future edit to drop independently of the other.
         -->
         <div class="mt-2.5">
           {#if rollupErr}
             <p class="text-coral text-[11px]">Rollup unavailable — {rollupErr}</p>
           {:else if rollup}
-            <div class="flex items-baseline justify-between gap-2">
-              <span class="mono text-[11px]">{rollup.cardsDone}/{rollup.cardsTotal} cards done</span>
-              <span class="mono text-[11px]">{fmtUsd(rollup.costUsd)}</span>
-            </div>
+            <div class="mono text-[11px]">{rollupHeadline(rollup)}</div>
             <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-inset">
               <div class="h-full rounded-full transition-all duration-1000" style="width:{progressPct(rollup)}%;background:var(--live)"></div>
-            </div>
-            <div class="text-muted-foreground mono mt-1 text-[10px]">
-              {formatAsOf(rollup)}{#if rollup.cardsOverdue > 0} · {rollup.cardsOverdue} overdue{/if}
             </div>
           {:else}
             <p class="text-muted-foreground text-[11px]">Loading rollup…</p>
