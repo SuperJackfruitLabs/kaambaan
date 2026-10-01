@@ -3720,6 +3720,18 @@ Guarded ALTERs for `project_id TEXT` and `milestone_id TEXT`, both into `CardVie
 
 - [ ] **Step 2: Validation, in the route**
 
+**A contract Task 18 set, which this task must honour.** `DELETE /v1/projects/:id` deletes
+unconditionally and accepts that cards in other boards keep a `project_id` pointing at a project that no
+longer exists — the route cannot reach those Durable Objects, and reaching them would put a cross-DO read
+on a write path, which the whole design forbids. It follows the precedent `deleteLabel` and
+`deleteCapability` already set here.
+
+So **an unresolved `project_id` or `milestone_id` is a normal state, not an error.** Treat it exactly as
+an unknown label id is treated today: dropped from display, never a refusal, never a 500. The rollup must
+skip it rather than fail, and a card carrying a dead project id must still read, claim and advance
+normally. A dangling id that breaks a card read would make deleting a project able to brick work on a
+board the deleter cannot see.
+
 `milestone_id` must belong to the card's `project_id`. The DO cannot check it; the route can, the same shape as Task 4's label check. Refuse with `MILESTONE_NOT_IN_PROJECT`.
 
 - [ ] **Step 3: Tests for the rollup**
@@ -3857,6 +3869,19 @@ git commit -m "feat(projects): card membership and a cached cross-board rollup t
   2. **Client wrappers for Task 18's project routes**, which have no caller otherwise:
      `listProjects`, `createProject`, `updateProject`, `deleteProject`, `createMilestone`,
      `deleteMilestone`, and `getProjectRollup` (Task 19's `GET /v1/projects/:id/rollup`).
+
+     **The envelopes Task 18 shipped, read off `index.ts` rather than guessed** — the brief did not
+     specify them, the implementer followed the existing `/v1/labels` convention, and flagged that this
+     task has to match:
+
+     | route | response |
+     |---|---|
+     | `GET /v1/projects` | `{ projects: [...] }` |
+     | `GET /v1/projects/:id` | `{ project, milestones }` — milestones already in `sortOrder` |
+     | `POST /v1/projects` | `{ project }`, 201 |
+     | `PATCH /v1/projects/:id` | `{ project }` |
+     | `POST /v1/projects/:id/milestones` | `{ milestone }`, 201 |
+     | `DELETE …` | 204, no body |
 
   **This is the fifth instance of one pattern in this plan**, and it is worth naming so the sixth does
   not happen: a field or route is built on one side of a phase boundary and its consumer is specified on
