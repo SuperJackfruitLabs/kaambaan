@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { renameLabel, recolourLabel, removeLabel } from './label-manager';
+import { renameLabel, recolourLabel, removeLabel, showsInferredBadge } from './label-manager';
 
 function makeDeps() {
   return {
@@ -33,5 +33,19 @@ describe('removeLabel', () => {
     expect(deps.deleteLabel).toHaveBeenCalledWith('lbl_1');
     expect(deps.deleteLabel).toHaveBeenCalledTimes(1);
     expect(deps.updateLabel).not.toHaveBeenCalled();
+  });
+});
+
+describe('showsInferredBadge', () => {
+  // The same treatment `CapabilitiesTab.svelte` already gives a capability's origin: only
+  // `inferred` is called out with a badge — `declared` is the unremarkable default a label gets
+  // by being named deliberately, and marking every row would bury the one fact an operator is
+  // actually looking for ("which of these did nobody mean to create?").
+  it('is true for a label that turned up from a typo in a card', () => {
+    expect(showsInferredBadge('inferred')).toBe(true);
+  });
+
+  it('is false for a label someone named deliberately', () => {
+    expect(showsInferredBadge('declared')).toBe(false);
   });
 });

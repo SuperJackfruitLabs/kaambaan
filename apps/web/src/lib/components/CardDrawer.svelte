@@ -198,12 +198,7 @@
         editingProject = false;
         return;
       }
-      // `updateCard`'s declared patch type does not list `projectId`/`milestoneId` — Task 19's
-      // route accepts and validates both (migration 0013), but no client wrapper was ever told
-      // about them (flagged in this task's report, not fixed here: out of this task's file scope,
-      // `$lib/api.ts`). The cast says exactly that: the server's contract is wider than the
-      // client's declared one.
-      const res = await updateCard(boardId, cardId, patch as Parameters<typeof updateCard>[2]);
+      const res = await updateCard(boardId, cardId, patch);
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
         projectAssignError = linkRefusalSentence(body?.error, res.status);

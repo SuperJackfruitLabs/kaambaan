@@ -393,10 +393,10 @@ describe('listLabels', () => {
   it('reads the tenant label catalogue', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => new Response(JSON.stringify({ labels: [{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }] }), { status: 200 })),
+      vi.fn(async () => new Response(JSON.stringify({ labels: [{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', origin: 'declared', createdAt: '2026-01-01' }] }), { status: 200 })),
     );
 
-    expect(await listLabels()).toEqual([{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }]);
+    expect(await listLabels()).toEqual([{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', origin: 'declared', createdAt: '2026-01-01' }]);
   });
 
   it('answers an empty list rather than throwing when the read is refused', async () => {

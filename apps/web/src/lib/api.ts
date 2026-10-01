@@ -153,6 +153,15 @@ export interface Label {
   tenantId: string;
   name: string;
   colour: string;
+  /**
+   * How this label came to exist — `declared, inferred`, the same spelling and the same
+   * distinction `CapabilityRecord.origin` already carries (`apps/api/src/db/capabilities.ts`'s
+   * `CapabilityOrigin`). `inferred` means it was typed into a card's Labels field and registered
+   * on the spot (`resolveLabelNames`, `apps/api/src/db/labels.ts`); `declared` means someone named
+   * it deliberately. Typed as the union the server actually stores, not `string`, so a third value
+   * nobody meant to introduce is a compile error here rather than a silently rendered one.
+   */
+  origin: 'declared' | 'inferred';
   createdAt: string;
 }
 
@@ -496,6 +505,17 @@ export function updateCard(
     labelNames?: string[];
     dueAt?: string | null;
     archivedAt?: string | null;
+    /**
+     * Cross-board project/milestone membership (migration 0013; Task 19). `null` clears it. The
+     * route validates both — an unknown `projectId` is left alone (a normal state, see
+     * `Card.projectId`'s comment), but a `milestoneId` that does not belong to the EFFECTIVE
+     * project (after this same patch) is refused as `MILESTONE_NOT_IN_PROJECT`. `CardDrawer`'s
+     * picker (`milestone-picker.ts`'s `assignmentPatch`) is written to never send a mismatch, by
+     * clearing the milestone the moment the project changes — not by relying on this route to
+     * catch it after the fact.
+     */
+    projectId?: string | null;
+    milestoneId?: string | null;
   },
 ): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', headers, body: JSON.stringify(patch) });

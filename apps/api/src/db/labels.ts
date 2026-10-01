@@ -10,13 +10,30 @@
  */
 import { newId } from '../ids';
 
-const COLUMNS = 'id, tenant_id AS tenantId, name, colour, created_at AS createdAt';
+/**
+ * How a label came to exist — the same distinction `capabilities` already carries
+ * (`CapabilityOrigin`, `db/capabilities.ts`) for the same reason: `declared` means someone named
+ * it deliberately, `inferred` means it was typed into a card's Labels field and registered on the
+ * spot (`resolveLabelNames`, below). Recorded rather than hidden because "which of these did
+ * nobody ever mean to create?" is exactly the question an operator needs to ask to find a typo
+ * after the fact — the question `LabelManager.svelte` exists to let them ask.
+ */
+export type LabelOrigin = 'declared' | 'inferred';
+
+/**
+ * `origin`, not `created_by` — migration 0011 added both, but nothing reads `created_by` (no
+ * route, no UI asks "who typed this"), and selecting a column nothing uses is exactly the
+ * unexamined-field habit this file's own `origin` omission was an instance of. Add it back the
+ * day something actually needs it.
+ */
+const COLUMNS = 'id, tenant_id AS tenantId, name, colour, origin, created_at AS createdAt';
 
 export interface LabelRecord {
   id: string;
   tenantId: string;
   name: string;
   colour: string;
+  origin: LabelOrigin;
   createdAt: string;
 }
 

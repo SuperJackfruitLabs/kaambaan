@@ -25,3 +25,12 @@ export function recolourLabel(deps: LabelActionDeps, id: string, colour: string)
 export function removeLabel(deps: LabelActionDeps, id: string): Promise<Response> {
   return deps.deleteLabel(id);
 }
+
+/**
+ * Should this label's row carry the "inferred" badge? Same treatment `CapabilitiesTab.svelte`
+ * already gives a capability's origin (`c.origin === 'inferred'`) — only the surprising case is
+ * called out; `declared` is the unremarkable default and gets no badge of its own.
+ */
+export function showsInferredBadge(origin: 'declared' | 'inferred'): boolean {
+  return origin === 'inferred';
+}

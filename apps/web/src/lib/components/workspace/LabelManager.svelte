@@ -6,19 +6,14 @@
    * recoloured or removed. `renameLabel`/`recolourLabel`/`removeLabel` (`./label-manager.ts`) are
    * that caller; this component is their UI.
    *
-   * **`origin` is not shown.** The brief asks for it — "List the catalogue with each label's
-   * origin, so an operator can see which were inferred from a typo" — and the label this app
-   * writes DOES carry one (`origin: 'inferred'`, migration 0011, same treatment `CapabilitiesTab`
-   * already gives a capability that "appeared as a stage owner nobody ever defined"). But
-   * `GET /v1/labels` (`apps/api/src/index.ts`) answers with `db/labels.ts`'s `listLabels`, whose
-   * `COLUMNS` constant is `id, tenant_id AS tenantId, name, colour, created_at AS createdAt` — it
-   * never selects `origin` — and the client `Label` type (`$lib/api`) does not declare the field
-   * either. Both are a server field and a server-side column list, respectively; out of this
-   * task's scope (`apps/api/**`, `apps/web/src/lib/api.ts`). Surfaced in the task report rather
-   * than worked around here.
+   * Each row also carries its `origin` (`showsInferredBadge`, `./label-manager.ts`) — the same
+   * treatment `CapabilitiesTab.svelte` already gives a capability's origin: only `inferred`
+   * (typed into a card's Labels field and registered on the spot, `resolveLabelNames`,
+   * `apps/api/src/db/labels.ts`) gets a badge; `declared` is the unremarkable default and gets
+   * none. This is what lets an operator find a typo after the fact.
    */
   import { listLabels, createLabel, updateLabel, deleteLabel, type Label } from '$lib/api';
-  import { renameLabel, recolourLabel, removeLabel } from './label-manager';
+  import { renameLabel, recolourLabel, removeLabel, showsInferredBadge } from './label-manager';
   import { Button } from '$lib/components/ui/button';
 
   let labels = $state<Label[]>([]);
@@ -125,6 +120,12 @@
         aria-label="Name for label {l.name}"
         class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-xs"
       />
+      {#if showsInferredBadge(l.origin)}
+        <span
+          class="border-border text-muted-foreground shrink-0 rounded-[4px] border px-1 text-[9px]"
+          title="Nobody defined this — it turned up in use"
+        >inferred</span>
+      {/if}
       <button
         onclick={() => void onRemove(l)}
         disabled={removing === l.id}
