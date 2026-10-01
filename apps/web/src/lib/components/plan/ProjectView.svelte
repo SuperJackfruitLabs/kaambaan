@@ -3,12 +3,13 @@
    * Projects — the view, not the catalogue. Per project: name, state, health, target date, a
    * progress bar from `cardsDone / cardsTotal`, cost, and its milestones in `sortOrder` (Step 1).
    *
-   * Every rollup number on this screen carries its own "as of" line, via `rollupHeadline`
-   * (`./project-rollup.ts`) — Step 2's obligation. `rollupHeadline` composes the cards/cost/
-   * overdue figures and their as-of provenance into one string, rendered through one
-   * interpolation below, so there is no template-level way to keep a figure while dropping its
-   * provenance: a cross-board total is stale the moment it returns, and a partial one is an
-   * admission the server already made that this view must not bury.
+   * Every rollup number on this screen carries its own "as of" line, via `rollupSegments`
+   * (`./project-rollup.ts`) — Step 2's obligation. `rollupSegments` returns the cards/cost figures
+   * and the as-of provenance as one ordered array (figures first, provenance last), rendered below
+   * through a single `{#each}`: dropping the provenance segment would mean filtering it out of
+   * that loop, a visible act, rather than deleting a separate interpolation. The per-segment
+   * `kind` ('figure' | 'provenance') picks the CSS class, which is what keeps the bold-figures /
+   * muted-provenance two-tier look without a second interpolation to go with it.
    */
   import { app } from '$lib/stores/app.svelte';
   import {
@@ -25,7 +26,7 @@
     type ProjectRollup,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
-  import { progressPct, rollupHeadline } from './project-rollup';
+  import { progressPct, rollupSegments } from './project-rollup';
 
   let projects = $state<Project[]>([]);
   let milestonesByProject = $state<Map<string, Milestone[]>>(new Map());
@@ -246,15 +247,22 @@
 
         <!--
           Rollup. NEVER a number with no provenance beside it (Step 2) — `rollupErr` renders
-          instead of a fabricated 0/0, and `rollup` renders through `rollupHeadline`, which bakes
-          every figure into the same string as its as-of provenance: there is no separate
-          interpolation here for a future edit to drop independently of the other.
+          instead of a fabricated 0/0, and `rollup` renders every segment `rollupSegments` returns
+          through this ONE `{#each}`. The `provenance` segment's `w-full` is a deliberate flex-wrap
+          trick, not incidental styling: it is what forces that segment onto its own line below the
+          two `figure` segments (which `justify-between` then pushes to opposite ends of the first
+          line), so the two-tier look survives without a second, independently-droppable
+          interpolation to produce it.
         -->
         <div class="mt-2.5">
           {#if rollupErr}
             <p class="text-coral text-[11px]">Rollup unavailable — {rollupErr}</p>
           {:else if rollup}
-            <div class="mono text-[11px]">{rollupHeadline(rollup)}</div>
+            <div class="flex flex-wrap items-baseline justify-between gap-x-2">
+              {#each rollupSegments(rollup) as seg, i (i)}
+                <span class={seg.kind === 'figure' ? 'mono text-[11px]' : 'text-muted-foreground mono mt-1 w-full text-[10px]'}>{seg.text}</span>
+              {/each}
+            </div>
             <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-inset">
               <div class="h-full rounded-full transition-all duration-1000" style="width:{progressPct(rollup)}%;background:var(--live)"></div>
             </div>

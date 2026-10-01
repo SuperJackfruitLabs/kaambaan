@@ -46,26 +46,45 @@ function fmtUsd(n: number): string {
   return `$${n.toFixed(2)}`;
 }
 
-type RollupHeadlineInput = Pick<
+type RollupSegmentsInput = Pick<
   ProjectRollup,
   'cardsTotal' | 'cardsDone' | 'costUsd' | 'cardsOverdue' | 'computedAt' | 'partial' | 'boardsUnanswered'
 >;
 
 /**
- * The entire rollup headline — cards done, cost, overdue count, and `formatAsOf`'s provenance —
- * composed into ONE string, so a template has exactly one interpolation to render it through.
- *
- * Before this existed, the obligation that no rollup figure render without `formatAsOf` beside it
- * was held by review alone: the template called `formatAsOf(rollup)` as a SEPARATE interpolation
- * from `{rollup.cardsDone}/{rollup.cardsTotal}` and `fmtUsd(rollup.costUsd)`, so an edit that
- * dropped just the `formatAsOf` call left every figure still rendering and every test green — this
- * project's Vitest config cannot import a `.svelte` file, so nothing could catch it at runtime.
- * Collapsing all four numbers into one return value removes that degree of freedom: there is no
- * longer anywhere in `ProjectView.svelte` a rollup figure that isn't part of the same string as
- * its provenance, and this function is the one place that string is built, so it is the one place
- * a test can hold the property.
+ * One piece of the rollup headline. `figure` is a number derived from the rollup (cards done,
+ * cost); `provenance` is `formatAsOf`'s sentence, with the overdue count folded in since overdue
+ * is itself a count that is only honest alongside the same "as of" line.
  */
-export function rollupHeadline(rollup: RollupHeadlineInput): string {
+export interface RollupSegment {
+  kind: 'figure' | 'provenance';
+  text: string;
+}
+
+/**
+ * The rollup headline as an ordered list of segments — cards done, cost, then provenance last —
+ * returned from ONE call so a template renders them through ONE `{#each}` rather than through
+ * separate interpolations it could drop independently.
+ *
+ * This replaces an earlier version (`rollupHeadline`) that concatenated everything into one
+ * string: correct for the "nothing to drop independently" property, but a visual downgrade (one
+ * flat line instead of a bold figures row over a muted provenance row) that read as a mistake and
+ * invited the next edit to "fix" it back into separate interpolations — which would have silently
+ * undone the guarantee. Segments solve both at once: `ProjectView.svelte` still renders exactly
+ * one value (this array), so dropping provenance now requires *filtering inside the loop* — a
+ * visible, deliberate act, not an accidental deletion — while the per-`kind` CSS class in that
+ * same loop restores the two-tier look.
+ *
+ * `cardsDone`/`cardsTotal`/`costUsd` are always `figure`; `formatAsOf(rollup)` (plus the overdue
+ * suffix, when there is one) is always the last segment and is always `provenance` — there is
+ * exactly one of those per call, for every input, including a `partial` rollup, where it carries
+ * the unanswered-board count rather than being omitted.
+ */
+export function rollupSegments(rollup: RollupSegmentsInput): RollupSegment[] {
   const overdue = rollup.cardsOverdue > 0 ? ` · ${rollup.cardsOverdue} overdue` : '';
-  return `${rollup.cardsDone}/${rollup.cardsTotal} cards done · ${fmtUsd(rollup.costUsd)} · ${formatAsOf(rollup)}${overdue}`;
+  return [
+    { kind: 'figure', text: `${rollup.cardsDone}/${rollup.cardsTotal} cards done` },
+    { kind: 'figure', text: fmtUsd(rollup.costUsd) },
+    { kind: 'provenance', text: `${formatAsOf(rollup)}${overdue}` },
+  ];
 }
