@@ -342,6 +342,15 @@ export interface CardView {
   queuedGrant: string[] | null;
   /** Applied label ids; the catalogue lives in D1 (`src/db/labels.ts`). */
   labels: string[];
+  /**
+   * Cross-board project/milestone membership (D1 catalogue, migration 0013; Task 19). Either may
+   * point at a project/milestone this tenant has since deleted — `DELETE /v1/projects/:id` deletes
+   * unconditionally, and this DO has no way to be told. That is a normal state, not an error: an
+   * unresolved id is treated exactly like an unknown label id, dropped from display and never a
+   * refusal here or in the rollup.
+   */
+  projectId: string | null;
+  milestoneId: string | null;
   /** ISO date (no time), or null. */
   dueAt: string | null;
   archivedAt: string | null;
@@ -828,7 +837,18 @@ export interface BoardStub {
   getCardView(cardId: string): Promise<Result<CardView>>;
   updateCard(
     cardId: string,
-    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+    patch: {
+      title?: string;
+      spec?: JsonValue;
+      priority?: number;
+      ownerUserId?: string;
+      labels?: string[];
+      dueAt?: string | null;
+      archivedAt?: string | null;
+      /** Cross-board project/milestone membership (Task 19). `null` clears it. */
+      projectId?: string | null;
+      milestoneId?: string | null;
+    },
   ): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
   setName(name: string): Promise<Result<{ ok: true }>>;
@@ -855,6 +875,16 @@ export interface BoardStub {
   listLinks(cardId: string): Promise<LinkView[]>;
   setBudget(input: { boardUsdCap?: number | null; cardUsdCap?: number | null }): Promise<Result<{ ok: true }>>;
   getUsage(opts?: { window?: string }): Promise<UsageSummary>;
+  /**
+   * This board's slice of one project's rollup (Task 19) — the one fan-out in this design.
+   * `computeRollup` (`db/projects.ts`) calls this on every board a tenant has and sums the
+   * results; it is never consulted by the claim path, the advance path, or any refusal.
+   * `{ ok: false }` when the board has no `boardId` meta, i.e. its DO was never initialized — see
+   * the implementation's own comment for why that is a `Result` rather than a thrown exception.
+   * `computeRollup` turns either that or a genuinely thrown error into `partial: true` plus an
+   * unanswered-board count, never a confident wrong total.
+   */
+  projectSummary(projectId: string): Promise<Result<{ total: number; done: number; overdue: number; costUsd: number }>>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
@@ -1209,6 +1239,27 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * Cross-board project/milestone membership (D1 catalogue, migration 0013; Task 19). A single-DO
+     * write, like every other card edit — the project itself, and the rollup that fans out across
+     * every board carrying its id, live entirely in D1 and are never consulted here. Either column
+     * may point at a project/milestone this tenant has since deleted (`DELETE /v1/projects/:id`
+     * deletes unconditionally and cannot reach this DO to clear it); that is a normal state, read
+     * straight off the row below exactly like a dangling label id, never checked and never fatal.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN project_id TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN milestone_id TEXT`);
+    } catch {
+      // column already exists
+    }
+    // Only `project_id` is indexed: `projectSummary` is the one query that filters cards by it,
+    // and nothing here looks cards up by `milestone_id` on its own.
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_project ON cards(project_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_due_at ON cards(due_at)`);
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
@@ -1798,7 +1849,17 @@ export class BoardDO extends DurableObject<Env> {
 
   async updateCard(
     cardId: string,
-    patch: { title?: string; spec?: JsonValue; priority?: number; ownerUserId?: string; labels?: string[]; dueAt?: string | null; archivedAt?: string | null },
+    patch: {
+      title?: string;
+      spec?: JsonValue;
+      priority?: number;
+      ownerUserId?: string;
+      labels?: string[];
+      dueAt?: string | null;
+      archivedAt?: string | null;
+      projectId?: string | null;
+      milestoneId?: string | null;
+    },
   ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     const existing = this.getCard(cardId);
@@ -1842,6 +1903,14 @@ export class BoardDO extends DurableObject<Env> {
     if (patch.archivedAt !== undefined) {
       sets.push('archived_at = ?');
       vals.push(patch.archivedAt);
+    }
+    if (patch.projectId !== undefined) {
+      sets.push('project_id = ?');
+      vals.push(patch.projectId);
+    }
+    if (patch.milestoneId !== undefined) {
+      sets.push('milestone_id = ?');
+      vals.push(patch.milestoneId);
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
@@ -2511,6 +2580,61 @@ export class BoardDO extends DurableObject<Env> {
     const ms = parseWindowMs(opts.window);
     const since = ms === null ? undefined : new Date(this.nowMs() - ms).toISOString();
     return this.computeUsage(since);
+  }
+
+  /**
+   * This board's slice of one project's rollup (Task 19) — see the `BoardStub` interface comment
+   * for why nothing on the claim or advance path may ever call it.
+   *
+   * Returns a `Result`, like every other externally-callable method here, rather than throwing a
+   * bare exception across the RPC boundary for the uninitialized case: workerd logs a thrown RPC
+   * exception as its own top-level "uncaught exception" regardless of whether the caller catches
+   * the rejection, which is harmless in production but makes a deliberately-exercised failure path
+   * indistinguishable from a real crash in a test run. `computeRollup` (`db/projects.ts`) still
+   * wraps its call in try/catch for genuinely unexpected throws; the `Result` is what keeps the
+   * one failure this is actually built to survive — a board whose DO was never initialized — from
+   * ever being a real exception in the first place.
+   *
+   * `done` matches `RESOLVED_SQL`, the same "resolved, not merely terminal" rule
+   * `unresolvedBlockerExists`/`openChildCount` already enforce elsewhere in this file: a `failed`
+   * card is terminal but not done, so counting it as done would report a project complete while
+   * part of its work failed.
+   *
+   * `overdue` mirrors `sweepBoard`'s own overdue predicate (due, not archived, not terminal) —
+   * the same fact, read here instead of notified.
+   */
+  async projectSummary(projectId: string): Promise<Result<{ total: number; done: number; overdue: number; costUsd: number }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const today = this.now().slice(0, 10);
+    const counts = this.sql
+      .exec(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN state IN ${BoardDO.RESOLVED_SQL} THEN 1 ELSE 0 END), 0) AS done,
+           COALESCE(SUM(CASE WHEN due_at IS NOT NULL AND due_at < ? AND archived_at IS NULL
+                             AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')
+                        THEN 1 ELSE 0 END), 0) AS overdue
+         FROM cards WHERE project_id = ?`,
+        today,
+        projectId,
+      )
+      .one();
+    const cost = this.sql
+      .exec(
+        `SELECT COALESCE(SUM(u.cost_usd), 0) AS c FROM usage_records u
+           JOIN cards c ON c.id = u.card_id WHERE c.project_id = ?`,
+        projectId,
+      )
+      .one();
+    return {
+      ok: true,
+      value: {
+        total: Number(counts.total),
+        done: Number(counts.done),
+        overdue: Number(counts.overdue),
+        costUsd: Number(cost.c),
+      },
+    };
   }
 
   /**
@@ -4762,6 +4886,12 @@ export class BoardDO extends DurableObject<Env> {
       queuedBy: (row.queued_by as string | null) ?? null,
       queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
       labels: row.labels ? (JSON.parse(row.labels as string) as string[]) : [],
+      // Columns on the card row, same as `dueAt` below — no query, no `pre` entry, read straight
+      // off what `SELECT *` already fetched. A value here that no longer resolves (the project or
+      // milestone was deleted) is read as-is; it is the caller's job to decide what to do with it,
+      // never this DO's.
+      projectId: (row.project_id as string | null) ?? null,
+      milestoneId: (row.milestone_id as string | null) ?? null,
       dueAt: (row.due_at as string | null) ?? null,
       archivedAt: (row.archived_at as string | null) ?? null,
       currentStageKey: row.current_stage_key as string,

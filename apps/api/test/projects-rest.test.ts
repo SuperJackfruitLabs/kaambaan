@@ -1,5 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
+import type { BoardInit } from '../src/board/board-do';
 
 /**
  * `/v1/projects[/:id[/milestones]]` and `/v1/milestones/:id` — the routing and validation layer
@@ -21,6 +22,31 @@ async function insertTenant(id: string, slug: string): Promise<void> {
 
 async function createProject(tenant: string, body: Record<string, unknown>) {
   return SELF.fetch('https://api.test/v1/projects', { method: 'POST', headers: dev(tenant), body: JSON.stringify(body) });
+}
+
+const PIPE: BoardInit['stages'] = [{ key: 'draft', name: 'Draft', order: 0, ownerKind: 'capability', owner: 'writing' }];
+
+async function board(tenant: string): Promise<string> {
+  const res = await SELF.fetch('https://api.test/v1/boards', {
+    method: 'POST',
+    headers: dev(tenant),
+    body: JSON.stringify({ name: 'Projects', stages: PIPE }),
+  });
+  return (await res.json<{ boardId: string }>()).boardId;
+}
+
+async function card(tenant: string, boardId: string, title: string): Promise<string> {
+  const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, {
+    method: 'POST',
+    headers: dev(tenant),
+    body: JSON.stringify({ title }),
+  });
+  return (await res.json<{ card: { id: string } }>()).card.id;
+}
+
+async function readCard(tenant: string, boardId: string, cardId: string): Promise<{ projectId: string | null; milestoneId: string | null }> {
+  const res = await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards/${cardId}`, { headers: dev(tenant) });
+  return (await res.json<{ card: { projectId: string | null; milestoneId: string | null } }>()).card;
 }
 
 describe('GET /v1/projects', () => {
@@ -329,5 +355,137 @@ describe('DELETE /v1/milestones/:id', () => {
     await insertTenant(t, 'prj-rest-msdeleteunknown');
     const res = await SELF.fetch('https://api.test/v1/milestones/mls_doesnotexist', { method: 'DELETE', headers: dev(t) });
     expect(res.status).toBe(404);
+  });
+});
+
+/**
+ * `PATCH /v1/boards/:id/cards/:cardId` — `milestoneId` validation (Task 19, step 2). The DO
+ * cannot check that a milestone belongs to the project it is about to be attached under —
+ * milestones are in D1 — so the route does, the same shape `labels`' unknown-id check takes in
+ * `labels-rest.test.ts`.
+ */
+describe('PATCH /v1/boards/:id/cards/:cardId — milestoneId validation', () => {
+  it('refuses a milestoneId from a different project, naming MILESTONE_NOT_IN_PROJECT', async () => {
+    const t = 'tnt_prj_rest_msmismatch';
+    await insertTenant(t, 'prj-rest-msmismatch');
+
+    const madeA = await createProject(t, { name: 'project A' });
+    const { project: projectA } = await madeA.json<{ project: { id: string } }>();
+    const madeB = await createProject(t, { name: 'project B' });
+    const { project: projectB } = await madeB.json<{ project: { id: string } }>();
+
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${projectA.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'A-only milestone' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'Wrong project');
+
+    // The card belongs to project B; the milestone belongs to project A.
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: projectB.id, milestoneId: milestone.id }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('MILESTONE_NOT_IN_PROJECT');
+
+    // Refused before the write lands — the card carries neither.
+    const after = await readCard(t, b, id);
+    expect(after.projectId).toBeNull();
+    expect(after.milestoneId).toBeNull();
+  });
+
+  it('refuses a milestoneId when the card has no projectId at all, in the same request or already stored', async () => {
+    const t = 'tnt_prj_rest_msnoproject';
+    await insertTenant(t, 'prj-rest-msnoproject');
+
+    const made = await createProject(t, { name: 'orphaned milestone target' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${project.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'needs a project' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'No project');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ milestoneId: milestone.id }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ error: { code: string } }>()).error.code).toBe('MILESTONE_NOT_IN_PROJECT');
+  });
+
+  it('accepts a milestoneId that belongs to the projectId set in the SAME request', async () => {
+    const t = 'tnt_prj_rest_msmatch';
+    await insertTenant(t, 'prj-rest-msmatch');
+
+    const made = await createProject(t, { name: 'matching project' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${project.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'on track' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'Matching project');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id, milestoneId: milestone.id }),
+    });
+    expect(res.status).toBe(200);
+
+    const after = await readCard(t, b, id);
+    expect(after.projectId).toBe(project.id);
+    expect(after.milestoneId).toBe(milestone.id);
+  });
+
+  it('accepts a milestoneId against a projectId already stored on the card from an earlier PATCH', async () => {
+    const t = 'tnt_prj_rest_msalreadystored';
+    await insertTenant(t, 'prj-rest-msalreadystored');
+
+    const made = await createProject(t, { name: 'already-assigned project' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${project.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'later milestone' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'Assigned earlier');
+
+    const first = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id }),
+    });
+    expect(first.status).toBe(200);
+
+    // This PATCH sends ONLY milestoneId — the route must read the card's already-stored
+    // projectId to validate against, not assume it is missing because the body omits it.
+    const second = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ milestoneId: milestone.id }),
+    });
+    expect(second.status).toBe(200);
+
+    const after = await readCard(t, b, id);
+    expect(after.projectId).toBe(project.id);
+    expect(after.milestoneId).toBe(milestone.id);
   });
 });

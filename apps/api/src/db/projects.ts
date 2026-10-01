@@ -11,6 +11,9 @@
  * Follows `db/labels.ts`'s shape: hand-written SQL, `tenant_id = ?` first in every WHERE clause.
  */
 import { newId } from '../ids';
+import type { Env } from '../env';
+import { boardStub } from '../board/stub';
+import { listAllBoards } from './catalog';
 
 export type ProjectState = 'planned' | 'active' | 'paused' | 'completed' | 'canceled';
 export type ProjectHealth = 'on-track' | 'at-risk' | 'off-track';
@@ -272,4 +275,144 @@ export async function updateMilestone(
 export async function deleteMilestone(db: D1Database, tenantId: string, id: string): Promise<boolean> {
   const res = await db.prepare(`DELETE FROM milestones WHERE tenant_id = ? AND id = ?`).bind(tenantId, id).run();
   return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Every project in the deployment, tenant and all — `listAllBoards`'s own shape (`db/catalog.ts`)
+ * and the same reason: the scheduled refresh has no caller and therefore no tenant to scope to.
+ * Not exported through any route; the only caller is `scheduled()`.
+ */
+export async function listAllProjects(db: D1Database): Promise<Array<{ id: string; tenantId: string }>> {
+  const { results } = await db
+    .prepare(`SELECT id, tenant_id AS tenantId FROM projects ORDER BY created_at ASC`)
+    .all<{ id: string; tenantId: string }>();
+  return results ?? [];
+}
+
+export interface ProjectRollup {
+  projectId: string;
+  cardsTotal: number;
+  cardsDone: number;
+  cardsOverdue: number;
+  costUsd: number;
+  computedAt: string;
+  /** True when one or more boards failed to answer — see `computeRollup`. */
+  partial: boolean;
+  /** How many boards failed to answer. 0 whenever `partial` is false. */
+  boardsUnanswered: number;
+}
+
+interface ProjectRollupRow {
+  project_id: string;
+  cards_total: number;
+  cards_done: number;
+  cards_overdue: number;
+  cost_usd: number;
+  computed_at: string;
+  partial: number;
+  boards_unanswered: number;
+}
+
+function rollupFromRow(row: ProjectRollupRow): ProjectRollup {
+  return {
+    projectId: row.project_id,
+    cardsTotal: Number(row.cards_total),
+    cardsDone: Number(row.cards_done),
+    cardsOverdue: Number(row.cards_overdue),
+    costUsd: Number(row.cost_usd),
+    computedAt: row.computed_at,
+    partial: Number(row.partial) === 1,
+    boardsUnanswered: Number(row.boards_unanswered),
+  };
+}
+
+/** The cached row `computeRollup` last wrote, or null if this project has never been computed. */
+export async function cachedRollup(db: D1Database, tenantId: string, projectId: string): Promise<ProjectRollup | null> {
+  const row = await db
+    .prepare(`SELECT * FROM project_rollups WHERE tenant_id = ? AND project_id = ?`)
+    .bind(tenantId, projectId)
+    .first<ProjectRollupRow>();
+  return row ? rollupFromRow(row) : null;
+}
+
+/**
+ * The one fan-out in this design.
+ *
+ * Everything else in superpipeline keeps the spine the rest of this module's comments describe:
+ * anything that may REFUSE a claim or an advance lives in one board's Durable Object and is
+ * strongly consistent; anything merely informational lives here in D1 and may span boards. This
+ * is that second kind, taken to its fan-out conclusion — it reads every board belonging to this
+ * tenant and is stale the instant it returns. That is acceptable only because nothing may ever
+ * decide anything on it: this function (and the cached row it writes) must never be read by the
+ * claim path, the advance path, or any refusal.
+ *
+ * **Tenant-scoped on purpose, even though `listAllBoards` is not.** `listAllBoards` is the cron's
+ * global walk across every tenant in the deployment (see its own comment in `db/catalog.ts`) — a
+ * fan-out that used its result unfiltered would read, and sum into one tenant's total, cards that
+ * belong to a completely different workspace. Filtering here, before a single board stub is
+ * touched, is what keeps a project's rollup inside its own tenant.
+ *
+ * **Partial, and says so.** A board's Durable Object may throw — never initialized, a transient
+ * error, anything — and one board's failure must not make the whole rollup throw, nor silently
+ * under-count. Each board is called in its own try/catch; a throw is counted in
+ * `boardsUnanswered` and skipped, never allowed to turn into a confidently wrong total. The
+ * caller (the route, and Task 20's UI) is expected to say so whenever `partial` is true, the same
+ * way `overBudget` exists to be surfaced rather than silently absorbed.
+ */
+export async function computeRollup(
+  db: D1Database,
+  env: Env,
+  tenantId: string,
+  projectId: string,
+): Promise<ProjectRollup> {
+  const boards = (await listAllBoards(db)).filter((b) => b.tenantId === tenantId);
+
+  let cardsTotal = 0;
+  let cardsDone = 0;
+  let cardsOverdue = 0;
+  let costUsd = 0;
+  let boardsUnanswered = 0;
+
+  for (const board of boards) {
+    try {
+      const result = await boardStub(env, tenantId, board.id).projectSummary(projectId);
+      // `{ ok: false }` (a board whose DO was never initialized) and a genuinely thrown error
+      // (anything else — a transient failure, a bug) are the same fact from this fan-out's point
+      // of view: one board did not answer. Both land here as "unanswered", never as a thrown
+      // exception that would abort the whole rollup.
+      if (!result.ok) {
+        boardsUnanswered += 1;
+        continue;
+      }
+      cardsTotal += result.value.total;
+      cardsDone += result.value.done;
+      cardsOverdue += result.value.overdue;
+      costUsd += result.value.costUsd;
+    } catch {
+      boardsUnanswered += 1;
+    }
+  }
+
+  const partial = boardsUnanswered > 0;
+  const computedAt = new Date().toISOString();
+
+  await db
+    .prepare(
+      `INSERT INTO project_rollups
+         (project_id, tenant_id, cards_total, cards_done, cards_overdue, cost_usd, computed_at, partial, boards_unanswered)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id) DO UPDATE SET
+         tenant_id = excluded.tenant_id,
+         cards_total = excluded.cards_total,
+         cards_done = excluded.cards_done,
+         cards_overdue = excluded.cards_overdue,
+         cost_usd = excluded.cost_usd,
+         computed_at = excluded.computed_at,
+         partial = excluded.partial,
+         boards_unanswered = excluded.boards_unanswered`,
+    )
+    .bind(projectId, tenantId, cardsTotal, cardsDone, cardsOverdue, costUsd, computedAt, partial ? 1 : 0, boardsUnanswered)
+    .run();
+
+  return { projectId, cardsTotal, cardsDone, cardsOverdue, costUsd, computedAt, partial, boardsUnanswered };
 }

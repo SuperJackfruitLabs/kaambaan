@@ -82,9 +82,13 @@ import {
   listMilestones,
   createMilestone,
   deleteMilestone,
+  milestoneById,
   isProjectNameCollision,
   PROJECT_STATES,
   PROJECT_HEALTHS,
+  computeRollup,
+  cachedRollup,
+  listAllProjects,
   type ProjectState,
   type ProjectHealth,
 } from './db/projects';
@@ -814,10 +818,11 @@ export default {
       }
     }
 
-    // /v1/projects[/:id[/milestones]] — a workspace's projects (migration 0013), which group
-    // cards ACROSS boards. Task 19 adds `GET /v1/projects/:id/rollup`; not here, because that read
-    // fans out to every board's Durable Object and this module and its routes do not.
-    const projectsMatch = path.match(/^\/v1\/projects(?:\/([^/]+)(?:\/(milestones))?)?$/);
+    // /v1/projects[/:id[/milestones|/rollup]] — a workspace's projects (migration 0013), which
+    // group cards ACROSS boards. `GET /v1/projects/:id/rollup` (Task 19) is the one read in this
+    // module that fans out to every board's Durable Object, via `computeRollup` (`db/projects.ts`)
+    // — nothing else here touches a board.
+    const projectsMatch = path.match(/^\/v1\/projects(?:\/([^/]+)(?:\/(milestones|rollup))?)?$/);
     if (projectsMatch) {
       try {
         // Same fallback as `/v1/labels`: `supi project ...` sends a hub JWT, never a session
@@ -827,7 +832,7 @@ export default {
         if (!u) u = await resolveHubUser(request, env);
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const projectId = projectsMatch[1];
-        const milestonesSeg = projectsMatch[2];
+        const subSeg = projectsMatch[2];
 
         if (request.method === 'GET' && !projectId) {
           const refused = refuseByRole(u, 'read');
@@ -835,7 +840,24 @@ export default {
           return Response.json({ projects: await listProjects(env.DB, u.tenantId) });
         }
 
-        if (request.method === 'GET' && projectId && !milestonesSeg) {
+        if (request.method === 'GET' && projectId && subSeg === 'rollup') {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          // Same cross-tenant-reads-as-404 reasoning as the project read just below.
+          if (!(await projectById(env.DB, u.tenantId, projectId))) {
+            return Response.json({ error: 'project not found' }, { status: 404 });
+          }
+          // The cached row, reused inside 60s; recomputed (and re-cached) once it is older than
+          // that. `computeRollup` is the one fan-out in this design — see its own comment in
+          // `db/projects.ts` for why it is tenant-scoped and why `partial` exists at all.
+          const cached = await cachedRollup(env.DB, u.tenantId, projectId);
+          const STALE_MS = 60_000;
+          const fresh = cached && Date.now() - new Date(cached.computedAt).getTime() < STALE_MS;
+          const rollup = fresh ? cached! : await computeRollup(env.DB, env, u.tenantId, projectId);
+          return Response.json({ rollup });
+        }
+
+        if (request.method === 'GET' && projectId && !subSeg) {
           const refused = refuseByRole(u, 'read');
           if (refused) return refused;
           const project = await projectById(env.DB, u.tenantId, projectId);
@@ -883,7 +905,7 @@ export default {
           }
         }
 
-        if (request.method === 'PATCH' && projectId && !milestonesSeg) {
+        if (request.method === 'PATCH' && projectId && !subSeg) {
           const body = (await request.json()) as {
             name?: string;
             description?: string | null;
@@ -930,7 +952,7 @@ export default {
           }
         }
 
-        if (request.method === 'DELETE' && projectId && !milestonesSeg) {
+        if (request.method === 'DELETE' && projectId && !subSeg) {
           // Unconditional, the same way `deleteLabel` is (NOT `deleteCapability`, which refuses
           // with 409 when still used — it can, because a capability's references are entirely in
           // D1 and one cheap query finds them all). A card carrying this project's (or one of its
@@ -944,7 +966,7 @@ export default {
           return new Response(null, { status: 204 });
         }
 
-        if (request.method === 'POST' && projectId && milestonesSeg) {
+        if (request.method === 'POST' && projectId && subSeg === 'milestones') {
           const body = (await request.json()) as { name?: string; targetDate?: string; sortOrder?: number };
           const name = typeof body.name === 'string' ? body.name.trim() : '';
           if (name === '') return Response.json({ error: 'name is required' }, { status: 400 });
@@ -1617,6 +1639,9 @@ export default {
           labelNames?: string[];
           dueAt?: string | null;
           archivedAt?: string | null;
+          /** Cross-board project/milestone membership (migration 0013; Task 19). `null` clears it. */
+          projectId?: string | null;
+          milestoneId?: string | null;
         };
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
@@ -1667,6 +1692,33 @@ export default {
           if (unknown.length > 0) {
             return Response.json(
               { error: { code: 'UNKNOWN_LABEL', message: `no such label in this workspace: ${unknown.join(', ')}` } },
+              { status: 400 },
+            );
+          }
+        }
+        // Milestones are in D1; the DO cannot check that a milestone belongs to the project it is
+        // about to be attached under, so the route does — the same shape `labels` just took above.
+        // Unlike labels, this is a RELATIONSHIP check, not an existence check: a `projectId` that
+        // no longer resolves is a normal state here (see the long comment on `deleteProject` in
+        // `db/projects.ts`), and nothing above refuses it. A `milestoneId`, though, is only ever
+        // meaningful alongside the project it was created under, so the route refuses the one
+        // combination the DO has no way to catch — a milestone from a DIFFERENT project.
+        if (body.milestoneId !== undefined && body.milestoneId !== null) {
+          let effectiveProjectId = body.projectId;
+          if (effectiveProjectId === undefined) {
+            const current = await stub.getCardView(cardMatch[1]!);
+            if (!current.ok) return Response.json({ error: current }, { status: statusForCode(current.code) });
+            effectiveProjectId = current.value.projectId;
+          }
+          const milestone = effectiveProjectId ? await milestoneById(env.DB, tenantId, body.milestoneId) : null;
+          if (!milestone || milestone.projectId !== effectiveProjectId) {
+            return Response.json(
+              {
+                error: {
+                  code: 'MILESTONE_NOT_IN_PROJECT',
+                  message: "milestoneId does not belong to the card's project",
+                },
+              },
               { status: 400 },
             );
           }
@@ -2538,6 +2590,19 @@ export default {
             // silently meant a board failing every five-minute tick, forever, left no trace
             // anywhere. Logged, not rethrown: the loop still continues to the next board.
             console.error(`sweepBoard failed for board ${board.id}`, err);
+          }
+        }
+        // Third arm, same shape as the two above: every project's rollup (Task 19), refreshed so
+        // `GET /v1/projects/:id/rollup` almost never has to pay for the fan-out itself — the 60s
+        // cache window is usually already warm by the time anyone asks. `computeRollup` is itself
+        // forgiving of a board that fails to answer (`partial`/`boardsUnanswered`); this try/catch
+        // is only for a failure in computeRollup's OWN bookkeeping (e.g. the D1 write that caches
+        // the row), logged rather than swallowed for the same reason the sweep above is.
+        for (const project of await listAllProjects(env.DB)) {
+          try {
+            await computeRollup(env.DB, env, project.tenantId, project.id);
+          } catch (err) {
+            console.error(`computeRollup failed for project ${project.id}`, err);
           }
         }
       })(),

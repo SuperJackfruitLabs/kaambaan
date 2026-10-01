@@ -9,6 +9,7 @@ import labels from '../../migrations/0010_labels.sql?raw';
 import labelsOrigin from '../../migrations/0011_labels_origin.sql?raw';
 import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
 import projectsAndMilestones from '../../migrations/0013_projects_and_milestones.sql?raw';
+import projectRollupPartial from '../../migrations/0014_project_rollup_partial.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -125,5 +126,10 @@ export async function setupCatalog(): Promise<void> {
   // `test/projects-rest.test.ts` assert the cascade and the tenant isolation it provides.
   if (!(await tableExists('projects'))) {
     for (const s of statementsOf(projectsAndMilestones)) await env.DB.prepare(s).run();
+  }
+  // 0014 adds `partial`/`boards_unanswered` to `project_rollups` (Task 19's fan-out cache). Guarded
+  // on the column, same as every other ALTER-TABLE migration mirrored above.
+  if (!(await tableHasColumn('project_rollups', 'partial'))) {
+    for (const s of statementsOf(projectRollupPartial)) await env.DB.prepare(s).run();
   }
 }
