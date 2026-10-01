@@ -86,6 +86,44 @@ export function renderGates(value: unknown): string {
     .join("\n\n");
 }
 
+/**
+ * A workspace's projects (Task 18's `/v1/projects`, Task 20's `supi project list`). Each project
+ * groups cards ACROSS boards, so there is no board to hang the listing off — name, state and
+ * health are the whole row.
+ */
+export function renderProjects(value: unknown): string {
+  const projects = list<{ id?: string; name?: string; state?: string; health?: string | null }>(value, "projects");
+  if (projects.length === 0) return "No projects. `supi project add <name>` makes one.";
+  return projects
+    .map((p) => `${p.name ?? "(unnamed)"}  [${p.state ?? "?"}]${p.health ? `  ${p.health}` : ""}\n${PAD}${p.id ?? ""}`)
+    .join("\n");
+}
+
+/**
+ * One project and its milestones, exactly in the order the server sent them — `GET
+ * /v1/projects/:id` already answers `sort_order ASC, name ASC` (`db/projects.ts`
+ * `listMilestones`), so this renderer does not re-sort; doing so would risk silently disagreeing
+ * with the one place `sortOrder` is actually enforced.
+ */
+export function renderProject(value: unknown): string {
+  const v = (value ?? {}) as {
+    project?: { id?: string; name?: string; state?: string; health?: string | null; targetDate?: string | null; description?: string | null };
+    milestones?: { id?: string; name?: string; targetDate?: string | null }[];
+  };
+  const p = v.project ?? {};
+  const milestones = v.milestones ?? [];
+  const lines = [
+    `${p.name ?? "(unnamed)"}  ${p.id ?? ""}`.trim(),
+    `state ${p.state ?? "?"}${p.health ? `  health ${p.health}` : ""}${p.targetDate ? `  target ${p.targetDate}` : ""}`,
+  ];
+  if (p.description) lines.push("", p.description);
+  lines.push("", milestones.length === 0 ? "No milestones." : "Milestones");
+  for (const m of milestones) {
+    lines.push(`${PAD}${m.name ?? "(unnamed)"}${m.targetDate ? `  ${m.targetDate}` : ""}  ${m.id ?? ""}`);
+  }
+  return lines.join("\n");
+}
+
 /** A handoff as written: a plain string, an object with a `summary`, or a JSON fallback. */
 function handoffText(value: unknown): string {
   if (value === null || value === undefined) return "";
