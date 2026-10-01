@@ -1582,8 +1582,18 @@ export default {
         // session-cookie caller carries none, and `undefined` there means "no
         // one with permission asked for this to run" — which is refused under
         // enforcement rather than treated as an empty grant.
+        //
+        // Built from named fields rather than `...body`: `as` above is a compile-time assertion
+        // only — it strips nothing at runtime, so a caller sending ANY key (`projectId` among
+        // them: `createCard`'s own input type carries it for `createChildCard`'s internal use
+        // alone, board-do.ts) would have had it spread straight through to the DO. A cast is not
+        // validation, so the route has to name what it accepts rather than forward what it
+        // received.
         const result = await stub.createCard({
-          ...body,
+          title: body.title,
+          spec: body.spec,
+          priority: body.priority,
+          dueAt: body.dueAt,
           ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_dev',
           queuedGrant: user?.mayDispatch ?? null,
         });

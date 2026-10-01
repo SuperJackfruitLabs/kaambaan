@@ -694,3 +694,36 @@ describe('GET /v1/projects/:id/rollup', () => {
     expect(res.status).toBe(403);
   });
 });
+
+/**
+ * `POST /v1/boards/:id/cards` — the route built its `createCard` call with `...body`, where
+ * `body` is a request body narrowed only by `as` (a COMPILE-time assertion — it strips nothing
+ * at runtime). `createCard`'s own input type carries `projectId` for `createChildCard`'s
+ * internal use alone (Task 19 follow-up); the spread meant any caller could set it too, through
+ * a surface the project design deliberately keeps a card off at creation (a card joins a project
+ * only via the second `PATCH` round trip — Task 21 decides whether that should change, not this
+ * route silently deciding it already has).
+ */
+describe('POST /v1/boards/:id/cards — body whitelisting (Task 19 follow-up)', () => {
+  it('ignores projectId, and any other unexpected key, in the create body — not rejected, just not applied', async () => {
+    const t = 'tnt_prj_rest_createwhitelist';
+    await insertTenant(t, 'prj-rest-createwhitelist');
+    const b = await board(t);
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({
+        title: 'Sneaky',
+        projectId: 'prj_should_be_ignored',
+        someOtherUnexpectedKey: 'whatever',
+      }),
+    });
+    // Ignored, not refused: rejecting unknown keys would be a separate API decision this test
+    // does not make.
+    expect(res.status).toBe(201);
+    const { card } = await res.json<{ card: { title: string; projectId: string | null } }>();
+    expect(card.title).toBe('Sneaky');
+    expect(card.projectId).toBeNull();
+  });
+});
