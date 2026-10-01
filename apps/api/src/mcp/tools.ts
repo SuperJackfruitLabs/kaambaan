@@ -61,6 +61,20 @@ export const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
   superpipeline_split_card: 'run',
 };
 
+/**
+ * Tools that CREATE work rather than progress it, and are therefore never reached by the
+ * `claim` → `run` grandfather clause (`auth/scopes.ts`).
+ *
+ * Membership is one question: *does calling this make new cards?* `superpipeline_split_card` turns
+ * one card into up to twenty, so a token minted with `['claim']` alone — which predates scope
+ * enforcement entirely — must not inherit it. Every other `run` verb finishes work the agent was
+ * already handed, which is exactly what the clause exists to keep possible.
+ *
+ * This set is the reason the clause does not widen on its own: without it, every `run` tool added
+ * from here on is grandfathered to legacy tokens by default, silently.
+ */
+const CREATES_WORK: ReadonlySet<string> = new Set(['superpipeline_split_card']);
+
 export interface ToolDeps {
   auth: McpAuth;
   /** Build a Board DO stub for (tenant, board) — identical to the Worker's `boardStub` helper. */
@@ -98,7 +112,7 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
    */
   const register: typeof server.registerTool = ((name: string, ...rest: unknown[]) => {
     const needed = TOOL_SCOPE[name];
-    if (needed && !scopePermits(auth.scopes ?? null, needed)) return undefined;
+    if (needed && !scopePermits(auth.scopes ?? null, needed, { grandfather: !CREATES_WORK.has(name) })) return undefined;
     return (server.registerTool as (...a: unknown[]) => unknown)(name, ...rest);
     // The cast is here because `registerTool` is generic over its input schema and this wrapper is
     // deliberately indifferent to it; the alternative is repeating the generic at eleven call sites.
