@@ -3973,6 +3973,37 @@ rediscovered by whoever next reads the code:
   path. Confirmed live. The spec's badge table says *what* each badge is and never *where* it lives —
   say so, because the answer is a deliberate cost and reads like an omission.
 
+- [ ] **Step 2c: Record what Phase 4 parked, and one standing rule it earned three times**
+
+Phase 4's findings, each judged correctly out of scope when found:
+
+- **`computeRollup` throws `D1_ERROR: FOREIGN KEY constraint failed` on a deleted project** — the cache
+  upsert's `project_rollups.project_id REFERENCES projects(id)`. Unreachable today (the route 404s first),
+  so only a delete racing the route's check would 500.
+- **`computeRollup` does not validate its `(tenantId, projectId)` pair**, and the cache row is keyed on
+  `project_id` alone with a mutable `tenant_id`. Defence in depth only; unreachable through both callers.
+- **`cardsTotal`/`cardsDone` count archived cards; `cardsOverdue` does not.** Internally inconsistent.
+  Decide which is right and say so — the inconsistency is the defect, not either answer.
+- **The cron's rollup arm is O(projects × boards-per-tenant) sequential DO calls**, where the other two
+  arms are O(boards). May approach the subrequest ceiling on a large tenant.
+- **`createCard` takes no `projectId` on its public surface**, so a card joins a project in a second round
+  trip — the pattern `createCard`'s own `dueAt` comment argues against. Task 19 added an *internal* field
+  for `createChildCard` and deliberately did not expose it, leaving this open on purpose.
+- **Three more routes spread a cast request body into their callee**: `PUT …/github`,
+  `POST …/push-configs`, `POST /v1/capabilities`. None leaks today, because each callee's accepted fields
+  happen to coincide with the route's declared body type. **That coincidence is the whole risk** — it is
+  exactly how `POST …/cards` broke after sitting harmless for months, the moment `createCard` gained a
+  field. Recommend one standalone PR applying the same whitelist treatment, not folded into a feature phase.
+
+**The standing rule, which three separate tasks discovered independently and none of the docs state:**
+
+> A foreign key proves a row **exists**. It never proves the row is **yours**.
+
+`addExternalLink` needed an explicit tenant-ownership check because a cross-tenant board id satisfies the
+FK (Task 16). `createMilestone` needed the same for a cross-tenant project id (Task 18). And the read path
+for advisory link titles needed it again (Task 17d). Three discoveries of one fact is a sign it belongs in
+`docs/01` beside the entity list, not in three comments.
+
 - [ ] **Step 3: Fix `docs/03`**
 
 Add a short section on what stops a card advancing: an open child, and (for a claim) an unresolved blocker. State the resolution rule — `completed` or `canceled`, not merely terminal — in the normative state-transition table, so the next reader finds it there rather than in a comment.
