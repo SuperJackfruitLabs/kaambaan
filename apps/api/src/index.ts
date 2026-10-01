@@ -931,11 +931,13 @@ export default {
         }
 
         if (request.method === 'DELETE' && projectId && !milestonesSeg) {
-          // Deletion is permissive, the same way `deleteLabel`/`deleteCapability` are: a card
-          // carrying this project's (or one of its milestones') id lives in a board Durable
-          // Object this route cannot and must not reach, so refusing while one might exist would
-          // mean exactly the cross-DO read the spec forbids on a write path. See the comment on
-          // `deleteProject` in db/projects.ts for the full reasoning.
+          // Unconditional, the same way `deleteLabel` is (NOT `deleteCapability`, which refuses
+          // with 409 when still used — it can, because a capability's references are entirely in
+          // D1 and one cheap query finds them all). A card carrying this project's (or one of its
+          // milestones') id lives in a board Durable Object this route cannot and must not reach,
+          // so refusing while one might exist would mean exactly the cross-DO read the spec
+          // forbids on a write path. See the comment on `deleteProject` in db/projects.ts for the
+          // full reasoning.
           if (!(await deleteProject(env.DB, u.tenantId, projectId))) {
             return Response.json({ error: 'project not found' }, { status: 404 });
           }

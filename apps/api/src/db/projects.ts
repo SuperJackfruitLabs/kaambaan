@@ -163,12 +163,25 @@ export async function updateProject(
  * Delete a project. Milestones cascade (`ON DELETE CASCADE`, migration 0013), the same way
  * `project_rollups` does.
  *
- * Permissive about cards, the same way `deleteLabel` and `deleteCapability` are about cards and
- * agents that still reference them: cards carrying this project's (or one of its milestones')
- * id live in board Durable Objects this module cannot and must not reach — refusing the delete
- * while any exist would require exactly the cross-DO read the spec forbids on a write path, and
- * a stale answer to "is this project referenced anywhere?" is either a delete that is wrongly
- * blocked or wrongly allowed. Readers (Task 19's rollup, the card view) are expected to treat a
+ * Unconditional about cards that may still reference it — and the rule this follows is not
+ * "deletes here are permissive", it is: refuse when the references are visible to you, accept
+ * dangling ones only when the architecture puts them out of reach.
+ *
+ * `DELETE /v1/labels/:id` (`deleteLabel`) and this are the "out of reach" case: a label is
+ * referenced only by a card id stored on the card itself, which lives in a board Durable Object
+ * neither route can see, so there is nothing local left to check.
+ *
+ * `DELETE /v1/capabilities/:id` is the OTHER case, and it is not a weaker version of this rule —
+ * it is the counter-example that proves it. A capability's references (agents, boards,
+ * implications) are entirely in D1, so `capabilityUsage` is one cheap local query, and that
+ * route genuinely refuses with 409 when any exist (`index.ts`, `DELETE /v1/capabilities/:id`).
+ * It can check, so it does.
+ *
+ * A project is the label's case, not the capability's: cards carrying this project's (or one of
+ * its milestones') id live in board Durable Objects this module cannot and must not reach —
+ * checking would mean exactly the cross-DO read the spec forbids on a write path, and a stale
+ * answer to "is this project referenced anywhere?" is either a delete that is wrongly blocked or
+ * wrongly allowed. Readers (Task 19's rollup, the card view) are expected to treat a
  * `project_id`/`milestone_id` that no longer resolves the same way a dead label id is already
  * treated: ignored, not fatal.
  */
