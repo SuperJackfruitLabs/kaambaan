@@ -324,6 +324,28 @@ describe('PATCH /v1/boards/:id/stages/:stageKey', () => {
     });
     expect(res.status).toBe(404);
   });
+
+  /**
+   * The route casts its body as `StagePatch`, the same type `updateStage` accepts — but a cast is
+   * still a compile-time assertion only, so a caller's JSON can carry a key that type never
+   * declared. This asserts one (`notAStageField`) is ignored rather than reaching the DO.
+   */
+  it('ignores a body key outside StagePatch', async () => {
+    const id = await board();
+    const res = await SELF.fetch(`https://api.test/v1/boards/${id}/stages/doing`, {
+      method: 'PATCH',
+      headers: dev,
+      body: JSON.stringify({ name: 'Renamed Doing', notAStageField: 'should never reach the DO' }),
+    });
+    expect(res.status).toBe(200);
+
+    const state = (await (await SELF.fetch(`https://api.test/v1/boards/${id}`, { headers: dev })).json()) as {
+      stages: Array<Record<string, unknown>>;
+    };
+    const doing = state.stages.find((s) => s.key === 'doing')!;
+    expect(doing.name).toBe('Renamed Doing');
+    expect(doing).not.toHaveProperty('notAStageField');
+  });
 });
 
 /**

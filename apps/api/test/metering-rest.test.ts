@@ -45,4 +45,23 @@ describe('REST — metering & budgets (docs/07 §6)', () => {
     expect(snap.usage.budgetUsd).toBe(10);
     expect(snap.usage.cardUsdCap).toBe(2);
   });
+
+  /**
+   * The route casts its body (`as { boardUsdCap?; cardUsdCap? }`) and used to forward it to
+   * `setBudget` WHOLE. Non-leaking today only because `setBudget`'s input type happens to match
+   * the route's declared body type exactly. This asserts a key outside that surface is ignored.
+   */
+  it('ignores a body key outside the budget surface', async () => {
+    const { bid } = await seedWorking();
+    const r = await SELF.fetch(`${base}/v1/boards/${bid}/budget`, {
+      method: 'PUT',
+      headers: T,
+      body: JSON.stringify({ boardUsdCap: 5, notABudgetField: 'should never reach the DO' }),
+    });
+    expect(r.status).toBe(200);
+    const snap = (await (await SELF.fetch(`${base}/v1/boards/${bid}`, { headers: T })).json()) as {
+      usage: { budgetUsd: number };
+    };
+    expect(snap.usage.budgetUsd).toBe(5);
+  });
 });
