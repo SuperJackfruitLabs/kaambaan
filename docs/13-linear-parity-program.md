@@ -29,7 +29,7 @@ PR.
 |---|---|---|
 | "**Not a chat app**" — conversation is structured activity, not a thread | Threaded **comments**, @mentions, reactions | **Reconcilable:** model a comment as a new typed activity `comment` on the same append-only log. Discussion lives *on the card as activity*, state is still **derived** (Principle 4 holds). Amend 00 to say "not a *freeform* chat app." → **P16** |
 | **Principle 4: state is derived, not declared** | Linear's human-**draggable status** (Todo→In Progress→Done) | **D2 below.** Either keep status fully derived (status = a *view* over stage+task-state) or admit a declared human-status axis as an explicit, audited exception. |
-| "**Domain-agnostic**; not coding-only" | Cycles, velocity, sprint burndown (human-team planning) | **Adapt or stub.** These encode *human* cadence; agents have no velocity. Ship the data structures for parity, reframe the metrics (P24), keep the planning machinery thin (P22). |
+| "**Domain-agnostic**; not coding-only" | Cycles, velocity, sprint burndown (human-team planning) | **Decline, don't adapt.** These encode *human* cadence; agents have no velocity, and a cycle is a commitment device for humans negotiating scope against their own week. Reframe the *metrics* (P24 — cost/throughput, not velocity); Cycles themselves are **declined** (P22, closed — see §3). |
 
 Everything else in Linear is either a **clean borrow** (✅) or a **reframe that
 strengthens the agent thesis** (🟡). The genuinely contested items are marked 🔴.
@@ -77,10 +77,10 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 
 | Area | Linear feature | Superpipeline today | Fit | Phase |
 |---|---|---|---|---|
-| **Card depth** | Sub-issues + progress rollup | ✗ | 🟡 (sub-card pipeline semantics — see P15) | P15 |
-| | Relations (blocks/blocked-by/related/duplicate) | ✗ (only *external* refs) | ✅ | P15 |
-| | Labels + label groups | field exists, no UI | ✅ | P15 |
-| | Due dates / target dates | ✗ | ✅ | P15 |
+| **Card depth** | Sub-issues + progress rollup | ✓ **shipped** — child cards (`createChildCard`), a markdown-checklist splitter over both REST and MCP (`splitCard` / `superpipeline_split_card`), an enforced `parent` edge (a parent cannot advance while any child is open), open/total counter on the board tile | — | done |
+| | Relations (blocks/blocked-by/related/duplicate) | ✓ **shipped**, as `blocks` / `relates` / `parent` — same-board edges live in the board DO and are enforced (claim/advance refuses on an unresolved `blocks` edge or an open `parent` child; adding an edge that would close a cycle is refused). Cross-board `blocks`/`relates` edges are stored in D1 and are advisory only, shown but never enforced. There is no `duplicate` kind and no stored reverse `blocked-by` kind — `blockedBy` is a *derived read*, not an edge | — | done |
+| | Labels + label groups | ✓ labels **shipped** — a D1 catalogue with `declared`/`inferred` origin and a management UI; no label *groups* exist | — | done |
+| | Due dates / target dates | ✓ **shipped** — a real `dueAt` column, ordered behind priority in claim order, feeding the overdue cron sweep | — | done |
 | | Estimates (points) | cost estimate only | 🟡 (points vs $/tokens) | P15 |
 | | Custom fields | opaque `spec` JSON | ✅ | P15 |
 | **Collaboration** | Comments (threaded, markdown) | agent activity only | 🔴→✅ (as `comment` activity) | P16 |
@@ -99,8 +99,9 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 | | Triage inbox | gates ≈ triage | 🟡 (generalize gates) | P19 |
 | | Issue/card + project templates | board templates | ✅ | P20 |
 | | Automation / workflow rules | ✗ | ✅ (also routes agents) | P20 |
-| **Planning** | Projects + milestones + updates + docs | ✗ | 🟡 | P21 |
-| | Cycles (sprints, velocity, rollover) | ✗ | 🔴 (no agent velocity) | P22 |
+| | Recurring / scheduled issue creation | ✓ **shipped** — schedules on a board; a restricted rule grammar, not cron (`every <n> minutes\|hours\|days`, `daily at HH:MM`, `weekly on <dow> at HH:MM`, `monthly on <1-28> at HH:MM`; shortest interval 5 minutes); IANA timezones, validated by construction and stored verbatim; fires from the Worker's 5-minute cron, not a per-board DO alarm | 🟡 (not a named Linear feature; superpipeline-native) | done |
+| **Planning** | Projects + milestones + updates + docs | ✓ projects + milestones **shipped** — D1, spanning boards, card membership, a cached cross-board rollup (`cardsTotal`/`cardsDone`/`cardsOverdue`/`costUsd`, a `computedAt` "as of" time, marks itself `partial` when a board does not answer). Project **updates** and **docs** (Linear's per-project changelog/longform doc) are not shipped | 🟡 | P21 (updates/docs remain) |
+| | Cycles (sprints, velocity, rollover) | ✗ | 🔴 **declined** — a cycle is a commitment device for humans negotiating scope against their own week, and agents have no week | declined |
 | | Initiatives + Roadmap | ✗ | 🔴 (human strategy) | P23 |
 | | Insights / analytics | cost metering | 🟡 (reframe → agent telemetry) | P24 |
 | **Integrations** | GitHub deep (branch, auto-close, status) | refs + webhook sync | ✅ | P25 |
@@ -108,7 +109,7 @@ Fit legend: ✅ clean borrow · 🟡 reframe for agents · 🔴 fights a locked 
 | | Slack two-way + Asks (message→card) | ✗ | ✅ (= an inbound trigger, [05](./05-integration-surfaces.md)) | P25 |
 | | Importers (Jira/Asana/GitHub/CSV) | ✗ | ✅ | P26 |
 | | Customer requests | ✗ | 🟡 | P26 |
-| **Enterprise** | RBAC enforcement | roles in DB, unenforced | ✅ | P27 |
+| **Enterprise** | RBAC enforcement | ✓ **enforced** since 2026-09-02 — every route resolves the caller's `memberships.role` and refuses what `permits(role, capability)` does not allow; a caller with no membership is refused outright, not demoted to a reader | — | done |
 | | Audit log | activity log ≈ audit | 🟡 (formalize) | P27 |
 | | Guest / limited access | ✗ | ✅ | P27 |
 | | SSO / SAML / SCIM | OAuth + tokens | ✅ | P28 |
@@ -160,12 +161,22 @@ agent-routing automation. Ties to the `pipeline` vs `manager` routing in
 
 ### Group 4 — Planning constructs (contested)
 
-**P21 — Projects.** Projects, milestones, project updates, documents. 🟡 Useful as
-"group related cards toward a goal," spanning boards (needs D1=B).
+**P21 — Projects.** ✅ **Shipped** (2026-09-30 planning-constructs-and-recurrence plan, Phase 4).
+Projects and milestones group cards toward a goal, spanning boards, in D1 — never on the claim or
+advance path, since neither may ever refuse anything. A cached cross-board rollup
+(`cardsTotal`/`cardsDone`/`cardsOverdue`/`costUsd`) fans out to every board on a 5-minute cron and
+marks itself `partial`, with a `boardsUnanswered` count, whenever a board fails to answer — the
+`computedAt` field is the reader's "as of" time. **Not shipped:** project updates (a per-project
+changelog) and docs (longform text attached to a project). "Needs D1=B" (Team-over-Boards) turned
+out not to be a real dependency — projects/milestones shipped tenant-scoped, spanning boards
+directly, without a Team container.
 
-**P22 — Cycles.** 🔴 Sprints / velocity / rollover. Ship the entity for parity;
-**stub the velocity machinery** (agents have no cadence). *⚠️ OPEN: do we expose
-cycles at all, or alias them to time-boxed views?*
+**P22 — Cycles. DECLINED**, not deferred. A cycle is a commitment device for humans negotiating
+scope against their own week — "we're behind, let's cut scope before Friday" — and agents have no
+week. There is no agent-shaped version of that negotiation to ship a stub of. **Do not** build the
+entity and **do not** alias it to a time-boxed view; a human team that wants sprint cadence on top
+of superpipeline can build it as a *view* over existing due dates and milestones. The open question
+below is closed, not re-asked.
 
 **P23 — Roadmap & temporal views.** Initiatives, Roadmap, Timeline/Gantt, Calendar.
 🟡 Calendar is cheap and useful — ship early. 🔴 Roadmap/Gantt are human-strategy
@@ -213,8 +224,8 @@ unless a customer requires it. Light/dark theming ships here cheaply regardless.
 | P18 | Views infra | M | P17 |
 | P19 | Teams + states + triage | L | **D1, D2** |
 | P20 | Templates + automation | L | P19 |
-| P21 | Projects | L | P19 |
-| P22 | Cycles | M | P21 |
+| P21 | Projects | ✅ done | — (shipped without D1; see §5) |
+| P22 | Cycles | — | **declined**, see §3 |
 | P23 | Roadmap/temporal views | L | P21 |
 | P24 | Insights (agent telemetry) | M | metering |
 | P25 | Integration breadth | L (parallel) | — |
@@ -235,10 +246,15 @@ chosen scope.
 
 Tracked the same way as [10's](./10-roadmap.md) closing list — resolved at their phase:
 
-- **D1** — Board = Team vs. Team-over-Boards. *(blocks P19, P21, P27)*
+- **D1** — Board = Team vs. Team-over-Boards. *(blocks P19, P27 — **not P21**: projects/milestones
+  shipped tenant-scoped, spanning boards directly, without a Team container; that dependency was
+  wrong)*
 - **D2** — status as derived projection vs. declared audited axis. *(blocks P19)*
-- Sub-card semantics — own pipeline vs. parent checklist. *(P15)*
-- Cycles — expose vs. alias to time-boxed views. *(P22)*
+- ~~Sub-card semantics — own pipeline vs. parent checklist.~~ **Closed (P15, shipped).** A sub-card
+  is a real child card (`createChildCard`, built on `createCard` + an enforced `parent` edge) —
+  "own pipeline," not a checklist item on the parent's. It runs its own stage progression and can
+  be claimed independently.
+- ~~Cycles — expose vs. alias to time-boxed views.~~ **Closed (P22). Declined** — see §3.
 - Local-first sync engine — attempt vs. formally decline. *(P30)*
 - Vision amendments — does parity change 00's "not a chat app" / Principle 4
   non-goals, and are we comfortable making that explicit? *(P16, P19)*
@@ -328,3 +344,61 @@ these are confidence, not work.
 with feedback-into-handoff; (2) the **agent-session card UI** with elicitation/error + plan checklist;
 (3) the **omni-channel triage inbox**; (4) **risk-driven two-tier gating** + `require-justification`;
 (5) the **versioned cost model**. The first two are parity-critical; the rest sharpen the agent thesis.
+
+## 7. Parked findings from implementation (2026-09-30 planning-constructs-and-recurrence)
+
+Nine items, found during review of Phases 3 and 4, each judged correctly out of scope at the time
+it was found. Recorded here — not in a changelog, not in a code comment — so none of them is
+rediscovered from scratch by whoever next reads this code. The standing rule three of them led to
+is in [01](./01-domain-model-and-glossary.md), beside the entity list.
+
+### Phase 3 (card dependencies, sub-tasks, cross-board advisory edges)
+
+- **`listLinks` has no `NOT_INITIALIZED` guard**, unlike `addLink`/`removeLink` — confirmed in
+  `apps/api/src/board/board-do.ts`, where every neighbouring write verb checks
+  `this.getMeta('boardId')` first and `listLinks` does not. `GET …/cards/:cardId/links` on an
+  uninitialised board answers `200` with an empty list while the write verbs answer `404`. Open:
+  guard it, or document the asymmetry as intended.
+- **`rowToCard` calls `budgetCap('budgetCardUsdCap')` per card, on every board read** — a `SELECT`
+  per card in the hot read path. Pre-existing, unrelated to Phase 3, and cheap to hoist into the
+  `pre` batch that already carries five other values (Task 14's own comment names the fix: `pre?`).
+  Found while building a test that would otherwise have been meaningless because of it.
+- **The advisory `⚑` badge appears in the card drawer but not on the board tile.** Confirmed live
+  and in code: `CardTile.svelte`'s own comment says why — the board read does not carry external
+  links, and showing the badge on the tile would mean a cross-board read on the board-list path.
+  The badge renders instead in `CardDrawer.svelte`'s Links section, where `GET …/links` already
+  resolves it. This is a deliberate cost, not an omission — worth saying plainly because nothing
+  else does.
+
+### Phase 4 (projects, milestones, cross-board rollup)
+
+- **`computeRollup` would throw `D1_ERROR: FOREIGN KEY constraint failed` on a deleted project** —
+  the cache upsert's `project_rollups.project_id REFERENCES projects(id)`. Unreachable today (the
+  route 404s before `computeRollup` is ever called), so only a delete racing the route's check
+  would 500.
+- **`computeRollup` does not validate its `(tenantId, projectId)` pair**, and the cache row is keyed
+  on `project_id` alone with a mutable `tenant_id`. Defence in depth only; unreachable through both
+  callers today.
+- **`cardsTotal`/`cardsDone` count archived cards; `cardsOverdue` does not.** Internally
+  inconsistent. The inconsistency is the defect, not either answer — a product decision is needed
+  on which is right, and it has not been made.
+- **The cron's rollup arm is O(projects × boards-per-tenant) sequential DO calls**
+  (`apps/api/src/index.ts`'s `scheduled()`, third arm), where the sweep and push-delivery arms are
+  O(boards). May approach the subrequest ceiling on a large tenant.
+- **`createCard` takes no `projectId` on its public surface**, so a card joins a project in a second
+  round trip — the pattern `createCard`'s own `dueAt` comment argues against. Task 19 added an
+  *internal* field for `createChildCard` and deliberately did not expose it on `createCard`, leaving
+  this open on purpose.
+- **Three more routes spread a cast request body into their callee**: `PUT …/github`,
+  `POST …/push-configs`, `POST /v1/capabilities`. None leaks today, because each callee's accepted
+  fields happen to coincide with the route's declared body type. That coincidence is the whole risk
+  — it is exactly how `POST …/cards` broke after sitting harmless for months, the moment `createCard`
+  gained a field (see the fix in commit `9f4789c`). Recommend one standalone PR applying the same
+  whitelist treatment, not folded into a feature phase.
+
+### The standing rule three separate tasks discovered independently
+
+> A foreign key proves a row **exists**. It never proves the row is **yours**.
+
+Recorded in full in [01](./01-domain-model-and-glossary.md), beside the entity list — three
+independent discoveries of one fact belong in documentation, not in three separate code comments.

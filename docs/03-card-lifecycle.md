@@ -15,11 +15,18 @@ which gives us a free, complete audit history.
 | `auth-required` | interrupted | Paused; the agent needs a credential/account link to proceed |
 | `completed` | terminal | Stage work done successfully (artifacts attached) |
 | `rejected` | terminal | A human (or agent) **declined** the work at a gate — *not an error* |
-| `failed` | terminal | Execution error |
-| `canceled` | terminal | An operator pulled the card |
+| `failed` | terminal | Execution error. **⚠️ No code path writes this state today** — see below |
+| `canceled` | terminal | An operator pulled the card. **⚠️ No code path writes this state today** — see below |
 
 > Terminal states never restart (A2A rule). Advancing a stage, retrying, or reworking always
 > creates a **new Task** under the same `contextId`.
+
+> **⚠️ `failed` and `canceled` have zero write sites.** No code path in this repository ever sets a
+> card's state to `failed` or to `canceled` — both are design intent, listed above because they are
+> part of the A2A `TaskState` machine, not because anything produces them. The only terminal states
+> a card can actually reach today are `completed` and `rejected`. This matters twice: a live-check
+> step that says "let the blocker fail" cannot be performed at all against this code, and `canceled`
+> sits inside the resolution rule (below) while being unreachable through any verb.
 
 ## Pipeline columns ⇆ states (the mapping)
 
@@ -37,8 +44,8 @@ top-level states.
 | **Review / Gate** | `input-required` (`select` signal) | **Human approval gate** |
 | **Done (stage)** → next stage **Ready** | `completed` → new `submitted` | Handoff to next stage |
 | **Rejected** | `rejected` | Declined at a gate (terminal for that task) |
-| **Failed** | `failed` | Execution error (terminal) |
-| **Canceled** | `canceled` | Operator-pulled (terminal) |
+| **Failed** | `failed` | Execution error (terminal). **⚠️ No card ever reaches this column today** — see the note above |
+| **Canceled** | `canceled` | Operator-pulled (terminal). **⚠️ No card ever reaches this column today** — see the note above |
 
 ## The pipeline (multi-agent handoff)
 
@@ -126,6 +133,30 @@ Borrowed from Hermes, expressed over the wire (since we don't own the agent proc
 The two enforced deadlines (heartbeat reclaim at 15 min, circuit breaker at 2) are tracked by the
 Board DO via its single alarm. There are **no Workflows** in the deployment ([02](./02-architecture.md)).
 
+## What stops a card advancing
+
+Two structural blocks sit outside the state machine above — a card can be in an otherwise-eligible
+state and still not move:
+
+- **An open child.** A card with an unresolved `parent` edge (see
+  [Domain Model → CardLink](./01-domain-model-and-glossary.md#cardlink-dependency-relation-edge))
+  cannot advance while any child is still open. `complete` on a parent is refused until every child
+  **resolves** (the rule below); `splitCard`/`createChildCard` are the only way a card acquires
+  children, and the open/total counter on the board tile mirrors the server's own count rather than
+  recomputing it independently.
+- **An unresolved blocker, for a claim.** A card carrying an unresolved same-board `blocks` edge
+  cannot be **claimed** until the blocker resolves. Cross-board `blocks` edges are advisory only
+  and are never checked on the claim path — see
+  [CardLink](./01-domain-model-and-glossary.md#cardlink-dependency-relation-edge).
+
+**The resolution rule.** A blocker or a child is *resolved* when its state is `completed` **or**
+`canceled` — **not** "any terminal state." `rejected` and `failed` are terminal but **not**
+resolved: a blocker that was rejected, or that failed, is precisely the case where the dependent
+card must stay blocked, otherwise the edge does nothing in the only situation anyone added it for.
+This is the same predicate as `isResolved()` (`apps/api/src/board/links.ts`), and it must never be
+replaced by "is terminal" — there is a test asserting the two disagree, on purpose. (`canceled` is
+part of this rule by design even though nothing in the code writes it today — see the note above.)
+
 ## State-transition table (normative — feeds TDD)
 
 | From | Event | To | Side effects |
@@ -135,14 +166,15 @@ Board DO via its single alarm. There are **no Workflows** in the deployment ([02
 | `working` | `complete` | `completed` | handoff metadata stored; card advances. **⚠️ `activity(response)` does NOT do this** — it is recorded and the card stays `working` ([04 §4](./04-agent-contract.md)) |
 | `working` | `request_input`/`elicitation` | `input-required` | gate/question rendered |
 | `working` | `auth` signal | `auth-required` | "link account" rendered |
-| `working` | `fail` | `failed` | run outcome `failed`; breaker++. **⚠️ `activity(error)` does NOT do this** — the card stays `working` |
+| `working` | `fail` | **`submitted`** (retry) or `input-required` (circuit breaker tripped) — **not** `failed` | run outcome `crashed` (not `failed`); `failure_count++`; at `CIRCUIT_BREAKER_LIMIT` (2) parks in `input-required` instead of retrying. **⚠️ `activity(error)` does NOT do this** — the card stays `working`. **⚠️ `failed` itself is never written to a card's `state` — this row's design intent (shown in the Canonical states table above) and its shipped behaviour have diverged; see the note above** |
 | `working` | heartbeat timeout | `submitted` (reclaim) | run `reclaimed`; breaker++ |
-| `working` | operator cancel | `canceled` | run `canceled` |
+| *(no verb exists)* | operator cancel | `canceled` | **⚠️ Design intent only — there is no cancel verb in this codebase and no code path writes `state = 'canceled'` to a card.** Not exercised by any test either; `links-enforcement.test.ts` says so explicitly in a comment beside the equivalent note for `failed` |
 | `input-required` (gate) | human **approve** | `completed` → next stage `submitted` | advance |
 | `input-required` (gate) | human **request changes** | `working` | new run; feedback as `prompt` |
 | `input-required` (gate) | human **reject** | `rejected` | terminal; card → Rejected |
 | `input-required` (question) | human reply (`prompt`) | `working` | run resumes |
 | `auth-required` | account linked | `working` | run resumes |
 | terminal (`completed/rejected/failed/canceled`) | rework | new Task `submitted` | same `contextId` |
+| *(resolution rule, for a blocker or a child)* | reaches `completed` **or** `canceled` | — | unblocks the dependent card's claim (`blocks`) or advance (`parent`). `rejected` and `failed` do **NOT** resolve — a blocker that was rejected or that failed must keep blocking, or the edge does nothing in the only situation it was added for |
 
 > Every row in this table is a test case. See [09 — Testing Strategy](./09-testing-strategy.md).
