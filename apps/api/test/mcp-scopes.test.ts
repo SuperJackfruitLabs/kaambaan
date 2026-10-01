@@ -103,4 +103,18 @@ describe('a token scoped to `claim` alone', () => {
       expect(names, `the grandfather clause must keep ${t}`).toContain(t);
     }
   });
+
+  it('does NOT get the one run verb that CREATES work', async () => {
+    // The grandfather clause above is argued entirely in terms of FINISHING: "a claim an agent
+    // cannot complete is not a safer claim". `superpipeline_split_card` does the opposite — it
+    // turns one card into up to twenty — so a legacy `['claim']` token inheriting it inherits an
+    // authority that argument never contemplated, and that nobody minting the token granted.
+    //
+    // The exposure is small on its own (the splitter must already hold the card's run, and the
+    // children inherit the parent's grant, so nothing escalates). What this guards is the slope:
+    // without it, EVERY future `run`-scoped verb is grandfathered to claim-only tokens by default,
+    // and the next person adding one will read the clause's comment as covering it.
+    const names = await toolNames(claimOnly);
+    expect(names).not.toContain('superpipeline_split_card');
+  });
 });
