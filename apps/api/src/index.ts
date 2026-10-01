@@ -73,6 +73,21 @@ import {
   resolveLabelNames,
   isLabelNameCollision,
 } from './db/labels';
+import {
+  listProjects,
+  createProject,
+  updateProject,
+  deleteProject,
+  projectById,
+  listMilestones,
+  createMilestone,
+  deleteMilestone,
+  isProjectNameCollision,
+  PROJECT_STATES,
+  PROJECT_HEALTHS,
+  type ProjectState,
+  type ProjectHealth,
+} from './db/projects';
 
 export { BoardDO };
 
@@ -794,6 +809,185 @@ export default {
         }
 
         return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
+    // /v1/projects[/:id[/milestones]] — a workspace's projects (migration 0013), which group
+    // cards ACROSS boards. Task 19 adds `GET /v1/projects/:id/rollup`; not here, because that read
+    // fans out to every board's Durable Object and this module and its routes do not.
+    const projectsMatch = path.match(/^\/v1\/projects(?:\/([^/]+)(?:\/(milestones))?)?$/);
+    if (projectsMatch) {
+      try {
+        // Same fallback as `/v1/labels`: `supi project ...` sends a hub JWT, never a session
+        // cookie, so `resolveUser` alone cannot authenticate it. Unconditional on method —
+        // `refuseByRole` below is what actually gates the writes.
+        let u = await resolveUser(request, env);
+        if (!u) u = await resolveHubUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const projectId = projectsMatch[1];
+        const milestonesSeg = projectsMatch[2];
+
+        if (request.method === 'GET' && !projectId) {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          return Response.json({ projects: await listProjects(env.DB, u.tenantId) });
+        }
+
+        if (request.method === 'GET' && projectId && !milestonesSeg) {
+          const refused = refuseByRole(u, 'read');
+          if (refused) return refused;
+          const project = await projectById(env.DB, u.tenantId, projectId);
+          // A cross-tenant read answers 404, not 403: a 403 confirms the row exists under some
+          // tenant, which is exactly the oracle that would let a caller enumerate another
+          // tenant's project ids one guess at a time. `projectById` already scopes on
+          // `tenant_id`, so "not mine" and "does not exist" are indistinguishable here, which is
+          // the point — they must read the same to the caller too.
+          if (!project) return Response.json({ error: 'project not found' }, { status: 404 });
+          const milestones = await listMilestones(env.DB, u.tenantId, projectId);
+          return Response.json({ project, milestones });
+        }
+
+        // Every write below is the same class of act as managing the workspace's capabilities or
+        // labels.
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method === 'POST' && !projectId) {
+          const body = (await request.json()) as {
+            name?: string;
+            description?: string;
+            targetDate?: string;
+            leadUserId?: string;
+          };
+          const name = typeof body.name === 'string' ? body.name.trim() : '';
+          if (name === '') return Response.json({ error: 'name is required' }, { status: 400 });
+          if (isInvalidDueAt(body.targetDate)) {
+            return Response.json({ error: 'targetDate must be YYYY-MM-DD' }, { status: 400 });
+          }
+          try {
+            const made = await createProject(env.DB, u.tenantId, {
+              name,
+              description: body.description ?? null,
+              targetDate: body.targetDate ?? null,
+              leadUserId: body.leadUserId ?? null,
+            });
+            return Response.json({ project: made }, { status: 201 });
+          } catch (err) {
+            if (!isProjectNameCollision(err)) throw err;
+            return Response.json(
+              { error: `a project named "${name}" already exists in this workspace` },
+              { status: 409 },
+            );
+          }
+        }
+
+        if (request.method === 'PATCH' && projectId && !milestonesSeg) {
+          const body = (await request.json()) as {
+            name?: string;
+            description?: string | null;
+            targetDate?: string | null;
+            state?: string;
+            health?: string | null;
+            leadUserId?: string | null;
+          };
+          if (body.name !== undefined) {
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            if (name === '') return Response.json({ error: 'name is required' }, { status: 400 });
+          }
+          if (isInvalidDueAt(body.targetDate)) {
+            return Response.json({ error: 'targetDate must be YYYY-MM-DD' }, { status: 400 });
+          }
+          if (body.state !== undefined && !PROJECT_STATES.includes(body.state as ProjectState)) {
+            return Response.json({ error: `unknown project state: "${body.state}"` }, { status: 400 });
+          }
+          if (
+            body.health !== undefined &&
+            body.health !== null &&
+            !PROJECT_HEALTHS.includes(body.health as ProjectHealth)
+          ) {
+            return Response.json({ error: `unknown project health: "${body.health}"` }, { status: 400 });
+          }
+          try {
+            const updated = await updateProject(env.DB, u.tenantId, projectId, {
+              ...(body.name !== undefined ? { name: body.name.trim() } : {}),
+              ...(body.description !== undefined ? { description: body.description } : {}),
+              ...(body.targetDate !== undefined ? { targetDate: body.targetDate } : {}),
+              ...(body.state !== undefined ? { state: body.state as ProjectState } : {}),
+              ...(body.health !== undefined ? { health: body.health as ProjectHealth | null } : {}),
+              ...(body.leadUserId !== undefined ? { leadUserId: body.leadUserId } : {}),
+            });
+            if (!updated) return Response.json({ error: 'project not found' }, { status: 404 });
+            return Response.json({ project: updated });
+          } catch (err) {
+            if (!isProjectNameCollision(err)) throw err;
+            const name = typeof body.name === 'string' ? body.name.trim() : '';
+            return Response.json(
+              { error: `a project named "${name}" already exists in this workspace` },
+              { status: 409 },
+            );
+          }
+        }
+
+        if (request.method === 'DELETE' && projectId && !milestonesSeg) {
+          // Deletion is permissive, the same way `deleteLabel`/`deleteCapability` are: a card
+          // carrying this project's (or one of its milestones') id lives in a board Durable
+          // Object this route cannot and must not reach, so refusing while one might exist would
+          // mean exactly the cross-DO read the spec forbids on a write path. See the comment on
+          // `deleteProject` in db/projects.ts for the full reasoning.
+          if (!(await deleteProject(env.DB, u.tenantId, projectId))) {
+            return Response.json({ error: 'project not found' }, { status: 404 });
+          }
+          return new Response(null, { status: 204 });
+        }
+
+        if (request.method === 'POST' && projectId && milestonesSeg) {
+          const body = (await request.json()) as { name?: string; targetDate?: string; sortOrder?: number };
+          const name = typeof body.name === 'string' ? body.name.trim() : '';
+          if (name === '') return Response.json({ error: 'name is required' }, { status: 400 });
+          if (isInvalidDueAt(body.targetDate)) {
+            return Response.json({ error: 'targetDate must be YYYY-MM-DD' }, { status: 400 });
+          }
+          if (body.sortOrder !== undefined && typeof body.sortOrder !== 'number') {
+            return Response.json({ error: 'sortOrder must be a number' }, { status: 400 });
+          }
+          // Checked here rather than caught from `createMilestone`'s own ownership throw, so an
+          // unrelated failure (a transient D1 error, say) still falls through to the outer
+          // `unexpected(err)` instead of being misreported as "project not found". Same 404 an
+          // enumeration attempt on `GET /v1/projects/:id` would get, for the same reason.
+          if (!(await projectById(env.DB, u.tenantId, projectId))) {
+            return Response.json({ error: 'project not found' }, { status: 404 });
+          }
+          const made = await createMilestone(env.DB, u.tenantId, projectId, {
+            name,
+            targetDate: body.targetDate ?? null,
+            sortOrder: body.sortOrder,
+          });
+          return Response.json({ milestone: made }, { status: 201 });
+        }
+
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
+    // DELETE /v1/milestones/:id — one milestone, removed on its own without deleting its project.
+    const milestoneMatch = path.match(/^\/v1\/milestones\/([^/]+)$/);
+    if (milestoneMatch) {
+      try {
+        let u = await resolveUser(request, env);
+        if (!u) u = await resolveHubUser(request, env);
+        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        const refused = refuseByRole(u, 'manage');
+        if (refused) return refused;
+
+        if (request.method !== 'DELETE') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        if (!(await deleteMilestone(env.DB, u.tenantId, milestoneMatch[1]!))) {
+          return Response.json({ error: 'milestone not found' }, { status: 404 });
+        }
+        return new Response(null, { status: 204 });
       } catch (err) {
         return unexpected(err);
       }

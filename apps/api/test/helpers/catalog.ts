@@ -8,6 +8,7 @@ import tenantForgeHost from '../../migrations/0009_tenant_forge_host.sql?raw';
 import labels from '../../migrations/0010_labels.sql?raw';
 import labelsOrigin from '../../migrations/0011_labels_origin.sql?raw';
 import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
+import projectsAndMilestones from '../../migrations/0013_projects_and_milestones.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -117,5 +118,12 @@ export async function setupCatalog(): Promise<void> {
   // behaviour, and `boards` already exists in this catalogue so the FK is satisfiable.
   if (!(await tableExists('card_links_external'))) {
     for (const s of statementsOf(cardLinksExternal)) await env.DB.prepare(s).run();
+  }
+  // 0013's `projects`/`milestones`/`project_rollups` keep their `REFERENCES tenants(id)` /
+  // `REFERENCES projects(id) ON DELETE CASCADE` FKs — the real migration file is run as-is (see
+  // the module comment on `labels` above), which is the point: `test/projects.test.ts` and
+  // `test/projects-rest.test.ts` assert the cascade and the tenant isolation it provides.
+  if (!(await tableExists('projects'))) {
+    for (const s of statementsOf(projectsAndMilestones)) await env.DB.prepare(s).run();
   }
 }
