@@ -2251,7 +2251,16 @@ describe('wouldCycle', () => {
   });
 
   it('terminates on an existing cycle instead of hanging', () => {
+    // ⚠️ This case alone does NOT prove termination: `c → d` starts a walk that never reaches the
+    // a↔b cycle, so it returns false without the seen-set doing anything. Keep it, but the next
+    // case is the one that earns the claim.
     expect(wouldCycle([link('a', 'b'), link('b', 'a')], link('c', 'd'))).toBe(false);
+  });
+
+  it('terminates when the walk ENTERS an existing cycle — the case that proves the seen-set', () => {
+    // `x → a` walks into a↔b. Without the seen-set this revisits `a` forever; with it, the second
+    // visit is skipped and the walk ends. Found by review: the case above passes either way.
+    expect(wouldCycle([link('a', 'b'), link('b', 'a')], link('x', 'a'))).toBe(false);
   });
 });
 ```
@@ -2555,8 +2564,44 @@ and it cannot claim/refuse hot-loop.
   }
 ```
 
-Both callers pick the change up unchanged. **Add a test asserting the count agrees**, mirroring Task
-5's `due-archived-count`:
+Both callers pick the change up unchanged.
+
+⚠️ **There is a THIRD eligibility site, and Phase 1 left you a note on it.** `notifyWorkAvailable`
+(`board-do.ts:2700`) is a JS predicate over a `CardView`, so it cannot call a SQL fragment. Its comment
+says exactly what this task must do:
+
+> Mirrors `claimableWhere`'s archived exclusion, by hand … any eligibility condition added there needs
+> its equivalent added here too, or a push fires for work `claim` will refuse.
+
+A blocked card that is reworked, returned, retried or gate-resolved would otherwise queue
+`work.available` pushes for work the claim path then declines. Bounded — one spurious ping, not the
+`readyForYou` loop — but it is the same family.
+
+**Do not hand-write a third copy of the rule.** Extract the two `NOT EXISTS` clauses into their own
+parameterless fragment and use it in both places:
+
+```ts
+  /**
+   * What makes a card ineligible regardless of stage or state: an unresolved blocker, or an open
+   * child. Parameterless and correlated on `c`, so it composes into `claimableWhere`'s SELECT and
+   * into a single-card check without either restating it.
+   *
+   * One definition, three readers — the claim query, the discovery count, and `notifyWorkAvailable`'s
+   * JS gate, which reaches it through `isHeldBack` below rather than by mirroring the SQL by hand.
+   */
+  private blockedWhere(): string { … }
+
+  /** The same rule, asked about one card, for callers that are not a SELECT over the stage set. */
+  private isHeldBack(cardId: string): boolean {
+    return this.sql.exec(`SELECT 1 FROM cards c WHERE c.id = ? AND (${this.blockedWhere()}) LIMIT 1`, cardId)
+      .toArray().length === 0;
+  }
+```
+
+Then `notifyWorkAvailable` gains `|| this.isHeldBack(card.id)` beside its archived check, and its
+comment is updated to say the blocked rule now comes from a shared fragment rather than by hand.
+
+**Add a test asserting the count agrees**, mirroring Task 5's `due-archived-count`:
 
 ```ts
   it('does not advertise a blocked card either', async () => {
@@ -2758,13 +2803,60 @@ style — one query, `COALESCE(SUM(...), 0)`:
 > `board-do.ts:2320` to decide whether to stop handing out work; widening it to include children
 > would silently move that gate. The two functions stay separate for that reason.
 
-- [ ] **Step 3: Run and commit**
+- [ ] **Step 3: The deferred advance — promoted here by Task 13's review**
+
+Task 13 guarded `moveCard` but **not `advanceCard`**, the automatic advance on `complete` and on gate
+approval. That was the right place to stop — `advanceCard` returns `void`, is called after the run has
+already ended and its side effects committed, so a `Result` refusal is impossible there and every
+obvious substitute invents untested recovery. But the gap is load-bearing and it is yours:
+
+- **It sits on Task 15's main path.** `superpipeline_split_card` is `run`-scoped — held by an agent
+  that has already claimed the card — and its tool description promises *"Your card will not advance
+  until all of them are resolved."* With only `moveCard` guarded, that sentence is false on the agent
+  path from the day it ships.
+- **It leaks past the parent.** If the parent is on its last stage, `advanceCard` writes
+  `state = 'completed'` outright, so anything blocked *by* the parent unblocks while the parent's
+  subtree is still open. Containment is not merely skipped — it is erased for the neighbours too.
+- **It inverts the intended asymmetry**: the refusal falls on the human and the exemption on the
+  agent, which is backwards.
+
+**The answer is a deferred advance, not a refusal.** `complete()` must still succeed — the agent did
+its stage, the run has to end and the lease has to release. What is withheld is the *advance*.
+
+Three options, two of which are traps:
+
+| | |
+|---|---|
+| park `submitted` in the current stage | ❌ unclaimable while children are open, then handed back to an agent to **redo stage work already done** |
+| refuse from `complete()` | ❌ the run stays open, the lease heartbeats out, the card is reclaimed, the work is redone — the hot-loop this phase exists to prevent |
+| **park non-claimable, re-trigger on the last child** | ✅ |
+
+So:
+
+1. Add `pending_advance_json TEXT` to `cards` (guarded `ALTER`). When `advanceCard` is reached for a
+   card with open children, it stores what it *would* have done — the from-stage and the handoff —
+   and parks the card instead.
+2. Park it in `input-required` **in its current stage**. That state is not claimable, so nothing
+   redoes the work. It normally means "a human must act", which is not quite true here — so
+   `openChildCount > 0` is what the UI reads to say *"waiting on 3 sub-tasks"* rather than showing a
+   gate (Task 17). Reusing the state avoids adding one to an A2A-aligned `TaskState`; say so in a
+   comment, because the next reader will wonder.
+3. **The trigger.** In `advanceCard`'s `completed` branch and on the cancel path, after resolving a
+   card, check whether it was the *last* open child of a parent carrying a `pending_advance_json`.
+   If so, perform that parent's deferred advance with the stored handoff and clear the column.
+
+Tests: a parent that splits mid-run and completes does **not** advance and is **not** claimable; the
+last child resolving advances it with the handoff intact; a parent on its last stage does **not** reach
+`completed` while children are open, and nothing blocked by it unblocks; and a parent whose children
+were already resolved before it completed advances immediately, as today.
+
+- [ ] **Step 4: Run and commit**
 
 Run: `cd apps/api && pnpm vitest run test/sub-cards.test.ts && pnpm test`
 
 ```bash
 git add apps/api/src/board/board-do.ts apps/api/test/sub-cards.test.ts
-git commit -m "feat(sub-tasks): child cards with inheritance and a non-destructive cost rollup"
+git commit -m "feat(sub-tasks): child cards, a non-destructive cost rollup, and the deferred advance"
 ```
 
 ---
@@ -2957,16 +3049,23 @@ git commit -m "feat(sub-tasks): split a card into children, over REST and over M
 -- contain. Cross-board decomposition is a project (migration 0013).
 CREATE TABLE card_links_external (
   tenant_id     TEXT NOT NULL REFERENCES tenants(id),
-  from_board_id TEXT NOT NULL,
+  from_board_id TEXT NOT NULL REFERENCES boards(id),
   from_card_id  TEXT NOT NULL,
-  to_board_id   TEXT NOT NULL,
+  to_board_id   TEXT NOT NULL REFERENCES boards(id),
   to_card_id    TEXT NOT NULL,
   kind          TEXT NOT NULL CHECK (kind IN ('blocks', 'relates')),
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (from_card_id, to_card_id, kind)
+  PRIMARY KEY (from_card_id, to_card_id, kind),
+  -- A card blocking itself is never a fact worth storing, and across boards it cannot even be a
+  -- typo the UI would catch: the two ends come from two different pickers.
+  CHECK (from_card_id <> to_card_id)
 );
 CREATE INDEX idx_card_links_external_tenant ON card_links_external(tenant_id);
+-- BOTH ends are indexed because `listExternalLinksFor` matches either one: a card's badge has to
+-- show the edges it declares as well as the edges declared against it. One index would leave half
+-- the reads doing a table scan.
 CREATE INDEX idx_card_links_external_to ON card_links_external(to_card_id);
+CREATE INDEX idx_card_links_external_from ON card_links_external(from_card_id);
 ```
 
 - [ ] **Step 2: Test that the boundary holds**
@@ -2982,6 +3081,13 @@ const B = { boardId: 'brd_releases', cardId: 'card_bbbbbbbbbbbbbbbb' };
 beforeAll(async () => {
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_x', 'x', 'X')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_y', 'y', 'Y')`).run();
+  // Both fixture boards must EXIST and belong to tnt_x: the migration FKs the board ids and
+  // `addExternalLink` checks tenant ownership of both ends.
+  for (const b of [A.boardId, B.boardId]) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES (?, 'tnt_x', ?, '[]')`,
+    ).bind(b, b).run();
+  }
 });
 
 describe('cross-board edges', () => {
@@ -3021,6 +3127,28 @@ describe('cross-board edges', () => {
     expect(await listExternalLinksFor(env.DB, 'tnt_y', B.cardId)).toHaveLength(0);
   });
 
+  it('finds the edge from EITHER end, not just the one it points at', async () => {
+    await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'blocks' });
+    // The card that DECLARES the edge has to show a badge too. Querying only `to_card_id` makes a
+    // card's own outgoing blockers invisible on the card that owns them.
+    expect(await listExternalLinksFor(env.DB, 'tnt_x', A.cardId)).not.toHaveLength(0);
+  });
+
+  it('refuses an edge into a board belonging to another tenant', async () => {
+    // `boards` is in D1 with a `tenant_id`, so this is checkable rather than assumed. Without the
+    // check, a tenant names any board id it likes and reads back rows about a board it cannot see.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_theirs', 'tnt_y', 'Theirs', '[]')`,
+    ).run();
+    const r = await addExternalLink(env.DB, 'tnt_x', {
+      from: A,
+      to: { boardId: 'brd_theirs', cardId: 'card_dddddddddddddddd' },
+      kind: 'blocks',
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('FOREIGN_BOARD');
+  });
+
   it('is idempotent on the same triple, rather than duplicating the badge', async () => {
     await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'relates' });
     await addExternalLink(env.DB, 'tnt_x', { from: A, to: B, kind: 'relates' });
@@ -3034,9 +3162,121 @@ describe('cross-board edges', () => {
 
 The `SAME_BOARD_EDGE` refusal is the one that protects the design: the enforced and advisory stores must never both be able to hold one edge.
 
-- [ ] **Step 3: Implement, run, commit**
+- [ ] **Step 3: Implement the module**
+
+The tests above are the contract. `apps/api/src/db/card-links-external.ts`:
+
+```ts
+/**
+ * Cross-board card edges (migration 0012) — ADVISORY, always.
+ *
+ * Same-board edges live in the board Durable Object's `card_links`, where the claim path reads them
+ * and they can actually refuse a claim. These cannot be: the two ends are in two different DOs, so
+ * any enforcement would rest on a cross-DO read that is stale the moment it returns. They exist to
+ * be SHOWN, and the UI must say so before an edge is created, not after.
+ */
+export type ExternalLinkKind = 'blocks' | 'relates';
+export interface ExternalEnd { boardId: string; cardId: string }
+export interface ExternalLinkRow { fromBoardId: string; fromCardId: string; toBoardId: string; toCardId: string; kind: ExternalLinkKind }
+
+const COLUMNS =
+  'from_board_id AS fromBoardId, from_card_id AS fromCardId, to_board_id AS toBoardId, to_card_id AS toCardId, kind';
+
+export type AddResult = { ok: true } | { ok: false; code: string; message: string };
+
+export async function addExternalLink(
+  db: D1Database,
+  tenantId: string,
+  edge: { from: ExternalEnd; to: ExternalEnd; kind: ExternalLinkKind },
+): Promise<AddResult> {
+  if (edge.kind === ('parent' as string)) {
+    return { ok: false, code: 'PARENT_MUST_BE_SAME_BOARD', message:
+      'A parent edge carries a rule — a parent does not advance while a child is open — and an advisory containment relationship is one that fails to contain. Use a project to group cards across boards.' };
+  }
+  if (edge.kind !== 'blocks' && edge.kind !== 'relates') {
+    return { ok: false, code: 'BAD_KIND', message: `kind must be 'blocks' or 'relates', got '${edge.kind}'` };
+  }
+  if (edge.from.boardId === edge.to.boardId) {
+    return { ok: false, code: 'SAME_BOARD_EDGE', message:
+      'Both cards are on the same board, so this edge belongs in the board\'s own card_links where it is enforced. Storing it here would show a badge that refuses nothing.' };
+  }
+  if (edge.from.cardId === edge.to.cardId) {
+    return { ok: false, code: 'SELF_EDGE', message: 'A card cannot block itself.' };
+  }
+  // Both boards must exist AND belong to this tenant. One query, so a caller naming a board it
+  // cannot see is refused identically to one naming a board that does not exist.
+  const owned = await db
+    .prepare(`SELECT COUNT(*) AS n FROM boards WHERE tenant_id = ? AND id IN (?, ?)`)
+    .bind(tenantId, edge.from.boardId, edge.to.boardId)
+    .first<{ n: number }>();
+  if ((owned?.n ?? 0) !== 2) {
+    return { ok: false, code: 'FOREIGN_BOARD', message: 'Both boards must exist and belong to this tenant.' };
+  }
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO card_links_external
+         (tenant_id, from_board_id, from_card_id, to_board_id, to_card_id, kind)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(tenantId, edge.from.boardId, edge.from.cardId, edge.to.boardId, edge.to.cardId, edge.kind)
+    .run();
+  return { ok: true };
+}
+
+/** Every advisory edge touching this card, from EITHER end. Tenant-scoped, like every D1 read. */
+export async function listExternalLinksFor(
+  db: D1Database,
+  tenantId: string,
+  cardId: string,
+): Promise<ExternalLinkRow[]> {
+  const { results } = await db
+    .prepare(`SELECT ${COLUMNS} FROM card_links_external WHERE tenant_id = ? AND (from_card_id = ? OR to_card_id = ?)`)
+    .bind(tenantId, cardId, cardId)
+    .all<ExternalLinkRow>();
+  return results ?? [];
+}
+
+export async function removeExternalLink(
+  db: D1Database,
+  tenantId: string,
+  fromCardId: string,
+  toCardId: string,
+  kind: ExternalLinkKind,
+): Promise<void> {
+  await db
+    .prepare(`DELETE FROM card_links_external WHERE tenant_id = ? AND from_card_id = ? AND to_card_id = ? AND kind = ?`)
+    .bind(tenantId, fromCardId, toCardId, kind)
+    .run();
+}
+```
+
+- [ ] **Step 4: Register the migration in the TEST catalogue, or every test above fails**
+
+`apps/api/test/helpers/catalog.ts`'s `setupCatalog()` builds the D1 schema the test environment
+sees. It does NOT apply `migrations/` wholesale. A new migration file is invisible to every test
+until it is registered there, and this plan has already lost a task to that.
+
+Follow the **`labels` pattern** at `catalog.ts:101-111`, not the hand-written-DDL pattern above it:
+
+```ts
+import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
+// …alongside the labels block:
+if (!(await tableExists('card_links_external'))) {
+  for (const st of statementsOf(cardLinksExternal)) await env.DB.prepare(st).run();
+}
+```
+
+The distinction matters. The hand-written `CREATE TABLE` statements at the top of that file
+deliberately **drop** their `REFERENCES tenants(id)` clauses (compare `catalog.ts:16`'s `boards` to
+`0001_catalog.sql:33-41`); importing the migration `?raw` keeps every constraint the real schema
+has, which for this table is the point — the `boards` FKs and the `from_card_id <> to_card_id` CHECK
+are behaviour Task 16's tests assert. `boards` itself already exists in the catalogue, so the FK is
+satisfiable; the test seeds real `boards` rows for exactly that reason.
+
+- [ ] **Step 5: Run and commit**
 
 ```bash
+pnpm --filter @superpipeline/api test
 git add apps/api/migrations/0012_card_links_external.sql apps/api/src apps/api/test
 git commit -m "feat(links): advisory cross-board edges, refused for same-board and for parent"
 ```
@@ -3046,10 +3286,52 @@ git commit -m "feat(links): advisory cross-board edges, refused for same-board a
 ## Task 17: Phase 3 in the UI, and the live check
 
 **Files:**
-- Modify: `apps/web/src/lib/components/CardDrawer.svelte` — a Sub-tasks section (children with state and cost), a Blockers section, an "Add sub-task" action
+- Modify: `apps/web/src/lib/components/CardDrawer.svelte` — a Sub-tasks section (children with state and cost), a Blockers section, an **"Add sub-task"**, an **"Add blocker"** and an **"Archive card"** action
+- Modify: `packages/cli/src/index.ts` — **`supi link add|rm|list`** and **`supi archive`**
+
+> **Why these are here and were not before.** An audit found this plan specified read surfaces
+> thoroughly and write surfaces unevenly: `supi link` appeared in the File Structure and in no task,
+> and archiving shipped a column and a "show archived" filter in Phase 1 with **no way to archive
+> anything** — a filter for a state nothing could produce. A construct a person can see and cannot
+> create is half-built, and the half that is missing is the half they would use.
 - Modify: `apps/web/src/lib/components/board/CardTile.svelte` — a blocked badge, a `2/5` child counter
 - Modify: `apps/web/src/lib/components/board/BoardKanban.svelte` — a per-stage blocked count
-- Modify: `apps/web/src/lib/api.ts`
+- Modify: **`apps/api/src/index.ts`** — the link routes, which do not exist yet. Task 12 built
+  `addLink` / `removeLink` / `listLinks` on the Durable Object (`board-do.ts:2139-2199`) and gave
+  them **no HTTP surface**. Both write surfaces below — the drawer's "Add blocker" and
+  `supi link add` — call an endpoint that is not there. Add:
+
+  | route | does |
+  |---|---|
+  | `POST   /v1/boards/:boardId/links` | body `{fromCardId, toCardId, kind}` → `addLink` |
+  | `DELETE /v1/boards/:boardId/links` | same body → `removeLink` |
+  | `GET    /v1/boards/:boardId/cards/:cardId/links` | → `listLinks`, merged with Task 16's advisory rows |
+
+  Map the DO's refusals to status codes rather than letting them fall through as 500s. These are the
+  codes `addLink` / `removeLink` actually return — read off `board-do.ts:2139-2199`, not guessed:
+
+  | code | status |
+  |---|---|
+  | `LINK_WOULD_CYCLE` | **409** |
+  | `ALREADY_HAS_PARENT` | **409** |
+  | `NO_SUCH_CARD` | **404** |
+  | `NOT_INITIALIZED` | **404** — the shared `statusForCode` already maps it there, alongside `NO_SUCH_CARD`. Do not give one code two statuses. |
+  | an unknown `kind` at the route | **400**, refused before the DO is called |
+
+  Add `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` to the **shared** `statusForCode` (they are absent
+  from it today, and no existing route can produce them, so it is not a behaviour change). Do not add a
+  second link-only mapping function: one code, one status, across the whole API.
+
+  Two earlier drafts of this table were wrong, both because I wrote status codes without opening
+  `statusForCode`. The first said `CARD_NOT_FOUND`, which does not exist — the DO says `NO_SUCH_CARD`.
+  The second said `NOT_INITIALIZED → 409`, which forced exactly the duplicate mapping the line above
+  forbids.
+  `LinkKind` is `'blocks' | 'relates' | 'parent'` and `LinkInput` is
+  `{fromCardId, toCardId, kind, createdBy?}` (`links.ts:5`, `board-do.ts:676-681`). The archive surface needs no new route — `PATCH` already validates
+  `archivedAt` (`index.ts:1325-1342`).
+
+- Modify: `apps/web/src/lib/api.ts` — `addLink`, `removeLink`, `listLinks` and `archiveCard`
+  wrappers for the above, in the file's existing style
 
 - [ ] **Step 1: Two badges, never one**
 
@@ -3062,6 +3344,127 @@ This is the part the design is most specific about. An enforced blocker and an a
 
 A single badge covering both would sometimes lie, and a badge that sometimes lies is worse than two honest badges.
 
+- [ ] **Step 1b: Creating an edge, and archiving**
+
+- **Add blocker** in the drawer: pick another card on this board, pick `blocks` or `relates`, and
+  surface Task 12's three refusals as sentences — a cycle and an existing parent each say which,
+  because "invalid link" tells a person nothing about what to do next.
+- **Archive** in the drawer, and `supi archive <boardId> <cardId>`. Both send `archivedAt`; the
+  existing filter then does what it has always claimed to do.
+- `supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent`, plus `rm` and
+  `list`. Reject an unknown `--kind` in the CLI rather than sending it.
+- **Cross-board edges (Task 16) get a creation surface too** — the same "Add blocker" dialogue,
+  with a board picker, writing to the advisory D1 store when the target is on another board. The
+  badge already distinguishes them; the dialogue must say so **before** the edge is created, not
+  after, or a person will expect enforcement they will not get.
+
+⚠️ Any new route here carries Phase 1's two lessons: the `resolveHubUser` fallback (or every `supi`
+verb 401s), and route-level shape validation (the Durable Object trusts its callers by design).
+
+- [ ] **Step 1d: Give Task 16's advisory store its routes and CLI too**
+
+`addExternalLink` and `removeExternalLink` (`apps/api/src/db/card-links-external.ts`) still have no
+caller. The three routes above are same-board only, and `supi link add <boardId> …` names one board.
+So the advisory store is reachable from nothing — Task 16's module in the same position Task 12's
+`addLink` was in before Step 1's routes.
+
+- `POST` / `DELETE` on the same `…/links` paths, taking a `toBoardId` alongside `toCardId`. When
+  `toBoardId` differs from the path's board, the row goes to D1 via `addExternalLink` and the response
+  says `enforced: false`; when it matches, it goes to the DO. **One route, the boundary decided by the
+  data**, so a client cannot pick the wrong store.
+- `supi link add` gains `--to-board <boardId>`, defaulting to the path board. When it is used, the CLI
+  prints that the edge is advisory and not enforced **before** it is created, for the same reason the
+  drawer dialogue must.
+
+The D1 module's refusal codes are a **different code space** from the DO's `BoardErrorCode`, so they get
+their own small mapping. That is not the duplicate-mapping mistake Step 1's table warns about: there the
+*same* code was being given two statuses. Here these codes appear in exactly one place.
+
+| code | status | why |
+|---|---|---|
+| `FOREIGN_BOARD` | **404** | The board exists but belongs to another tenant. 404, not 403 — a 403 confirms it exists, which is a tenant-isolation leak by status code. |
+| `PARENT_MUST_BE_SAME_BOARD` | **400** | The same payload can never succeed; the caller must change it. Same reasoning as `TOO_MANY_CHILDREN`. |
+| `SELF_EDGE` | **400** | Likewise. |
+| `BAD_KIND` | **400** | Refused at the route before the module, like the DO arm's unknown `kind`. |
+| `SAME_BOARD_EDGE` | **500** | Unreachable by construction — the route sends same-board edges to the DO, so the module can only see this if the routing logic is broken. Defence in depth: keep the check, and if it ever fires, that is a bug in the route, not a client error. |
+
+That last row is the interesting one. Two stores that can each hold the same edge is how an enforced rule
+quietly stops being enforced, so the module keeps refusing same-board edges even though the route should
+never hand it one — and the status says "our fault", because it would be.
+
+This is server work with its own tests, so it belongs here rather than in the components task.
+
+- [ ] **Step 1c: Surface "blocked" on the card, from the SAME SQL the claim query uses**
+
+Nothing in `CardView` says whether a card is blocked. Its fields are `parentCardId`, `openChildCount`
+and `costUsdRollup` — a client wanting the badge below would have to call `listLinks` per card and then
+resolve each blocker's state, some of which lives on another board. Step 1's badges and Step 2's
+per-stage count therefore have **no data source** until this exists.
+
+Add to `CardView`:
+
+```ts
+/**
+ * Is this card held back by an unresolved same-board `blocks` edge — the enforced kind?
+ *
+ * Derived from the SAME `blockedWhere()` fragment the claim query uses, never from a second
+ * expression that means the same thing today. A badge computed independently is a badge that will
+ * eventually disagree with the claim query, and the disagreement is invisible: the UI says
+ * "Blocked" while `claim_card` hands the card out, or the reverse. This plan has already had one
+ * claim/discovery divergence from exactly that cause.
+ */
+blockedBy: Array<{ cardId: string; title: string }>;
+```
+
+`blockedBy` rather than a boolean because the tooltip has to name the blocker ("Blocked by *Title*"),
+and a count alone would send the drawer back for another round trip.
+
+**Only the `blocks` half.** `blockedWhere()` is two `NOT EXISTS` clauses, not one: an unresolved
+`blocks` edge pointing *at* this card, and an unresolved `parent` edge pointing *from* it (an open
+child). Both exclude a card from claiming, but they are different facts with different badges, and
+`CardView` already carries `openChildCount` for the second. `blockedBy` covers the **first clause
+only**; a card with open children is not "Blocked by" anything.
+
+So extract the two clauses into named fragments and compose `blockedWhere()` from them:
+
+```ts
+/** An unresolved `blocks` edge pointing at `c.id`. The enforced dependency. */
+private unresolvedBlockerExists(): string {
+  return `EXISTS (
+      SELECT 1 FROM card_links l JOIN cards b ON b.id = l.from_card_id
+       WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+         AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
+    )`;
+}
+/** An unresolved child of `c.id` — surfaced as `openChildCount`, not as a blocker. */
+private openChildExists(): string { /* the `parent` clause, same shape */ }
+
+private blockedWhere(): string {
+  return `NOT ${this.unresolvedBlockerExists()} AND NOT ${this.openChildExists()}`;
+}
+```
+
+This is the point of the exercise: the badge and the claim query must not be able to disagree about
+what "unresolved" means, and the only durable way to guarantee that is for one spelling of the rule to
+exist. `RESOLVED_SQL` already centralises the state list; these fragments centralise the two shapes
+built on it. The `blockedBy` batch query then reuses the same `kind = 'blocks'` + `RESOLVED_SQL`
+predicate to select the blocker rows themselves.
+
+Note that only **one** of `rowToCard`'s three call sites passes `pre` today (`board-do.ts:4636`, the
+batched board read); the other two (`:3524`, `:4583`) are single-card reads that fall back to
+per-card queries. Follow that existing split rather than changing it — add `blockedBy` to the `pre`
+shape for the batched path, and a single-card fallback query for the other two.
+
+**Compute it once per board read, not once per card.** `rowToCard(row, pre?)` already takes a
+precomputed argument for exactly this reason — Task 14 added it because `rowToCard` had grown to five
+extra queries per card. Follow that pattern: one query per board read that returns every unresolved
+blocker edge for the whole board, grouped in memory, then handed to `rowToCard` through `pre`. Do not
+add a per-card query.
+
+Advisory cross-board edges (Task 16) are **not** in `blockedBy` — they block nothing, and putting them
+in a field named `blockedBy` is how a client ends up rendering the enforced badge for an advisory edge.
+They reach the client through the `GET …/links` route's separate advisory channel.
+
 - [ ] **Step 2: The blocked count per stage**
 
 Because a blocked card is *excluded* rather than refused, an agent reports "no work" and a human sees cards sitting in a column doing nothing. The stage header must show `3 blocked` or the board looks broken. **This is not optional polish** — it is the only place the exclusion is ever explained.
@@ -3072,15 +3475,38 @@ Run: `cd apps/web && pnpm check && pnpm test`
 
 ```bash
 git push -u origin feat/planning-phase3-links
-gh pr create --title "feat: dependencies and sub-tasks" --body "<see plan>"
+gh pr create --title "feat: dependencies and sub-tasks" --body-file /dev/stdin <<'BODY'
+# write the body from THIS task's text: what shipped, the two badge kinds, and the live-check results
+BODY
 ```
 
 - [ ] **Step 4: THE LIVE CHECK**
 
 On a scratch board:
 
-1. Two cards, B blocked by A, B at higher priority. An agent must claim **A**. If it claims B, the `NOT EXISTS` clause is not live.
-2. Let A **fail**. Confirm B is *still* not claimed. This is the `isResolved`-vs-`isTerminal` distinction, and it is the one bug in this plan that unit tests could pass while production is wrong.
+0. **Arrange for something to actually poll the board, or steps 1-2 cannot be run.** Phase 2's live
+   check discovered this the hard way: "an agent claims it" was unprovable because *nothing polls a
+   scratch board* — the `bridge_agents` roster points every Guild agent at the Press board. Two ways
+   out, and pick one before starting: roster an agent onto the scratch board (agentpod console →
+   **Admin → Bridge**, which takes effect within ten seconds and needs no restart), or skip the
+   bridge and claim directly over the API with an agent token. The second is less realistic but
+   touches no shared configuration — prefer it unless the point is to exercise the bridge.
+
+1. Two cards, B blocked by A, B at higher priority. The claim must return **A**. If it returns B, the `NOT EXISTS` clause is not live.
+2. **Reject** A — do not try to fail it. Confirm B is *still* not claimed. This is the
+   `isResolved`-vs-`isTerminal` distinction, and it is the one bug in this plan that unit tests
+   could pass while production is wrong.
+
+   The verb matters, and an earlier draft of this step had it wrong. Of the four terminal states the
+   contract names, **only two are reachable**: `completed` (`board-do.ts:4068`) and `rejected`
+   (`:3770`), one write site each. `failed` and `canceled` have **zero** write sites — no code path
+   in the Durable Object ever assigns them. So "let A fail" is not a hard step, it is an impossible
+   one, and an operator following it would conclude the blocker logic was broken when they could
+   not perform it.
+   `rejected` is the right probe anyway: it is precisely the state that is terminal but **not**
+   resolved (`RESOLVED_SQL = ('completed', 'canceled')`), so it is the one that proves a dead
+   blocker still blocks. Note in passing that `canceled` is half the resolved set and unreachable —
+   dead but harmless, so leave it.
 3. Give a card two children. Confirm the parent cannot advance, and that the drawer says why.
 4. From a real agent run, call `superpipeline_split_card` over MCP and confirm children appear and are claimed by the right capabilities. **This is the feature's actual purpose**; everything else is bookkeeping.
 5. Confirm the stage header's blocked count is visible on a phone-width window.
@@ -3097,7 +3523,31 @@ The only phase with cross-DO reads, and the only one whose numbers are a snapsho
 
 **Files:**
 - Create: `apps/api/migrations/0013_projects_and_milestones.sql`, `apps/api/src/db/projects.ts`
-- Test: `apps/api/test/projects.test.ts` (create)
+- Modify: **`apps/api/src/index.ts`** — the project and milestone CRUD routes. Without them Task 20's
+  `supi project list|add|show|rm`, `supi milestone add|rm`, and the Projects view's own "new project"
+  and "add milestone" controls all call endpoints that do not exist:
+
+  | route | does |
+  |---|---|
+  | `GET    /v1/projects` | list the tenant's projects |
+  | `POST   /v1/projects` | create; body `{name, description?, targetDate?, leadUserId?}` |
+  | `GET    /v1/projects/:id` | one project with its milestones in `sortOrder` |
+  | `PATCH  /v1/projects/:id` | `name`, `description`, `targetDate`, `state`, `health`, `leadUserId` |
+  | `DELETE /v1/projects/:id` | delete; milestones cascade (`ON DELETE CASCADE`) |
+  | `POST   /v1/projects/:id/milestones` | create; body `{name, targetDate?, sortOrder?}` |
+  | `DELETE /v1/milestones/:id` | delete one milestone |
+
+  Validate `targetDate` with the **same** `^\d{4}-\d{2}-\d{2}$` validator Task 5 added, reused not
+  rewritten, and `state`/`health` against the same unions the module exports. `GET /v1/projects/:id/rollup`
+  belongs to Task 19, not here.
+
+  **Why this is in Task 18 rather than Task 20.** This plan has now shipped two modules whose callers
+  were specified before their routes were: Task 12's `addLink` reached Task 17 with no HTTP surface,
+  and this would have been the same mistake a third time. A D1 module and the routes that expose it
+  belong to one task, so a reviewer who can reject one can reject both.
+- Test: `apps/api/test/projects.test.ts` (create), `apps/api/test/projects-rest.test.ts` (create) —
+  route-level tests following `labels-rest.test.ts`, including a `targetDate` rejection and a
+  cross-tenant read returning 404 rather than another tenant's project
 
 **Interfaces:**
 - Produces:
@@ -3395,9 +3845,20 @@ git commit -m "feat(projects): card membership and a cached cross-board rollup t
 ## Task 20: Projects in the UI and in `supi`
 
 **Files:**
-- Create: `apps/web/src/lib/components/plan/ProjectView.svelte`
-- Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`
+- Create: `apps/web/src/lib/components/plan/ProjectView.svelte`, **`apps/web/src/lib/components/workspace/LabelManager.svelte`**
+- Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`, **`apps/web/src/routes/workspace/[tab]/+page.svelte`**
 - Modify: `packages/cli/src/index.ts` — `supi project list|add|show|rm`, `supi milestone add|rm`
+
+**Also close two write-surface gaps the same audit found:**
+
+- **A label manager**, as a `labels` tab beside `capabilities`/`people`/`connections` in `/workspace`.
+  `api.ts` already exports `createLabel`, `updateLabel` and `deleteLabel` and **no component calls
+  them** — so a label can be created by typing a name into a card, and then never renamed,
+  recoloured or removed. List the catalogue with each label's `origin`, so an operator can see which
+  ones were `inferred` from a typo, which is the cost `capabilities` already accepted for the same
+  convenience.
+- **Creating and editing milestones in `ProjectView`**, not only through `supi milestone`. A project
+  view that lists milestones and cannot add one sends a person to a terminal to do the obvious thing.
 
 - [ ] **Step 1: The view**
 
@@ -3455,7 +3916,9 @@ Add a short section on what stops a card advancing: an open child, and (for a cl
 git add docs/
 git commit -m "docs: record what shipped, decline cycles, and correct two stale claims in 13"
 git push -u origin feat/planning-phase4-projects
-gh pr create --title "feat: projects and milestones" --body "<see plan>"
+gh pr create --title "feat: projects and milestones" --body-file /dev/stdin <<'BODY'
+# write the body from THIS task's text: the rollup's staleness contract, and the live-check results
+BODY
 ```
 
 Then, live:

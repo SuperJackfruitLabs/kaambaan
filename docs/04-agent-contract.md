@@ -209,6 +209,13 @@ The same verb on two surfaces — full detail in [05 — Integration Surfaces](.
 | `submitForReview` | `superpipeline_submit_for_review` | `POST /v1/boards/:id/runs/:runId/`**`submit`** |
 | `complete` | `superpipeline_complete` | `POST /v1/boards/:id/runs/:runId/complete` |
 | `block` / `release` / `fail` | `superpipeline_block` / `_release` / `_fail` | `POST /v1/boards/:id/runs/:runId/{block,release,fail}` |
+| *(split a card into children)* | `superpipeline_split_card` *(not read-only, not idempotent)* | `POST /v1/boards/:id/cards/:cardId/split` *(human-auth)* |
+
+`superpipeline_split_card` is the one agent verb that **creates** work rather than progressing it: it
+turns a markdown checklist in a card's body into one child card per line. It is gated to the card the
+calling agent's own run holds — refusing `NOT_RUN_OWNER` otherwise — so an agent can decompose the work
+it was given and nothing else. Children inherit the parent's dispatch grant, so a split cannot be used
+to create work that bypasses the control pair.
 
 There is no `superpipeline_request_input` tool — an elicitation is an activity, on both wires.
 

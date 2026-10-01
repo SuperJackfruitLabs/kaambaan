@@ -12,14 +12,25 @@
     addReference,
     resolveGate,
     answerElicitation,
+    archiveCard,
+    unarchiveCard,
+    addLink,
+    removeLink,
+    listLinks,
+    splitCard,
+    getBoard,
     type CardActivities,
     type Attempt,
     type Estimate,
     type GateDecision,
+    type CardLinks,
+    type LinkKind,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
+  import { buildLinkGroups, edgeKey, type RemoveArgs } from '$lib/components/link-groups';
+  import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -50,6 +61,14 @@
     card && app.board ? (app.board.stages.find((s) => s.key === card.currentStageKey)?.name ?? card.currentStageKey) : '',
   );
 
+  /**
+   * Sub-tasks: this card's direct children, read straight off the board's own card list by
+   * `parentCardId` — same-board only (`kind: 'parent'` refuses a cross-board edge server-side), so
+   * no extra fetch is needed; the children are already in `app.board.cards`.
+   */
+  const children = $derived(card ? (app.board?.cards ?? []).filter((c) => c.parentCardId === card.id) : []);
+  const totalChildren = $derived(children.length);
+
   // ---- local async state ----
   /**
    * Tool calls are hidden by default.
@@ -65,6 +84,29 @@
   const activityGroups = $derived(groupActivities(cardDetail?.activities ?? [], drawerAttempts ?? []));
 
   let cardEstimate = $state<Estimate | null>(null);
+  /** Same-board (enforced) and cross-board (advisory) edges touching this card — Task 17a/17d's `GET …/links`. */
+  let cardLinks = $state<CardLinks>({ links: [], externalLinks: [] });
+
+  /**
+   * Every edge this card has, grouped so the meanings stay distinct (whole-branch review,
+   * Important finding): rendering only `blockedBy` left a `relates` edge, or an outgoing `blocks`
+   * edge, creatable through the very dialogue below and visible NOWHERE — no row, no error, no way
+   * to know it existed or to remove it. `buildLinkGroups` (`$lib/components/link-groups`) is the
+   * one place that reads `cardLinks.links`/`cardLinks.externalLinks` for display; nothing here
+   * re-derives which edges mean what.
+   */
+  const linkGroups = $derived(
+    card && boardId
+      ? buildLinkGroups(boardId, card.id, card.blockedBy, cardLinks.links, cardLinks.externalLinks, (id) => app.cardById(id)?.title ?? id)
+      : { blockedBy: [], resolvedBlockedBy: [], blocks: [], relates: [], advisory: [] },
+  );
+  const hasAnyLink = $derived(
+    linkGroups.blockedBy.length > 0 ||
+      linkGroups.resolvedBlockedBy.length > 0 ||
+      linkGroups.blocks.length > 0 ||
+      linkGroups.relates.length > 0 ||
+      linkGroups.advisory.length > 0,
+  );
 
   // ---- edit state ----
   let editing = $state(false);
@@ -120,20 +162,30 @@
       editing = false;
       newRefUrl = '';
       localError = null;
+      newSubtaskTitle = '';
+      subtaskError = null;
+      addBlockerOpen = false;
+      blockerError = null;
+      // The board switcher list — needed to name a cross-board advisory blocker's board, and to
+      // populate the Add-blocker dialogue's board picker. Best-effort, same as everywhere else
+      // `app.boards` is read: a board the catalogue could not resolve just shows no name.
+      void app.loadBoards();
       void refreshDrawer(id, boardId);
     } else {
       cardDetail = null;
       drawerAttempts = [];
       cardEstimate = null;
+      cardLinks = { links: [], externalLinks: [] };
     }
   });
 
   async function refreshDrawer(id: string, bid: string): Promise<void> {
     try {
-      [cardDetail, drawerAttempts, cardEstimate] = await Promise.all([
+      [cardDetail, drawerAttempts, cardEstimate, cardLinks] = await Promise.all([
         getCardActivities(bid, id),
         getAttempts(bid, id),
         getEstimate(bid, id),
+        listLinks(bid, id),
       ]);
     } catch {
       /* best-effort */
@@ -281,6 +333,188 @@
       await app.refresh();
     } else {
       localError = `Couldn't add that link (${res.status})`;
+    }
+  }
+
+  // ---- archive (Step 1b) ----
+  // A construct a person can see and cannot create is half-built. Phase 1 shipped the
+  // `archivedAt` column and a "show archived" filter with no way to ever produce an archived
+  // card; this is that write. Sends a real timestamp (`archiveCard`), not a client-side flag.
+  let archiving = $state(false);
+  async function onArchiveCard(): Promise<void> {
+    if (!boardId || !cardId) return;
+    if (!confirm('Archive this card? It will drop off the board unless "show archived" is on.')) return;
+    archiving = true;
+    try {
+      const res = await archiveCard(boardId, cardId);
+      if (res.ok) {
+        close();
+        await app.refresh();
+      } else {
+        localError = `Couldn't archive the card (${res.status})`;
+      }
+    } finally {
+      archiving = false;
+    }
+  }
+
+  /**
+   * Un-archive: whole-branch review, Minor. `board-do.ts:3347` names un-archiving as one of THREE
+   * recoveries for a parent parked by an archived child; the other two already had a surface here
+   * and this one didn't, so an archived card was a one-way door through the web app even though
+   * the route/DO have always accepted `archivedAt: null`. Does not close the drawer — unlike
+   * archiving, un-archiving does not drop the card out of the CURRENT view (`passesArchivedFilter`
+   * shows an archived card either way once "show archived" is on, which is how this drawer was
+   * reached in the first place).
+   */
+  async function onUnarchiveCard(): Promise<void> {
+    if (!boardId || !cardId) return;
+    archiving = true;
+    try {
+      const res = await unarchiveCard(boardId, cardId);
+      if (res.ok) {
+        await app.refresh();
+      } else {
+        localError = `Couldn't un-archive the card (${res.status})`;
+      }
+    } finally {
+      archiving = false;
+    }
+  }
+
+  // ---- sub-tasks (Step 1b) ----
+  // "Add sub-task" reuses Task 15's split (one title in, one child out) rather than
+  // createCard + addLink('parent'): createCard's wrapper discards its response body, so it
+  // cannot hand back the new child's id to link, while split's response already carries it.
+  let newSubtaskTitle = $state('');
+  let addingSubtask = $state(false);
+  let subtaskError = $state<string | null>(null);
+  async function addSubtask(): Promise<void> {
+    if (!boardId || !cardId || newSubtaskTitle.trim() === '' || addingSubtask) return;
+    addingSubtask = true;
+    subtaskError = null;
+    try {
+      const res = await splitCard(boardId, cardId, [newSubtaskTitle.trim()]);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        subtaskError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      newSubtaskTitle = '';
+      await app.refresh();
+    } finally {
+      addingSubtask = false;
+    }
+  }
+
+  // ---- add blocker (Step 1b) ----
+  // Cross-board blockers get a board picker in THIS dialogue, and the advisory notice
+  // (`crossBoardNoticeText` below) must say the edge will not be enforced BEFORE the edge is
+  // created, not after — a person who asks for a blocker and gets a silent no-op has already
+  // been misled by the time any response comes back.
+  let addBlockerOpen = $state(false);
+  let blockerBoardId = $state('');
+  let blockerCardId = $state('');
+  let blockerKind = $state<LinkKindChoice>('blocks');
+  let blockerBoardCards = $state<{ id: string; title: string }[]>([]);
+  let addingBlocker = $state(false);
+  let blockerError = $state<string | null>(null);
+
+  /** Computed client-side, from the same board-id comparison the server route makes — no round trip needed. */
+  const crossBoardNoticeText = $derived(boardId ? crossBoardNotice(blockerBoardId, boardId) : null);
+
+  function openAddBlocker(): void {
+    if (!boardId || !cardId) return;
+    addBlockerOpen = true;
+    blockerBoardId = boardId;
+    blockerCardId = '';
+    blockerKind = 'blocks';
+    blockerError = null;
+    blockerBoardCards = (app.board?.cards ?? []).filter((c) => c.id !== cardId);
+  }
+
+  async function onBlockerBoardChange(): Promise<void> {
+    blockerCardId = '';
+    if (!boardId || !cardId) return;
+    if (blockerBoardId === boardId) {
+      blockerBoardCards = (app.board?.cards ?? []).filter((c) => c.id !== cardId);
+      return;
+    }
+    if (!blockerBoardId) {
+      blockerBoardCards = [];
+      return;
+    }
+    try {
+      const snap = await getBoard(blockerBoardId);
+      blockerBoardCards = snap.cards;
+    } catch {
+      blockerBoardCards = [];
+    }
+  }
+
+  async function onAddBlocker(): Promise<void> {
+    if (!boardId || !cardId || !blockerBoardId || !blockerCardId || addingBlocker) return;
+    addingBlocker = true;
+    blockerError = null;
+    try {
+      const res = await submitAddBlocker(
+        { blockerBoardId, blockerCardId, thisBoardId: boardId, thisCardId: cardId, kind: blockerKind },
+        {
+          addLink: (bid, from, to, kind, toBoardId) => addLink(bid, from, to, kind as LinkKind, toBoardId),
+          // A no-op body: the reactive `crossBoardNoticeText` banner above already shows the
+          // notice as soon as a different board is picked, well before this submit even runs.
+          // Still routed through `submitAddBlocker` (rather than calling `addLink` directly) so
+          // this code path runs through the SAME order-of-operations the unit test asserts —
+          // `notify` before `addLink` — instead of a second implementation that could drift from it.
+          notify: () => {},
+        },
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        blockerError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      addBlockerOpen = false;
+      await app.refresh();
+      if (cardId && boardId) void refreshDrawer(cardId, boardId);
+    } finally {
+      addingBlocker = false;
+    }
+  }
+
+  // ---- remove a link (whole-branch review, Important) ----
+  // Every group rendered below (`linkGroups`) carries a `remove` field that is EXACTLY the
+  // argument tuple `removeLink` takes — computed once, in `buildLinkGroups`, from the edge's own
+  // stored from/to/board ids, never reconstructed here. For an advisory row that means `boardId`
+  // is the edge's OWN `fromBoardId` (which may not be THIS card's board at all) and `toBoardId`
+  // names the other side — the same asymmetric contract `submitAddBlocker` already follows for
+  // creation, so removal targets the same store creation would have written to.
+  //
+  // `removingKeys` is tracked by `edgeKey(args)` — the SAME function every `{#each}` below uses
+  // for its own key — rather than a second, hand-rolled string built here. One function computing
+  // "what identifies this edge" is what keeps the in-flight tracking and the render key from ever
+  // being able to name two different rows the same thing.
+  let removingKeys = $state(new Set<string>());
+  let linksError = $state<string | null>(null);
+
+  async function onRemoveLink(args: RemoveArgs): Promise<void> {
+    const key = edgeKey(args);
+    if (removingKeys.has(key)) return;
+    removingKeys = new Set(removingKeys).add(key);
+    linksError = null;
+    try {
+      const res = await removeLink(args.boardId, args.fromCardId, args.toCardId, args.kind, args.toBoardId);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        linksError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      await app.refresh();
+      if (cardId && boardId) void refreshDrawer(cardId, boardId);
+    } finally {
+      const next = new Set(removingKeys);
+      next.delete(key);
+      removingKeys = next;
     }
   }
 
@@ -812,6 +1046,244 @@
           </section>
         {/if}
 
+        <!--
+          Links (whole-branch review, Important finding) — EVERY edge this card has, in five
+          groups that never share a row style, because a person could otherwise create a `relates`
+          edge or an outgoing `blocks` edge through the dialogue below and never see it rendered
+          anywhere: what blocks this card (enforced, ⛔), what blocked it but has since resolved,
+          what this card blocks, what it merely relates to, and the advisory cross-board ones —
+          each with its own "remove" control, since `removeLink` (Task 17a) had shipped with zero
+          callers in this app.
+
+          Every `{#each}` below is keyed by `edgeKey(row.remove)` — the EDGE's own identity, never
+          `row.cardId`/`row.boardId` alone. See `edgeKey`'s own doc comment (`link-groups.ts`) for
+          why: two edges can legitimately name the same "other card" (mutual `relates`, since
+          `wouldCycle` excludes it from the cycle check), and a key that collides is not a cosmetic
+          bug — Svelte 5 throws on a duplicate `{#each}` key, which fails this whole section's
+          render. No test in this project can reach that failure directly (Vitest cannot import a
+          `.svelte` file here), which is exactly why the reasoning has to live here, not only in a
+          function nobody reading this template is forced to open.
+        -->
+        <section class="sec">
+          <div class="sec-h eyebrow">links</div>
+
+          {#if linkGroups.blockedBy.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocked by</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.blockedBy as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]" title={row.badge.tooltip}>
+                  <span class="blk-pill">{row.badge.glyph}</span>
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.resolvedBlockedBy.length > 0}
+            <!--
+              Re-review N2: `blockedBy` only ever carries UNRESOLVED inbound blockers (the claim
+              query's own predicate) — a blocker that has since completed drops out of it, but the
+              edge itself is never deleted, so it was previously visible in NEITHER group. Shown
+              here as resolved, never `⛔`: nothing is currently enforcing it, and re-opening the
+              blocker (`moveCard` sets a card back to `submitted` unconditionally) would silently
+              re-arm an edge its owner never saw — this is where they can see and clear it first.
+            -->
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocked by (resolved)</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.resolvedBlockedBy as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]" title="{row.title} blocked this card — resolved, no longer enforced">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.blocks.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">blocks</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.blocks as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.relates.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">relates to</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.relates as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.advisory.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">advisory (other boards)</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.advisory as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div
+                  class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]"
+                  title={row.badge?.tooltip ?? `${row.relation === 'blocks' ? 'Blocks' : 'Relates to'} ${row.title} on another board — advisory, not enforced`}
+                >
+                  {#if row.badge}
+                    <span class="blk-pill blk-pill-advisory">{row.badge.glyph}</span>
+                  {/if}
+                  <span class="min-w-0 flex-1 truncate">
+                    {row.title}
+                    {#if row.relation !== 'blocked-by'}<span class="text-muted-foreground">· {row.relation}</span>{/if}
+                  </span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if !hasAnyLink}
+            <p class="text-muted-foreground mb-2.5 text-xs">No links on this card.</p>
+          {/if}
+
+          {#if linksError}
+            <p role="alert" class="text-coral mono mb-2.5 text-[11px]">{linksError}</p>
+          {/if}
+
+          <Button size="sm" variant="outline" onclick={openAddBlocker}>Add link</Button>
+
+          {#if addBlockerOpen}
+            <div class="bg-inset border-border mt-2.5 space-y-2 rounded-[8px] border p-3 text-xs">
+              <!--
+                Re-review N3: the dialogue always creates an edge pointing AT this card ("picked
+                card → this card") — there is no way, here, to create the reverse. That used to be
+                implicit in generic Board/Card/Kind fields sitting directly under a visible "blocks"
+                (outgoing) group, which invites exactly the wrong expectation. Said outright instead
+                of left to be inferred, per the reviewer's finding — the symmetry argument for NOT
+                adding an outgoing-creation path stands (that edge is always reachable from the
+                other card's own drawer), so this fixes the wording, not the architecture.
+              -->
+              <p class="text-muted-foreground mono text-[10.5px]">
+                The card you pick below will point <strong>at "{card.title}"</strong> — e.g. picking "blocks" creates
+                "picked card blocks this card", never the other way around.
+              </p>
+              <div>
+                <label for="blocker-board" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Board</label>
+                <select
+                  id="blocker-board"
+                  bind:value={blockerBoardId}
+                  onchange={() => void onBlockerBoardChange()}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  {#each app.boards as b (b.id)}
+                    <option value={b.id}>{b.name}</option>
+                  {/each}
+                </select>
+              </div>
+
+              {#if crossBoardNoticeText}
+                <!-- Shown the moment a different board is picked — BEFORE any request, never after. -->
+                <p class="mono text-[11px]" style="color:var(--marigold)">⚑ {crossBoardNoticeText}</p>
+              {/if}
+
+              <div>
+                <label for="blocker-card" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Card (the one that will act on this one)</label>
+                <select
+                  id="blocker-card"
+                  bind:value={blockerCardId}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  <option value="">Pick a card…</option>
+                  {#each blockerBoardCards as c (c.id)}
+                    <option value={c.id}>{c.title}</option>
+                  {/each}
+                </select>
+              </div>
+
+              <div>
+                <label for="blocker-kind" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Kind</label>
+                <select
+                  id="blocker-kind"
+                  bind:value={blockerKind}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  <option value="blocks">blocks this card — this card will not be claimed while it is open</option>
+                  <option value="relates">relates to this card — informational only</option>
+                </select>
+              </div>
+
+              <div class="flex gap-1.5">
+                <Button size="sm" onclick={() => void onAddBlocker()} disabled={blockerCardId === '' || addingBlocker}>
+                  {addingBlocker ? 'Adding…' : 'Add'}
+                </Button>
+                <Button size="sm" variant="ghost" onclick={() => (addBlockerOpen = false)}>Cancel</Button>
+              </div>
+
+              {#if blockerError}
+                <p role="alert" class="text-coral mono text-[11px]">{blockerError}</p>
+              {/if}
+            </div>
+          {/if}
+        </section>
+
+        <!--
+          Sub-tasks (Step 1b) — children with their state and cost, plus "Add sub-task".
+          `children` (script, above) reads `parentCardId` straight off the board's own card list;
+          `card.openChildCount`/the count of `children` is the same pair `CardTile`'s counter shows.
+        -->
+        <section class="sec">
+          <div class="sec-h eyebrow">
+            sub-tasks
+            {#if totalChildren > 0}<span class="ml-auto">{card.openChildCount}/{totalChildren} open</span>{/if}
+          </div>
+          {#if children.length > 0}
+            <div class="mb-2.5 space-y-1.5">
+              {#each children as child (child.id)}
+                <button
+                  onclick={() => app.openCard(child.id)}
+                  class="bg-inset border-border mono flex w-full items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-left text-[11px]"
+                >
+                  <span class="min-w-0 flex-1 truncate">{child.title}</span>
+                  <span class={statePillClass(child.state)} style="padding:1px 7px;font-size:9.5px">{statePillLabel(child.state)}</span>
+                  {#if child.costUsd > 0}<span class="text-muted-foreground shrink-0">{fmtUsd(child.costUsd)}</span>{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <div class="flex gap-1.5">
+            <input
+              bind:value={newSubtaskTitle}
+              placeholder="New sub-task title…"
+              onkeydown={(e) => { if (e.key === 'Enter') void addSubtask(); }}
+              class="bg-inset border-border focus:border-marigold flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+            />
+            <Button size="sm" variant="outline" onclick={() => void addSubtask()} disabled={newSubtaskTitle.trim() === '' || addingSubtask}>
+              {addingSubtask ? 'Adding…' : 'Add'}
+            </Button>
+          </div>
+          {#if subtaskError}
+            <p role="alert" class="text-coral mono mt-1.5 text-[11px]">{subtaskError}</p>
+          {/if}
+        </section>
+
         <!-- activity stream -->
         <section class="sec">
           <div class="sec-h eyebrow">session activity</div>
@@ -1051,8 +1523,17 @@
           </div>
         </section>
 
-        <!-- delete -->
-        <div class="border-border/60 border-t pt-4">
+        <!-- archive / un-archive / delete -->
+        <div class="border-border/60 flex gap-3 border-t pt-4">
+          {#if card.archivedAt}
+            <button onclick={() => void onUnarchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
+              {archiving ? 'Un-archiving…' : 'Archived — un-archive'}
+            </button>
+          {:else}
+            <button onclick={() => void onArchiveCard()} disabled={archiving} class="text-muted-foreground hover:text-marigold text-xs disabled:opacity-50">
+              {archiving ? 'Archiving…' : 'Archive card'}
+            </button>
+          {/if}
           <button onclick={onDeleteCard} class="text-muted-foreground hover:text-coral text-xs">Delete card</button>
         </div>
       </div>

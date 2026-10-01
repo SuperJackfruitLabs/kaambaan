@@ -97,6 +97,7 @@ that flow in the present tense. None of it was ever built.
 | `superpipeline_complete` | `runId`, `leaseEpoch`, `handoff?` | `POST …/runs/:runId/complete` |
 | `superpipeline_block` / `superpipeline_fail` | `runId`, `leaseEpoch`, `reason` *(required, non-empty)* | `POST …/runs/:runId/{block,fail}` *(REST defaults `reason` to `''`)* |
 | `superpipeline_release` | `runId`, `leaseEpoch`, `reason?` | `POST …/runs/:runId/release` *(REST drops `reason`)* |
+| `superpipeline_split_card` | `cardId`, `titles[]` | `POST …/cards/:cardId/split` *(human-auth; the MCP arm additionally requires the calling agent to hold the card's run)* |
 
 `{tenant, agentId, capabilities}` always come from the token, never from tool arguments.
 

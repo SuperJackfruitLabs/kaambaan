@@ -107,6 +107,32 @@ export interface Card {
   labels: string[];
   dueAt: string | null;
   archivedAt: string | null;
+  /**
+   * This card's `parent` edge (`card_links`, this card as `to_card_id`), or null if it has none.
+   * Task 14; type-only addition here (Task 17b) — already on the wire via `CardView`, just never
+   * declared on this client type until the sub-tasks UI needed to count siblings by it.
+   */
+  parentCardId: string | null;
+  /**
+   * How many of this card's direct children are still unresolved — the same rule
+   * `blockedWhere`/`openChildCount` enforce at claim time (Task 14). A DIFFERENT fact from
+   * `blockedBy`: an open child parks the PARENT (it cannot advance), it does not block anything
+   * from being claimed, so it gets its own counter rather than sharing the `⛔` badge.
+   */
+  openChildCount: number;
+  /**
+   * `costUsd` plus one level of children's summed cost (Task 14). Deliberately separate from
+   * `costUsd`, which still means "what this card itself spent" for `overBudget`.
+   */
+  costUsdRollup: number;
+  /**
+   * Unresolved same-board `blocks` edges holding this card back — the enforced kind, derived
+   * server-side from the same predicate the claim query uses (`CardView.blockedBy`, Task 17c).
+   * Empty when nothing blocks the card, including when it only has an open child (that is
+   * `openChildCount`'s fact, not this one) or only cross-board advisory blockers (Task 16, not
+   * enforced, carried separately by the links route).
+   */
+  blockedBy: Array<{ cardId: string; title: string }>;
 }
 
 /** One entry in the tenant's label catalogue (migration 0010). */
@@ -418,6 +444,24 @@ export async function createCard(
 }
 
 /**
+ * Split a card into children, one per (non-blank) title (Task 15's `POST …/cards/:cardId/split`,
+ * unwired to any web client until now). "Add sub-task" (Task 17b) calls this with a single title
+ * rather than `createCard` + `addLink('parent')`: `createCard`'s wrapper above discards its
+ * response body, so it has no way to hand back the new card's id to link as a child, while this
+ * route's response already carries the created children in full — one call, no race.
+ *
+ * Returns the raw response, like `addLink`/`removeLink` do, so a caller can surface the server's
+ * own refusal (`TOO_MANY_CHILDREN`, `NOTHING_TO_SPLIT`, `CARD_BLOCKED`) as a sentence.
+ */
+export function splitCard(boardId: string, cardId: string, titles: string[]): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/cards/${cardId}/split`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ titles }),
+  });
+}
+
+/**
  * Edit a card's title / description (spec) / priority / owner.
  *
  * `ownerUserId` reassigns. It is deliberately not `queuedBy`: who is answerable for a card and
@@ -483,6 +527,110 @@ export function patchStage(
 /** Delete a card and everything scoped to it. */
 export function deleteCard(boardId: string, cardId: string): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/cards/${cardId}`, { method: 'DELETE', headers });
+}
+
+/**
+ * Archive a card: `PATCH archivedAt` with a real timestamp, not a client-side flag. Phase 1
+ * shipped an `archivedAt` column and a "show archived" filter with no way to ever produce an
+ * archived card — a filter for a state nothing could reach. This is that write.
+ */
+export function archiveCard(boardId: string, cardId: string): Promise<Response> {
+  return updateCard(boardId, cardId, { archivedAt: new Date().toISOString() });
+}
+
+/**
+ * Un-archive a card: `PATCH archivedAt` to `null`. Whole-branch review, Minor: `board-do.ts:3347`
+ * names un-archiving as one of three recoveries for a parent parked by an archived child — the
+ * other two already had a surface, this one didn't, making an archived card a one-way door through
+ * the web app even though the route/DO have always accepted `archivedAt: null`.
+ */
+export function unarchiveCard(boardId: string, cardId: string): Promise<Response> {
+  return updateCard(boardId, cardId, { archivedAt: null });
+}
+
+/** Dependencies and sub-task containment (spec §3.4) — one table on the DO, told apart by `kind`. */
+export type LinkKind = 'blocks' | 'relates' | 'parent';
+
+/**
+ * A same-board edge (Task 12's `card_links`, read on the claim path). NOT always enforced: the
+ * route stamps `enforced: kind !== 'relates'` (whole-branch review fix, commit `166abfe`) — a
+ * `relates` edge is decoration, consulted nowhere `blockedWhere` looks, so it reads `false` here
+ * exactly like a cross-board `ExternalLink` does, even though it lives in the same-board store.
+ */
+export interface Link {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdAt: string;
+  createdBy: string | null;
+  enforced: boolean;
+}
+
+/**
+ * A cross-board edge (Task 16's `card_links_external`) — advisory, always. `parent` is not a valid
+ * kind here: a parent edge carries a rule (a parent does not advance while a child is open), and
+ * an edge nothing enforces cannot carry one.
+ */
+export interface ExternalLink {
+  fromBoardId: string;
+  fromCardId: string;
+  toBoardId: string;
+  toCardId: string;
+  kind: 'blocks' | 'relates';
+  enforced: false;
+  /**
+   * The OTHER end's card title (whichever end is not the card `listLinks` was asked about),
+   * resolved server-side, per row, by `GET .../links` itself (17b follow-up, commit `433f4bb`) —
+   * never re-derived or re-fetched on the client. `null` is a real state, not a missing field: the
+   * other board may be unavailable, the card may be gone, or it may belong to another tenant, and
+   * the route degrades that one row rather than failing the whole response.
+   */
+  otherCardTitle: string | null;
+  /** The OTHER end's board name, resolved the same way and with the same `null` meaning. */
+  otherBoardName: string | null;
+}
+
+export interface CardLinks {
+  links: Link[];
+  externalLinks: ExternalLink[];
+}
+
+/**
+ * Declare an edge between two cards. Returns the raw response, like `setStages` does, so a caller
+ * can show the server's own refusal sentence — `LINK_WOULD_CYCLE` and `ALREADY_HAS_PARENT` each
+ * say which cards are involved, and "invalid link" would throw that away.
+ *
+ * `toBoardId` names where `toCardId` lives when it is on another board. Omitted, the edge stays
+ * same-board and enforced (Task 12's DO). Given a board other than `boardId`, the SAME route
+ * (Task 17d) stores it in Task 16's advisory D1 table instead and the response says
+ * `enforced: false` — the server decides the store from this value, never the client.
+ */
+export function addLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind, toBoardId?: string): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(toBoardId ? { fromCardId, toCardId, kind, toBoardId } : { fromCardId, toCardId, kind }),
+  });
+}
+
+/**
+ * Remove an edge. Removing one that is not there is not an error — same as the route it calls.
+ * `toBoardId`, as in `addLink`, routes the removal to the advisory D1 store when it names another
+ * board.
+ */
+export function removeLink(boardId: string, fromCardId: string, toCardId: string, kind: LinkKind, toBoardId?: string): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/links`, {
+    method: 'DELETE',
+    headers,
+    body: JSON.stringify(toBoardId ? { fromCardId, toCardId, kind, toBoardId } : { fromCardId, toCardId, kind }),
+  });
+}
+
+/** Every edge touching this card: same-board (enforced) and cross-board (advisory), kept apart. */
+export async function listLinks(boardId: string, cardId: string): Promise<CardLinks> {
+  const res = await fetch(`/v1/boards/${boardId}/cards/${cardId}/links`, { headers });
+  if (!res.ok) return { links: [], externalLinks: [] };
+  return (await res.json()) as CardLinks;
 }
 
 /** Attach a reference (link) to a card by hand. */

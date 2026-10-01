@@ -3,6 +3,8 @@
   import { columnDropTarget } from '$lib/dnd';
   import CardTile from './CardTile.svelte';
   import StageStepper from '$lib/components/plan/StageStepper.svelte';
+  import { blockedCountInStage } from './board-counts';
+  import { childCountsByParent } from './card-children';
 
   /** The lane scroller, so the stepper can observe which lane is on screen and scroll to one. */
   let scroller = $state<HTMLElement | null>(null);
@@ -13,6 +15,16 @@
   function cardsInStage(stageKey: string) {
     return app.filteredCards().filter((c) => c.currentStageKey === stageKey);
   }
+
+  /**
+   * Every card's child count, by parent id — built ONCE per render here, not once per tile.
+   *
+   * A tile used to scan `app.board.cards` itself (`cards.filter(c => c.parentCardId === id)`)
+   * inside its own `$derived`, which is O(n) work repeated for every one of the n tiles on the
+   * board — O(n²) overall. Computed once and handed down, same fix the server side already made
+   * with `rowToCard`'s `pre` argument (Task 14) and for the same reason.
+   */
+  const childCounts = $derived(childCountsByParent(app.board?.cards ?? []));
 </script>
 
 {#if app.board}
@@ -34,6 +46,7 @@
     {#each stages as stage, i (stage.key)}
       {@const cards = cardsInStage(stage.key)}
       {@const overLimit = stage.wipLimit !== undefined && cards.length >= stage.wipLimit}
+      {@const blocked = blockedCountInStage(cards)}
 
       {#if i > 0}
         <!-- The flow arrow, thinner. It used to take ~50px between every pair of 288px lanes,
@@ -61,12 +74,27 @@
           onOver: (o) => (overStage = o ? stage.key : overStage === stage.key ? null : overStage),
         }}
       >
-        <!-- waypoint header -->
-        <div class="lane-head flex h-[30px] items-center gap-2 px-1.5">
+        <!-- waypoint header
+             `min-h` + `flex-wrap` rather than a fixed height: a long stage name plus the WIP count
+             plus the blocked count (below) can run out of room on a phone-width lane, and a fixed
+             30px height would clip the overflow instead of letting it wrap to a second line. -->
+        <div class="lane-head flex min-h-[30px] flex-wrap items-center gap-x-2 gap-y-0.5 px-1.5 py-0.5">
           <h2 id="lane-{stage.key}" class="wordmark text-[13px] font-normal tracking-wide">{stage.name}</h2>
           <span class="mono text-xs {overLimit ? 'text-coral' : 'text-muted-foreground'}">
             {cards.length}{#if stage.wipLimit !== undefined}/{stage.wipLimit}{/if}
           </span>
+          {#if blocked > 0}
+            <!--
+              The only place the claim-query's exclusion of blocked cards is ever explained: a
+              blocked card is EXCLUDED from claim, not refused, so an agent reports "no work" while
+              this column visibly holds cards. Count is from `blockedBy.length > 0` (Step 2) — the
+              same field the tile's ⛔ badge reads, never a second "is this blocked" expression.
+            -->
+            <span
+              class="mono text-coral shrink-0 text-[11px]"
+              title="{blocked} of {cards.length} card{cards.length === 1 ? '' : 's'} here {blocked === 1 ? 'is' : 'are'} blocked — held back by an unresolved same-board blocker, excluded from claim"
+            >⛔ {blocked} blocked</span>
+          {/if}
           <span class="ml-auto flex items-center gap-1.5">
             {#if stage.gate === 'approval'}
               <span class="eyebrow text-coral" title="Approval gate">gate</span>
@@ -87,7 +115,7 @@
             </div>
           {/if}
           {#each cards as card (card.id)}
-            <CardTile {card} />
+            <CardTile {card} {childCounts} />
           {/each}
         </div>
       </section>

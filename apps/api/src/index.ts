@@ -32,9 +32,11 @@ import {
   type Result,
   type JsonValue,
 } from './board/board-do';
+import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
+import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
@@ -86,6 +88,16 @@ function isInvalidDueAt(value: unknown): boolean {
   return value !== undefined && value !== null && (typeof value !== 'string' || !DUE_AT_RE.test(value));
 }
 
+/**
+ * One code, one status, across the whole API. Every route that gets a `BoardErrorCode` back reads
+ * its HTTP status from here — there is no second table anywhere that answers the same code
+ * differently. A brief for Task 17a once asked for `NOT_INITIALIZED` to mean 409 on the link
+ * routes specifically, while every other route here still answers it 404: a client cannot learn
+ * "this code means X, except on these three routes where it means Y" from anything in this file,
+ * so that request was wrong and this function stayed the single source of truth. If a future route
+ * genuinely needs a code to carry a different status, that is a sign the DO should return a
+ * different code for that case, not that this switch should grow a second entry for the same one.
+ */
 function statusForCode(code: BoardErrorCode): number {
   switch (code) {
     case 'WIP_LIMIT':
@@ -106,6 +118,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'GATE_NOT_FOUND':
     case 'ELICITATION_NOT_FOUND':
     case 'SCHEDULE_NOT_FOUND':
+    case 'NO_SUCH_CARD':
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
@@ -130,6 +143,96 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_TIMEZONE':
     case 'INVALID_SCHEDULE':
       return 400;
+    // A conflict with the graph the caller believed in, not a malformed request: the same payload
+    // succeeds once the cycle is avoided or the existing parent edge is removed first.
+    case 'LINK_WOULD_CYCLE':
+    case 'ALREADY_HAS_PARENT':
+    // Same shape: the same move succeeds once the open child resolves. Advancing is a refusal
+    // (Task 13), not the exclusion `claim` uses, but it is still a conflict with the graph the
+    // caller believed in, not a malformed request.
+    case 'CARD_BLOCKED':
+      return 409;
+    // Malformed requests: too many lines, or nothing usable once stripped. The same payload will
+    // never succeed unless the caller changes it, unlike the conflict codes above.
+    case 'TOO_MANY_CHILDREN':
+    case 'NOTHING_TO_SPLIT':
+      return 400;
+  }
+}
+
+/**
+ * Status mapping for Task 16's advisory D1 store (`db/card-links-external.ts`, `addExternalLink`'s
+ * `AddResult['code']`) — a DIFFERENT code space from `BoardErrorCode` above, used in exactly one
+ * place (the `toBoardId` arm of the `…/links` route below). That is why this is a second small
+ * mapping function rather than a violation of "one code, one status": the duplicate-mapping mistake
+ * `statusForCode` itself once made was the SAME code (`NOT_INITIALIZED`) getting two statuses. These
+ * codes are not `BoardErrorCode` at all, so there is no second status for anything already mapped.
+ */
+function statusForExternalLinkCode(code: string): number {
+  switch (code) {
+    case 'FOREIGN_BOARD':
+      // The board exists but belongs to another tenant. 404, not 403 — a 403 would confirm the
+      // board exists, which is a tenant-isolation leak by status code.
+      return 404;
+    case 'PARENT_MUST_BE_SAME_BOARD':
+    case 'SELF_EDGE':
+    case 'BAD_KIND':
+      // The same payload can never succeed; the caller must change it.
+      return 400;
+    case 'SAME_BOARD_EDGE':
+      // Unreachable through this route by construction — the route below sends a same-board edge
+      // to the DO and never to `addExternalLink`. If this ever fires, the routing logic is broken,
+      // not the caller's request, so the status says "our fault" rather than blaming them.
+      return 500;
+    default:
+      return 500;
+  }
+}
+
+/**
+ * Names for the boards in `boardIds`, but ONLY the ones `tenantId` actually owns — a board id that
+ * names another tenant's board, or no board at all, simply has no entry in the returned map.
+ *
+ * This is the read-side guard for `GET .../cards/:cardId/links`'s `otherBoardName`: a cross-board
+ * advisory row's write is already checked against `FOREIGN_BOARD` (`addExternalLink`), but this
+ * read must not assume every row in `card_links_external` got there through that guard — a title
+ * is content, and resolving one for a board outside the tenant would disclose more than the 404
+ * that guard answers with. `tenant_id = ?` first, like every other D1 read in this codebase.
+ */
+async function boardNamesById(db: D1Database, tenantId: string, boardIds: string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(boardIds)];
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => '?').join(', ');
+  const { results } = await db
+    .prepare(`SELECT id, name FROM boards WHERE tenant_id = ? AND id IN (${placeholders})`)
+    .bind(tenantId, ...ids)
+    .all<{ id: string; name: string }>();
+  return new Map((results ?? []).map((row) => [row.id, row.name]));
+}
+
+/**
+ * The title of one card on another board, for one advisory edge's tooltip — or `null` if it
+ * cannot be read, for any reason. This is the one place a cross-DO read happens for a cross-board
+ * edge, and it is deliberately narrow: on-demand, per row, called only from the `GET .../links`
+ * route, never from `listExternalLinksFor` (the D1 module stays free of cross-DO concerns) and
+ * never consulted by a claim or advance decision — the read is stale the instant it returns, which
+ * is exactly why the edge it labels is advisory rather than enforced, and that does not change
+ * just because this read is now a little more informative than an id.
+ *
+ * Degrades rather than fails: an uninitialized board, a deleted card, or a thrown error (the DO
+ * being genuinely unavailable) all come back `null`, wrapped PER CALL so one bad reference cannot
+ * take the rest of a card's blocker list down with it — a 500 here would be a worse outcome than
+ * the id the drawer already falls back to showing.
+ *
+ * Callers must already have confirmed `boardId` belongs to `tenantId` (see `boardNamesById`); this
+ * function does not check tenancy itself, so it must never be reached for a foreign board.
+ */
+async function getOtherCardTitle(env: Env, tenantId: string, boardId: string, cardId: string): Promise<string | null> {
+  try {
+    const result = await boardStub(env, tenantId, boardId).getCardView(cardId);
+    return result.ok ? result.value.title : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1226,6 +1329,16 @@ export default {
       // The DO is emptied FIRST. If that throws, the catalog row survives and the board is still
       // listed and still reachable — a delete that visibly did not happen, rather than a board
       // that vanished from the list while its contents quietly stayed.
+      //
+      // That ordering only works if the SECOND half — `deleteBoard` — cannot fail. It used to be
+      // a bare `DELETE FROM boards`, which was safe only because nothing referenced that table.
+      // Migration 0012 changed that: `card_links_external` FKs onto `boards(id)` with no `ON
+      // DELETE`, so a board named by any cross-board advisory edge started throwing here, AFTER
+      // the DO was already gone — the exact "quiet loss" this comment describes, just moved to
+      // the other half. `deleteBoard` (`db/catalog.ts`) now cleans those rows in the SAME batch as
+      // the board itself, so this call cannot fail on that FK. Whoever next adds a foreign key
+      // onto `boards(id)`: it needs the same treatment here, not a reordering of these two lines —
+      // reordering only relocates the failure window to the irreversible half.
       if (rest === '' && request.method === 'DELETE') {
         await stub.destroy();
         await deleteBoard(env.DB, tenantId, boardId);
@@ -1369,7 +1482,136 @@ export default {
       if (cardMatch && request.method === 'DELETE') {
         const result = await stub.deleteCard(cardMatch[1]!);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        // `deleteCard` cleans the DO's own same-board `card_links` in both directions, for a
+        // reason that applies identically to Task 16's cross-board advisory store: a lingering
+        // edge would point at a card that no longer exists. The DO cannot reach D1, so this is
+        // that same cleanup's other half, run here once the DO has confirmed the card existed.
+        await deleteExternalLinksForCard(env.DB, tenantId, cardMatch[1]!);
         return new Response(null, { status: 204 });
+      }
+
+      // POST /v1/boards/:id/links — declare an edge · DELETE — remove one (spec §3.4).
+      //
+      // Task 12 built `addLink`/`removeLink` on the Durable Object (`board-do.ts:2139-2199`) with
+      // no HTTP surface; Task 17a gave it one, for the drawer's "Add blocker" and `supi link`.
+      //
+      // Task 17d: the SAME route also carries Task 16's cross-board advisory edges
+      // (`db/card-links-external.ts`), via an optional `toBoardId` alongside `toCardId`. One
+      // route, and the DATA decides the store: `toBoardId` absent, or equal to the path's own
+      // board, stays same-board (the DO, enforced); any other value routes to D1 (advisory, never
+      // read on the claim path). The client names where the other end of the edge lives — it never
+      // picks the store, which is what keeps the enforced/advisory distinction from becoming a lie
+      // a client could tell by choosing wrong.
+      //
+      // Shape-checked here, not left to the DO or the D1 module: both trust their callers by
+      // design, so `kind` outside the known set — and now a malformed `toBoardId` — are refused as
+      // a 400 before either is called, rather than being stored or crashing downstream.
+      if (rest === 'links' && (request.method === 'POST' || request.method === 'DELETE')) {
+        const body = (await request.json().catch(() => null)) as
+          | { fromCardId?: unknown; toCardId?: unknown; kind?: unknown; toBoardId?: unknown }
+          | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        if (
+          typeof body.fromCardId !== 'string' ||
+          body.fromCardId.trim() === '' ||
+          typeof body.toCardId !== 'string' ||
+          body.toCardId.trim() === ''
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'fromCardId and toCardId are required, non-empty card ids' } },
+            { status: 400 },
+          );
+        }
+        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent') {
+          return Response.json(
+            {
+              error: {
+                code: 'INVALID_LINK_KIND',
+                message: `kind must be 'blocks', 'relates' or 'parent', got ${JSON.stringify(body.kind)}`,
+              },
+            },
+            { status: 400 },
+          );
+        }
+        if (body.toBoardId !== undefined && (typeof body.toBoardId !== 'string' || body.toBoardId.trim() === '')) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'toBoardId must be a non-empty board id when present' } },
+            { status: 400 },
+          );
+        }
+        const kind: LinkKind = body.kind;
+        const fromCardId = body.fromCardId;
+        const toCardId = body.toCardId;
+        const toBoardId = typeof body.toBoardId === 'string' ? body.toBoardId : boardId;
+
+        if (toBoardId !== boardId) {
+          // Cross-board: Task 16's advisory D1 store. `parent` is refused here rather than handed
+          // to the module: `ExternalLinkKind` excludes it, and — unlike `addExternalLink` —
+          // `removeExternalLink` performs no validation of its own, so a DELETE with kind=parent
+          // would otherwise silently no-op (nothing was ever written under that kind) instead of
+          // saying why such an edge can never exist. Same code and message `addExternalLink` would
+          // give, so POST and DELETE disagree about nothing.
+          if (kind === 'parent') {
+            return Response.json(
+              {
+                error: {
+                  code: 'PARENT_MUST_BE_SAME_BOARD',
+                  message:
+                    "A parent edge carries a rule — a parent does not advance while a child is open — and an advisory containment relationship is one that fails to contain. Use a project to group cards across boards.",
+                },
+              },
+              { status: 400 },
+            );
+          }
+          if (request.method === 'POST') {
+            const result = await addExternalLink(env.DB, tenantId, {
+              from: { boardId, cardId: fromCardId },
+              to: { boardId: toBoardId, cardId: toCardId },
+              kind,
+            });
+            if (!result.ok) return Response.json({ error: result }, { status: statusForExternalLinkCode(result.code) });
+            return Response.json(
+              { link: { fromBoardId: boardId, fromCardId, toBoardId, toCardId, kind, enforced: false as const } },
+              { status: 201 },
+            );
+          }
+          await removeExternalLink(env.DB, tenantId, fromCardId, toCardId, kind);
+          return Response.json({ ok: true, enforced: false as const });
+        }
+
+        // Same-board: Task 12's enforced edge on the DO, unchanged from Task 17a except that the
+        // response now names its own `enforced` boolean too, matching the cross-board arm above so
+        // a caller never has to infer enforcement from whether `toBoardId` was sent.
+        if (request.method === 'POST') {
+          const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
+          if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+          return Response.json({ link: { ...result.value, enforced: true as const } }, { status: 201 });
+        }
+        const result = await stub.removeLink(fromCardId, toCardId, kind);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ ...result.value, enforced: true as const });
+      }
+
+      // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
+      // per (non-blank) line (Task 15, spec §3.4). A human/web route: the agent path reaches
+      // `splitCard` through `superpipeline_split_card` (scope `run`) instead, calling the same DO
+      // method directly — this route and that tool are the same contract on two wires.
+      const splitMatch = rest.match(/^cards\/([^/]+)\/split$/);
+      if (splitMatch && request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { titles?: unknown } | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        // Shape-checked here — the DO trusts its callers by design — so a malformed body answers
+        // 400 rather than reaching `splitCard` and failing in a way that points at the wrong layer.
+        if (!Array.isArray(body.titles) || body.titles.some((t) => typeof t !== 'string')) {
+          return Response.json({ error: { message: '`titles` is required and must be an array of strings.' } }, { status: 400 });
+        }
+        const result = await stub.splitCard(splitMatch[1]!, body.titles as string[], user?.userId ?? 'usr_dev');
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ children: result.value.children }, { status: 201 });
       }
 
       // PUT /v1/boards/:id/cards/:cardId/references — idempotent reference upsert (docs/06 §1)
@@ -1428,6 +1670,80 @@ export default {
         const result = await stub.estimateCardCost(estimateMatch[1]!);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
+      }
+
+      // GET /v1/boards/:id/cards/:cardId/links — every edge touching this card, from both stores.
+      //
+      // `links` (same-board, from the DO's `listLinks`) and `externalLinks` (cross-board, from
+      // Task 16's advisory D1 rows, `card-links-external.ts`) are kept in two separate arrays
+      // rather than merged into one list, and each row also carries its own `enforced` boolean —
+      // belt and braces, because the two kinds mean different things. A same-board `blocks` is
+      // read on the claim path and genuinely refuses a claim; a cross-board `blocks` is shown and
+      // nothing more — `addExternalLink`'s own comment calls it "advisory, always". A client that
+      // merged them into one list, or told them apart only by comparing `toBoardId` to this
+      // board's id, is one bug away from drawing an enforced badge on an edge that enforces
+      // nothing. 17b's badge logic is built on this response never requiring that inference.
+      //
+      // 17b follow-up: the specified tooltip ("Blocked by *Title* on *Board* — not enforced across
+      // boards") needs a title and a board name, and `ExternalLinkRow` only ever carried ids. Each
+      // `externalLinks` row here also carries `otherBoardName`/`otherCardTitle` for whichever end
+      // is NOT `cardId` — a cheap tenant-scoped D1 read for the name, and a per-row, on-demand
+      // cross-DO read for the title. This is the ONLY place that title read happens: it is not
+      // added to `listExternalLinksFor` (the module stays free of cross-DO concerns) and it never
+      // informs a claim or advance decision — the whole reason the edge is advisory rather than
+      // enforced is that a cross-DO read is stale the instant it returns, and that stays true of
+      // this one too; it exists solely to label one drawer, once, on request.
+      const cardLinksMatch = rest.match(/^cards\/([^/]+)\/links$/);
+      if (cardLinksMatch && request.method === 'GET') {
+        const cardId = cardLinksMatch[1]!;
+        const [links, externalLinks] = await Promise.all([
+          stub.listLinks(cardId),
+          listExternalLinksFor(env.DB, tenantId, cardId),
+        ]);
+
+        // The other end of each advisory edge — `listExternalLinksFor` matches `cardId` from
+        // EITHER side, so which field holds "the other card" depends on the row's direction.
+        const otherEnds = externalLinks.map((l) =>
+          l.fromCardId === cardId
+            ? { boardId: l.toBoardId, cardId: l.toCardId }
+            : { boardId: l.fromBoardId, cardId: l.fromCardId },
+        );
+        // Tenant-scoped by the WHERE clause itself: a board this tenant does not own is simply
+        // absent from the map. That is deliberate defence in depth, not redundant with
+        // `addExternalLink`'s own `FOREIGN_BOARD` guard at write time — this read must not assume
+        // every row in the table got there through that guard. Boards not owned by the tenant, or
+        // no longer present at all, degrade to `otherBoardName: null` the same way an unresolved
+        // title does, never a leak or a failure.
+        const boardNames = await boardNamesById(env.DB, tenantId, otherEnds.map((e) => e.boardId));
+        // One on-demand, per-row cross-DO read per advisory edge, run in parallel rather than
+        // sequentially — not batched into a single multi-card DO call. Considered and rejected for
+        // now: these rows are hand-added one at a time through a board-picker dialogue, so the
+        // realistic count for one card is a handful at most, and rows just as often name DIFFERENT
+        // boards (nothing to batch within) as the same one. A batched "read several cards" RPC
+        // would mean a new Durable Object method, which is out of this route's scope. Skipped
+        // entirely — no DO call at all — for any end whose board did not resolve above, so a
+        // foreign board is never even asked, not just never shown.
+        const otherTitles = await Promise.all(
+          otherEnds.map((e) => (boardNames.has(e.boardId) ? getOtherCardTitle(env, tenantId, e.boardId, e.cardId) : null)),
+        );
+
+        return Response.json({
+          // `enforced` must mean what it says: true only for a same-board edge that can actually
+          // refuse a claim. `blockedWhere` has two clauses — an unresolved `blocks` edge pointing
+          // AT a card, and an open child (`parent`) pointing FROM one — so both `blocks` and
+          // `parent` genuinely enforce something; `relates` is decoration, consulted nowhere.
+          // Stamping every kind `true` unconditionally told a client a `relates` edge refuses a
+          // claim it does not — unreachable today only because of a web-side defect being fixed
+          // separately, and the whole point of this flag is that a client should never have to
+          // infer enforcement itself, including for the one kind that has none.
+          links: links.map((l) => ({ ...l, enforced: l.kind !== 'relates' })),
+          externalLinks: externalLinks.map((l, i) => ({
+            ...l,
+            enforced: false as const,
+            otherBoardName: boardNames.get(otherEnds[i]!.boardId) ?? null,
+            otherCardTitle: otherTitles[i] ?? null,
+          })),
+        });
       }
 
       // GET /v1/boards/:id/events — the board's own event log (docs/03).

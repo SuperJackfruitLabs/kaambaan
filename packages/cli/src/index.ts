@@ -43,6 +43,18 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
   supi request-changes <boardId> <gateId> --comment "what to change"
                                decide a gate without leaving the terminal
   supi log <boardId> <cardId>  what an agent did on a card, and its handoff
+  supi archive <boardId> <cardId>
+                               archive a card, so the "show archived" filter has something to show
+  supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
+                               [--to-board <boardId>]
+                               declare an edge; --to-board names another board for an
+                               advisory (not enforced) cross-board edge
+  supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
+                               [--to-board <boardId>]
+                               remove one
+  supi link list <boardId> <cardId>
+                               every edge touching a card — same-board (enforced) and
+                               cross-board (advisory), kept apart
 
   supi create-board <name> [--template <id>] [--stages <file|->]
                                create a board; --template defaults to \`simple\`
@@ -387,6 +399,90 @@ async function main(argv: string[]): Promise<void> {
       if (!pos[0] || !pos[1]) fail("usage: supi log <boardId> <cardId>");
       out(await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/activities`), renderLog);
       return;
+    }
+
+    /**
+     * Archive a card. Phase 1 shipped the `archivedAt` column and the "show archived" filter with
+     * no way to ever produce an archived card — a filter for a state nothing could reach. This,
+     * and the drawer's own Archive action (Task 17b), are that write. Both send `archivedAt`
+     * through the same `PATCH /cards/:cardId` the rest of this file already uses, so there is one
+     * server-side rule (`isInvalidDueAt`'s sibling check, `index.ts` ~1345) rather than two.
+     */
+    case "archive": {
+      if (!pos[0] || !pos[1]) fail("usage: supi archive <boardId> <cardId>");
+      out(
+        await api(`/v1/boards/${pos[0]}/cards/${pos[1]}`, {
+          method: "PATCH",
+          body: JSON.stringify({ archivedAt: new Date().toISOString() }),
+        }),
+      );
+      return;
+    }
+
+    /**
+     * Dependencies and sub-task containment (spec §3.4) — the CLI's client for Task 17a's link
+     * routes (`POST|DELETE /v1/boards/:id/links`, `GET .../cards/:cardId/links`), which Task 12
+     * built on the Durable Object and Task 17a finally gave a wire.
+     *
+     * `--kind` is validated here, not sent and refused: the route already checks it and answers
+     * 400 for anything else, but a client that let the server catch its own typo would show a
+     * generic "invalid kind" instead of naming the three values that are actually accepted.
+     *
+     * `--to-board` is Task 17d: the same route now also carries Task 16's cross-board advisory
+     * edges when it names a board other than the path's own. **The notice below is the point of
+     * this flag, not a nice-to-have.** A cross-board edge is stored but never enforced — nothing
+     * on the claim path ever reads it — so a person who asks for a blocker across boards and gets
+     * one that silently refuses nothing has been misled the moment the badge is the first they
+     * hear of it. The CLI has no server round trip to wait on to know this: `toBoardId` vs the
+     * path `boardId` is the same string comparison the route itself makes, so it is printed BEFORE
+     * the request is sent, not parsed out of the response after. A prompt-for-confirmation was
+     * the other option; this is a non-interactive tool run from scripts as often as a terminal, so
+     * a printed warning that can't hang on absent stdin was preferred over one that can.
+     */
+    case "link": {
+      const LINK_KINDS = ["blocks", "relates", "parent"] as const;
+      const sub = pos[0];
+
+      if (sub === "add" || sub === "rm") {
+        const boardId = pos[1];
+        const fromCardId = pos[2];
+        const toCardId = pos[3];
+        const usage = `usage: supi link ${sub} <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]`;
+        if (!boardId || !fromCardId || !toCardId) fail(usage);
+        const kind = flag(rest, "--kind");
+        if (!kind || !(LINK_KINDS as readonly string[]).includes(kind)) {
+          fail(`--kind must be one of ${LINK_KINDS.join(", ")}${kind ? `, got "${kind}"` : ""}.`, usage);
+        }
+        const toBoardId = flag(rest, "--to-board");
+        if (sub === "add" && toBoardId && toBoardId !== boardId) {
+          process.stdout.write(
+            `Note: ${toBoardId} is a different board, so this edge will be ADVISORY ONLY — shown, but ` +
+              `not enforced. A card on another board cannot be read on this board's claim path, so this ` +
+              `will not block anything from being claimed. Only a same-board blocker does that.\n`,
+          );
+        }
+        out(
+          await api(`/v1/boards/${boardId}/links`, {
+            method: sub === "add" ? "POST" : "DELETE",
+            body: JSON.stringify(toBoardId ? { fromCardId, toCardId, kind, toBoardId } : { fromCardId, toCardId, kind }),
+          }),
+        );
+        return;
+      }
+
+      if (sub === "list") {
+        const boardId = pos[1];
+        const cardId = pos[2];
+        if (!boardId || !cardId) fail("usage: supi link list <boardId> <cardId>");
+        out(await api(`/v1/boards/${boardId}/cards/${cardId}/links`));
+        return;
+      }
+
+      fail(
+        "usage: supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]\n" +
+          "  supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]\n" +
+          "  supi link list <boardId> <cardId>",
+      );
     }
 
     // The two sides of the routing comparison, and the edges between them.

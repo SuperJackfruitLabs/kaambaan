@@ -15,6 +15,7 @@ import { signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
 import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
+import { wouldCycle, type LinkKind, type LinkRow } from './links';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -40,6 +41,51 @@ function stripStaleSpecKeys(spec: JsonValue | undefined): JsonValue | undefined 
   const { due: _due, labels: _labels, ...rest } = spec;
   return rest;
 }
+
+/**
+ * Turn one pasted/typed line into a title, the way `splitCard` (Task 15) does for every line it is
+ * given. The input is whatever a human or an agent pasted — often a markdown checklist — so
+ * `- [ ] Write the spec` must not become a card titled `- [ ] Write the spec`.
+ *
+ * Stripped in order: a leading `-`/`*`/`<digit>.` bullet, then a `[ ]`/`[x]` checkbox, then
+ * whitespace. A line that is blank before or after stripping comes back `''`, which `splitCard`
+ * filters out rather than turning into an untitled card.
+ *
+ * Both marker regexes require `\s+` (one-or-more), not `\s*` (zero-or-more), after the marker —
+ * markdown's own rule is that a bullet/checkbox is followed by a SEPARATING space, and without
+ * that requirement this silently mangled caller data that merely started with a similar character:
+ * `2.0 launch plan` → `0 launch plan`, `1.5x throughput` → `5x throughput`, `-fix the bug` →
+ * `fix the bug`, `**bold title**` → `*bold title**`. None of those are bullets; a version number,
+ * a measurement, a hyphenated word and a bold marker all happen to start the same way a real
+ * bullet does, and the caller got no signal that its title had been rewritten — that mangled name
+ * is what the next agent's prompt would carry.
+ *
+ * Deliberately does NOT trim `raw` as one whole-string operation before stripping (only the final
+ * return trims): an earlier version did, and that pre-trim consumed the separating space `\s+`
+ * needs to see, so a line that was JUST a checkbox with a trailing space (`'- [ ] '`) stopped
+ * stripping to `''` — the one-space requirement above only works if that space is still there when
+ * the checkbox regex runs. `'- [ ] '` stripping to `''` is not a bug to guard against, it is the
+ * spec: a marker with no title text is blank, the same as an empty line — see the "ignores blank
+ * lines" test, which asserts exactly this input is dropped.
+ *
+ * Each marker regex instead carries its OWN leading `\s*`, rather than one whole-string pre-trim,
+ * so an indented bullet/checkbox — the ordinary shape of a nested markdown checklist (`- [ ] parent`
+ * with `  - [ ] child` under it) — still unwraps. This differs from the removed pre-trim in the one
+ * way that matters: `\s*` at the FRONT of a regex only ever consumes LEADING characters at THAT
+ * match's own start position; it cannot reach into the string's trailing end the way a whole-string
+ * `.trim()` did, so it cannot repeat the original bug of eating the checkbox's separating space
+ * before the checkbox regex gets to run. Verified empirically against every case above plus
+ * indentation (leading spaces, a leading tab, a nested item) before shipping — see the fix-round
+ * report.
+ */
+function stripListLineSyntax(raw: string): string {
+  let s = raw.replace(/^\s*(?:[-*]|\d+\.)\s+/, ''); // optional indent, then bullet: "-", "*", or "2.", each followed by a space
+  s = s.replace(/^\s*\[[ xX]\]\s+/, ''); // optional indent, then checkbox: "[ ]" or "[x]"/"[X]", followed by a space
+  return s.trim();
+}
+
+/** The most children one `splitCard` call may create — see its doc comment. */
+const MAX_SPLIT_CHILDREN = 20;
 
 /** How long an agent may go without a heartbeat before its run is reclaimed (docs/08 §3, ⚠️ OPEN). */
 const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -311,6 +357,41 @@ export interface CardView {
   overBudget: boolean;
   /** Number of runs (attempts) against this card (docs/07 §5). */
   attemptCount: number;
+  /**
+   * This card's `parent` edge (`card_links`, this card as `to_card_id`), or null if it has none.
+   * Task 14.
+   */
+  parentCardId: string | null;
+  /**
+   * How many of this card's direct children (the `parent` edge, this card as `from_card_id`) are
+   * still unresolved — the same rule `blockedWhere`/`openChildCount` enforce at claim time, surfaced
+   * here so a reader (Task 17's UI) can say "waiting on N sub-tasks" without re-deriving it. Task 14.
+   */
+  openChildCount: number;
+  /**
+   * `costUsd` plus one level of children's summed cost. Deliberately NOT folded into `costUsd`
+   * itself: `costUsd` feeds `overBudget`, the per-card budget gate, and must keep meaning "what
+   * this card itself spent". Task 14.
+   */
+  costUsdRollup: number;
+  /**
+   * Is this card held back by an unresolved same-board `blocks` edge — the enforced kind?
+   *
+   * Derived from the SAME `blockedWhere()` fragment the claim query uses (`unresolvedBlockerExists`,
+   * Task 17), never from a second expression that means the same thing today. A badge computed
+   * independently is a badge that will eventually disagree with the claim query, and the
+   * disagreement is invisible: the UI says "Blocked" while `claim_card` hands the card out, or the
+   * reverse. This plan has already had one claim/discovery divergence from exactly that cause.
+   *
+   * An array rather than a boolean because the tooltip has to name the blocker ("Blocked by
+   * *Title*"), and a count alone would send the drawer back for another round trip.
+   *
+   * Only the `blocks` half of `blockedWhere()` — an open child (the `parent` half) is a different
+   * fact with a different badge, already carried as `openChildCount`. Cross-board advisory edges
+   * (Task 16) are never in here either: they block nothing, and this field name is exactly how a
+   * client would end up rendering the enforced badge for an advisory edge.
+   */
+  blockedBy: Array<{ cardId: string; title: string }>;
 }
 
 /** A registered push subscription (A2A PushNotificationConfig, docs/05 §4). */
@@ -601,6 +682,22 @@ export interface ReferenceInput {
   lastSyncedAt?: string;
 }
 
+/** A stored edge (spec §3.4) — `LinkRow` plus the provenance columns the DO adds. */
+export interface LinkView {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdAt: string;
+  createdBy: string | null;
+}
+
+export interface LinkInput {
+  fromCardId: string;
+  toCardId: string;
+  kind: LinkKind;
+  createdBy?: string | null;
+}
+
 export interface BoardSnapshot {
   boardId: string | null;
   tenantId: string | null;
@@ -683,7 +780,13 @@ export type BoardErrorCode =
   | 'INVALID_RULE'
   | 'INVALID_TIMEZONE'
   | 'SCHEDULE_NOT_FOUND'
-  | 'INVALID_SCHEDULE';
+  | 'INVALID_SCHEDULE'
+  | 'NO_SUCH_CARD'
+  | 'LINK_WOULD_CYCLE'
+  | 'ALREADY_HAS_PARENT'
+  | 'CARD_BLOCKED'
+  | 'TOO_MANY_CHILDREN'
+  | 'NOTHING_TO_SPLIT';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -699,6 +802,21 @@ export interface BoardStub {
     priority?: number;
     dueAt?: string;
   }): Promise<Result<CardView>>;
+  /** Split a card into a sub-task: a claimable card of its own, linked back with a `parent` edge. */
+  createChildCard(
+    parentCardId: string,
+    input: { title: string; ownerUserId: string; spec?: JsonValue; priority?: number },
+  ): Promise<Result<CardView>>;
+  /**
+   * Split a card into several children at once, one per (non-blank) line — the agent-facing
+   * decomposition tool (Task 15, spec §3.4). `actorUserId` becomes each child's `ownerUserId`.
+   *
+   * `agentId`, when supplied, must be the agent whose run currently holds `cardId`
+   * (`CardView.delegateAgentId`) or the call refuses `NOT_RUN_OWNER` — "the card you are working
+   * on" enforced, not just described. Omitted (`undefined`/`null`) for the human/REST path, which
+   * has no run to check against.
+   */
+  splitCard(cardId: string, titles: string[], actorUserId: string, agentId?: string | null): Promise<Result<{ children: CardView[] }>>;
   moveCard(
     cardId: string,
     toStageKey: string,
@@ -731,6 +849,10 @@ export interface BoardStub {
   release(input: RunVerbInput & { reason?: string }): Promise<Result<CardView>>;
   submitForReview(input: RunVerbInput & { output?: JsonValue }): Promise<Result<CardView>>;
   addReference(input: ReferenceInput): Promise<Result<ReferenceView>>;
+  /** Dependencies and sub-task containment (spec §3.4) — one table, told apart by `kind`. */
+  addLink(input: LinkInput): Promise<Result<LinkView>>;
+  removeLink(fromCardId: string, toCardId: string, kind: LinkKind): Promise<Result<{ ok: true }>>;
+  listLinks(cardId: string): Promise<LinkView[]>;
   setBudget(input: { boardUsdCap?: number | null; cardUsdCap?: number | null }): Promise<Result<{ ok: true }>>;
   getUsage(opts?: { window?: string }): Promise<UsageSummary>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
@@ -1074,6 +1196,19 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * What `advanceCard` would have done, if it had not found this card held back by an open
+     * child: the from-stage, who produced the handoff, and the handoff itself (already a JSON
+     * string). Set only while parked (Task 14 step 3); cleared the moment the deferred advance is
+     * replayed. Internal, like `overdue_notified_at` above — not on `CardView`. A reader doesn't
+     * need the stored from-stage/handoff, only that the card is waiting (`openChildCount > 0`
+     * plus `state = 'input-required'` already says that).
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN pending_advance_json TEXT`);
+    } catch {
+      // column already exists
+    }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_due_at ON cards(due_at)`);
     // In-app notifications (docs/07 §7): the notify-worthy status transitions, for the card owner.
     this.sql.exec(
@@ -1149,6 +1284,27 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_card ON card_references(card_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_external ON card_references(external_id)`);
+    // Dependencies AND sub-task containment, in one table (spec §3.4). Same-board only: an edge
+    // that may refuse a claim has to be strongly consistent, which means inside this DO.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS card_links (
+        from_card_id TEXT NOT NULL,
+        to_card_id   TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        created_by   TEXT,
+        PRIMARY KEY (from_card_id, to_card_id, kind)
+      )`,
+    );
+    // A card has at most one parent.
+    this.sql.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS card_links_one_parent ON card_links (to_card_id) WHERE kind = 'parent'`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_to ON card_links(to_card_id, kind)`);
+    // The mirror of idx_card_links_to: the `parent` clause in `blockedWhere`/`openChildCount` (and
+    // `notifyDependents`'s `blocks` fan-out) both filter on `from_card_id`, unindexed until now.
+    // Negligible with today's card counts; Task 15 starts creating children in bulk.
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_links_from ON card_links(from_card_id, kind)`);
     // Inbound webhook delivery dedup (docs/06 §3): GitHub may redeliver the same X-GitHub-Delivery.
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS webhook_deliveries (delivery_id TEXT PRIMARY KEY, received_at TEXT NOT NULL)`,
@@ -1265,6 +1421,133 @@ export class BoardDO extends DurableObject<Env> {
     this.emit('card.created', { card });
     this.notifyWorkAvailable(id);
     return { ok: true, value: card };
+  }
+
+  /**
+   * Split a card into a sub-task (spec §3.4, Task 14 / 15). A real, independently claimable card —
+   * built on `createCard` plus a `parent` edge (`addLink`), not a lighter-weight "checklist item"
+   * type.
+   *
+   * Inherits `priority` (unless the caller overrides it) because a sub-task of an urgent card is
+   * itself urgent. Deliberately does NOT inherit `labels` or `dueAt`: a label describes what a card
+   * IS, not what its parent is, and a sub-task's own deadline is not its parent's — Linear inherits
+   * neither either. `project_id`/`milestone_id` are not inherited because this board model has no
+   * such columns to inherit from.
+   *
+   * ALSO inherits `queuedGrant` — not optional, not overridable by the caller. The parent's grant
+   * IS the authority under which this work exists, the same reasoning `moveCard` already applies
+   * when it preserves `queued_grant` across a re-queue. Before this, a child was created with
+   * `queued_grant = NULL` — under `ENFORCE_CONTROL_PAIR` that made EVERY child unclaimable, because
+   * `grantPermitsAgent(null, …)` is unconditionally false, which silently broke the promise
+   * `splitCard`'s tool description makes ("each becomes a real card that can be claimed
+   * separately"). Phase 2 shipped the identical bug for scheduled cards (`triggerGrant()` null on a
+   * board that had never saved GitHub settings); the fix there was the same shape — record and
+   * carry forward the authorising grant rather than leaving a creation path to default to none.
+   */
+  async createChildCard(
+    parentCardId: string,
+    input: { title: string; ownerUserId: string; spec?: JsonValue; priority?: number },
+  ): Promise<Result<CardView>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    const parent = this.getCard(parentCardId);
+    if (!parent) return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${parentCardId}` };
+    const created = await this.createCard({
+      title: input.title,
+      ownerUserId: input.ownerUserId,
+      spec: input.spec,
+      priority: input.priority ?? parent.priority,
+      queuedGrant: parent.queuedGrant,
+    });
+    if (!created.ok) return created;
+    const linked = await this.addLink({ fromCardId: parentCardId, toCardId: created.value.id, kind: 'parent' });
+    if (!linked.ok) return { ok: false, code: linked.code, message: linked.message };
+    return { ok: true, value: this.mustGetCard(created.value.id) };
+  }
+
+  /**
+   * Split a card into several children at once — the tool that makes the parent/child construct
+   * worth having (Task 15, spec §3.4): an agent decomposing the card it is working on into pieces
+   * different capabilities can pick up in parallel, mid-run. Built on `createChildCard` (one call
+   * per line), not on `addLink` directly, so it inherits that method's parentage and priority rules
+   * unchanged.
+   *
+   * `agentId` (present only on the MCP/agent path — see the `BoardStub` doc comment) gates this to
+   * "the card YOU are working on": without it, any `run`-scoped token could split any card in the
+   * workspace, and the consequence is worse than an ordinary unauthorized write — creating a child
+   * makes the target fail `blockedWhere`, so it drops out of `claim` and `list_work` and
+   * `advanceCard` parks it, until that child resolves. One agent could freeze another team's card
+   * indefinitely by giving it a child nobody will complete. Checked against `delegateAgentId`
+   * (who currently holds the card's active run), not `ownerUserId` — the same identity `claim`
+   * stamps onto the card and clears when the run ends.
+   *
+   * All-or-nothing on the two refusals:
+   *  - more than `MAX_SPLIT_CHILDREN` lines ⇒ `TOO_MANY_CHILDREN`, before anything is created.
+   *    Partially creating 20 of 21 would be worse than refusing outright, because the caller could
+   *    not tell which of its lines had succeeded.
+   *  - every line blank (before or after stripping) ⇒ `NOTHING_TO_SPLIT`, rather than silently
+   *    succeeding with an empty `children` array.
+   *
+   * Deliberately NOT idempotent: calling this twice with the same titles creates two separate sets
+   * of children. De-duplicating by title would silently drop a legitimately repeated sub-task — the
+   * tool description tells the caller to call it once, and the UI confirms before a second call.
+   *
+   * The loop below creates children one at a time and returns early on the first failure (line
+   * below: `if (!created.ok) return created;`), which WOULD be a partial-creation hole — k children
+   * left behind, with the caller told nothing about them — except it is unreachable today:
+   * `createChildCard`'s two failure modes beyond `NO_SUCH_CARD` (already checked above, before this
+   * loop starts) are `addLink`'s `ALREADY_HAS_PARENT` and `LINK_WOULD_CYCLE`, and both require a
+   * PRE-EXISTING edge that a brand-new leaf card — created fresh, one line above, with no links of
+   * its own yet — cannot have. This is the sentence a refactor should have to falsify: if
+   * `createChildCard` (or whatever this loop calls) ever gains a failure mode that a fresh child CAN
+   * hit, this early-return stops being merely theoretical and the loop needs to collect-then-commit
+   * or roll back what it already created.
+   */
+  async splitCard(
+    cardId: string,
+    titles: string[],
+    actorUserId: string,
+    agentId?: string | null,
+  ): Promise<Result<{ children: CardView[] }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    const card = this.getCard(cardId);
+    if (!card) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${cardId}` };
+    }
+    if (agentId !== undefined && agentId !== null && card.delegateAgentId !== agentId) {
+      return { ok: false, code: 'NOT_RUN_OWNER', message: 'this card is not your active run' };
+    }
+    if (titles.length > MAX_SPLIT_CHILDREN) {
+      return {
+        ok: false,
+        code: 'TOO_MANY_CHILDREN',
+        message: `a card may be split into at most ${MAX_SPLIT_CHILDREN} children in one call, not ${titles.length}`,
+      };
+    }
+    const cleanedTitles = titles.map(stripListLineSyntax).filter((t) => t.length > 0);
+    if (cleanedTitles.length === 0) {
+      return { ok: false, code: 'NOTHING_TO_SPLIT', message: 'every line was blank — nothing to split into' };
+    }
+    // A child's owner must be a HUMAN, because `owner_user_id` is what `notify()` files
+    // gate/park/overdue notifications under and `getNotifications` reads back for the requesting
+    // human — an id nobody can sign in as leaves that feed with no recipient. On the REST/human
+    // path (no `agentId`), `actorUserId` already names the signed-in human and is used as before.
+    // On the MCP/agent path (`agentId` present — the same signal the ownership check above uses),
+    // `actorUserId` IS the calling agent's own id (`mcp/tools.ts` passes `auth.agentId` for both
+    // parameters), so the PARENT's own owner is used instead: `card` above is that parent, already
+    // fetched, and it is presumed to carry a human owner because nothing on any path can make
+    // `ownerUserId` an agent id except this one now-closed hole.
+    const childOwnerUserId = agentId ? card.ownerUserId : actorUserId;
+    const children: CardView[] = [];
+    for (const title of cleanedTitles) {
+      const created = await this.createChildCard(cardId, { title, ownerUserId: childOwnerUserId });
+      if (!created.ok) return created;
+      children.push(created.value);
+    }
+    return { ok: true, value: { children } };
   }
 
   /**
@@ -1426,6 +1709,25 @@ export class BoardDO extends DurableObject<Env> {
         message: `WIP limit reached for stage "${target.key}" (limit ${target.wipLimit})`,
       };
     }
+    // Advancing IS a refusal, unlike claim's exclusion: this is an explicit act by a named caller,
+    // not a selection from a set (see the header note on Task 13). Only an OPEN CHILD refuses it —
+    // a parent whose sub-tasks are unfinished is not something anyone should be able to mark done.
+    // An unresolved `blocks` edge deliberately does NOT refuse this: Principle 3 says a human owns
+    // the card and is accountable, and can see the blocker badge, so a human move through a blocker
+    // is allowed through (and recorded, below) rather than refused — the one place Linear's
+    // advisory model is right.
+    const openChildren = this.openChildCount(cardId);
+    if (openChildren > 0) {
+      return {
+        ok: false,
+        code: 'CARD_BLOCKED',
+        // Direction-agnostic wording: this refusal applies to ANY move, forward or backward (e.g.
+        // pulling a parent back to an earlier stage for rework), so it must not read as "you can't
+        // finish yet" — it is simply a fact about the card, regardless of which way it is moving.
+        message: `card has ${openChildren} open sub-task${openChildren === 1 ? '' : 's'}`,
+      };
+    }
+    const unresolvedBlockers = this.unresolvedBlockerCount(cardId);
     const now = this.now();
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
@@ -1456,6 +1758,16 @@ export class BoardDO extends DurableObject<Env> {
       to: target.key,
       by: actorUserId ?? null,
     });
+    // The override is made VISIBLE, not silently allowed (Principle 3: a human is accountable for
+    // moving a card past a blocker they can see on the badge, and the record is how that
+    // accountability stays legible after the fact).
+    if (unresolvedBlockers > 0) {
+      this.notify(
+        'moved-while-blocked',
+        cardId,
+        `moved to "${target.name}" past ${unresolvedBlockers} unresolved blocker${unresolvedBlockers === 1 ? '' : 's'}${actorUserId ? ` by ${actorUserId}` : ''}`,
+      );
+    }
     return { ok: true, value: updated };
   }
 
@@ -1541,15 +1853,24 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: card };
   }
 
-  /** Delete a card and everything scoped to it (references, runs, activities, gates, usage, notifications). */
+  /** Delete a card and everything scoped to it (references, runs, activities, gates, usage, notifications, links). */
   async deleteCard(cardId: string): Promise<Result<{ ok: true }>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     if (!this.getCard(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    // Captured before the edge is deleted below — a deleted card may be the last open child of a
+    // parent parked on a deferred advance (Task 14 step 3), which `resumeParentAdvanceIfFree` needs
+    // to know to check.
+    const parentId = this.parentIdOf(cardId);
     for (const t of ['usage_records', 'activities', 'runs', 'gates', 'elicitations', 'card_references', 'notifications']) {
       this.sql.exec(`DELETE FROM ${t} WHERE card_id = ?`, cardId);
     }
+    // Both directions. A deleted card's edges must go with it: a lingering `blocks` row points at a
+    // card that no longer exists, and the drawer would render a blocker nobody can open or resolve.
+    // `card_links` is keyed on two columns, so it cannot join the single-column loop above.
+    this.sql.exec(`DELETE FROM card_links WHERE from_card_id = ? OR to_card_id = ?`, cardId, cardId);
     this.sql.exec(`DELETE FROM cards WHERE id = ?`, cardId);
     this.emit('card.deleted', { cardId });
+    if (parentId) this.resumeParentAdvanceIfFree(parentId);
     return { ok: true, value: { ok: true } };
   }
 
@@ -1841,6 +2162,90 @@ export class BoardDO extends DurableObject<Env> {
     const ref = this.mustGetReference(id);
     this.emit('reference.added', { reference: ref });
     return { ok: true, value: ref };
+  }
+
+  /**
+   * Declare an edge between two cards on this board (spec §3.4). `blocks` and `parent` both order
+   * work and so can deadlock; `relates` is decoration and is exempt from both checks below.
+   *
+   * Idempotent on the primary key: re-declaring the exact same (from, to, kind) is a no-op, not an
+   * error — the same reasoning as `addImplication` (`db/implications.ts`).
+   *
+   * Refusals are one distinct code per reason, not a generic one, because a caller needs to know
+   * what to do next: `NO_SUCH_CARD` (either end is missing), `ALREADY_HAS_PARENT` (a card may have
+   * at most one `parent` edge pointing at it — enforced again by `card_links_one_parent` for any
+   * caller that reaches the table directly), `LINK_WOULD_CYCLE` (this edge would close a loop among
+   * the ordering kinds — see `links.ts#wouldCycle`).
+   */
+  async addLink(input: LinkInput): Promise<Result<LinkView>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    if (!this.getCardRow(input.fromCardId)) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${input.fromCardId}` };
+    }
+    if (!this.getCardRow(input.toCardId)) {
+      return { ok: false, code: 'NO_SUCH_CARD', message: `card not found: ${input.toCardId}` };
+    }
+    if (input.kind === 'parent') {
+      const existingParent = this.sql
+        .exec(`SELECT from_card_id FROM card_links WHERE to_card_id = ? AND kind = 'parent'`, input.toCardId)
+        .toArray()[0];
+      if (existingParent && (existingParent.from_card_id as string) !== input.fromCardId) {
+        return {
+          ok: false,
+          code: 'ALREADY_HAS_PARENT',
+          message: `card ${input.toCardId} already has a parent (${existingParent.from_card_id as string})`,
+        };
+      }
+    }
+    const candidate: LinkRow = { fromCardId: input.fromCardId, toCardId: input.toCardId, kind: input.kind };
+    if (wouldCycle(this.allLinks(), candidate)) {
+      return {
+        ok: false,
+        code: 'LINK_WOULD_CYCLE',
+        message: `linking ${input.fromCardId} -> ${input.toCardId} (${input.kind}) would close a cycle`,
+      };
+    }
+    const now = this.now();
+    this.sql.exec(
+      `INSERT INTO card_links (from_card_id, to_card_id, kind, created_at, created_by)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (from_card_id, to_card_id, kind) DO NOTHING`,
+      input.fromCardId,
+      input.toCardId,
+      input.kind,
+      now,
+      input.createdBy ?? null,
+    );
+    const link = this.mustGetLink(input.fromCardId, input.toCardId, input.kind);
+    this.emit('link.added', { link });
+    return { ok: true, value: link };
+  }
+
+  /** Remove an edge. Deleting a link that does not exist is not an error — the end state is what was asked for. */
+  async removeLink(fromCardId: string, toCardId: string, kind: LinkKind): Promise<Result<{ ok: true }>> {
+    if (!this.getMeta('boardId')) {
+      return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    }
+    this.sql.exec(`DELETE FROM card_links WHERE from_card_id = ? AND to_card_id = ? AND kind = ?`, fromCardId, toCardId, kind);
+    this.emit('link.removed', { fromCardId, toCardId, kind });
+    // Un-parenting a card is the other way (besides completion) it can stop counting as an open
+    // child — see `resumeParentAdvanceIfFree`'s note. `fromCardId` IS the parent for a `parent` edge.
+    if (kind === 'parent') this.resumeParentAdvanceIfFree(fromCardId);
+    return { ok: true, value: { ok: true } };
+  }
+
+  /** Every edge touching `cardId`, either as source or target — what the drawer renders. */
+  async listLinks(cardId: string): Promise<LinkView[]> {
+    return this.sql
+      .exec(
+        `SELECT * FROM card_links WHERE from_card_id = ? OR to_card_id = ? ORDER BY created_at ASC`,
+        cardId,
+        cardId,
+      )
+      .toArray()
+      .map((r) => this.rowToLink(r));
   }
 
   /** Store/rotate this board's GitHub webhook secret (docs/06 §3, §6). */
@@ -2699,10 +3104,14 @@ export class BoardDO extends DurableObject<Env> {
    */
   private notifyWorkAvailable(cardId: string): void {
     const card = this.getCard(cardId);
-    // Mirrors `claimableWhere`'s archived exclusion, by hand: this is a JS predicate over a
-    // `CardView`, not SQL, so it cannot call that helper — but any eligibility condition added
-    // there needs its equivalent added here too, or a push fires for work `claim` will refuse.
-    if (!card || card.state !== 'submitted' || card.archivedAt) return;
+    // `state`/`archivedAt` mirror `claimableWhere`'s own conditions, by hand: this is a JS
+    // predicate over a `CardView`, not SQL, so it cannot call that helper directly. The blocked
+    // rule (unresolved `blocks`, open `parent` child) no longer needs its own hand-copy, though —
+    // it comes from the same `blockedWhere()` fragment `claimableWhere` uses, via `isHeldBack`, so
+    // the two cannot drift apart the way the archived check once risked. Any FUTURE eligibility
+    // condition added to `claimableWhere` still needs its equivalent added here too, or a push
+    // fires for work `claim` will refuse.
+    if (!card || card.state !== 'submitted' || card.archivedAt || this.isHeldBack(cardId)) return;
     if (this.boardOverBudget()) return;
     const stage = this.stages().find((s) => s.key === card.currentStageKey);
     if (!stage || !this.isAgentClaimable(stage)) return;
@@ -2801,12 +3210,198 @@ export class BoardDO extends DurableObject<Env> {
    * work-discovery count so the two cannot drift apart.
    *
    * They were independent copies of `state = 'submitted' AND current_stage_key IN (…)`. Every
-   * condition added to claim from here on — archived here, blocked and parent-with-open-children in
-   * Task 13 — has to be invisible to `list_work` as well, or the board advertises work it will not
-   * hand out. The table is aliased `c` in both callers so this fragment can qualify its columns.
+   * condition added to claim from here on — archived here, blocked and parent-with-open-children via
+   * `blockedWhere()` (Task 13) — has to be invisible to `list_work` as well, or the board advertises
+   * work it will not hand out. The table is aliased `c` in both callers so this fragment can qualify
+   * its columns.
    */
   private claimableWhere(placeholders: string): string {
-    return `c.state = 'submitted' AND c.archived_at IS NULL AND c.current_stage_key IN (${placeholders})`;
+    return `c.state = 'submitted' AND c.archived_at IS NULL
+      AND c.current_stage_key IN (${placeholders})
+      AND ${this.blockedWhere()}`;
+  }
+
+  /**
+   * The one spelling of "resolved", as SQL — interpolated into every WHERE clause below that asks
+   * it (`blockedWhere`'s two conditions, `openChildCount`, `unresolvedBlockerCount`), so the rule
+   * has a single place to change instead of four string literals that could drift independently.
+   *
+   * A blocker/child is resolved only when it is `completed` or `canceled` — **not** all four
+   * terminal states. `TERMINAL_STATES` also contains `rejected` and `failed`; either must keep its
+   * dependent blocked, or the edge does nothing in the situation it exists for. This is the SQL
+   * form of `isResolved` (`links.ts`) — that function is its JS twin (currently unused in this DO,
+   * since every check here is a SQL WHERE clause, not a JS predicate), kept for parity and for any
+   * future caller that needs the rule outside SQL. Do not widen this to `isTerminal()` or the four
+   * terminal states — the `'keeps the dependent blocked while the blocker is rejected…'` test in
+   * `links-enforcement.test.ts` exists to catch exactly that (the mid-retry test does not: a
+   * mid-retry blocker is `submitted`, which is unresolved under either rule, so it can't tell the
+   * two apart).
+   */
+  private static readonly RESOLVED_SQL = "('completed', 'canceled')";
+
+  /**
+   * An unresolved `blocks` edge pointing at `c.id` — the enforced dependency. Correlated on the
+   * alias `c`, so it only composes where the cards table is aliased `c` (`blockedWhere`,
+   * `isHeldBack`). Extracted (Task 17) so `CardView.blockedBy`'s batch query can select the same
+   * blocker rows this EXISTS clause tests for, instead of restating the predicate.
+   */
+  private unresolvedBlockerExists(): string {
+    return `EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards b ON b.id = l.from_card_id
+         WHERE l.to_card_id = c.id AND l.kind = 'blocks'
+           AND b.state NOT IN ${BoardDO.RESOLVED_SQL}
+      )`;
+  }
+
+  /**
+   * An unresolved child of `c.id` (the `parent` edge) — surfaced to readers as `openChildCount`,
+   * never as a `blockedBy` entry: it is a different fact with a different badge. Extracted (Task 17)
+   * alongside `unresolvedBlockerExists` so `blockedWhere` composes from two named fragments instead
+   * of two inline `NOT EXISTS` clauses.
+   */
+  private openChildExists(): string {
+    return `EXISTS (
+        SELECT 1 FROM card_links l
+          JOIN cards ch ON ch.id = l.to_card_id
+         WHERE l.from_card_id = c.id AND l.kind = 'parent'
+           AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
+      )`;
+  }
+
+  /**
+   * Whether nothing holds `c` back from being handed out: no unresolved blocker (`blocks`), and no
+   * open child (`parent`). Parameterless and correlated on the alias `c`, so it composes directly
+   * into `claimableWhere`'s SELECT and into `isHeldBack`'s single-card check below, without either
+   * restating the rule. TRUE means eligible — `claimableWhere` ANDs it straight into its WHERE
+   * clause, and `isHeldBack` inverts the question to ask it about one card.
+   *
+   * One definition, three readers — the claim query (via `claimableWhere`), the discovery count
+   * (`countReadyForCapabilities`, which calls `claimableWhere` too), and `notifyWorkAvailable`'s JS
+   * gate, which reaches it through `isHeldBack` rather than mirroring the SQL by hand. A fourth
+   * reader, `CardView.blockedBy`, reuses `unresolvedBlockerExists`'s predicate directly rather than
+   * this composed form — it needs the `blocks` half only, never the `parent` half.
+   */
+  private blockedWhere(): string {
+    return `NOT ${this.unresolvedBlockerExists()} AND NOT ${this.openChildExists()}`;
+  }
+
+  /** The same rule, asked about one card, for callers that are not a SELECT over the stage set. */
+  private isHeldBack(cardId: string): boolean {
+    return (
+      this.sql.exec(`SELECT 1 FROM cards c WHERE c.id = ? AND (${this.blockedWhere()})`, cardId).toArray().length ===
+      0
+    );
+  }
+
+  /**
+   * Every card this one directly holds back: the cards it blocks (`blocks`, this card as source),
+   * and its own parent, if it has one (`parent`, this card as the child/target) — a parent may now
+   * have lost its last open child. Called once a card reaches a genuinely resolved state
+   * (`completed`/`canceled`), to re-issue `work.available` pings that `notifyWorkAvailable`
+   * correctly suppressed while this card was still open. Without this fan-out, a push-subscribed
+   * agent waiting on a dependent never hears that it unblocked — only `list_work` polling would
+   * ever find it, which is the same shape of silent gap Phase 1 fixed for the archived exclusion.
+   *
+   * `notifyWorkAvailable` re-checks eligibility itself (`isHeldBack`, stage ownership, budget), so
+   * calling it here for a card that is STILL blocked by something else (e.g. a second unresolved
+   * blocker) is safe — it just no-ops.
+   */
+  private notifyDependents(cardId: string): void {
+    for (const row of this.sql.exec(`SELECT to_card_id FROM card_links WHERE from_card_id = ? AND kind = 'blocks'`, cardId).toArray()) {
+      this.notifyWorkAvailable(row.to_card_id as string);
+    }
+    const parentId = this.parentIdOf(cardId);
+    if (parentId) this.notifyWorkAvailable(parentId);
+  }
+
+  /**
+   * `cardId`'s parent, via its `parent` edge (`cardId` as `to_card_id`) — or null if it has none.
+   * One spelling of the lookup, used by `CardView.parentCardId` (`rowToCard`), `notifyDependents`'s
+   * fan-out, and `resumeDeferredParentAdvance`'s trigger (Task 14).
+   */
+  private parentIdOf(cardId: string): string | null {
+    return (
+      (this.sql
+        .exec(`SELECT from_card_id FROM card_links WHERE to_card_id = ? AND kind = 'parent'`, cardId)
+        .toArray()[0]?.from_card_id as string | undefined) ?? null
+    );
+  }
+
+  /**
+   * How many of `cardId`'s children (via the `parent` edge, `cardId` as source) are still
+   * unresolved. Originally used only by `moveCard`'s advance refusal — deliberately NOT
+   * `blockedWhere()`, which also folds in the `blocks` condition that `moveCard` must NOT refuse on
+   * (Principle 3). Task 14 gave it two more callers: `advanceCard`'s deferral (the same "is this
+   * card held back by an open child" question, asked of the agent path) and `CardView.openChildCount`
+   * (`rowToCard`), a read-only surfacing of the same count for the UI.
+   */
+  private openChildCount(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+            WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+          cardId,
+        )
+        .one().n,
+    );
+  }
+
+  /**
+   * `cardId`'s open children (via the `parent` edge), id and title, oldest first — for the
+   * deferred-advance park notification (`advanceCard`). A card can be "open" here forever without
+   * ever resolving: `rejected` is deliberately outside `RESOLVED_SQL` (a rejected blocker must keep
+   * blocking, same reasoning as a failed one), and an archived child is excluded from `claimableWhere`
+   * so it can never be claimed to completion either. Both are recoverable with existing verbs
+   * (delete the child, `removeLink` it, un-archive and finish it), but neither is visible from the
+   * parked parent alone — hence naming the children, not just the count.
+   */
+  private openChildren(cardId: string): { id: string; title: string }[] {
+    return this.sql
+      .exec(
+        `SELECT ch.id, ch.title FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+           WHERE l.from_card_id = ? AND l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL}
+           ORDER BY ch.created_at ASC`,
+        cardId,
+      )
+      .toArray()
+      .map((r) => ({ id: r.id as string, title: r.title as string }));
+  }
+
+  /**
+   * How many unresolved blockers (via the `blocks` edge, `cardId` as target) `cardId` has. Used
+   * only to decide whether `moveCard`'s human-override notification fires — a `blocks` edge never
+   * refuses the move itself.
+   */
+  private unresolvedBlockerCount(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM card_links l JOIN cards b ON b.id = l.from_card_id
+            WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+          cardId,
+        )
+        .one().n,
+    );
+  }
+
+  /**
+   * `cardId`'s unresolved blockers (the `blocks` edge, `cardId` as target), id and title — the same
+   * `kind = 'blocks'` + `RESOLVED_SQL` predicate as `unresolvedBlockerExists()`, as a SELECT rather
+   * than an EXISTS, for `CardView.blockedBy`'s single-card fallback (`rowToCard`, no `pre`). The
+   * batched board read (`allCards`) asks this same question in one grouped query instead of calling
+   * this once per card — see the note on `blockersByCard` there.
+   */
+  private blockersOf(cardId: string): Array<{ cardId: string; title: string }> {
+    return this.sql
+      .exec(
+        `SELECT b.id, b.title FROM card_links l JOIN cards b ON b.id = l.from_card_id
+          WHERE l.to_card_id = ? AND l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+        cardId,
+      )
+      .toArray()
+      .map((r) => ({ cardId: r.id as string, title: r.title as string }));
   }
 
   /** How many cards are ready (submitted) in stages these capabilities can claim — for work discovery. */
@@ -3494,8 +4089,55 @@ export class BoardDO extends DurableObject<Env> {
     this.notifyWorkAvailable(cardId);
   }
 
-  /** Advance a card to the next stage — opening an approval gate on entry to a human review stage. */
+  /**
+   * Advance a card to the next stage — opening an approval gate on entry to a human review stage.
+   *
+   * Called after a run's side effects are already committed (`complete()`'s SQL has run,
+   * `resolveGate()`'s approval is recorded), so this method is `void`: by the time it runs there is
+   * nothing left to refuse *into*. What it CAN still refuse is the advance itself.
+   *
+   * A card with open children (the `parent` edge) cannot advance — on the LAST stage this would
+   * otherwise write `state = 'completed'` outright, resolving the card while its subtree is still
+   * open: anything this card blocks would unblock, and a parent with half-finished children would
+   * read as "done" (Task 14 step 3, promoted by Task 13's review — Task 13 guarded `moveCard`, the
+   * human path, but left this one, the agent path, open). The fix is a DEFERRED advance, not a
+   * refusal: `complete()`/`resolveGate()` must still succeed — the run has ended, the lease has to
+   * release — so what is withheld is only the transition, recorded in `pending_advance_json` and
+   * replayed by `resumeDeferredParentAdvance` once the last child resolves. Parking in
+   * `submitted`/current-stage was rejected: that would make the card claimable again and hand an
+   * agent work already done. Refusing from `complete()` was rejected too: the run would stay open,
+   * the lease would heartbeat out, and the card would be reclaimed — the retry hot-loop this phase
+   * exists to prevent. So: park `input-required`, in the CURRENT stage (not re-queued into it, and
+   * not advanced) — the one non-claimable state available without adding one to the A2A-aligned
+   * `TaskState`. It is not literally true here ("a human must act"); `openChildCount > 0` is what a
+   * reader (Task 17's UI) uses to tell this park apart from a real review gate.
+   */
   private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null): void {
+    const openChildren = this.openChildCount(cardId);
+    if (openChildren > 0) {
+      this.sql.exec(
+        `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL,
+                pending_advance_json = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify({ fromStageKey, producedBy, handoffJson }),
+        this.now(),
+        cardId,
+      );
+      this.emit('card.advance_deferred', { cardId, openChildren });
+      // A human has no other way to learn this happened: unlike `moveCard`'s `CARD_BLOCKED`
+      // refusal (Task 13), nothing here rejects anything the owner did, so there is no error to
+      // see. Some open children never resolve on their own (`openChildren`'s own comment) and the
+      // recovery is an existing verb, not automatic — so name them, not just the count, or the
+      // owner has a parked card and nothing explaining why.
+      this.notify(
+        'advance-deferred',
+        cardId,
+        `waiting on ${openChildren} sub-task${openChildren === 1 ? '' : 's'}: ` +
+          this.openChildren(cardId)
+            .map((c) => `${c.title} (${c.id})`)
+            .join(', '),
+      );
+      return;
+    }
     const stages = this.stages();
     const idx = stages.findIndex((s) => s.key === fromStageKey);
     if (idx === -1) return; // unknown stage — never silently advance to stage[0]
@@ -3509,6 +4151,20 @@ export class BoardDO extends DurableObject<Env> {
         cardId,
       );
       this.emit('card.completed', { cardId });
+      // This card just became genuinely resolved (Task 13's rule: `completed`/`canceled` only) —
+      // anything it held back may now be claimable. `notifyWorkAvailable` alone only ever fires for
+      // the card that just changed, never for its dependents, so without this fan-out a
+      // push-subscribed agent waiting on a blocked card never hears it unblocked; only `list_work`
+      // polling would find it. Any FUTURE path that writes `state = 'completed'` or `'canceled'` to
+      // a card needs this same call — there is no `'canceled'`-writing verb today, so this is the
+      // only site, but that will not stay true.
+      this.notifyDependents(cardId);
+      // This card may itself be the last open child of a parent parked by the deferral above — the
+      // ONLY reachable resolution today (`TERMINAL_STATES` also has `rejected`/`failed`, but no
+      // verb writes either to a card, and nothing writes `canceled` either; see the state-machine
+      // note on `RESOLVED_SQL`). Checked here, not in `complete()`/`resolveGate()`, so it fires
+      // for every path through this branch, current and future.
+      this.resumeDeferredParentAdvance(cardId);
       return;
     }
     const gated = next.gate === 'approval' && !this.isAgentClaimable(next);
@@ -3523,6 +4179,51 @@ export class BoardDO extends DurableObject<Env> {
     this.emit('card.advanced', { cardId, from: fromStageKey, to: next.key });
     if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy);
     else this.notifyWorkAvailable(cardId);
+  }
+
+  /**
+   * `childId` just reached `completed` (the resolution rule — `RESOLVED_SQL` — which today only
+   * `completed` reaches; see the note on `resolveGate`'s sibling branch in `advanceCard`). If it has
+   * a parent, that parent may now be free of open children — hand off to `resumeParentAdvanceIfFree`
+   * to check and, if so, replay the deferred advance.
+   */
+  private resumeDeferredParentAdvance(childId: string): void {
+    const parentId = this.parentIdOf(childId);
+    if (parentId) this.resumeParentAdvanceIfFree(parentId);
+  }
+
+  /**
+   * `parentId` may have just lost its last open child — not only by that child reaching
+   * `completed` (`resumeDeferredParentAdvance`, above), but also by the `parent` edge itself being
+   * removed: `deleteCard` deletes a child outright, and `removeLink` can un-parent one without
+   * touching the card. `openChildCount` is a live join over `card_links`, so it cannot tell a
+   * resolved child from a vanished one — which means neither can a park that depends on it. Without
+   * this second call site, deleting or un-parenting the LAST open child of a parked parent would
+   * silently strand it: `pending_advance_json` would sit there forever with nothing left to ever
+   * recheck it.
+   *
+   * `openChildCount` is RE-CHECKED here, not decremented — so a parent with several children stays
+   * parked through every resolution/removal but the last, and fires exactly once. Clearing
+   * `pending_advance_json` before calling `advanceCard` (rather than after) means a parent that
+   * turns out to have open children again by the time the replay runs — not reachable via either
+   * caller today, but defensive against a future one — cannot re-defer onto a stale record.
+   *
+   * That clear-before-call ordering has a cost: `advanceCard`'s `idx === -1` guard (stored
+   * `fromStageKey` not found in the board's current stage list) returns silently, and by then the
+   * record is already gone — so if that guard were ever hit here, the parent would be stranded with
+   * nothing left to recheck. Not reachable today — `setStages` refuses to remove a stage holding any
+   * card, `countInStage` counts every state so a parked card still holds its stage, and nothing ever
+   * moves a parked card's `current_stage_key` — but that safety rests on those three facts staying
+   * true elsewhere in this file, not on anything local to this method.
+   */
+  private resumeParentAdvanceIfFree(parentId: string): void {
+    const row = this.sql.exec(`SELECT pending_advance_json FROM cards WHERE id = ?`, parentId).toArray()[0];
+    const pendingJson = (row?.pending_advance_json as string | null | undefined) ?? null;
+    if (!pendingJson) return;
+    if (this.openChildCount(parentId) > 0) return; // another child is still open
+    const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null };
+    this.sql.exec(`UPDATE cards SET pending_advance_json = NULL WHERE id = ?`, parentId);
+    this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson);
   }
 
   private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string): string {
@@ -3956,8 +4657,10 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   private allCards(): CardView[] {
-    // Precompute per-card cost + attempt count in two grouped queries instead of N point queries —
-    // allCards() feeds every snapshot, which is the live-feed hot path.
+    // Precompute per-card cost + attempt count in grouped queries instead of N point queries —
+    // allCards() feeds every snapshot, which is the live-feed hot path. Task 14's three child-card
+    // fields (`parentCardId`, `openChildCount`, the cost half of `costUsdRollup`) joined this same
+    // batch rather than adding three more point queries per card back onto `rowToCard`.
     const costByCard = new Map<string, number>();
     for (const r of this.sql.exec(`SELECT card_id, COALESCE(SUM(cost_usd), 0) AS c FROM usage_records GROUP BY card_id`).toArray()) {
       costByCard.set(r.card_id as string, Number(r.c));
@@ -3966,17 +4669,91 @@ export class BoardDO extends DurableObject<Env> {
     for (const r of this.sql.exec(`SELECT card_id, COUNT(*) AS n FROM runs GROUP BY card_id`).toArray()) {
       attemptsByCard.set(r.card_id as string, Number(r.n));
     }
+    // Child → parent, over every `parent` edge on the board — one row per child, so a direct map.
+    const parentByChild = new Map<string, string>();
+    for (const r of this.sql.exec(`SELECT to_card_id, from_card_id FROM card_links WHERE kind = 'parent'`).toArray()) {
+      parentByChild.set(r.to_card_id as string, r.from_card_id as string);
+    }
+    // Parent → its open-child count, the same rule `openChildCount` asks per-card, grouped instead.
+    const openChildCountByParent = new Map<string, number>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.from_card_id AS parent_id, COUNT(*) AS n FROM card_links l JOIN cards ch ON ch.id = l.to_card_id
+           WHERE l.kind = 'parent' AND ch.state NOT IN ${BoardDO.RESOLVED_SQL} GROUP BY l.from_card_id`,
+      )
+      .toArray()) {
+      openChildCountByParent.set(r.parent_id as string, Number(r.n));
+    }
+    // Parent → its children's summed cost, the same query `childrenCost` runs per-card, grouped.
+    const childrenCostByParent = new Map<string, number>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.from_card_id AS parent_id, COALESCE(SUM(u.cost_usd), 0) AS c FROM card_links l
+           JOIN usage_records u ON u.card_id = l.to_card_id
+          WHERE l.kind = 'parent' GROUP BY l.from_card_id`,
+      )
+      .toArray()) {
+      childrenCostByParent.set(r.parent_id as string, Number(r.c));
+    }
+    // Blocked card → its unresolved blockers (id, title), grouped — Task 17's `CardView.blockedBy`,
+    // the same `kind = 'blocks'` + `RESOLVED_SQL` predicate `unresolvedBlockerExists()` tests for,
+    // as a SELECT instead of an EXISTS, run once for the whole board rather than once per card
+    // (`blockersOf`'s per-card version exists only for `rowToCard`'s single-card fallback below).
+    const blockersByCard = new Map<string, Array<{ cardId: string; title: string }>>();
+    for (const r of this.sql
+      .exec(
+        `SELECT l.to_card_id AS blocked_id, b.id AS blocker_id, b.title AS blocker_title
+           FROM card_links l JOIN cards b ON b.id = l.from_card_id
+          WHERE l.kind = 'blocks' AND b.state NOT IN ${BoardDO.RESOLVED_SQL}`,
+      )
+      .toArray()) {
+      const blockedId = r.blocked_id as string;
+      const list = blockersByCard.get(blockedId) ?? [];
+      list.push({ cardId: r.blocker_id as string, title: r.blocker_title as string });
+      blockersByCard.set(blockedId, list);
+    }
     return this.sql
       .exec(`SELECT * FROM cards ORDER BY priority DESC, (due_at IS NULL), due_at ASC, created_at ASC`)
       .toArray()
-      .map((r) => this.rowToCard(r, { costUsd: costByCard.get(r.id as string) ?? 0, attemptCount: attemptsByCard.get(r.id as string) ?? 0 }));
+      .map((r) => {
+        const id = r.id as string;
+        return this.rowToCard(r, {
+          costUsd: costByCard.get(id) ?? 0,
+          attemptCount: attemptsByCard.get(id) ?? 0,
+          parentCardId: parentByChild.get(id) ?? null,
+          openChildCount: openChildCountByParent.get(id) ?? 0,
+          childrenCost: childrenCostByParent.get(id) ?? 0,
+          blockedBy: blockersByCard.get(id) ?? [],
+        });
+      });
   }
 
-  private rowToCard(row: Row, pre?: { costUsd: number; attemptCount: number }): CardView {
+  private rowToCard(
+    row: Row,
+    pre?: {
+      costUsd: number;
+      attemptCount: number;
+      parentCardId: string | null;
+      openChildCount: number;
+      childrenCost: number;
+      blockedBy: Array<{ cardId: string; title: string }>;
+    },
+  ): CardView {
     const id = row.id as string;
     const costUsd = pre?.costUsd ?? this.cardCost(id);
     const cardCap = this.budgetCap('budgetCardUsdCap');
     const attemptCount = pre?.attemptCount ?? Number(this.sql.exec(`SELECT COUNT(*) AS n FROM runs WHERE card_id = ?`, id).one().n);
+    // `pre` (not `??`) for these four: `parentCardId` is legitimately `null` for most cards, and
+    // `??` would treat a batched `null` as "missing" and re-query — still correct, just defeating
+    // the batch it's here to avoid. `blockedBy` joins this group for the same reason from the other
+    // direction: an unblocked card's real, batched answer is `[]`, and testing the array itself
+    // (its length, or `pre?.blockedBy ?? fallback`) risks mistaking that legitimate empty answer for
+    // a missing one. Branching on `pre` — the presence of the whole precomputed object, never the
+    // field's own value — is the one test that can't make that mistake for any of the four.
+    const parentCardId = pre ? pre.parentCardId : this.parentIdOf(id);
+    const openChildCount = pre ? pre.openChildCount : this.openChildCount(id);
+    const childrenCost = pre ? pre.childrenCost : this.childrenCost(id);
+    const blockedBy = pre ? pre.blockedBy : this.blockersOf(id);
     return {
       id,
       title: row.title as string,
@@ -3999,6 +4776,14 @@ export class BoardDO extends DurableObject<Env> {
       // chip appears exactly when billing stops.
       overBudget: cardCap !== null && costUsd >= cardCap,
       attemptCount,
+      parentCardId,
+      openChildCount,
+      // Own cost plus one level of children. One level, not recursive: nesting deeper than one is
+      // not a shape this board model encourages, and an unbounded walk inside `rowToCard` would run
+      // on every card of every board read. NOT folded into `costUsd` above — see that field's own
+      // comment on `CardView` and `childrenCost`'s, below `cardCost`.
+      costUsdRollup: costUsd + childrenCost,
+      blockedBy,
     };
   }
 
@@ -4032,6 +4817,36 @@ export class BoardDO extends DurableObject<Env> {
       .exec(`SELECT * FROM card_references ORDER BY created_at ASC`)
       .toArray()
       .map((r) => this.rowToReference(r));
+  }
+
+  private rowToLink(row: Row): LinkView {
+    return {
+      fromCardId: row.from_card_id as string,
+      toCardId: row.to_card_id as string,
+      kind: row.kind as LinkKind,
+      createdAt: row.created_at as string,
+      createdBy: (row.created_by as string | null) ?? null,
+    };
+  }
+
+  private mustGetLink(fromCardId: string, toCardId: string, kind: LinkKind): LinkView {
+    const row = this.sql
+      .exec(`SELECT * FROM card_links WHERE from_card_id = ? AND to_card_id = ? AND kind = ?`, fromCardId, toCardId, kind)
+      .toArray()[0];
+    if (!row) throw new Error(`invariant violation: link ${fromCardId}->${toCardId} (${kind}) missing immediately after write`);
+    return this.rowToLink(row);
+  }
+
+  /** Every edge on the board, as the pure `wouldCycle` predicate wants them — no DO-specific shape. */
+  private allLinks(): LinkRow[] {
+    return this.sql
+      .exec(`SELECT from_card_id, to_card_id, kind FROM card_links`)
+      .toArray()
+      .map((r) => ({
+        fromCardId: r.from_card_id as string,
+        toCardId: r.to_card_id as string,
+        kind: r.kind as LinkKind,
+      }));
   }
 
   private getScheduleRow(id: string): Row | null {
@@ -4068,6 +4883,25 @@ export class BoardDO extends DurableObject<Env> {
 
   private cardCost(cardId: string): number {
     return Number(this.sql.exec(`SELECT COALESCE(SUM(cost_usd), 0) AS c FROM usage_records WHERE card_id = ?`, cardId).one().c);
+  }
+
+  /**
+   * The summed cost of a card's direct children.
+   *
+   * One level deep, matching `costUsdRollup`. Deliberately a sibling of `cardCost` rather than a
+   * parameter to it: `cardCost` feeds the budget gate (`boardOverBudget`'s cousin, the per-card cap
+   * check in `postActivity`) and must keep meaning "what this card itself spent".
+   */
+  private childrenCost(cardId: string): number {
+    return Number(
+      this.sql
+        .exec(
+          `SELECT COALESCE(SUM(u.cost_usd), 0) AS c FROM usage_records u
+             WHERE u.card_id IN (SELECT to_card_id FROM card_links WHERE from_card_id = ? AND kind = 'parent')`,
+          cardId,
+        )
+        .one().c,
+    );
   }
 
   private boardCost(): number {
