@@ -488,4 +488,209 @@ describe('PATCH /v1/boards/:id/cards/:cardId — milestoneId validation', () => 
     expect(after.projectId).toBe(project.id);
     expect(after.milestoneId).toBe(milestone.id);
   });
+
+  it('refuses changing projectId out from under an already-stored milestone, leaving both untouched', async () => {
+    const t = 'tnt_prj_rest_msprojectchange';
+    await insertTenant(t, 'prj-rest-msprojectchange');
+
+    const madeA = await createProject(t, { name: 'original project' });
+    const { project: projectA } = await madeA.json<{ project: { id: string } }>();
+    const madeB = await createProject(t, { name: 'new project' });
+    const { project: projectB } = await madeB.json<{ project: { id: string } }>();
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${projectA.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'A-only milestone' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'Starts in A');
+    const first = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: projectA.id, milestoneId: milestone.id }),
+    });
+    expect(first.status).toBe(200);
+
+    // ONLY projectId changes — milestoneId is not in the body at all. The card's already-stored
+    // milestone (project A's) would now belong to a card in project B, which the route must catch
+    // even though `body.milestoneId` says nothing.
+    const second = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: projectB.id }),
+    });
+    expect(second.status).toBe(400);
+    expect((await second.json<{ error: { code: string } }>()).error.code).toBe('MILESTONE_NOT_IN_PROJECT');
+
+    // Refused before the write lands — the card still carries project A and its milestone.
+    const after = await readCard(t, b, id);
+    expect(after.projectId).toBe(projectA.id);
+    expect(after.milestoneId).toBe(milestone.id);
+  });
+
+  it('refuses clearing projectId to null out from under an already-stored milestone', async () => {
+    const t = 'tnt_prj_rest_msprojectnull';
+    await insertTenant(t, 'prj-rest-msprojectnull');
+
+    const made = await createProject(t, { name: 'project to clear' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const msRes = await SELF.fetch(`https://api.test/v1/projects/${project.id}/milestones`, {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'the milestone' }),
+    });
+    const { milestone } = await msRes.json<{ milestone: { id: string } }>();
+
+    const b = await board(t);
+    const id = await card(t, b, 'Starts assigned');
+    const first = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id, milestoneId: milestone.id }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: null }),
+    });
+    expect(second.status).toBe(400);
+    expect((await second.json<{ error: { code: string } }>()).error.code).toBe('MILESTONE_NOT_IN_PROJECT');
+
+    const after = await readCard(t, b, id);
+    expect(after.projectId).toBe(project.id);
+    expect(after.milestoneId).toBe(milestone.id);
+  });
+});
+
+/**
+ * `GET /v1/projects/:id/rollup` (Task 19) — the one route in this module that fans out to every
+ * board's Durable Object (`computeRollup`, `db/projects.ts`) and the one that serves the staleness
+ * contract (`partial`/`boardsUnanswered`/`computedAt`) to a caller. Had no test at all until this
+ * block: a regression that dropped `partial` from the cached row's mapping would have passed every
+ * other test in the suite while serving a confident-looking row the computation itself knew was
+ * incomplete.
+ */
+describe('GET /v1/projects/:id/rollup', () => {
+  it('reuses the cached row inside 60s — a cache HIT returns the SAME computedAt, not merely a recent one', async () => {
+    const t = 'tnt_prj_rest_rollupcache';
+    await insertTenant(t, 'prj-rest-rollupcache');
+    const made = await createProject(t, { name: 'cached' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const b = await board(t);
+    const id = await card(t, b, 'One');
+    await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id }),
+    });
+
+    const first = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    expect(first.status).toBe(200);
+    const { rollup: r1 } = await first.json<{ rollup: { computedAt: string; cardsTotal: number } }>();
+    expect(r1.cardsTotal).toBe(1);
+
+    const second = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    const { rollup: r2 } = await second.json<{ rollup: { computedAt: string } }>();
+    // Not "close to r1.computedAt" — the SAME value. A second request that recomputed anyway would
+    // still read as "recent" but would not be serving the cache the 60s window exists to provide.
+    expect(r2.computedAt).toBe(r1.computedAt);
+  });
+
+  it('recomputes to a strictly newer computedAt once the cached row is older than 60s', async () => {
+    const t = 'tnt_prj_rest_rollupstale';
+    await insertTenant(t, 'prj-rest-rollupstale');
+    const made = await createProject(t, { name: 'stale' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const b = await board(t);
+    const id = await card(t, b, 'One');
+    await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id }),
+    });
+
+    const first = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    const { rollup: r1 } = await first.json<{ rollup: { computedAt: string } }>();
+
+    // Backdated directly in D1 rather than waiting 61 real seconds.
+    const backdated = new Date(Date.now() - 61_000).toISOString();
+    await env.DB.prepare(`UPDATE project_rollups SET computed_at = ? WHERE project_id = ?`).bind(backdated, project.id).run();
+
+    const second = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    const { rollup: r2 } = await second.json<{ rollup: { computedAt: string } }>();
+    expect(r2.computedAt).not.toBe(r1.computedAt);
+    expect(new Date(r2.computedAt).getTime()).toBeGreaterThan(new Date(backdated).getTime());
+  });
+
+  it('partial and boardsUnanswered survive the cache round trip, not just the fresh computation', async () => {
+    const t = 'tnt_prj_rest_rolluppartial';
+    await insertTenant(t, 'prj-rest-rolluppartial');
+    const made = await createProject(t, { name: 'partial' });
+    const { project } = await made.json<{ project: { id: string } }>();
+    const b = await board(t);
+    const id = await card(t, b, 'One');
+    await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ projectId: project.id }),
+    });
+    // A catalog row whose Durable Object was never initialized — `projectSummary` can't answer it.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_rollup_ghost', ?, 'ghost', '[]')`,
+    )
+      .bind(t)
+      .run();
+
+    const first = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    const { rollup: r1 } = await first.json<{ rollup: { partial: boolean; boardsUnanswered: number; computedAt: string } }>();
+    expect(r1.partial).toBe(true);
+    expect(r1.boardsUnanswered).toBe(1);
+
+    // A SECOND read, inside the 60s window, must come from the cached row rather than a fresh
+    // computation — proven the same way as the cache-hit test above, by the identical computedAt —
+    // and the partial admission must survive that exact round trip through the row mapping.
+    const second = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(t) });
+    const { rollup: r2 } = await second.json<{ rollup: { partial: boolean; boardsUnanswered: number; computedAt: string } }>();
+    expect(r2.computedAt).toBe(r1.computedAt);
+    expect(r2.partial).toBe(true);
+    expect(r2.boardsUnanswered).toBe(1);
+  });
+
+  it('404s a rollup request for another tenant\'s project, rather than a cross-tenant read', async () => {
+    const owner = 'tnt_prj_rest_rolluptenant';
+    const stranger = 'tnt_prj_rest_rolluptenant_stranger';
+    await insertTenant(owner, 'prj-rest-rolluptenant');
+    await insertTenant(stranger, 'prj-rest-rolluptenant-stranger');
+    const made = await createProject(owner, { name: 'owners rollup' });
+    const { project } = await made.json<{ project: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, { headers: dev(stranger) });
+    expect(res.status).toBe(404);
+  });
+
+  it('holds the read-role gate: a caller who is not a member of the workspace is refused', async () => {
+    const t = 'tnt_prj_rest_rolluprole';
+    await insertTenant(t, 'prj-rest-rolluprole');
+    // A real membership, so the dev-header fallback (`resolveUser`) stops granting 'owner' to
+    // anyone who merely names the tenant — once a workspace has members, the header must name one
+    // of them. 'usr_dev' (the default `dev()` identity every other helper in this file relies on)
+    // is made a member here so `createProject`/`board`/`card` keep working unmodified.
+    await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email) VALUES ('usr_dev', 'rolluprole-dev@test.dev')`).run();
+    await env.DB.prepare(
+      `INSERT INTO memberships (id, tenant_id, user_id, role) VALUES ('mbr_rolluprole_dev', ?, 'usr_dev', 'owner')`,
+    )
+      .bind(t)
+      .run();
+    const made = await createProject(t, { name: 'gated' });
+    const { project } = await made.json<{ project: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/projects/${project.id}/rollup`, {
+      headers: { 'X-Tenant-Id': t, 'X-User-Id': 'usr_rollup_stranger' },
+    });
+    expect(res.status).toBe(403);
+  });
 });

@@ -1440,6 +1440,13 @@ export class BoardDO extends DurableObject<Env> {
      * `PATCH /cards/:id`'s `dueAt`), so this DO trusts a bare `YYYY-MM-DD` string.
      */
     dueAt?: string;
+    /**
+     * NOT part of the public `createCard` surface (`BoardStub`'s own `createCard` doesn't carry
+     * it) — `createChildCard` is the one internal caller, passing the parent's `projectId` along
+     * (see that method's comment). A generic `POST /cards` taking `projectId` directly is Task
+     * 21's, parked deliberately rather than added here.
+     */
+    projectId?: string | null;
   }): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
@@ -1451,8 +1458,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant, due_at)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant, due_at, project_id)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
       JSON.stringify((this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(input.spec) : input.spec) ?? {}),
@@ -1467,6 +1474,7 @@ export class BoardDO extends DurableObject<Env> {
       input.ownerUserId,
       input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
       input.dueAt ?? null,
+      input.projectId ?? null,
     );
     const card = this.mustGetCard(id);
     this.emit('card.created', { card });
@@ -1482,8 +1490,15 @@ export class BoardDO extends DurableObject<Env> {
    * Inherits `priority` (unless the caller overrides it) because a sub-task of an urgent card is
    * itself urgent. Deliberately does NOT inherit `labels` or `dueAt`: a label describes what a card
    * IS, not what its parent is, and a sub-task's own deadline is not its parent's — Linear inherits
-   * neither either. `project_id`/`milestone_id` are not inherited because this board model has no
-   * such columns to inherit from.
+   * neither either.
+   *
+   * `projectId` IS inherited (Task 19 follow-up): a sub-task is part of the same body of work as
+   * its parent, so the project follows — without this, decomposing a card would silently shrink
+   * the project it belongs to, under-counting both `cardsTotal` and `costUsd` in the rollup, which
+   * is exactly the "silently under-counting a project's cost" failure `overBudget` exists to
+   * prevent elsewhere. `milestoneId` is deliberately left null, NOT inherited: a milestone is a
+   * narrower, dated commitment the PARENT made, and silently enrolling a brand-new child into it
+   * would let decomposition inflate a milestone nobody re-committed to.
    *
    * ALSO inherits `queuedGrant` — not optional, not overridable by the caller. The parent's grant
    * IS the authority under which this work exists, the same reasoning `moveCard` already applies
@@ -1510,6 +1525,7 @@ export class BoardDO extends DurableObject<Env> {
       spec: input.spec,
       priority: input.priority ?? parent.priority,
       queuedGrant: parent.queuedGrant,
+      projectId: parent.projectId,
     });
     if (!created.ok) return created;
     const linked = await this.addLink({ fromCardId: parentCardId, toCardId: created.value.id, kind: 'parent' });

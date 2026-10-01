@@ -379,17 +379,26 @@ export async function computeRollup(
       // `{ ok: false }` (a board whose DO was never initialized) and a genuinely thrown error
       // (anything else — a transient failure, a bug) are the same fact from this fan-out's point
       // of view: one board did not answer. Both land here as "unanswered", never as a thrown
-      // exception that would abort the whole rollup.
+      // exception that would abort the whole rollup — but LOGGED, with which board and why. The
+      // collapse into "unanswered" is the right abstraction for `partial`/`boardsUnanswered`; the
+      // silence under it is not — a real failure here would otherwise be an anonymous count with
+      // no trace, the exact failure mode `scheduled()`'s own sweep arm (`index.ts`, one file over)
+      // is already written about: "a board failing every five-minute tick, forever, left no trace
+      // anywhere."
       if (!result.ok) {
         boardsUnanswered += 1;
+        console.error(
+          `computeRollup: board ${board.id} did not answer for project ${projectId} (${result.code}): ${result.message}`,
+        );
         continue;
       }
       cardsTotal += result.value.total;
       cardsDone += result.value.done;
       cardsOverdue += result.value.overdue;
       costUsd += result.value.costUsd;
-    } catch {
+    } catch (err) {
       boardsUnanswered += 1;
+      console.error(`computeRollup: board ${board.id} threw for project ${projectId}`, err);
     }
   }
 

@@ -1697,30 +1697,40 @@ export default {
           }
         }
         // Milestones are in D1; the DO cannot check that a milestone belongs to the project it is
-        // about to be attached under, so the route does — the same shape `labels` just took above.
-        // Unlike labels, this is a RELATIONSHIP check, not an existence check: a `projectId` that
-        // no longer resolves is a normal state here (see the long comment on `deleteProject` in
+        // attached under, so the route does — the same shape `labels` just took above. Unlike
+        // labels, this is a RELATIONSHIP check, not an existence check: a `projectId` that no
+        // longer resolves is a normal state here (see the long comment on `deleteProject` in
         // `db/projects.ts`), and nothing above refuses it. A `milestoneId`, though, is only ever
-        // meaningful alongside the project it was created under, so the route refuses the one
-        // combination the DO has no way to catch — a milestone from a DIFFERENT project.
-        if (body.milestoneId !== undefined && body.milestoneId !== null) {
+        // meaningful alongside the project it was created under.
+        //
+        // Checked whenever EITHER half of the pair could change, not only when `milestoneId` is in
+        // the body — `PATCH { projectId: B }` on a card carrying `{ projectId: A, milestoneId: mA
+        // }` changes the pair just as much as sending `milestoneId` would, and silently leaving
+        // `mA` (project A's milestone) attached to a card now in project B is the same invariant
+        // violation. Refused, not silently cleared: clearing would discard a commitment the caller
+        // never asked to drop.
+        if (body.milestoneId !== undefined || body.projectId !== undefined) {
+          let effectiveMilestoneId = body.milestoneId;
           let effectiveProjectId = body.projectId;
-          if (effectiveProjectId === undefined) {
+          if (effectiveMilestoneId === undefined || effectiveProjectId === undefined) {
             const current = await stub.getCardView(cardMatch[1]!);
             if (!current.ok) return Response.json({ error: current }, { status: statusForCode(current.code) });
-            effectiveProjectId = current.value.projectId;
+            if (effectiveMilestoneId === undefined) effectiveMilestoneId = current.value.milestoneId;
+            if (effectiveProjectId === undefined) effectiveProjectId = current.value.projectId;
           }
-          const milestone = effectiveProjectId ? await milestoneById(env.DB, tenantId, body.milestoneId) : null;
-          if (!milestone || milestone.projectId !== effectiveProjectId) {
-            return Response.json(
-              {
-                error: {
-                  code: 'MILESTONE_NOT_IN_PROJECT',
-                  message: "milestoneId does not belong to the card's project",
+          if (effectiveMilestoneId) {
+            const milestone = effectiveProjectId ? await milestoneById(env.DB, tenantId, effectiveMilestoneId) : null;
+            if (!milestone || milestone.projectId !== effectiveProjectId) {
+              return Response.json(
+                {
+                  error: {
+                    code: 'MILESTONE_NOT_IN_PROJECT',
+                    message: "milestoneId does not belong to the card's project",
+                  },
                 },
-              },
-              { status: 400 },
-            );
+                { status: 400 },
+              );
+            }
           }
         }
         const result = await stub.updateCard(cardMatch[1]!, body);

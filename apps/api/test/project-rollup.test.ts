@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { BoardDO, type BoardInit } from '../src/board/board-do';
 import { createProject, computeRollup } from '../src/db/projects';
 
@@ -14,19 +14,17 @@ const STAGES: BoardInit['stages'] = [
 // and reading have to agree on that same address or the rollup would silently sum a board nobody
 // seeded. Same convention `agent-run-identity.test.ts`/`control-pair-claim.test.ts` use for the
 // same reason.
-function stubFor(name: string): DurableObjectStub<BoardDO> {
-  return env.BOARD_DO.get(env.BOARD_DO.idFromName(`tnt_r:brd_${name}`)) as unknown as DurableObjectStub<BoardDO>;
+function stubFor(name: string, tenantId = 'tnt_r'): DurableObjectStub<BoardDO> {
+  return env.BOARD_DO.get(env.BOARD_DO.idFromName(`${tenantId}:brd_${name}`)) as unknown as DurableObjectStub<BoardDO>;
 }
 
 /** Register a board in the catalog so `listAllBoards` finds it, then seed it into the project. */
-async function seedBoard(name: string, projectId: string, titles: string[]): Promise<void> {
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES (?, 'tnt_r', ?, '[]')`,
-  )
-    .bind(`brd_${name}`, name)
+async function seedBoard(name: string, projectId: string, titles: string[], tenantId = 'tnt_r'): Promise<void> {
+  await env.DB.prepare(`INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES (?, ?, ?, '[]')`)
+    .bind(`brd_${name}`, tenantId, name)
     .run();
-  await runInDurableObject(stubFor(name), async (board: BoardDO) => {
-    await board.init({ id: `brd_${name}`, tenantId: 'tnt_r', name, stages: STAGES });
+  await runInDurableObject(stubFor(name, tenantId), async (board: BoardDO) => {
+    await board.init({ id: `brd_${name}`, tenantId, name, stages: STAGES });
     for (const title of titles) {
       const c = await board.createCard({ title, ownerUserId: 'usr_a' });
       if (!c.ok) throw new Error(c.message);
@@ -35,8 +33,18 @@ async function seedBoard(name: string, projectId: string, titles: string[]): Pro
   });
 }
 
+// A SEPARATE tenant for the two tests that deliberately register a catalog row for a board whose
+// DO is never initialized (`brd_ghost*`). Durable, not merely ordered: the first draft of this
+// file put that board under `tnt_r` and relied on test declaration order (placed last) to keep it
+// from poisoning every earlier `partial: false` assertion — real D1 storage in this suite is
+// isolated per test FILE, not per test, so any `tnt_r` test appended later would silently inherit
+// `partial: true` for a reason that has nothing to do with what it's checking. A dedicated tenant
+// removes the ordering requirement entirely, rather than documenting it.
+const GHOST_TENANT = 'tnt_r_ghost';
+
 beforeAll(async () => {
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES ('tnt_r', 'rollup', 'Rollup')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, 'rollup-ghost', 'Rollup Ghost')`).bind(GHOST_TENANT).run();
 });
 
 describe('project rollup', () => {
@@ -97,11 +105,6 @@ describe('project rollup', () => {
     // exactly the failure this test exists to catch: the other tenant's cards carry the SAME
     // project id as this tenant's project, so nothing but the tenant filter can tell them apart.
     //
-    // Placed before the "survives one board failing" test below on purpose: that test registers a
-    // catalog row for a board whose DO is never initialized (`brd_ghost`, under `tnt_r`), and D1
-    // storage in this suite is isolated per FILE, not per test — once that row exists it would make
-    // every later `computeRollup(..., 'tnt_r', ...)` call in this file `partial: true`, including
-    // this one, for a reason that has nothing to do with what THIS test is checking.
     const other = 'tnt_r_leak';
     await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, ?)`).bind(other, 'rollup-leak', 'Rollup Leak').run();
 
@@ -154,18 +157,50 @@ describe('project rollup', () => {
   });
 
   it('survives one board failing to answer, and says the rollup is partial', async () => {
-    const p = await createProject(env.DB, 'tnt_r', { name: 'partial' });
-    await seedBoard('rollE', p.id, ['One']);
-    // A catalog row whose Durable Object was never initialised: `projectSummary` throws on it.
+    const p = await createProject(env.DB, GHOST_TENANT, { name: 'partial' });
+    await seedBoard('rollE', p.id, ['One'], GHOST_TENANT);
+    // A catalog row whose Durable Object was never initialised: `projectSummary` answers
+    // `{ ok: false, code: 'NOT_INITIALIZED' }` on it (a `Result`, not a thrown exception — see
+    // `projectSummary`'s own comment in board-do.ts for why).
     await env.DB.prepare(
-      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json)
-         VALUES ('brd_ghost', 'tnt_r', 'ghost', '[]')`,
-    ).run();
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_ghost', ?, 'ghost', '[]')`,
+    )
+      .bind(GHOST_TENANT)
+      .run();
 
-    const r = await computeRollup(env.DB, env, 'tnt_r', p.id);
+    const r = await computeRollup(env.DB, env, GHOST_TENANT, p.id);
     // It must NOT throw, and must NOT report a confident total.
     expect(r.partial).toBe(true);
     expect(r.boardsUnanswered).toBe(1);
     expect(r.cardsTotal).toBe(1);
+  });
+
+  it('logs the board id and reason when a board does not answer, rather than an anonymous count', async () => {
+    // `boardsUnanswered` collapsing `{ ok: false }` and a genuine throw into "one board did not
+    // answer" is the right abstraction (nothing downstream needs to tell them apart) — but a real
+    // failure with no trace anywhere is exactly the failure mode `scheduled()`'s own sweep arm
+    // comment (`index.ts`) already names. This asserts the trace exists, not just the count.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const p = await createProject(env.DB, GHOST_TENANT, { name: 'logged' });
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_ghost_logged', ?, 'ghost-logged', '[]')`,
+      )
+        .bind(GHOST_TENANT)
+        .run();
+
+      await computeRollup(env.DB, env, GHOST_TENANT, p.id);
+
+      // Not `toHaveBeenCalledTimes(1)` — `GHOST_TENANT`'s catalog also carries `brd_ghost` from
+      // the test above (same tenant, and D1 storage here is isolated per FILE, not per test), so
+      // this project's own walk logs that board too. Asserted by content instead: THIS board's
+      // failure left a trace naming it and why, regardless of how many others also failed.
+      const logged = spy.mock.calls.some(
+        ([message]) => String(message).includes('brd_ghost_logged') && String(message).includes('NOT_INITIALIZED'),
+      );
+      expect(logged).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

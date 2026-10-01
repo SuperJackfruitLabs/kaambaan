@@ -31,6 +31,19 @@ describe('splitCard', () => {
     });
   });
 
+  it('inherits the parent\'s projectId on every split child (Task 19 follow-up)', async () => {
+    await runInDurableObject(stubFor('split-project'), async (board: BoardDO) => {
+      const parentId = await parentOn(board, 'splitproject');
+      const withProject = await board.updateCard(parentId, { projectId: 'prj_split' });
+      if (!withProject.ok) throw new Error(withProject.message);
+
+      const r = await board.splitCard(parentId, ['One', 'Two'], 'usr_a');
+      if (!r.ok) throw new Error(r.message);
+      expect(r.value.children.every((c) => c.projectId === 'prj_split')).toBe(true);
+      expect(r.value.children.every((c) => c.milestoneId === null)).toBe(true);
+    });
+  });
+
   it('strips markdown checkbox syntax, so "- [ ] Foo" becomes "Foo"', async () => {
     await runInDurableObject(stubFor('split-md'), async (board: BoardDO) => {
       const parentId = await parentOn(board, 'splitmd');
