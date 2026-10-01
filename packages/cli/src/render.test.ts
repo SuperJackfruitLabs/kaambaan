@@ -7,7 +7,7 @@
  * something a person can read, and hold the JSON to being reachable on demand.
  */
 import { describe, expect, it } from "vitest";
-import { renderBoards, renderBoard, renderGates, renderLog } from "./render";
+import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render";
 
 describe("boards", () => {
   it("lists a board's id beside its name", () => {
@@ -70,6 +70,46 @@ describe("gates", () => {
 
   it("says nothing is waiting rather than printing a header over emptiness", () => {
     expect(renderGates({ gates: [] }).toLowerCase()).toMatch(/no gates|nothing/);
+  });
+});
+
+describe("projects", () => {
+  it("lists a project's id, state and health beside its name", () => {
+    const text = renderProjects({ projects: [{ id: "prj_1", name: "Launch", state: "active", health: "at-risk" }] });
+    expect(text).toContain("Launch");
+    expect(text).toContain("prj_1");
+    expect(text).toContain("active");
+    expect(text).toContain("at-risk");
+  });
+
+  it("says so plainly when there are none", () => {
+    expect(renderProjects({ projects: [] }).toLowerCase()).toContain("no projects");
+  });
+});
+
+describe("a project", () => {
+  it("shows the project's own fields and its milestones, in the order the server sent them", () => {
+    const text = renderProject({
+      project: { id: "prj_1", name: "Launch", state: "active", health: "on-track", targetDate: "2026-12-01" },
+      milestones: [
+        { id: "mil_2", name: "Beta", targetDate: "2026-11-01" },
+        { id: "mil_1", name: "Alpha", targetDate: "2026-10-01" },
+      ],
+    });
+    expect(text).toContain("Launch");
+    expect(text).toContain("prj_1");
+    expect(text).toContain("active");
+    expect(text).toContain("on-track");
+    expect(text).toContain("2026-12-01");
+    // Server order (Beta before Alpha here) is NOT re-sorted by the renderer.
+    expect(text.indexOf("Beta")).toBeLessThan(text.indexOf("Alpha"));
+    expect(text).toContain("mil_1");
+    expect(text).toContain("mil_2");
+  });
+
+  it("says so plainly when a project has no milestones", () => {
+    const text = renderProject({ project: { id: "prj_1", name: "Launch", state: "active" }, milestones: [] });
+    expect(text.toLowerCase()).toContain("no milestones");
   });
 });
 

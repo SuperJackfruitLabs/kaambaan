@@ -46,6 +46,24 @@ Card ──< Task (one per stage / rework, A2A-immutable) ──< Run (one per a
 
 ## Entities
 
+> **A standing rule, discovered three times.** A foreign key proves a row **exists**. It never
+> proves the row is **yours**. `addExternalLink` needed an explicit tenant-ownership check because a
+> cross-tenant board id satisfies the FK — the row exists, just under a different tenant
+> (`apps/api/src/db/card-links-external.ts`). `createMilestone` needed the same for a cross-tenant
+> project id (`apps/api/src/db/projects.ts`). And the read path for advisory link titles
+> (`getOtherCardTitle`, `apps/api/src/index.ts`) needed it again — resolving a title for a board
+> outside the tenant would disclose more than the `404` the write-side guard already answers with.
+> Three separate tasks found this independently; every D1 read and write that answers a tenant's
+> request starts `tenant_id = ?` first, and this is why. The exceptions are deliberate, global
+> walks, not oversights: `listAllBoards` (`db/catalog.ts`) and `listAllProjects`
+> (`db/projects.ts`) scan every tenant in the deployment, for the cron sweep and the rollup fan-out
+> respectively — which is exactly why `computeRollup` (`db/projects.ts`) filters the boards
+> `listAllBoards` returns down to the caller's tenant **before** touching a single board stub. That
+> filter is the single most load-bearing line in the Project rollup: without it, `listAllBoards`'s
+> lack of a `tenant_id = ?` would leak another tenant's cards into the total. See
+> [13 §7](./13-linear-parity-program.md#7-parked-findings-from-implementation-2026-09-30-planning-constructs-and-recurrence)
+> for the reviews that found it.
+
 ### Tenant *(a.k.a. Workspace)*
 superpipeline's **local hard isolation boundary** — and only that. All data, auth, and agent
 registrations are scoped to exactly one tenant. Fields: `id`, `slug`, `name`, `createdAt`,
@@ -162,6 +180,8 @@ The durable unit of work. Fields:
 - `references[]` — external links (see below)
 - `dueAt` — a due date (`YYYY-MM-DD`), or `null`; feeds claim order (behind priority) and the
   overdue cron sweep
+- `projectId`, `milestoneId` — the Project/Milestone this card belongs to, or `null`; read straight
+  off the row, never validated for existence (see Project/Milestone below)
 - timestamps, `archivedAt`
 
 ### Task *(A2A-aligned)* — **⚠️ not implemented**
@@ -241,6 +261,70 @@ attachments. Fields: `id`, `cardId`, `url` (**dedup key** within a card), `title
 (`synced | stale | error`), `lastSyncedAt`. Upsert is idempotent on `(cardId, url)`. Detailed
 in [06 — External References](./06-external-references.md).
 
+### Label
+A reusable, named tag in the tenant's label catalogue (D1, migration 0010). Fields: `id` (`lbl_`),
+`tenantId`, `name`, `colour`, `origin` (`declared` — created deliberately, e.g. via the label
+manager UI; `inferred` — typed into a card's Labels field and registered on the spot), `createdAt`.
+A card carries labels as an array of label **ids** (`Card.labels`), not names, so renaming a label
+never orphans a card that already carries it. There are no label *groups* — Linear's grouped-label
+hierarchy has no superpipeline equivalent.
+
+### CardLink *(dependency / relation edge)*
+A typed edge between two cards: `blocks`, `relates`, or `parent`.
+
+- **Same-board edges are enforced.** They live in the board Durable Object's `card_links` table —
+  a `blocks` edge refuses claim/advance on the blocked card until the blocker **resolves**
+  (`completed` or `canceled` — see [Card Lifecycle](./03-card-lifecycle.md)), and a `parent` edge
+  refuses the parent's advance while any child is open. Adding a `blocks`/`parent` edge that would
+  close a cycle is refused (`wouldCycle`); `relates` is pure decoration and cannot cycle.
+- **Cross-board edges are advisory, always.** `blocks`/`relates` only — `parent` is refused outright
+  ("an advisory containment relationship is one that fails to contain"; use a Project to group
+  cards across boards instead). Stored in D1's `card_links_external`, never in a board DO, because
+  the two ends live in two different Durable Objects and any enforcement would rest on a cross-DO
+  read that is stale the instant it returns.
+- **The advisory `⚑` badge renders in the card drawer's Links section, not on the board tile.** The
+  board-list read does not carry external links, and showing the badge on the tile would mean a
+  cross-board read on the board-list path. Confirmed live. That is a deliberate cost, not an
+  omission — stated here because nowhere else says *where* the badge lives, only what it means.
+
+A `CardLink` has no standalone id; it is identified by `(fromCardId, toCardId, kind)`.
+
+### Schedule *(recurring card declaration)*
+A board-level declaration that mints a new card on a cadence. Fields: `id` (`sch_`), `enabled`,
+`title`, `spec`, `priority`, `labels`, `stageKey`, `rule`, `timezone`, `overlap` (`skip | allow`),
+`nextFireAt`, `lastFiredAt`, `lastCardId`, `skipCount`, `createdBy`.
+
+`rule` is a **restricted grammar, not cron** — `every <n> minutes|hours|days`, `daily at HH:MM`,
+`weekly on <mon-sun> at HH:MM`, `monthly on <1-28> at HH:MM` (29–31 are refused outright rather than
+clamped, so the rule means the same thing in every month). The shortest interval is 5 minutes,
+matching the sweep. `timezone` is an **IANA** zone name, validated by construction
+(`new Intl.DateTimeFormat` either accepts it or throws) and stored/echoed exactly as typed, never
+canonicalised to a runtime-preferred spelling. Schedules fire from `sweepBoard`, which rides the
+**Worker's 5-minute cron**, not a per-board Durable Object alarm.
+
+### Project
+A tenant-level grouping of cards that spans boards, living in D1 — never a board DO, because
+nothing about a project may ever refuse a claim or an advance. Fields: `id` (`prj_`), `tenantId`,
+`name`, `description`, `targetDate`, `state` (`planned | active | paused | completed | canceled`),
+`health` (`on-track | at-risk | off-track`, nullable), `leadUserId`, timestamps. A card joins a
+project via `Card.projectId` (nullable; droppable like a stale label id if the project is later
+deleted — `DELETE /v1/projects/:id` deletes unconditionally, and a card sitting in a board DO has no
+way to be told its project just vanished).
+
+**Project rollup.** `GET /v1/projects/:id/rollup` fans out to every board that might carry the
+project's cards and sums `cardsTotal`, `cardsDone`, `cardsOverdue`, `costUsd`, cached in D1 for up
+to 60 seconds with a `computedAt` ("as of") timestamp. It **marks itself `partial`** (and records
+`boardsUnanswered`) whenever one or more boards fail to answer, rather than returning a confidently
+wrong total. A background cron refreshes every project's rollup on the same 5-minute tick as the
+board sweep, so a reader usually finds the cache already warm.
+
+### Milestone
+An ordered checkpoint inside one Project. Fields: `id` (`mls_`), `projectId`, `tenantId`, `name`,
+`targetDate`, `sortOrder`, `createdAt`. A card's `milestoneId` must belong to the same project as
+the card's own `projectId` — checked whenever either half of the pair could change, and **refused**
+rather than silently cleared, because clearing would discard a commitment the caller never asked to
+drop (`MILESTONE_NOT_IN_PROJECT`, 400).
+
 ### Event
 The append-only audit + realtime feed for a board. Every meaningful change (card created,
 stage advanced, agent claimed, activity emitted, gate resolved, reference added) is an Event.
@@ -265,6 +349,11 @@ Events drive the WebSocket broadcast to UI clients and the webhook dispatch to s
 | **Signal** | Typed overlay on an activity (stop/auth/select/approve/reject) |
 | **Gate** | Human-approval pause; a Task in `input-required` |
 | **Reference** | First-class external link (GitHub issue/PR, repo, doc) |
+| **Label** | A reusable named tag in the tenant's label catalogue (D1); a card carries label ids, not names. `origin` is `declared` or `inferred` |
+| **CardLink** | A typed edge (`blocks`/`relates`/`parent`) between two cards. Same-board: enforced, in the board DO. Cross-board: advisory only, in D1 — shown, never enforced |
+| **Schedule** | A board-level declaration that mints a new card on a cadence; a restricted rule grammar (not cron), an IANA timezone, fired by the Worker's 5-minute cron |
+| **Project** | A tenant-level, D1-held grouping of cards that spans boards; purely informational, never on a claim/advance path |
+| **Milestone** | An ordered checkpoint inside one Project; a card's milestone must belong to the card's own project |
 | **AgentCard** | A2A capability/discovery document for an agent |
 | **Seat** | What an account may do inside one plane — superpipeline's `memberships.role`. Local, never unified with another plane's, never inferred from a post |
 | **Post** | What a principal is *for*: duties, required capabilities, authority, how it is judged. The Organization plane's Role. **Does not exist yet** |

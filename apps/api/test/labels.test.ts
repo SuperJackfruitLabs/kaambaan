@@ -42,6 +42,25 @@ describe('label catalogue', () => {
       'lbl_deadbeefdeadbeef',
     ]);
   });
+
+  // The GET /v1/labels envelope and `LabelManager.svelte` both read `origin` straight off
+  // `listLabels`'s rows (and `createLabel`'s own return) — migration 0011 added the COLUMN, but
+  // `COLUMNS` (this file) never selected it and `LabelRecord` never declared it, so an operator
+  // had no way to see which labels were `inferred` from a typo (the exact gap `labels.test.ts`'s
+  // "registers a newly created name as inferred…" test below already proves via a RAW SQL query —
+  // this proves the same fact through the PUBLIC functions a caller actually uses).
+  it('surfaces origin on createLabel\'s own return and on every row listLabels answers', async () => {
+    const t = 'tnt_lbl_origin_public';
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, 'lbl-origin-public', 'OriginPublic')`).bind(t).run();
+
+    const declared = await createLabel(env.DB, t, { name: 'declared-one', colour: '#f00' });
+    expect(declared.origin).toBe('declared');
+
+    await resolveLabelNames(env.DB, t, ['inferred-one'], 'usr_a');
+    const rows = await listLabels(env.DB, t);
+    expect(rows.find((l) => l.name === 'declared-one')?.origin).toBe('declared');
+    expect(rows.find((l) => l.name === 'inferred-one')?.origin).toBe('inferred');
+  });
 });
 
 describe('resolveLabelNames — the drawer input resolved against the catalogue', () => {

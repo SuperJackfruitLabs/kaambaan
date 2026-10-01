@@ -3720,6 +3720,18 @@ Guarded ALTERs for `project_id TEXT` and `milestone_id TEXT`, both into `CardVie
 
 - [ ] **Step 2: Validation, in the route**
 
+**A contract Task 18 set, which this task must honour.** `DELETE /v1/projects/:id` deletes
+unconditionally and accepts that cards in other boards keep a `project_id` pointing at a project that no
+longer exists — the route cannot reach those Durable Objects, and reaching them would put a cross-DO read
+on a write path, which the whole design forbids. It follows the precedent `deleteLabel` and
+`deleteCapability` already set here.
+
+So **an unresolved `project_id` or `milestone_id` is a normal state, not an error.** Treat it exactly as
+an unknown label id is treated today: dropped from display, never a refusal, never a 500. The rollup must
+skip it rather than fail, and a card carrying a dead project id must still read, claim and advance
+normally. A dangling id that breaks a card read would make deleting a project able to brick work on a
+board the deleter cannot see.
+
 `milestone_id` must belong to the card's `project_id`. The DO cannot check it; the route can, the same shape as Task 4's label check. Refuse with `MILESTONE_NOT_IN_PROJECT`.
 
 - [ ] **Step 3: Tests for the rollup**
@@ -3735,7 +3747,14 @@ const STAGES: BoardInit['stages'] = [
 ];
 
 function stubFor(name: string): DurableObjectStub<BoardDO> {
-  return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
+  // `${tenantId}:${boardId}`, NOT the bare name every other task's helper uses — and this is the one
+  // task where that difference is load-bearing. Those tasks drive the DO directly, so any stable name
+  // works. `computeRollup` reaches boards through the production `boardStub(env, tenantId, boardId)`,
+  // which hashes `${tenantId}:${boardId}`; a bare name addresses a DIFFERENT physical Durable Object,
+  // so the test would seed one object and the rollup would read an empty one — and report 0 rather
+  // than fail, which is the shape of wrong answer this whole task is about. Same reason
+  // `agent-run-identity.test.ts` and `control-pair-claim.test.ts` already hash the pair.
+  return env.BOARD_DO.get(env.BOARD_DO.idFromName(`tnt_r:brd_${name}`)) as unknown as DurableObjectStub<BoardDO>;
 }
 
 /** Register a board in the catalog so `listAllBoards` finds it, then seed it into the project. */
@@ -3848,6 +3867,37 @@ git commit -m "feat(projects): card membership and a cached cross-board rollup t
 - Create: `apps/web/src/lib/components/plan/ProjectView.svelte`, **`apps/web/src/lib/components/workspace/LabelManager.svelte`**
 - Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`, **`apps/web/src/routes/workspace/[tab]/+page.svelte`**
 - Modify: `packages/cli/src/index.ts` — `supi project list|add|show|rm`, `supi milestone add|rm`
+- Modify: **`apps/web/src/lib/api.ts`** — two things that exist nowhere else, and without which Steps 1
+  and 3 cannot be built:
+
+  1. **The `Card` interface gains `projectId: string | null` and `milestoneId: string | null`.** Task 19
+     puts both on `CardView`, so they are already on the wire; no task declares them on the *client*
+     type. Step 3's project filter and milestone picker both read them.
+  2. **Client wrappers for Task 18's project routes**, which have no caller otherwise:
+     `listProjects`, `createProject`, `updateProject`, `deleteProject`, `createMilestone`,
+     `deleteMilestone`, and `getProjectRollup` (Task 19's `GET /v1/projects/:id/rollup`).
+
+     **The envelopes Task 18 shipped, read off `index.ts` rather than guessed** — the brief did not
+     specify them, the implementer followed the existing `/v1/labels` convention, and flagged that this
+     task has to match:
+
+     | route | response |
+     |---|---|
+     | `GET /v1/projects` | `{ projects: [...] }` |
+     | `GET /v1/projects/:id` | `{ project, milestones }` — milestones already in `sortOrder` |
+     | `POST /v1/projects` | `{ project }`, 201 |
+     | `PATCH /v1/projects/:id` | `{ project }` |
+     | `POST /v1/projects/:id/milestones` | `{ milestone }`, 201 |
+     | `DELETE …` | 204, no body |
+
+  **This is the fifth instance of one pattern in this plan**, and it is worth naming so the sixth does
+  not happen: a field or route is built on one side of a phase boundary and its consumer is specified on
+  the other, with nothing owning the join. Task 12's `addLink` reached Task 17 with no HTTP surface;
+  Task 16's advisory store reached 17a with no route; Task 18's projects nearly reached Task 20 the same
+  way; `CardView.blockedBy` had to be invented for a badge that had no data source; and `openChildCount`
+  / `costUsdRollup` / `parentCardId` were on the wire from Task 14 and never declared on the web `Card`,
+  which forced Task 17b outside its own scope to finish. **Before dispatching any task that renders or
+  sends something, name the field or endpoint that carries it — by name, in the brief.**
 
 **Also close two write-surface gaps the same audit found:**
 
@@ -3905,6 +3955,54 @@ The docs are wrong in ways this work has now established. Leaving them wrong is 
 - The Card entity lists `labels` and `archivedAt` — remove the ⚠️ implying they are unimplemented, and delete `currentTaskId` (Task 2 removed it from the contract).
 - Add `Label`, `Project`, `Milestone`, `CardLink` and `Schedule` to the entity list and the glossary.
 - Keep the Task ⚠️ exactly as it is. Task is still unimplemented and that warning is still load-bearing.
+
+- [ ] **Step 2b: Record the three things Phase 3 left parked**
+
+Each was found during Phase 3, judged correctly out of scope at the time, and will otherwise be
+rediscovered by whoever next reads the code:
+
+- **`listLinks` has no `NOT_INITIALIZED` guard**, unlike `addLink`/`removeLink`, so
+  `GET …/cards/:cardId/links` on an uninitialised board answers 200 with an empty list while the write
+  verbs answer 404. Decide: guard it, or document the asymmetry as intended.
+- **`rowToCard` calls `budgetCap('budgetCardUsdCap')` per card, on every board read** — a `SELECT` per
+  card in the hot read path. Pre-existing, unrelated to Phase 3, and cheap to hoist into the `pre` batch
+  that already carries five other values. Found while building a test that would otherwise have been
+  meaningless because of it.
+- **The advisory `⚑` badge appears in the drawer but not on the board tile**, because the board read
+  does not carry external links and showing it there would mean a cross-board read on the board-list
+  path. Confirmed live. The spec's badge table says *what* each badge is and never *where* it lives —
+  say so, because the answer is a deliberate cost and reads like an omission.
+
+- [ ] **Step 2c: Record what Phase 4 parked, and one standing rule it earned three times**
+
+Phase 4's findings, each judged correctly out of scope when found:
+
+- **`computeRollup` throws `D1_ERROR: FOREIGN KEY constraint failed` on a deleted project** — the cache
+  upsert's `project_rollups.project_id REFERENCES projects(id)`. Unreachable today (the route 404s first),
+  so only a delete racing the route's check would 500.
+- **`computeRollup` does not validate its `(tenantId, projectId)` pair**, and the cache row is keyed on
+  `project_id` alone with a mutable `tenant_id`. Defence in depth only; unreachable through both callers.
+- **`cardsTotal`/`cardsDone` count archived cards; `cardsOverdue` does not.** Internally inconsistent.
+  Decide which is right and say so — the inconsistency is the defect, not either answer.
+- **The cron's rollup arm is O(projects × boards-per-tenant) sequential DO calls**, where the other two
+  arms are O(boards). May approach the subrequest ceiling on a large tenant.
+- **`createCard` takes no `projectId` on its public surface**, so a card joins a project in a second round
+  trip — the pattern `createCard`'s own `dueAt` comment argues against. Task 19 added an *internal* field
+  for `createChildCard` and deliberately did not expose it, leaving this open on purpose.
+- **Three more routes spread a cast request body into their callee**: `PUT …/github`,
+  `POST …/push-configs`, `POST /v1/capabilities`. None leaks today, because each callee's accepted fields
+  happen to coincide with the route's declared body type. **That coincidence is the whole risk** — it is
+  exactly how `POST …/cards` broke after sitting harmless for months, the moment `createCard` gained a
+  field. Recommend one standalone PR applying the same whitelist treatment, not folded into a feature phase.
+
+**The standing rule, which three separate tasks discovered independently and none of the docs state:**
+
+> A foreign key proves a row **exists**. It never proves the row is **yours**.
+
+`addExternalLink` needed an explicit tenant-ownership check because a cross-tenant board id satisfies the
+FK (Task 16). `createMilestone` needed the same for a cross-tenant project id (Task 18). And the read path
+for advisory link titles needed it again (Task 17d). Three discoveries of one fact is a sign it belongs in
+`docs/01` beside the entity list, not in three comments.
 
 - [ ] **Step 3: Fix `docs/03`**
 

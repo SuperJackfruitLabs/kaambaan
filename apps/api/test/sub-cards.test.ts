@@ -39,6 +39,26 @@ describe('child cards', () => {
     });
   });
 
+  it('inherits projectId but NOT milestoneId from the parent (Task 19 follow-up)', async () => {
+    // Without this, a split silently drops the child out of its parent's project rollup —
+    // `cardsTotal` AND `costUsd` both under-count, which is exactly the "silently under-counting a
+    // project's cost" failure `overBudget` exists to prevent elsewhere. `milestoneId` stays null: a
+    // milestone is a narrower, dated commitment the PARENT made, and enrolling a new child into it
+    // without anyone re-committing would let decomposition inflate a milestone's scope on its own.
+    await runInDurableObject(stubFor('sub-project'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_sp', tenantId: 'tnt_a', name: 'SP', stages: STAGES });
+      const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a' });
+      if (!p.ok) throw new Error(p.message);
+      const withProject = await board.updateCard(p.value.id, { projectId: 'prj_x', milestoneId: 'mls_x' });
+      if (!withProject.ok) throw new Error(withProject.message);
+
+      const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a' });
+      if (!child.ok) throw new Error(child.message);
+      expect(child.value.projectId).toBe('prj_x');
+      expect(child.value.milestoneId).toBeNull();
+    });
+  });
+
   it('reports the parent’s open child count', async () => {
     await runInDurableObject(stubFor('sub-count'), async (board: BoardDO) => {
       await board.init({ id: 'brd_sc', tenantId: 'tnt_a', name: 'SC', stages: STAGES });

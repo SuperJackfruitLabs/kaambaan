@@ -7,6 +7,7 @@
    * removable chip beside the control: a board must never silently misrepresent what it is showing.
    */
   import { app } from '$lib/stores/app.svelte';
+  import { resolveProjectName } from './project-lookup';
 
   let open = $state(false);
   let el = $state<HTMLDivElement | null>(null);
@@ -16,6 +17,7 @@
   const owners = $derived(app.boardOwners());
   const labelCatalogue = $derived(app.labels);
   const labelById = $derived(app.labelById());
+  const projectCatalogue = $derived(app.projects);
 
   /** One chip per active filter, each knowing how to switch itself off. */
   const active = $derived([
@@ -31,6 +33,20 @@
       clear: () => (app.filters.labels = f.labels.filter((x) => x !== id)),
     })),
     ...(f.showArchived ? [{ key: 'arch', label: 'archived', clear: () => (app.filters.showArchived = false) }] : []),
+    ...(f.projectId
+      ? [
+          {
+            key: `prj:${f.projectId}`,
+            // `resolveProjectName`, not a second `.find`/`.get` here — the single place that
+            // decides what a dangling project id renders as. `CardDrawer` and `ProjectView` both
+            // already route through it; this used to duplicate its exact fallback semantics
+            // instead of calling it, which is the kind of agreement that holds today and silently
+            // drifts later (whole-branch review, Important finding).
+            label: resolveProjectName(f.projectId, projectCatalogue) ?? f.projectId,
+            clear: () => (app.filters.projectId = null),
+          },
+        ]
+      : []),
   ]);
 
   function toggle<T>(list: T[], v: T): T[] {
@@ -59,7 +75,7 @@
     {/each}
     {#if active.length > 1}
       <button
-        onclick={() => (app.filters = { states: [], owners: [], minPriority: null, needsReview: false, live: false, overBudget: false, labels: [], showArchived: false })}
+        onclick={() => (app.filters = { states: [], owners: [], minPriority: null, needsReview: false, live: false, overBudget: false, labels: [], showArchived: false, projectId: null })}
         class="text-muted-foreground hover:text-foreground mono text-[10px] underline underline-offset-2"
         style="min-height:var(--tap)"
       >clear all</button>
@@ -93,6 +109,23 @@
             <button onclick={() => (app.filters.labels = toggle(f.labels, l.id))} aria-pressed={f.labels.includes(l.id)}
               class="mono rounded-[5px] border px-1.5 text-[10px] {f.labels.includes(l.id) ? 'border-marigold text-marigold' : 'border-border text-muted-foreground'}"
               style="min-height:var(--tap)">{l.name}</button>
+          {/each}
+        </div>
+      {/if}
+
+      {#if projectCatalogue.length > 0}
+        <!-- A SINGLE project at a time (unlike labels, which AND together) — a card belongs to at
+             most one project, so "match every selected project" would always show nothing past
+             the first click. -->
+        <div class="eyebrow mt-3 mb-1.5">project</div>
+        <div class="flex flex-wrap gap-1">
+          {#each projectCatalogue as p (p.id)}
+            <button
+              onclick={() => (app.filters.projectId = f.projectId === p.id ? null : p.id)}
+              aria-pressed={f.projectId === p.id}
+              class="mono max-w-full truncate rounded-[5px] border px-1.5 text-[10px] {f.projectId === p.id ? 'border-marigold text-marigold' : 'border-border text-muted-foreground'}"
+              style="min-height:var(--tap)"
+            >{p.name}</button>
           {/each}
         </div>
       {/if}

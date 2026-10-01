@@ -16,6 +16,7 @@
   const TABS = [
     { id: 'agents', label: 'Agents' },
     { id: 'capabilities', label: 'Capabilities' },
+    { id: 'labels', label: 'Labels' },
     { id: 'people', label: 'People' },
     { id: 'connections', label: 'Connections' },
   ];

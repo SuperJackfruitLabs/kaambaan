@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard, unarchiveCard, splitCard } from './api';
+import { setAgentPrincipal, setWorkspaceFleet, getWorkspace, issueAgentToken, revokeAgentToken, getAgents, getHubPrincipals, getBoard, resolveGate, setUnauthorizedHandler, BOARD_TEMPLATES, createCard, listLabels, getSchedules, createSchedule, updateSchedule, deleteSchedule, addLink, removeLink, listLinks, archiveCard, unarchiveCard, splitCard, listProjects, getProject, createProject, updateProject, deleteProject, createMilestone, deleteMilestone, getProjectRollup, type Card } from './api';
 import { capabilityTag } from '@superpipeline/contract';
 import { forgetHubToken } from './hub-token';
 
@@ -20,6 +20,45 @@ function jwtExpiringIn(seconds: number): string {
   const payload = btoa(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + seconds })).replace(/=+$/, '');
   return `header.${payload}.signature`;
 }
+
+/**
+ * `Card` gains `projectId`/`milestoneId` (Task 19's `CardView` fields, never declared on the
+ * client type until now). A compile-time lock: this card literal fails to typecheck if either
+ * field goes missing or is widened away, which is the point — Step 3's filter and picker (20b)
+ * read both directly off `Card`.
+ */
+describe('Card', () => {
+  it('carries projectId and milestoneId, nullable, as a card shape', () => {
+    const card: Card = {
+      id: 'crd_1',
+      title: 'Ship it',
+      ownerUserId: 'u1',
+      currentStageKey: 'todo',
+      state: 'queued',
+      priority: 0,
+      costUsd: 0,
+      overBudget: false,
+      attemptCount: 0,
+      labels: [],
+      dueAt: null,
+      archivedAt: null,
+      parentCardId: null,
+      openChildCount: 0,
+      costUsdRollup: 0,
+      blockedBy: [],
+      projectId: null,
+      milestoneId: null,
+    };
+    expect(card.projectId).toBeNull();
+    expect(card.milestoneId).toBeNull();
+
+    // A card bound to a project whose milestone it does NOT carry (not yet assigned one) — proves
+    // the two are independently nullable, not a pair that must both be set or both be null.
+    const bound: Card = { ...card, projectId: 'prj_1', milestoneId: null };
+    expect(bound.projectId).toBe('prj_1');
+    expect(bound.milestoneId).toBeNull();
+  });
+});
 
 describe('setAgentPrincipal', () => {
   it('PATCHes the agent with the principal id', async () => {
@@ -354,10 +393,10 @@ describe('listLabels', () => {
   it('reads the tenant label catalogue', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => new Response(JSON.stringify({ labels: [{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }] }), { status: 200 })),
+      vi.fn(async () => new Response(JSON.stringify({ labels: [{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', origin: 'declared', createdAt: '2026-01-01' }] }), { status: 200 })),
     );
 
-    expect(await listLabels()).toEqual([{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', createdAt: '2026-01-01' }]);
+    expect(await listLabels()).toEqual([{ id: 'lbl_1', tenantId: 't1', name: 'urgent', colour: '#f00', origin: 'declared', createdAt: '2026-01-01' }]);
   });
 
   it('answers an empty list rather than throwing when the read is refused', async () => {
@@ -753,5 +792,160 @@ describe('splitCard', () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { code: string; message: string } };
     expect(body.error.code).toBe('NOTHING_TO_SPLIT');
+  });
+});
+
+/**
+ * Task 18's project routes, and Task 19's rollup — Task 20's client. Envelopes read off
+ * `apps/api/src/index.ts` directly (see the table in `task-20-brief.md`), not guessed: `{
+ * projects }`, `{ project, milestones }`, `{ project }`, `{ milestone }`, 204/no-body deletes, and
+ * the rollup's own `{ rollup }`.
+ */
+describe('listProjects', () => {
+  it('reads the workspace project list', async () => {
+    const project = { id: 'prj_1', tenantId: 't1', name: 'Launch', description: null, targetDate: null, state: 'active', health: null, leadUserId: null, createdAt: '2026-01-01', updatedAt: null };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ projects: [project] }), { status: 200 })));
+
+    expect(await listProjects()).toEqual([project]);
+  });
+
+  it('answers an empty list rather than throwing when the read is refused', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+    expect(await listProjects()).toEqual([]);
+  });
+});
+
+describe('getProject', () => {
+  it('reads one project with its milestones, already in sortOrder', async () => {
+    const project = { id: 'prj_1', tenantId: 't1', name: 'Launch', description: null, targetDate: null, state: 'active', health: null, leadUserId: null, createdAt: '2026-01-01', updatedAt: null };
+    const milestones = [
+      { id: 'mil_2', projectId: 'prj_1', tenantId: 't1', name: 'Beta', targetDate: null, sortOrder: 1, createdAt: '2026-01-02' },
+      { id: 'mil_1', projectId: 'prj_1', tenantId: 't1', name: 'Alpha', targetDate: null, sortOrder: 0, createdAt: '2026-01-01' },
+    ];
+    const fetchSpy = vi.fn(async (url: string) => {
+      expect(url).toBe('/v1/projects/prj_1');
+      return new Response(JSON.stringify({ project, milestones }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    expect(await getProject('prj_1')).toEqual({ project, milestones });
+  });
+
+  it('answers null for a 404 — a stale project id is a normal state, not a thrown error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'project not found' }), { status: 404 })));
+    expect(await getProject('prj_gone')).toBeNull();
+  });
+});
+
+describe('createProject', () => {
+  it('POSTs the project fields to /v1/projects', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ project: {} }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await createProject({ name: 'Launch', targetDate: '2026-12-01' });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/projects');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(init?.body as string)).toEqual({ name: 'Launch', targetDate: '2026-12-01' });
+  });
+
+  it('surfaces the server\'s own name-collision refusal so the form can show it verbatim', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ error: 'a project named "Launch" already exists in this workspace' }), { status: 409 })),
+    );
+
+    const res = await createProject({ name: 'Launch' });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('a project named "Launch" already exists in this workspace');
+  });
+});
+
+describe('updateProject', () => {
+  it('PATCHes only the given fields to the project route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ project: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await updateProject('prj_1', { state: 'paused', health: 'at-risk' });
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/projects/prj_1');
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(init?.body as string)).toEqual({ state: 'paused', health: 'at-risk' });
+  });
+});
+
+describe('deleteProject', () => {
+  it('DELETEs the project', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await deleteProject('prj_1');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/projects/prj_1');
+    expect(init?.method).toBe('DELETE');
+  });
+});
+
+describe('createMilestone', () => {
+  it('POSTs the milestone fields to the project\'s milestones route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ milestone: {} }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await createMilestone('prj_1', { name: 'Beta', sortOrder: 1 });
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/projects/prj_1/milestones');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(init?.body as string)).toEqual({ name: 'Beta', sortOrder: 1 });
+  });
+});
+
+describe('deleteMilestone', () => {
+  it('DELETEs against /v1/milestones/:id, not the project route', async () => {
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await deleteMilestone('mil_1');
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/v1/milestones/mil_1');
+    expect(init?.method).toBe('DELETE');
+  });
+});
+
+/**
+ * Task 19's `GET /v1/projects/:id/rollup`. `partial`/`boardsUnanswered` are asserted explicitly,
+ * not swallowed by a loose `toMatchObject` — dropping them in the wrapper is exactly the failure
+ * mode the brief calls out as fatal to the honesty contract.
+ */
+describe('getProjectRollup', () => {
+  it('reads the rollup, carrying partial and boardsUnanswered through untouched', async () => {
+    const rollup = {
+      projectId: 'prj_1',
+      cardsTotal: 10,
+      cardsDone: 4,
+      cardsOverdue: 1,
+      costUsd: 12.5,
+      computedAt: '2026-10-01T14:32:00.000Z',
+      partial: true,
+      boardsUnanswered: 1,
+    };
+    const fetchSpy = vi.fn(async (url: string) => {
+      expect(url).toBe('/v1/projects/prj_1/rollup');
+      return new Response(JSON.stringify({ rollup }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    expect(await getProjectRollup('prj_1')).toEqual(rollup);
+  });
+
+  it('throws on failure rather than inventing a zeroed or falsely-complete rollup', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })));
+    await expect(getProjectRollup('prj_1')).rejects.toThrow('getProjectRollup failed (500)');
   });
 });

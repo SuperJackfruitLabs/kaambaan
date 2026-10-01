@@ -33,14 +33,16 @@ import {
   type Member,
   listLabels,
   type Label,
+  listProjects,
+  type Project,
 } from '$lib/api';
-import { passesArchivedFilter } from './card-filters';
+import { passesArchivedFilter, passesProjectFilter } from './card-filters';
 
 const BOARD_KEY = 'superpipeline.boardId';
 const THEME_KEY = 'superpipeline.theme';
 
 export type Theme = 'dark' | 'light';
-export type View = 'board' | 'list';
+export type View = 'board' | 'list' | 'projects';
 export type ListGroupBy = 'stage' | 'state' | 'owner' | 'priority';
 export interface CardFilters {
   states: string[];
@@ -53,6 +55,8 @@ export interface CardFilters {
   labels: string[];
   /** Archived cards are hidden by default; this is the one way back in. */
   showArchived: boolean;
+  /** A card matches only when its `projectId` is exactly this one (Task 20, Step 3). `null` = off. */
+  projectId: string | null;
 }
 
 class AppStore {
@@ -98,6 +102,12 @@ class AppStore {
    * card or per render — a tile only ever needs to look an id up in it.
    */
   labels = $state<Label[]>([]);
+  /**
+   * The tenant's project catalogue (Task 18's `migration 0013`) — cross-board, fetched once per
+   * board open the same way `labels` is, so the project filter and `CardDrawer`'s picker only ever
+   * need to look an id up in it rather than fetch per card.
+   */
+  projects = $state<Project[]>([]);
 
   // navigation + view
   theme = $state<Theme>('dark');
@@ -112,6 +122,7 @@ class AppStore {
     overBudget: false,
     labels: [],
     showArchived: false,
+    projectId: null,
   });
 
   // overlays
@@ -157,6 +168,10 @@ class AppStore {
   labelById(): Map<string, { name: string; colour: string }> {
     return new Map(this.labels.map((l) => [l.id, { name: l.name, colour: l.colour }]));
   }
+  /** id → Project, for a filter chip or a card's assignment that only knows the id. */
+  projectById(): Map<string, Project> {
+    return new Map(this.projects.map((p) => [p.id, p]));
+  }
   filteredCards(): Card[] {
     const b = this.board;
     if (!b) return [];
@@ -171,6 +186,7 @@ class AppStore {
       if (f.overBudget && !c.overBudget) return false;
       if (!passesArchivedFilter(f.showArchived, c.archivedAt)) return false;
       if (f.labels.length > 0 && !f.labels.every((l) => c.labels.includes(l))) return false;
+      if (!passesProjectFilter(f.projectId, c.projectId)) return false;
       return true;
     });
   }
@@ -298,10 +314,16 @@ class AppStore {
     await this.loadBoards();
     // Best-effort and independent: a workspace where one read is refused should still resolve the
     // others rather than fall back to ids for everything.
-    const [agents, members, labels] = await Promise.allSettled([getAgents(), getMembers(), listLabels()]);
+    const [agents, members, labels, projects] = await Promise.allSettled([
+      getAgents(),
+      getMembers(),
+      listLabels(),
+      listProjects(),
+    ]);
     this.agents = agents.status === 'fulfilled' ? agents.value : [];
     this.members = members.status === 'fulfilled' ? members.value : [];
     this.labels = labels.status === 'fulfilled' ? labels.value : [];
+    this.projects = projects.status === 'fulfilled' ? projects.value : [];
     this.#connect(id);
   }
 
