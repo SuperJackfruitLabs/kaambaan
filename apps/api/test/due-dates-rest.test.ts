@@ -182,3 +182,31 @@ describe('PATCH /v1/boards/:id/cards/:cardId — archivedAt validation', () => {
     expect((await readCard(t, b, id)).archivedAt).toBeNull();
   });
 });
+
+/**
+ * `PATCH /v1/boards/:id/cards/:cardId` casts its body (`as { title?; spec?; priority?; ... }`),
+ * then forwards it to `stub.updateCard` WHOLE — not built from named fields at all. Non-leaking
+ * today only because the body type happens to be a superset of `updateCard`'s patch type, and
+ * both recently-added fields (`projectId`, `milestoneId`) are separately validated above the
+ * call — but every field the patch type ever gains becomes settable here by default, with no
+ * route-level decision that it should be. This asserts an unexpected body key is ignored rather
+ * than quietly reaching the DO (and, implicitly, that the named-field rewrite does not change the
+ * declared fields' own behaviour).
+ */
+describe('PATCH /v1/boards/:id/cards/:cardId: an unexpected body key does not reach the stored card', () => {
+  it('updates the declared fields and ignores a key outside the patch surface', async () => {
+    const t = 'tnt_due_rest_whitelist';
+    const b = await board(t);
+    const id = await card(t, b, 'Named fields only');
+
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards/${id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ title: 'Renamed', notAPatchField: 'should never reach the DO' }),
+    });
+    expect(res.status).toBe(200);
+    const { card: updated } = (await res.json()) as { card: Record<string, unknown> };
+    expect(updated.title).toBe('Renamed');
+    expect(updated).not.toHaveProperty('notAPatchField');
+  });
+});

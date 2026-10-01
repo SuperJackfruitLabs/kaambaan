@@ -152,3 +152,42 @@ describe('a reference names a provider the registry knows', () => {
     expect(state.status).toBe(200);
   });
 });
+
+/**
+ * `PUT /v1/boards/:id/cards/:cardId/references` cast its body (`as { url; provider?; ... }`),
+ * then built the call as `resolveReferenceInput({ cardId: refMatch[1]!, ...body }, …)` — the path
+ * segment's `cardId` set first, the body spread AFTER it. `resolveReferenceInput` reads `cardId`
+ * off its argument, so a body carrying its own `cardId` won outright: the reference attached to
+ * whatever card the BODY named, not the one the URL named. Scope was limited to a board the
+ * caller could already write to, but the URL should win — a route cannot let its own path be
+ * overridden by the payload it is receiving on that path.
+ */
+describe('REST — PUT .../cards/:cardId/references: the URL, not a body `cardId`, decides which card', () => {
+  it('attaches the reference to the card named in the URL, even when the body names a different one', async () => {
+    const { boardId, cardId: urlCardId } = await seedBoardCard();
+    const other = (await (
+      await SELF.fetch(`${base}/v1/boards/${boardId}/cards`, {
+        method: 'POST',
+        headers: T,
+        body: JSON.stringify({ title: 'Other card', ownerUserId: 'usr_a' }),
+      })
+    ).json()) as { card: { id: string } };
+    const bodyCardId = other.card.id;
+    expect(bodyCardId).not.toBe(urlCardId);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${boardId}/cards/${urlCardId}/references`, {
+      method: 'PUT',
+      headers: T,
+      body: JSON.stringify({ cardId: bodyCardId, url: 'https://example.test/smuggled' }),
+    });
+    expect(res.status).toBe(200);
+    const { reference } = (await res.json()) as { reference: { cardId: string } };
+    expect(reference.cardId).toBe(urlCardId);
+
+    const snap = (await (await SELF.fetch(`${base}/v1/boards/${boardId}`, { headers: T })).json()) as {
+      references: Array<{ cardId: string; url: string }>;
+    };
+    const stored = snap.references.find((r) => r.url === 'https://example.test/smuggled');
+    expect(stored?.cardId).toBe(urlCardId);
+  });
+});

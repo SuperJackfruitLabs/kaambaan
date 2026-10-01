@@ -1913,8 +1913,28 @@ export default {
         // fact, and a board that cached it would keep enriching against a host the workspace had
         // already changed.
         const refTenant = await tenantById(env.DB, tenantId);
+        // Built from named fields rather than `{ cardId, ...body }`: the spread came AFTER the path
+        // segment, and `resolveReferenceInput` reads `cardId` off its argument — so a body carrying
+        // its own `cardId` won outright and the reference attached to a card the URL never named.
+        // The cast above does not even declare `cardId`; it arrived as an extra key, because `as`
+        // strips nothing at runtime. A cast is not validation, so the route has to name what it
+        // accepts rather than forward what it received — the same lesson as the `provider: "web"`
+        // incident this route's comment above already records.
         const result = await stub.addReference(
-          resolveReferenceInput({ cardId: refMatch[1]!, ...body }, refTenant?.forgeHost ?? null),
+          resolveReferenceInput(
+            {
+              cardId: refMatch[1]!,
+              url: body.url,
+              provider: body.provider,
+              sourceType: body.sourceType,
+              title: body.title,
+              subtitle: body.subtitle,
+              externalId: body.externalId,
+              metadata: body.metadata,
+              addedBy: body.addedBy,
+            },
+            refTenant?.forgeHost ?? null,
+          ),
         );
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ reference: result.value });
@@ -2295,7 +2315,19 @@ export default {
         const agentId = request.headers.get('X-Agent-Id');
         if (!agentId || agentId.trim() === '') return Response.json({ error: 'X-Agent-Id required' }, { status: 400 });
         const body = (await request.json()) as { url: string; token: string; capabilities?: string[]; events?: string[] };
-        const result = await stub.registerPushConfig({ agentId, ...body });
+        // Built from named fields rather than `...body`: `agentId` is the caller's own identity,
+        // asserted by the `X-Agent-Id` header above — `as` strips nothing at runtime, so a body
+        // `agentId` would otherwise win over the header for this call (it did, before this fix: a
+        // caller could register the subscription under any agent id it liked while authenticating
+        // as a different one). A cast is not validation, so the route has to name what it accepts
+        // rather than forward what it received.
+        const result = await stub.registerPushConfig({
+          agentId,
+          url: body.url,
+          token: body.token,
+          capabilities: body.capabilities,
+          events: body.events,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
       }

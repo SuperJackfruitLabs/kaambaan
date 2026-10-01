@@ -190,3 +190,26 @@ describe('the OASF mapping — a local capability, also known elsewhere', () => 
     expect(half.status).toBe(500); // ExternalMappingError, surfaced as the shared unexpected shape
   });
 });
+
+/**
+ * `POST /v1/capabilities` casts its body (`as { key?; name?; description?; ... }`), then builds
+ * the call as `{ ...body, key: body.key, createdBy: u.userId }` — the body spread BEFORE the
+ * trusted value, so `createdBy` wins for that field today regardless of what the body sends. Safe
+ * only because `createCapability`'s other accepted fields happen to match the route's declared
+ * body type — a coincidence, not a guarantee. This asserts an unexpected body key (a
+ * caller-supplied `createdBy`) is ignored, not merely that the explicit override already
+ * protects that one field.
+ */
+describe('POST /v1/capabilities: an unexpected body key does not reach the stored record', () => {
+  it("ignores a caller-supplied createdBy, recording the authenticated caller's own id instead", async () => {
+    const t = 'tnt_cap_whitelist';
+    const res = await SELF.fetch('https://api.test/v1/capabilities', {
+      method: 'POST',
+      headers: T(t),
+      body: JSON.stringify({ key: 'impersonation-check', createdBy: 'usr_smuggled_in_body' }),
+    });
+    expect(res.status).toBe(201);
+    const { capability } = (await res.json()) as { capability: { createdBy: string | null } };
+    expect(capability.createdBy).toBe('usr_cap'); // X-User-Id set by T(), never the body's value
+  });
+});
