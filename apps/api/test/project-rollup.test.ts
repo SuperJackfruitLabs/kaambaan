@@ -89,6 +89,70 @@ describe('project rollup', () => {
     expect(cached?.computed_at).toBe(r.computedAt);
   });
 
+  it('excludes another tenant\'s board even when its cards carry this project\'s id, and stays non-partial', async () => {
+    // `listAllBoards` (`db/catalog.ts`) has no tenant filter of its own — it's the cron's global
+    // walk across every tenant in the deployment. `computeRollup` is what keeps the fan-out inside
+    // one tenant, by filtering BEFORE a single board stub is touched. A missing (or broken) filter
+    // here produces no error and no refusal — just a total that is silently too large, which is
+    // exactly the failure this test exists to catch: the other tenant's cards carry the SAME
+    // project id as this tenant's project, so nothing but the tenant filter can tell them apart.
+    //
+    // Placed before the "survives one board failing" test below on purpose: that test registers a
+    // catalog row for a board whose DO is never initialized (`brd_ghost`, under `tnt_r`), and D1
+    // storage in this suite is isolated per FILE, not per test — once that row exists it would make
+    // every later `computeRollup(..., 'tnt_r', ...)` call in this file `partial: true`, including
+    // this one, for a reason that has nothing to do with what THIS test is checking.
+    const other = 'tnt_r_leak';
+    await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, ?)`).bind(other, 'rollup-leak', 'Rollup Leak').run();
+
+    const p = await createProject(env.DB, 'tnt_r', { name: 'isolation' });
+
+    // This tenant's own board: one card, with cost, carrying `p.id`.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_rollIso', 'tnt_r', 'rollIso', '[]')`,
+    ).run();
+    await runInDurableObject(stubFor('rollIso'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_rollIso', tenantId: 'tnt_r', name: 'rollIso', stages: STAGES });
+      const c = await board.createCard({ title: 'Mine', ownerUserId: 'usr_a' });
+      if (!c.ok) throw new Error(c.message);
+      await board.updateCard(c.value.id, { projectId: p.id });
+      const claim = await board.claim({ agentId: 'agt_w', capabilities: ['writing'] });
+      if (!claim.claimed) throw new Error('expected a claim');
+      await board.postActivity({ runId: claim.runId, leaseEpoch: claim.leaseEpoch, type: 'action', usage: { costUsd: 1 } });
+    });
+
+    // ANOTHER tenant's board, carrying the SAME project id on its cards — the DO has no way to
+    // check this (projects are in D1), so nothing stops a card in a different tenant's board from
+    // naming it. Two cards with cost, so a leak would be unmissable rather than a rounding error.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO boards (id, tenant_id, name, stages_json) VALUES ('brd_leak', ?, 'leak', '[]')`,
+    )
+      .bind(other)
+      .run();
+    const leakStub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${other}:brd_leak`)) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(leakStub, async (board: BoardDO) => {
+      await board.init({ id: 'brd_leak', tenantId: other, name: 'leak', stages: STAGES });
+      for (const title of ['Not mine 1', 'Not mine 2']) {
+        const c = await board.createCard({ title, ownerUserId: 'usr_x' });
+        if (!c.ok) throw new Error(c.message);
+        await board.updateCard(c.value.id, { projectId: p.id }); // same project id, different tenant
+      }
+      const claim = await board.claim({ agentId: 'agt_x', capabilities: ['writing'] });
+      if (!claim.claimed) throw new Error('expected a claim');
+      await board.postActivity({ runId: claim.runId, leaseEpoch: claim.leaseEpoch, type: 'action', usage: { costUsd: 50 } });
+    });
+
+    const r = await computeRollup(env.DB, env, 'tnt_r', p.id);
+    // Only the one card on tnt_r's own board. If the tenant filter in `computeRollup` were
+    // missing, this would read 3 cards and $51 instead.
+    expect(r.cardsTotal).toBe(1);
+    expect(r.costUsd).toBe(1);
+    // The other tenant's board is out of SCOPE, not unanswered — conflating the two would make a
+    // correctly-filtered rollup look exactly like a degraded one.
+    expect(r.partial).toBe(false);
+    expect(r.boardsUnanswered).toBe(0);
+  });
+
   it('survives one board failing to answer, and says the rollup is partial', async () => {
     const p = await createProject(env.DB, 'tnt_r', { name: 'partial' });
     await seedBoard('rollE', p.id, ['One']);
