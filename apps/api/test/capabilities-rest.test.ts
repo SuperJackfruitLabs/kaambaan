@@ -213,3 +213,33 @@ describe('POST /v1/capabilities: an unexpected body key does not reach the store
     expect(capability.createdBy).toBe('usr_cap'); // X-User-Id set by T(), never the body's value
   });
 });
+
+/**
+ * `PATCH /v1/capabilities/:id` casts its body (`as { name?; description?; ... }`), then forwarded
+ * it to `updateCapability` WHOLE — not built from named fields. Non-leaking today only because
+ * `updateCapability`'s patch type happens to match the route's declared body type exactly, and
+ * because `updateCapability` itself reads named fields off its argument rather than spreading it.
+ * This asserts a key outside the patch surface (`createdBy`, which only `createCapability`
+ * accepts) is ignored.
+ */
+describe('PATCH /v1/capabilities/:id: an unexpected body key does not reach the stored record', () => {
+  it('updates the declared fields and ignores a key outside the patch surface', async () => {
+    const t = 'tnt_cap_patch_whitelist';
+    const made = await SELF.fetch('https://api.test/v1/capabilities', {
+      method: 'POST',
+      headers: T(t),
+      body: JSON.stringify({ key: 'patch-whitelist-check' }),
+    });
+    const { capability } = (await made.json()) as { capability: { id: string; createdBy: string | null } };
+
+    const res = await SELF.fetch(`https://api.test/v1/capabilities/${capability.id}`, {
+      method: 'PATCH',
+      headers: T(t),
+      body: JSON.stringify({ name: 'Patch Whitelist Check', createdBy: 'usr_smuggled_in_patch' }),
+    });
+    expect(res.status).toBe(200);
+    const after = (await res.json()) as { capability: { name: string; createdBy: string | null } };
+    expect(after.capability.name).toBe('Patch Whitelist Check');
+    expect(after.capability.createdBy).toBe(capability.createdBy); // unchanged by the smuggled key
+  });
+});

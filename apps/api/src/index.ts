@@ -669,7 +669,20 @@ export default {
           const existing = (await listCapabilities(env.DB, u.tenantId)).map((c) => c.key);
           const similar = similarKeys(body.key, existing);
 
-          const made = await createCapability(env.DB, u.tenantId, { ...body, key: body.key, createdBy: u.userId });
+          // Built from named fields rather than `{ ...body, key: body.key, createdBy: u.userId }`:
+          // `createdBy` already won that field (it was placed after the spread), but the cast
+          // above does not stop a body from carrying other keys `createCapability` happens to
+          // read — safe today only because its input type coincides with this one.
+          const made = await createCapability(env.DB, u.tenantId, {
+            key: body.key,
+            name: body.name,
+            description: body.description,
+            tags: body.tags,
+            examples: body.examples,
+            externalId: body.externalId,
+            externalSource: body.externalSource,
+            createdBy: u.userId,
+          });
           if (!made) {
             // A collision reads as a sentence rather than a raw UNIQUE failure — and re-declaring
             // an existing capability is a rename, which `PATCH` does.
@@ -694,7 +707,18 @@ export default {
           if ('key' in body) {
             return Response.json({ error: 'a capability key cannot be renamed — stages and agents refer to it. Create another and restaff.' }, { status: 400 });
           }
-          if (!(await updateCapability(env.DB, u.tenantId, capId, body))) {
+          // Built from named fields rather than forwarding `body` whole: the cast above strips
+          // nothing at runtime, so the route has to name what `updateCapability` accepts.
+          if (
+            !(await updateCapability(env.DB, u.tenantId, capId, {
+              name: body.name,
+              description: body.description,
+              tags: body.tags,
+              examples: body.examples,
+              externalId: body.externalId,
+              externalSource: body.externalSource,
+            }))
+          ) {
             return Response.json({ error: 'capability not found, or nothing to change' }, { status: 404 });
           }
           return Response.json({ capability: await capabilityById(env.DB, u.tenantId, capId) });
@@ -792,7 +816,9 @@ export default {
             }
           }
           try {
-            const updated = await updateLabel(env.DB, u.tenantId, labelId, body);
+            // Built from named fields rather than forwarding `body` whole, same as the capability
+            // PATCH above: the cast strips nothing at runtime.
+            const updated = await updateLabel(env.DB, u.tenantId, labelId, { name: body.name, colour: body.colour });
             if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
             return Response.json({ label: updated });
           } catch (err) {
@@ -1510,7 +1536,19 @@ export default {
             );
           }
         }
-        const result = await stub.updateStage(stageMatch[1]!, body);
+        // Built from named fields rather than forwarding `body` whole: the cast above names the
+        // same type `updateStage` accepts, but it is still only a compile-time assertion — it does
+        // not stop a caller's JSON from carrying a key the type never declared.
+        const result = await stub.updateStage(stageMatch[1]!, {
+          name: body.name,
+          owner: body.owner,
+          ownerKind: body.ownerKind,
+          requires: body.requires,
+          gate: body.gate,
+          wipLimit: body.wipLimit,
+          instructions: body.instructions,
+          completion: body.completion,
+        });
         if (!result.ok) {
           // `UNKNOWN_STAGE` is a 400 in the shared mapping, which is right where the stage is in
           // the BODY — `move` asking for a lane that does not exist is a bad request. Here it is a
@@ -1743,7 +1781,22 @@ export default {
             }
           }
         }
-        const result = await stub.updateCard(cardMatch[1]!, body);
+        // Built from named fields rather than forwarding `body` whole: the cast above strips
+        // nothing at runtime, so the route has to name what `updateCard` accepts rather than
+        // forward what it received — `labelNames` is deliberately excluded here, since it was
+        // already resolved into `body.labels` above and `updateCard`'s patch type has no field for
+        // it at all.
+        const result = await stub.updateCard(cardMatch[1]!, {
+          title: body.title,
+          spec: body.spec,
+          priority: body.priority,
+          ownerUserId: body.ownerUserId,
+          labels: body.labels,
+          dueAt: body.dueAt,
+          archivedAt: body.archivedAt,
+          projectId: body.projectId,
+          milestoneId: body.milestoneId,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
       }
@@ -2081,7 +2134,17 @@ export default {
           autonomyLevel?: string;
           capabilities?: string[];
         };
-        const result = await stub.setProfile(body);
+        // Built from named fields rather than forwarding `body` whole: the cast above strips
+        // nothing at runtime, so the route has to name what `setProfile` accepts.
+        const result = await stub.setProfile({
+          key: body.key,
+          name: body.name,
+          harness: body.harness,
+          model: body.model,
+          permissionPolicy: body.permissionPolicy,
+          autonomyLevel: body.autonomyLevel,
+          capabilities: body.capabilities,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
       }
@@ -2345,7 +2408,9 @@ export default {
       // PUT /v1/boards/:id/budget — set/clear USD budget caps (docs/07 §6)
       if (rest === 'budget' && request.method === 'PUT') {
         const body = (await request.json()) as { boardUsdCap?: number | null; cardUsdCap?: number | null };
-        const result = await stub.setBudget(body);
+        // Built from named fields rather than forwarding `body` whole, same as the other PUT/POST
+        // routes in this file: the cast strips nothing at runtime.
+        const result = await stub.setBudget({ boardUsdCap: body.boardUsdCap, cardUsdCap: body.cardUsdCap });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
       }
@@ -2362,7 +2427,15 @@ export default {
         // Re-sent on every config write, deliberately: the grant is only as good
         // as the last person who confirmed it, and re-saving the settings is how
         // an operator refreshes it after their own permissions change.
-        const result = await stub.setGithubConfig({ ...body, triggerGrant: user?.mayDispatch ?? null });
+        // Built from named fields rather than `{ ...body, triggerGrant }`: the spread came BEFORE
+        // `triggerGrant`, so that field already wins today, but the cast above does not stop a
+        // body from carrying other keys `setGithubConfig` happens to read — safe only because its
+        // input type coincides with this one.
+        const result = await stub.setGithubConfig({
+          secret: body.secret,
+          issueTrigger: body.issueTrigger,
+          triggerGrant: user?.mayDispatch ?? null,
+        });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value);
       }

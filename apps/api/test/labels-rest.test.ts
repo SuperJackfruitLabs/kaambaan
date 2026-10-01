@@ -145,6 +145,33 @@ describe('PATCH /v1/labels/:id', () => {
     });
     expect(res.status).toBe(400);
   });
+
+  /**
+   * The route casts its body (`as { name?; colour? }`) and used to forward it to `updateLabel`
+   * WHOLE. Non-leaking today only because `updateLabel`'s patch type happens to match the route's
+   * declared body type exactly. This asserts a key outside that surface (`id`, which names no
+   * patchable column) is ignored.
+   */
+  it('ignores a body key outside the patch surface', async () => {
+    const t = 'tnt_lbl_rest_patch_whitelist';
+    await insertTenant(t, 'lbl-rest-patch-whitelist');
+    const made = await SELF.fetch('https://api.test/v1/labels', {
+      method: 'POST',
+      headers: dev(t),
+      body: JSON.stringify({ name: 'original', colour: '#f00' }),
+    });
+    const { label } = await made.json<{ label: { id: string } }>();
+
+    const res = await SELF.fetch(`https://api.test/v1/labels/${label.id}`, {
+      method: 'PATCH',
+      headers: dev(t),
+      body: JSON.stringify({ colour: '#0f0', id: 'lbl_smuggled' }),
+    });
+    expect(res.status).toBe(200);
+    const { label: updated } = await res.json<{ label: { id: string; colour: string } }>();
+    expect(updated.colour).toBe('#0f0');
+    expect(updated.id).toBe(label.id); // unchanged by the smuggled key
+  });
 });
 
 describe('PATCH /v1/boards/:id/cards/:cardId — labels validation', () => {
