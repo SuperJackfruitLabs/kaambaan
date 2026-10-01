@@ -7,6 +7,7 @@
    * removable chip beside the control: a board must never silently misrepresent what it is showing.
    */
   import { app } from '$lib/stores/app.svelte';
+  import { resolveProjectName } from './project-lookup';
 
   let open = $state(false);
   let el = $state<HTMLDivElement | null>(null);
@@ -17,7 +18,6 @@
   const labelCatalogue = $derived(app.labels);
   const labelById = $derived(app.labelById());
   const projectCatalogue = $derived(app.projects);
-  const projectById = $derived(app.projectById());
 
   /** One chip per active filter, each knowing how to switch itself off. */
   const active = $derived([
@@ -34,7 +34,18 @@
     })),
     ...(f.showArchived ? [{ key: 'arch', label: 'archived', clear: () => (app.filters.showArchived = false) }] : []),
     ...(f.projectId
-      ? [{ key: `prj:${f.projectId}`, label: projectById.get(f.projectId)?.name ?? f.projectId, clear: () => (app.filters.projectId = null) }]
+      ? [
+          {
+            key: `prj:${f.projectId}`,
+            // `resolveProjectName`, not a second `.find`/`.get` here — the single place that
+            // decides what a dangling project id renders as. `CardDrawer` and `ProjectView` both
+            // already route through it; this used to duplicate its exact fallback semantics
+            // instead of calling it, which is the kind of agreement that holds today and silently
+            // drifts later (whole-branch review, Important finding).
+            label: resolveProjectName(f.projectId, projectCatalogue) ?? f.projectId,
+            clear: () => (app.filters.projectId = null),
+          },
+        ]
       : []),
   ]);
 
