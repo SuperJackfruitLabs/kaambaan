@@ -3848,6 +3848,24 @@ git commit -m "feat(projects): card membership and a cached cross-board rollup t
 - Create: `apps/web/src/lib/components/plan/ProjectView.svelte`, **`apps/web/src/lib/components/workspace/LabelManager.svelte`**
 - Modify: `apps/web/src/lib/components/plan/PlanView.svelte` (a third view toggle beside Board and List), `FilterBar.svelte`, `CardDrawer.svelte`, `api.ts`, **`apps/web/src/routes/workspace/[tab]/+page.svelte`**
 - Modify: `packages/cli/src/index.ts` — `supi project list|add|show|rm`, `supi milestone add|rm`
+- Modify: **`apps/web/src/lib/api.ts`** — two things that exist nowhere else, and without which Steps 1
+  and 3 cannot be built:
+
+  1. **The `Card` interface gains `projectId: string | null` and `milestoneId: string | null`.** Task 19
+     puts both on `CardView`, so they are already on the wire; no task declares them on the *client*
+     type. Step 3's project filter and milestone picker both read them.
+  2. **Client wrappers for Task 18's project routes**, which have no caller otherwise:
+     `listProjects`, `createProject`, `updateProject`, `deleteProject`, `createMilestone`,
+     `deleteMilestone`, and `getProjectRollup` (Task 19's `GET /v1/projects/:id/rollup`).
+
+  **This is the fifth instance of one pattern in this plan**, and it is worth naming so the sixth does
+  not happen: a field or route is built on one side of a phase boundary and its consumer is specified on
+  the other, with nothing owning the join. Task 12's `addLink` reached Task 17 with no HTTP surface;
+  Task 16's advisory store reached 17a with no route; Task 18's projects nearly reached Task 20 the same
+  way; `CardView.blockedBy` had to be invented for a badge that had no data source; and `openChildCount`
+  / `costUsdRollup` / `parentCardId` were on the wire from Task 14 and never declared on the web `Card`,
+  which forced Task 17b outside its own scope to finish. **Before dispatching any task that renders or
+  sends something, name the field or endpoint that carries it — by name, in the brief.**
 
 **Also close two write-surface gaps the same audit found:**
 
@@ -3905,6 +3923,23 @@ The docs are wrong in ways this work has now established. Leaving them wrong is 
 - The Card entity lists `labels` and `archivedAt` — remove the ⚠️ implying they are unimplemented, and delete `currentTaskId` (Task 2 removed it from the contract).
 - Add `Label`, `Project`, `Milestone`, `CardLink` and `Schedule` to the entity list and the glossary.
 - Keep the Task ⚠️ exactly as it is. Task is still unimplemented and that warning is still load-bearing.
+
+- [ ] **Step 2b: Record the three things Phase 3 left parked**
+
+Each was found during Phase 3, judged correctly out of scope at the time, and will otherwise be
+rediscovered by whoever next reads the code:
+
+- **`listLinks` has no `NOT_INITIALIZED` guard**, unlike `addLink`/`removeLink`, so
+  `GET …/cards/:cardId/links` on an uninitialised board answers 200 with an empty list while the write
+  verbs answer 404. Decide: guard it, or document the asymmetry as intended.
+- **`rowToCard` calls `budgetCap('budgetCardUsdCap')` per card, on every board read** — a `SELECT` per
+  card in the hot read path. Pre-existing, unrelated to Phase 3, and cheap to hoist into the `pre` batch
+  that already carries five other values. Found while building a test that would otherwise have been
+  meaningless because of it.
+- **The advisory `⚑` badge appears in the drawer but not on the board tile**, because the board read
+  does not carry external links and showing it there would mean a cross-board read on the board-list
+  path. Confirmed live. The spec's badge table says *what* each badge is and never *where* it lives —
+  say so, because the answer is a deliberate cost and reads like an omission.
 
 - [ ] **Step 3: Fix `docs/03`**
 
