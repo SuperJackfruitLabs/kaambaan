@@ -19,18 +19,23 @@
     listLinks,
     splitCard,
     getBoard,
+    getProject,
     type CardActivities,
     type Attempt,
     type Estimate,
     type GateDecision,
     type CardLinks,
     type LinkKind,
+    type Project,
+    type Milestone,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
   import { buildLinkGroups, edgeKey, type RemoveArgs } from '$lib/components/link-groups';
   import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
+  import { resolveProjectName } from '$lib/components/plan/project-lookup';
+  import { milestonesForProject, assignmentPatch } from '$lib/components/milestone-picker';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -108,6 +113,109 @@
       linkGroups.advisory.length > 0,
   );
 
+  // ---- project / milestone (Step 3) ----
+  /**
+   * The card's CURRENT project, fetched for display (the project's own name — `resolveProjectName`
+   * stays safe without it, but this is also where the card's milestone NAME comes from) and reused
+   * as the editor's initial milestone options when editing starts without changing the project.
+   *
+   * Keyed off `cardProjectId` (a derived primitive), not `card` itself, so this does not refetch on
+   * every board refresh while the drawer sits open — only when the id actually changes.
+   */
+  const cardProjectId = $derived(card?.projectId ?? null);
+  let projectDetail = $state<{ project: Project; milestones: Milestone[] } | null>(null);
+  $effect(() => {
+    const pid = cardProjectId;
+    if (!pid) {
+      projectDetail = null;
+      return;
+    }
+    void getProject(pid).then((d) => {
+      // A dangling projectId (its project was deleted) resolves to `null` here, same as any other
+      // stale id (see `Card.projectId`'s own comment) — `projectDetail` just stays null, and the
+      // name below falls back to the raw id. Never a thrown error, never a spinner with nothing to
+      // wait for.
+      projectDetail = d;
+    });
+  });
+  /** Safe against a dangling id — never throws, falls back to the raw id (`project-lookup.ts`). */
+  const currentProjectName = $derived(resolveProjectName(cardProjectId, app.projects));
+  const currentMilestoneName = $derived(
+    card?.milestoneId
+      ? (projectDetail?.milestones.find((m) => m.id === card.milestoneId)?.name ?? card.milestoneId)
+      : null,
+  );
+
+  let editingProject = $state(false);
+  let selProjectId = $state('');
+  let selMilestoneId = $state('');
+  let selProjectMilestones = $state<Milestone[]>([]);
+  let savingProject = $state(false);
+  let projectAssignError = $state<string | null>(null);
+
+  function startProjectEdit(): void {
+    if (!card) return;
+    selProjectId = card.projectId ?? '';
+    selMilestoneId = card.milestoneId ?? '';
+    selProjectMilestones =
+      projectDetail && projectDetail.project.id === selProjectId ? milestonesForProject(projectDetail.milestones, selProjectId) : [];
+    projectAssignError = null;
+    editingProject = true;
+  }
+
+  /**
+   * The project changed — clear the milestone selection immediately and reload the picker's
+   * options to the NEW project's own milestones only.
+   *
+   * This is the chosen handling for the server's stale-milestone refusal: `PATCH { projectId: B }`
+   * on a card still carrying a milestone from project A is refused as `MILESTONE_NOT_IN_PROJECT`
+   * (`apps/api/src/index.ts`) even when the request never mentions `milestoneId` at all, because
+   * the route recomputes the "effective" pair from the card's current value whenever either half
+   * could change. Clearing here — rather than letting the save fail and showing that refusal as a
+   * sentence — means the picker never lets a person build a request the server will refuse: the
+   * same principle the milestone list itself already follows (`milestonesForProject`, scoped to
+   * the chosen project so it never OFFERS a mismatch either).
+   */
+  async function onProjectSelectChange(): Promise<void> {
+    selMilestoneId = '';
+    if (!selProjectId) {
+      selProjectMilestones = [];
+      return;
+    }
+    const d = await getProject(selProjectId);
+    selProjectMilestones = d ? milestonesForProject(d.milestones, selProjectId) : [];
+  }
+
+  async function saveProjectAssignment(): Promise<void> {
+    if (!boardId || !cardId || !card || savingProject) return;
+    savingProject = true;
+    projectAssignError = null;
+    try {
+      const current = { projectId: card.projectId, milestoneId: card.milestoneId };
+      const next = { projectId: selProjectId === '' ? null : selProjectId, milestoneId: selMilestoneId === '' ? null : selMilestoneId };
+      const patch = assignmentPatch(current, next);
+      if (Object.keys(patch).length === 0) {
+        editingProject = false;
+        return;
+      }
+      // `updateCard`'s declared patch type does not list `projectId`/`milestoneId` — Task 19's
+      // route accepts and validates both (migration 0013), but no client wrapper was ever told
+      // about them (flagged in this task's report, not fixed here: out of this task's file scope,
+      // `$lib/api.ts`). The cast says exactly that: the server's contract is wider than the
+      // client's declared one.
+      const res = await updateCard(boardId, cardId, patch as Parameters<typeof updateCard>[2]);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+        projectAssignError = linkRefusalSentence(body?.error, res.status);
+        return;
+      }
+      editingProject = false;
+      await app.refresh();
+    } finally {
+      savingProject = false;
+    }
+  }
+
   // ---- edit state ----
   let editing = $state(false);
   let editTitle = $state('');
@@ -166,6 +274,8 @@
       subtaskError = null;
       addBlockerOpen = false;
       blockerError = null;
+      editingProject = false;
+      projectAssignError = null;
       // The board switcher list — needed to name a cross-board advisory blocker's board, and to
       // populate the Add-blocker dialogue's board picker. Best-effort, same as everywhere else
       // `app.boards` is read: a board the catalogue could not resolve just shows no name.
@@ -1045,6 +1155,71 @@
             </ul>
           </section>
         {/if}
+
+        <!--
+          Project / milestone (Step 3) — a card's cross-board membership. `currentProjectName` and
+          `currentMilestoneName` are both total: a dangling id (its project/milestone was deleted)
+          shows the raw id rather than throwing or spinning forever (see `project-lookup.ts`).
+        -->
+        <section class="sec">
+          <div class="sec-h eyebrow">project</div>
+          {#if editingProject}
+            <div class="bg-inset border-border space-y-2 rounded-[8px] border p-3 text-xs">
+              <div>
+                <label for="assign-project" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Project</label>
+                <select
+                  id="assign-project"
+                  bind:value={selProjectId}
+                  onchange={() => void onProjectSelectChange()}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none"
+                >
+                  <option value="">No project</option>
+                  {#each app.projects as p (p.id)}
+                    <option value={p.id}>{p.name}</option>
+                  {/each}
+                </select>
+              </div>
+              <div>
+                <!--
+                  Scoped to the chosen project ONLY (`milestonesForProject`) — the server refuses a
+                  milestone that does not belong to the card's project (`MILESTONE_NOT_IN_PROJECT`),
+                  so this picker never offers one it would refuse.
+                -->
+                <label for="assign-milestone" class="text-muted-foreground mono mb-1 block text-[11px] uppercase tracking-widest">Milestone</label>
+                <select
+                  id="assign-milestone"
+                  bind:value={selMilestoneId}
+                  disabled={selProjectId === ''}
+                  class="bg-surface border-border focus:border-marigold w-full rounded-[6px] border px-2 py-1.5 text-xs outline-none disabled:opacity-50"
+                >
+                  <option value="">No milestone</option>
+                  {#each selProjectMilestones as m (m.id)}
+                    <option value={m.id}>{m.name}</option>
+                  {/each}
+                </select>
+              </div>
+              <div class="flex gap-1.5">
+                <Button size="sm" onclick={() => void saveProjectAssignment()} disabled={savingProject}>{savingProject ? 'Saving…' : 'Save'}</Button>
+                <Button size="sm" variant="ghost" onclick={() => (editingProject = false)}>Cancel</Button>
+              </div>
+              {#if projectAssignError}
+                <p role="alert" class="text-coral mono text-[11px]">{projectAssignError}</p>
+              {/if}
+            </div>
+          {:else}
+            <div class="flex flex-wrap items-center gap-2 text-[12px]">
+              {#if currentProjectName}
+                <span class="mono">{currentProjectName}</span>
+                {#if currentMilestoneName}<span class="text-muted-foreground">· {currentMilestoneName}</span>{/if}
+              {:else}
+                <span class="text-muted-foreground">No project</span>
+              {/if}
+              <button onclick={startProjectEdit} class="text-muted-foreground hover:text-foreground mono text-[11px] underline underline-offset-2">
+                {currentProjectName ? 'change' : 'assign'}
+              </button>
+            </div>
+          {/if}
+        </section>
 
         <!--
           Links (whole-branch review, Important finding) — EVERY edge this card has, in five

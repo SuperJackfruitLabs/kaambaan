@@ -9,6 +9,7 @@
   import { app } from '$lib/stores/app.svelte';
   import BoardKanban from '$lib/components/board/BoardKanban.svelte';
   import ListView from './ListView.svelte';
+  import ProjectView from './ProjectView.svelte';
   import FilterBar from './FilterBar.svelte';
 </script>
 
@@ -27,15 +28,28 @@
         class="mono border-border border-l px-2.5 {app.view === 'list' ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}"
         style="min-height:var(--tap)"
       >List</button>
+      <button
+        onclick={() => app.setView('projects')}
+        aria-pressed={app.view === 'projects'}
+        class="mono border-border border-l px-2.5 {app.view === 'projects' ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}"
+        style="min-height:var(--tap)"
+      >Projects</button>
     </div>
-    <FilterBar />
+    <!-- The card filters (state/owner/label/project…) describe a list of CARDS, which this view
+         stops being the moment "Projects" is selected — no `FilterBar` for a screen with no cards
+         in it. -->
+    {#if app.view !== 'projects'}
+      <FilterBar />
+    {/if}
   </div>
 
   <div class="min-h-0 flex-1 overflow-auto">
     {#if app.view === 'board'}
       <BoardKanban />
-    {:else}
+    {:else if app.view === 'list'}
       <ListView />
+    {:else}
+      <ProjectView />
     {/if}
   </div>
 </div>

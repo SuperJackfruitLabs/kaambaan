@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { passesArchivedFilter } from './card-filters';
+import { passesArchivedFilter, passesProjectFilter } from './card-filters';
 
 describe('passesArchivedFilter', () => {
   it('shows a never-archived card (archivedAt: null) when the filter is off', () => {
@@ -23,5 +23,24 @@ describe('passesArchivedFilter', () => {
 
   it('shows an unarchived card when the filter is on', () => {
     expect(passesArchivedFilter(true, null)).toBe(true);
+  });
+});
+
+describe('passesProjectFilter', () => {
+  it('passes every card when no project filter is set', () => {
+    expect(passesProjectFilter(null, null)).toBe(true);
+    expect(passesProjectFilter(null, 'prj_1')).toBe(true);
+  });
+
+  it('passes a card carrying exactly the filtered project', () => {
+    expect(passesProjectFilter('prj_1', 'prj_1')).toBe(true);
+  });
+
+  it('hides a card with no project once a project filter is on', () => {
+    expect(passesProjectFilter('prj_1', null)).toBe(false);
+  });
+
+  it('hides a card belonging to a different project', () => {
+    expect(passesProjectFilter('prj_1', 'prj_2')).toBe(false);
   });
 });

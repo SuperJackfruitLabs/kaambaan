@@ -20,3 +20,13 @@ export function passesArchivedFilter(showArchived: boolean, archivedAt: string |
   if (showArchived) return true;
   return !archivedAt;
 }
+
+/**
+ * Should a card pass the project filter? `null` means "no filter" — every card passes, including
+ * one with no project of its own. Once a project IS selected, a card with no `projectId` (or a
+ * different one) no longer matches: narrowing is what a filter is for, same as every other axis.
+ */
+export function passesProjectFilter(filterProjectId: string | null, cardProjectId: string | null): boolean {
+  if (!filterProjectId) return true;
+  return cardProjectId === filterProjectId;
+}
