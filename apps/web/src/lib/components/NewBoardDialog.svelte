@@ -60,7 +60,13 @@ function ownerParts(raw: string): string[] {
   function fromTemplate(tplStages: Stage[]): DraftStage[] {
     return tplStages.map((s) => ({
       name: s.name,
-      ownerKind: s.ownerKind ?? 'human',
+      // This editor offers `capability` or `human` and nothing else — `DraftStage` says so, and the
+      // pickers below have two options. The templates it seeds from carry neither kind of surprise
+      // today, but `Stage.ownerKind` also admits `'agent'` (a stage pinned to ONE agent, which the
+      // server has always supported), so a template that ever used one would arrive here unmappable.
+      // Narrowed deliberately rather than cast: an agent-owned template stage becomes a human stage
+      // the operator can see and change, instead of a value the pickers cannot display.
+      ownerKind: s.ownerKind === 'capability' ? 'capability' : 'human',
       owner: s.requires ? [...(s.requires.all ?? s.requires.any ?? [])].join(', ') : (s.owner ?? ''),
       match: s.requires?.any ? 'any' : 'all',
       gate: s.gate === 'approval',
