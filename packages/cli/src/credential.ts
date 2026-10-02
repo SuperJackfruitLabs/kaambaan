@@ -12,11 +12,20 @@
  *   3. the token cache `fleet login` writes
  *   4. its device credential, exchanged with its recorded issuer when the cache expires
  *
- * **It never reads a `spa_` agent token.** Those name an agent, and an agent is not a person
- * operating a board: it claims work through the MCP server or the REST verbs with its own
- * identity. A CLI that silently acted as an agent would attribute a human's decisions to one,
- * which is the distinction `charter → decisions/2026-08-13-ecosystem-identity.md` Decision 2
- * exists to protect — when a human acts, the human is the actor.
+ * **An agent may also drive this CLI, from `$SUPERPIPELINE_AGENT_TOKEN` alone.**
+ *
+ * This module used to refuse `spa_` tokens outright, on the argument that "an agent is not a person
+ * operating a board". That was the operating model until 2026-10-02, when the operator settled the
+ * opposite: they do not drive `supi` routinely, agents do, and a coordinator that cannot use the CLI
+ * is a commentator — it can describe the board while every actual change waits on a human opening a
+ * terminal.
+ *
+ * What `charter → decisions/2026-08-13-ecosystem-identity.md` Decision 2 protects is unchanged:
+ * when a human acts, the human is the actor. So the two credentials are never interchangeable —
+ * an agent token is read ONLY from the variable that names it, it outranks a human token because an
+ * agent's shell may well carry a leftover one, and a value in the wrong slot is refused rather than
+ * honoured. A hub token quietly accepted in the agent slot would act as whoever it names while the
+ * caller believed it was acting as an agent, which is how provenance becomes a lie.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +33,12 @@ import { readFileSync, mkdtempSync, writeFileSync, renameSync, rmSync } from "no
 
 export const ENV_TOKEN = "SUPERPIPELINE_TOKEN";
 export const ENV_HUB_TOKEN = "AGENTPOD_TOKEN";
+/**
+ * An agent's own `spa_` credential. Separate from `ENV_TOKEN` on purpose: the variable's name is
+ * where the caller states which identity it intends to act as, and a mismatch between the name and
+ * the token's shape is a mistake worth reporting rather than resolving.
+ */
+export const ENV_AGENT_TOKEN = "SUPERPIPELINE_AGENT_TOKEN";
 export const ENV_BASE = "SUPERPIPELINE_URL";
 
 /**
@@ -40,6 +55,19 @@ export interface Credential {
   token: string;
   /** Where it came from, so an error can name the thing to change. */
   source: string;
+  /**
+   * Which kind of principal this acts as.
+   *
+   * Carried rather than re-derived from the token's shape at each call site, because the two are
+   * routed and renewed differently: a human's token is refreshed from a device credential, an
+   * agent's is a long-lived secret with nothing to exchange it for.
+   */
+  kind: "human" | "agent";
+}
+
+/** A superpipeline agent token, by its prefix — the same test `resolveAgent` applies server-side. */
+function isAgentToken(value: string): boolean {
+  return value.startsWith("spa_");
 }
 
 /** Match Go os.UserConfigDir(), used by fleet on every supported platform. */
@@ -57,14 +85,34 @@ function fleetTokenPath(): string {
 }
 
 export function loadCredential(): Credential | null {
+  // First, and deliberately: a station's shell can hold a leftover hub token from `fleet login`,
+  // and if that won the agent would act as the operator — indistinguishably.
+  const agentToken = (process.env[ENV_AGENT_TOKEN] ?? "").trim();
+  if (agentToken !== "") {
+    if (!isAgentToken(agentToken)) {
+      throw new Error(
+        `${ENV_AGENT_TOKEN} must hold a superpipeline agent token (spa_…). ` +
+          `A hub token here would act as the person it names, not as this agent — put it in ${ENV_TOKEN} instead.`,
+      );
+    }
+    return { token: agentToken, source: `env:${ENV_AGENT_TOKEN}`, kind: "agent" };
+  }
   for (const name of [ENV_TOKEN, ENV_HUB_TOKEN]) {
     const v = (process.env[name] ?? "").trim();
-    if (v !== "") return { token: v, source: `env:${name}` };
+    if (v === "") continue;
+    if (isAgentToken(v)) {
+      throw new Error(
+        `${name} holds an agent token (spa_…), which names an agent rather than a person. ` +
+          `Set ${ENV_AGENT_TOKEN} instead, so what acts is what the board records.`,
+      );
+    }
+    return { token: v, source: `env:${name}`, kind: "human" };
   }
   try {
     const raw = JSON.parse(readFileSync(fleetTokenPath(), "utf8")) as { token?: string };
     if (typeof raw?.token === "string" && raw.token.trim() !== "") {
-      return { token: raw.token.trim(), source: fleetTokenPath() };
+      // `fleet login` writes a human's token. An agent never arrives through this file.
+      return { token: raw.token.trim(), source: fleetTokenPath(), kind: "human" };
     }
   } catch {
     // Absent or unreadable is simply "no credential". Nothing else is tried.
@@ -75,6 +123,9 @@ export function loadCredential(): Credential | null {
 /** Resolve locally first. Explicit environment credentials never change identity silently. */
 export async function resolveCredential(): Promise<Credential | null> {
   const cached = loadCredential();
+  // An agent credential is returned as-is and never renewed: there is no device to exchange, and
+  // the renewal path below would mint a HUMAN token, silently changing who is acting.
+  if (cached?.kind === "agent") return cached;
   if (cached?.source.startsWith("env:")) return cached;
   const claims = cached ? inspect(cached.token) : null;
   if (claims?.expiry && !expired(claims)) return cached;
@@ -156,7 +207,9 @@ export async function resolveCredential(): Promise<Credential | null> {
       try { rmSync(staging, { recursive: true, force: true }); } catch { /* Best-effort cleanup. */ }
     }
   }
-  return { token, source: devicePath };
+  // A device exchange always mints a HUMAN token: the device belongs to a person who ran `fleet
+  // login`. An agent credential never reaches this path — `resolveCredential` returns it before here.
+  return { token, source: devicePath, kind: "human" };
 }
 
 export function baseUrl(): string {
@@ -199,4 +252,35 @@ export function inspect(token: string): Claims | null {
 
 export function expired(c: Claims): boolean {
   return c.expiry !== null && c.expiry.getTime() <= Date.now();
+}
+
+/**
+ * What a credential says about itself, for `whoami`.
+ *
+ * An agent's `spa_` token is opaque — it is a random secret, not a JWT, and the agent it names lives
+ * in superpipeline's catalog rather than in the string. So `principal` is null, and that is a fact
+ * rather than a failure: before this, `whoami` on an agent credential answered "The stored
+ * credential is not a token this can read", which reads like a broken credential and described a
+ * working one.
+ *
+ * Null is reserved for a HUMAN credential that genuinely cannot be parsed, which the caller should
+ * still refuse.
+ */
+export function describeCredential(c: Credential): {
+  principal: string | null;
+  kind: string;
+  source: string;
+  expires: string | null;
+} | null {
+  if (c.kind === "agent") {
+    return { principal: null, kind: "agent", source: c.source, expires: null };
+  }
+  const claims = inspect(c.token);
+  if (!claims) return null;
+  return {
+    principal: claims.subject,
+    kind: claims.principalKind,
+    source: c.source,
+    expires: claims.expiry?.toISOString() ?? null,
+  };
 }

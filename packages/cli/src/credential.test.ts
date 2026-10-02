@@ -1,10 +1,15 @@
 /**
  * What `supi` will and will not authenticate with.
  *
- * The rule worth testing is an absence: it never reads a `spa_` AGENT token. Those name an
- * agent, and an agent is not a person operating a board — a CLI that silently acted as one would
- * attribute a human's decisions to it, which is what
- * `charter → decisions/2026-08-13-ecosystem-identity.md` Decision 2 exists to protect.
+ * This used to test an absence: `supi` never read a `spa_` AGENT token at all, because "an agent is
+ * not a person operating a board". That stopped being the operating model on 2026-10-02 — the
+ * operator does not drive this CLI routinely, agents do, and a coordinator that cannot use it is a
+ * commentator.
+ *
+ * What Decision 2 actually protects is unchanged and is what these tests now pin: a human's
+ * decisions must never be attributed to an agent, or an agent's to a human. So an agent token is
+ * read only from a variable that NAMES it, every credential says which kind it is, and the two are
+ * never silently interchangeable.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -14,9 +19,11 @@ import { join } from "node:path";
 import {
   DEFAULT_BASE,
   ENV_BASE,
+  ENV_AGENT_TOKEN,
   ENV_HUB_TOKEN,
   ENV_TOKEN,
   baseUrl,
+  describeCredential,
   expired,
   inspect,
   loadCredential,
@@ -25,7 +32,7 @@ import {
 
 let home: string;
 beforeEach(() => {
-  for (const k of [ENV_TOKEN, ENV_HUB_TOKEN, ENV_BASE]) vi.stubEnv(k, "");
+  for (const k of [ENV_TOKEN, ENV_HUB_TOKEN, ENV_AGENT_TOKEN, ENV_BASE]) vi.stubEnv(k, "");
   // Redirect every platform's config directory, never the developer's real credentials.
   home = mkdtempSync(join(tmpdir(), "supi-"));
   for (const k of ["HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME"]) vi.stubEnv(k, home);
@@ -71,11 +78,53 @@ describe("loadCredential", () => {
     expect(loadCredential()).toBeNull();
   });
 
-  it("never reads a spa_ agent token from anywhere", () => {
-    // An agent token in the environment under any name this CLI does not read must not be
-    // picked up. The absence is the point: `supi` acts as a person or not at all.
-    vi.stubEnv("SUPERPIPELINE_AGENT_TOKEN", "spa_deadbeef");
+  it("ignores an agent token sitting in a variable this CLI does not read", () => {
     vi.stubEnv("KBN_TOKEN", "spa_deadbeef");
+    expect(loadCredential()).toBeNull();
+  });
+
+  it("labels a human credential as one", () => {
+    vi.stubEnv(ENV_TOKEN, "eyJhbGciOi.payload.sig");
+    expect(loadCredential()).toMatchObject({ kind: "human" });
+  });
+});
+
+describe("an agent credential", () => {
+  it("is read from the variable that names it, and labelled an agent's", () => {
+    // The operator does not drive this CLI; Super Chotu does. A coordinator that can read ten
+    // boards and put a shaped card on one is the whole point of the change this supports.
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_chotu0000");
+    expect(loadCredential()).toMatchObject({
+      token: "spa_chotu0000",
+      kind: "agent",
+      source: `env:${ENV_AGENT_TOKEN}`,
+    });
+  });
+
+  it("OUTRANKS a human token, because an agent's shell may carry both", () => {
+    // A station's environment can easily hold a leftover hub token from `fleet login`. If that won,
+    // the agent would act as the operator — indistinguishably, which is the exact failure the
+    // control pair and `queued_by_agent_id` exist to make impossible.
+    vi.stubEnv(ENV_TOKEN, "eyJhbGciOi.payload.sig");
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_chotu0000");
+    expect(loadCredential()).toMatchObject({ kind: "agent" });
+  });
+
+  it("REFUSES a non-spa_ value in the agent slot rather than acting as a person", () => {
+    // A hub token here would authenticate fine and act as whoever it names — a human — while the
+    // caller believed it was acting as an agent. Silently honouring it is how provenance becomes a
+    // lie; refusing names the mistake.
+    vi.stubEnv(ENV_AGENT_TOKEN, "eyJhbGciOi.payload.sig");
+    expect(() => loadCredential()).toThrow(/spa_/);
+  });
+
+  it("REFUSES a spa_ token in the human slot, for the same reason in reverse", () => {
+    vi.stubEnv(ENV_TOKEN, "spa_chotu0000");
+    expect(() => loadCredential()).toThrow(new RegExp(ENV_AGENT_TOKEN));
+  });
+
+  it("ignores whitespace, so an unset variable is unset", () => {
+    vi.stubEnv(ENV_AGENT_TOKEN, "   ");
     expect(loadCredential()).toBeNull();
   });
 });
@@ -141,5 +190,32 @@ describe("fleetConfigDir pins Go's os.UserConfigDir() per platform", () => {
     vi.stubEnv("HOME", "/home/someone");
     vi.stubEnv("XDG_CONFIG_HOME", "");
     expect(fleetConfigDir("linux")).toBe("/home/someone/.config/agentpod");
+  });
+});
+
+describe("describeCredential", () => {
+  // `whoami` is the first thing a caller runs to check what it is acting as, and for an agent it
+  // used to fail outright: a `spa_` token is opaque, `inspect` returns null, and the CLI answered
+  // "The stored credential is not a token this can read." — which reads like a broken credential
+  // and describes a working one.
+  it("reports an agent honestly, including what it cannot know", () => {
+    expect(describeCredential({ token: "spa_x", source: "env:X", kind: "agent" })).toEqual({
+      principal: null,
+      kind: "agent",
+      source: "env:X",
+      expires: null,
+    });
+  });
+
+  it("reads a human's claims as before", () => {
+    const token = jwt({ sub: "usr_1", principalKind: "human", exp: 2_000_000_000 });
+    expect(describeCredential({ token, source: "env:Y", kind: "human" })).toMatchObject({
+      principal: "usr_1",
+      kind: "human",
+    });
+  });
+
+  it("returns null for a human credential it cannot parse, so the caller can still refuse", () => {
+    expect(describeCredential({ token: "not-a-jwt", source: "env:Y", kind: "human" })).toBeNull();
   });
 });
