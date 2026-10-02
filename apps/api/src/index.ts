@@ -43,7 +43,8 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue } from './db/catalog';
+import { authorizeAgentQueue } from './auth/agent-queue';
 import {
   AGENT_TOKEN_SCOPES,
   isAgentScope,
@@ -1401,9 +1402,13 @@ export default {
      * would be a route an agent reaches unchecked.
      */
     const isCoordinatorRoute =
-      !!boardId &&
-      ((request.method === 'GET' && (rest === '' || /^cards\/[^/]+$/.test(rest))) ||
-        (request.method === 'POST' && rest === 'cards'));
+      // Listing the workspace's boards. No `boardId`, and `rest` is empty for both this and the
+      // board read below — which is why `requiredScope` says `read` for both without needing to
+      // tell them apart. POST here CREATES a board and stays human-only.
+      (!boardId && request.method === 'GET' && rest === '') ||
+      (!!boardId &&
+        ((request.method === 'GET' && (rest === '' || /^cards\/[^/]+$/.test(rest))) ||
+          (request.method === 'POST' && rest === 'cards')));
     /**
      * Was an agent credential actually OFFERED?
      *
@@ -1414,9 +1419,8 @@ export default {
      */
     const offersBearer = /^Bearer\s+\S/i.test(request.headers.get('Authorization') ?? '');
     const isAgentRoute =
-      !!boardId &&
-      (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute ||
-        (isCoordinatorRoute && offersBearer));
+      (!!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute)) ||
+      (isCoordinatorRoute && offersBearer);
     // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
     const isWebhook = !!boardId && (rest === 'webhooks/github' || rest === 'webhooks/forge');
     let tenantId: string;
@@ -1697,15 +1701,48 @@ export default {
         // alone, board-do.ts) would have had it spread straight through to the DO. A cast is not
         // validation, so the route has to name what it accepts rather than forward what it
         // received.
+        /**
+         * Who is answerable for this card, and on whose authority it may be dispatched.
+         *
+         * Two callers now reach here. For a person the two have always been the same value and
+         * `ownerUserId` ended with `?? 'usr_dev'`; for an AGENT that literal would have owned real
+         * work to a user that exists in no workspace, and `user?.mayDispatch` would have been
+         * `undefined` — a null grant, which the control pair refuses at claim time. So an agent
+         * could have created cards that nothing could ever claim: queued-looking, and dead.
+         */
+        const queueing = agent
+          ? await authorizeAgentQueue(env.DB, agent, boardId, body.ownerUserId)
+          : null;
+        if (queueing && !queueing.ok) {
+          return Response.json(
+            { error: { code: queueing.code, message: queueing.message } },
+            { status: queueing.status },
+          );
+        }
         const result = await stub.createCard({
           title: body.title,
           spec: body.spec,
           priority: body.priority,
           dueAt: body.dueAt,
-          ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_dev',
-          queuedGrant: user?.mayDispatch ?? null,
+          ownerUserId: queueing ? queueing.ownerUserId : body.ownerUserId ?? user!.userId,
+          queuedGrant: queueing ? queueing.queuedGrant : user?.mayDispatch ?? null,
+          // Null for a person, and that is the whole signal: every card on every board today was
+          // queued by one, and a reader must be able to see at a glance which ones were not.
+          queuedBy: queueing ? queueing.queuedBy : null,
+          queuedByAgentId: agent?.agentId ?? null,
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        // Written AFTER the card exists, so the ceiling counts cards that were actually created
+        // rather than attempts — and so a board that refused the card does not spend the agent's
+        // hourly budget on nothing.
+        if (agent?.agentId) {
+          await recordAgentQueue(env.DB, {
+            tenantId,
+            agentId: agent.agentId,
+            boardId,
+            cardId: result.value.id,
+          });
+        }
         return Response.json({ card: result.value }, { status: 201 });
       }
 
