@@ -6,6 +6,8 @@
 # Optional env:
 #   VERSION     pin a release tag (e.g. v0.0.2); default: the latest release
 #   BIN_DIR     where to install; default: ~/.local/bin
+#   SKILL_DIR   also install the agent skill here (e.g. ~/.hermes/profiles/super-chotu/skills);
+#               omitted by default, because most callers are people and a person needs no skill
 #
 # Installs one binary under two names, `supi` and `superpipeline`, matching the `bin` entries in
 # packages/cli/package.json: the full name for scripts and documentation a stranger reads, the
@@ -82,6 +84,27 @@ mv -f "${BIN_DIR}/.supi.incoming.$$" "${BIN_DIR}/supi"
 ln -sf "${BIN_DIR}/supi" "${BIN_DIR}/superpipeline"
 
 printf 'Installed %s\n' "$("${BIN_DIR}/supi" version)"
+
+# The agent skill, when a caller asks for it by naming a directory.
+#
+# Opt-in rather than always: supi is a client a person runs, and a skill in a human's home is
+# clutter. But when the caller IS an agent's station, the skill has to arrive WITH the binary — a
+# skill that teaches verbs is only true of the version it shipped beside, and one placed by hand
+# drifts the moment a verb is renamed, silently, because its reader cannot notice.
+if [ -n "${SKILL_DIR:-}" ]; then
+  skill_dest="${SKILL_DIR}/superpipeline-boards"
+  mkdir -p "$skill_dest"
+  if curl -fsSL "${base}/SKILL.md" -o "${tmp}/SKILL.md"; then
+    # Same staged rename as the binary, for the same reason: a reader must never see half a file.
+    cp "${tmp}/SKILL.md" "${skill_dest}/.SKILL.md.incoming.$$"
+    mv -f "${skill_dest}/.SKILL.md.incoming.$$" "${skill_dest}/SKILL.md"
+    printf 'Installed the superpipeline-boards skill into %s\n' "$skill_dest"
+  else
+    # Not fatal. The binary is installed and works; the skill is documentation for an agent, and a
+    # release predating it simply has none to fetch.
+    printf 'No SKILL.md in %s — skill not installed (the CLI is fine)\n' "$tag" >&2
+  fi
+fi
 
 # shellcheck disable=SC2016  # $PATH here is literal text for the reader to type, not an expansion
 case ":${PATH}:" in
