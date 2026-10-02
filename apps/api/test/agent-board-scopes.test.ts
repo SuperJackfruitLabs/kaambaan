@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { requiredScope, scopePermits } from '../src/auth/scopes';
+import { requiredScope, scopePermits, stagePatchRefusal } from '../src/auth/scopes';
 
 /**
  * Which board routes an agent credential may reach, and on which scope.
@@ -141,13 +141,23 @@ describe('`plan` rearranges work that already exists', () => {
     expect(requiredScope('gates/gate_1/resolve', 'POST')).toBe('__forbidden__');
   });
 
-  it('STILL FORBIDS restructuring the board', () => {
-    // Changing stages re-routes every card and can strand work outright.
-    for (const rest of ['stages', 'stages/review']) {
-      for (const m of ['POST', 'PATCH', 'PUT', 'DELETE']) {
-        expect(requiredScope(rest, m)).toBe('__forbidden__');
-      }
+  it('STILL FORBIDS replacing the pipeline, which is the part that strands cards', () => {
+    /**
+     * Narrowed deliberately, not weakened.
+     *
+     * This asserted that EVERY method on EVERY stage path was refused. One stage's `PATCH` is now
+     * reached on `compose` — but only to set `instructions`, and `stagePatchRefusal` refuses every
+     * routing field in the body. What this test was protecting is intact: the hazard was
+     * "re-routes every card on it", and nothing here lets an agent re-route anything.
+     */
+    for (const m of ['POST', 'PATCH', 'PUT', 'DELETE']) {
+      expect(requiredScope('stages', m)).toBe('__forbidden__');
     }
+    for (const m of ['POST', 'PUT', 'DELETE']) {
+      expect(requiredScope('stages/review', m)).toBe('__forbidden__');
+    }
+    expect(requiredScope('stages/review', 'PATCH')).toBe('compose');
+    expect(stagePatchRefusal({ owner: 'code' })).toContain('owner');
   });
 
   it('a `plan` token cannot queue, and a `queue` token cannot plan', () => {
@@ -161,5 +171,74 @@ describe('`plan` rearranges work that already exists', () => {
     const c = ['read', 'queue', 'plan'];
     for (const s of ['read', 'queue', 'plan'] as const) expect(scopePermits(c, s)).toBe(true);
     for (const s of ['claim', 'run'] as const) expect(scopePermits(c, s)).toBe(false);
+  });
+});
+
+describe('`compose` makes a place for work, and the runbook for doing it', () => {
+  it('gates creating a board on `compose`', () => {
+    // `boardId` is absent for the create route, exactly as for the list — and the method is what
+    // separates them. GET is a `read`; POST makes a board.
+    expect(requiredScope('', 'POST', { hasBoardId: false })).toBe('compose');
+    expect(requiredScope('', 'GET', { hasBoardId: false })).toBe('read');
+  });
+
+  it('gates ONE stage on `compose`, where the whole pipeline stays refused', () => {
+    // Editing one stage's prose is recoverable and visible. Replacing the pipeline re-routes every
+    // card on the board and has already destroyed instructions once.
+    expect(requiredScope('stages/audit', 'PATCH')).toBe('compose');
+    expect(requiredScope('stages', 'POST')).toBe('__forbidden__');
+    expect(requiredScope('stages', 'PUT')).toBe('__forbidden__');
+    expect(requiredScope('stages/audit', 'DELETE')).toBe('__forbidden__');
+  });
+
+  it('STILL refuses renaming or deleting a board, on every scope', () => {
+    // The operator's line: agents create, agents never delete. A rename is withheld in this first
+    // cut rather than argued about — it is cosmetic, and adding it later costs nothing.
+    expect(requiredScope('', 'DELETE')).toBe('__forbidden__');
+    expect(requiredScope('', 'PATCH')).toBe('__forbidden__');
+  });
+
+  it('`compose` and `plan` do not imply each other, in either direction', () => {
+    expect(scopePermits(['plan'], 'compose')).toBe(false);
+    expect(scopePermits(['compose'], 'plan')).toBe(false);
+    // Nor does the worker pair reach it — the grandfather regression, a fourth time.
+    expect(scopePermits(['claim', 'run'], 'compose')).toBe(false);
+  });
+
+  it('a documentation agent can hold `compose` alone', () => {
+    // The point of giving it its own name: the agent who writes runbooks needs neither card edits
+    // nor moves, and should not get them as a side effect.
+    const karen = ['read', 'compose'];
+    expect(scopePermits(karen, 'compose')).toBe(true);
+    for (const s of ['plan', 'queue', 'claim', 'run'] as const) expect(scopePermits(karen, s)).toBe(false);
+  });
+});
+
+describe('a stage PATCH is authorised FIELD by field', () => {
+  it('permits `instructions` and nothing else', () => {
+    // The first field-level grant in this codebase. A scope that permitted the whole body would hand
+    // an agent `owner` and `requires` — routing — through a door opened for prose.
+    expect(stagePatchRefusal({ instructions: 'do the thing' })).toBeNull();
+  });
+
+  it('refuses every routing field, and NAMES the one that was wrong', () => {
+    // A caller that sends `owner` must learn which key was the problem, not that the route is shut.
+    for (const field of ['owner', 'ownerKind', 'requires', 'order', 'gate', 'wipLimit']) {
+      const refusal = stagePatchRefusal({ instructions: 'ok', [field]: 'x' });
+      expect(refusal, `${field} must be refused`).not.toBeNull();
+      expect(refusal).toContain(field);
+    }
+  });
+
+  it('refuses a body that changes nothing, rather than reporting success', () => {
+    expect(stagePatchRefusal({})).not.toBeNull();
+  });
+
+  it('allows `name` and `completion` to stay human-only for now', () => {
+    // `name` is cosmetic but still a stage identity a reader navigates by; `completion` defines what
+    // counts as done, and an agent loosening it would make "done" mean less. Withheld in the first
+    // cut; neither is hard to add once somebody wants it.
+    expect(stagePatchRefusal({ name: 'Renamed' })).toContain('name');
+    expect(stagePatchRefusal({ completion: { required: [] } })).toContain('completion');
   });
 });
