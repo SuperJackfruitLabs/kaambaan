@@ -3,6 +3,7 @@
   import { cardProvenance } from '$lib/components/board/card-provenance';
   import { onDestroy } from 'svelte';
   import { groupActivities, isNarrative, defaultOpen, visibleActivities } from '$lib/activity-groups';
+  import { stageAccount, formatHandoff } from '$lib/stage-account';
   import { app } from '$lib/stores/app.svelte';
   import {
     getCardActivities,
@@ -88,6 +89,16 @@
   const decidedGates = $derived((cardDetail?.gates ?? []).filter((g) => g.status !== 'pending'));
   let drawerAttempts = $state<Attempt[]>([]);
   const activityGroups = $derived(groupActivities(cardDetail?.activities ?? [], drawerAttempts ?? []));
+  /**
+   * How each run ENDED, and what it attached — keyed by run so a group can show its own foot.
+   *
+   * The activities say what an agent DID. Until `runs.handoff_json`/`runs.failure_reason` existed
+   * there was nowhere to read what it concluded: the handoff was one column on the card, overwritten
+   * at every stage, and a failure's reason went to a notification. So a card worked three times
+   * showed three lists of actions and the last line of the story.
+   */
+  const stageEntries = $derived(stageAccount(drawerAttempts ?? [], refs));
+  const stageByRun = $derived(new Map(stageEntries.map((e) => [e.runId, e])));
 
   let cardEstimate = $state<Estimate | null>(null);
   /** Same-board (enforced) and cross-board (advisory) edges touching this card — Task 17a/17d's `GET …/links`. */
@@ -1572,6 +1583,14 @@
                     {#if g.outcome}
                       <span style="color:{g.outcome === 'completed' ? 'var(--live)' : 'var(--coral)'}">{g.outcome}</span>
                     {/if}
+                    <!--
+                      "attempt 2" rather than two things that look like two stages. A retry at one
+                      stage is its own run with its own story, and the fact that an earlier one failed
+                      is the most useful thing on the card — so it is named, not merged away.
+                    -->
+                    {#if (stageByRun.get(g.runId)?.attemptOfStage ?? 1) > 1}
+                      <span class="text-muted-foreground text-[10px]">attempt {stageByRun.get(g.runId)!.attemptOfStage}</span>
+                    {/if}
                     <span class="text-muted-foreground ml-auto whitespace-nowrap text-[10px]">
                       {g.counts.total} event{g.counts.total === 1 ? '' : 's'}{g.counts.error > 0 ? ` · ${g.counts.error} error` : ''}
                     </span>
@@ -1637,6 +1656,50 @@
                         </div>
                       {/if}
                     {/each}
+
+                    <!--
+                      How this run ended, and what it attached.
+                      ──────────────────────────────────────────
+                      The activities above say what the agent DID; this says what it concluded, and
+                      it is the half that had nowhere to live. The handoff was one column on the card,
+                      overwritten by the next stage; a failure's reason went to a notification and the
+                      event stream. Both are now kept on the run itself.
+
+                      Nothing is rendered for a run that ended with neither — a legacy card, or a
+                      completed run that said nothing — because an empty "Handoff" heading is worse
+                      than silence.
+                    -->
+                    {#if stageByRun.get(g.runId)}
+                      {@const e = stageByRun.get(g.runId)!}
+                      {#if e.failureReason}
+                        <div class="stage-foot stage-foot-failed">
+                          <div class="stage-foot-h">failed</div>
+                          <div class="text-xs leading-relaxed">{e.failureReason}</div>
+                        </div>
+                      {:else if formatHandoff(e.handoff).length > 0}
+                        <div class="stage-foot">
+                          <div class="stage-foot-h">handed on</div>
+                          {#each formatHandoff(e.handoff) as f (f.label ?? f.value)}
+                            <div class="text-xs leading-relaxed">
+                              {#if f.label}<span class="mono text-muted-foreground">{f.label}:</span>{/if}
+                              {f.value}
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+                      {#if e.references.length > 0}
+                        <div class="stage-foot">
+                          <div class="stage-foot-h">attached here</div>
+                          <div class="flex flex-wrap gap-1">
+                            {#each e.references as r (r.id)}
+                              <a class="refchip hover:border-marigold/50" href={r.url} target="_blank" rel="noreferrer noopener">
+                                {r.title || r.url}
+                              </a>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+                    {/if}
                   </div>
                 </details>
               {/each}

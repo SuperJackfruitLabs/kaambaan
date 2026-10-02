@@ -146,7 +146,9 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     {
       description:
         'Claim the next ready card you are eligible to work, using your token\'s capabilities. ' +
-        'Returns a run + lease + the upstream handoff, or {claimed:false} when no work is available.',
+        'Returns a run + lease + the upstream handoff, or {claimed:false} when no work is available. ' +
+        'When a previous attempt at this stage failed, `lastFailure` carries its reason — READ IT before ' +
+        'repeating the same approach, because the wall it hit is probably still there.',
       inputSchema: { boardId: z.string(), maxConcurrency: z.number().int().positive().optional() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -207,7 +209,10 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     {
       description:
         'Attach a first-class external reference (GitHub PR/issue, repo, doc, or any url) to a card. ' +
-        'Idempotent on (card, url); a bare GitHub url is auto-recognized into provider/sourceType/externalId.',
+        'Idempotent on (card, url); a bare GitHub url is auto-recognized into provider/sourceType/externalId. ' +
+        'Attribution is automatic: a reference you attach while working a card is recorded against YOUR run, ' +
+        'so the card can show what each stage produced. There is no url for a local file — superpipeline ' +
+        'stores no content, so publish the document first and reference where it landed.',
       inputSchema: {
         boardId: z.string(),
         cardId: z.string(),
@@ -221,12 +226,22 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
-    async ({ boardId, cardId, url, provider, sourceType, title, subtitle, externalId, metadata }) =>
-      fromResult(
+    async ({ boardId, cardId, url, provider, sourceType, title, subtitle, externalId, metadata }) => {
+      /**
+       * The run is DERIVED, never taken as an argument.
+       *
+       * The board already knows which run holds this card, and an agent that could name a run could
+       * attribute its own evidence to somebody else's attempt. Taken off the card, and only when the
+       * holder is this agent — otherwise null, which is the same honest value a human's reference has.
+       */
+      const card = (await deps.boardStub(boardId).getState()).cards.find((c) => c.id === cardId);
+      const runId = card && card.delegateAgentId === auth.agentId ? card.currentRunId : null;
+      return fromResult(
         await deps.boardStub(boardId).addReference(
-          resolveReferenceInput({ cardId, url, provider, sourceType, title, subtitle, externalId, metadata, addedBy: 'agent' }),
+          resolveReferenceInput({ cardId, url, provider, sourceType, title, subtitle, externalId, metadata, addedBy: 'agent', runId }),
         ),
-      ),
+      );
+    },
   );
 
   register(

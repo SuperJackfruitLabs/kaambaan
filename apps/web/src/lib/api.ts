@@ -195,6 +195,15 @@ export interface Attempt {
   costUsd: number;
   model: string | null;
   profileKey: string | null;
+  /**
+   * What THIS run handed on, kept per-run since the spec of 2026-10-02.
+   *
+   * The card's `handoff` is one value overwritten at every stage, so it only ever showed the latest.
+   * This is what lets a reader see the account stage by stage rather than its last line.
+   */
+  handoff: unknown;
+  /** Why this run died. Null for one that completed, or is still open. */
+  failureReason: string | null;
 }
 
 export interface Activity {
@@ -312,6 +321,12 @@ export interface Elicitation {
 export interface Reference {
   id: string;
   cardId: string;
+  /**
+   * The run that attached this, when an agent did it mid-run. Null for a human's, and for every
+   * reference from before the column existed — both of which belong to the card rather than to a
+   * stage.
+   */
+  runId?: string | null;
   url: string;
   title?: string | null;
   subtitle?: string | null;

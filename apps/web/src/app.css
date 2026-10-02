@@ -364,6 +364,32 @@
     max-width: 11rem;
   }
 
+  /*
+    The foot of one run's group: what it handed on, why it failed, what it attached.
+    Set apart from the activity rows above it, because it is a conclusion rather than another event.
+  */
+  .stage-foot {
+    margin: 4px 6px 0;
+    padding: 5px 7px;
+    border-left: 2px solid var(--line);
+    background: var(--inset);
+    border-radius: 0 5px 5px 0;
+  }
+  .stage-foot-failed {
+    border-left-color: var(--coral);
+  }
+  .stage-foot-h {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+  .stage-foot-failed .stage-foot-h {
+    color: var(--coral);
+  }
+
   /* cost bar */
   .costbar {
     height: 3px;
