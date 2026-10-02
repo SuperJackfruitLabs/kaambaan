@@ -44,7 +44,14 @@ import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, res
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
-import { AGENT_TOKEN_SCOPES, isAgentScope, requiredScope, scopePermits, type AgentScope } from './auth/scopes';
+import {
+  AGENT_TOKEN_SCOPES,
+  isAgentScope,
+  requiredScope,
+  scopePermits,
+  SCOPE_FORBIDDEN,
+  type AgentScope,
+} from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
@@ -1375,8 +1382,21 @@ export default {
     // stops offering buttons for a decision already made. Deciding a gate stays human-only.
     const isEitherRoute =
       !!boardId && (rest === 'gates/pending' || /^gates\/[^/]+$/.test(rest));
+    /**
+     * What a COORDINATOR agent reaches: the board, one card, and creating a card.
+     *
+     * Method-scoped at the door as well as in `requiredScope`, so a credential that may read a
+     * board cannot even enter the agent branch to DELETE it. Both checks exist because they fail
+     * differently: this one picks the branch, that one picks the scope, and a route admitted here
+     * with no scope opinion would be a route an agent reaches unchecked.
+     */
+    const isCoordinatorRoute =
+      !!boardId &&
+      ((request.method === 'GET' && (rest === '' || /^cards\/[^/]+$/.test(rest))) ||
+        (request.method === 'POST' && rest === 'cards'));
     const isAgentRoute =
-      !!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute);
+      !!boardId &&
+      (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute || isCoordinatorRoute);
     // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
     const isWebhook = !!boardId && (rest === 'webhooks/github' || rest === 'webhooks/forge');
     let tenantId: string;
@@ -1406,7 +1426,13 @@ export default {
         // migration 0001, the resolver has always returned it, and nothing compared it to the action
         // being attempted — so a token minted to claim drove every run verb. A recorded permission
         // nobody checks reads as protection that does not exist (auth/scopes.ts).
-        const needed = requiredScope(rest);
+        const needed = requiredScope(rest, request.method);
+        if (needed === SCOPE_FORBIDDEN) {
+          return Response.json(
+            { error: `an agent token cannot ${request.method} this route` },
+            { status: 403 },
+          );
+        }
         if (needed && !scopePermits(agent.scopes, needed)) {
           return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
         }
