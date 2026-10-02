@@ -1109,11 +1109,25 @@ export default {
         // no network call in this path — and resolves to the same principal shape,
         // so nothing downstream can tell which credential arrived.
         //
-        // Deliberately not extended to POST or DELETE yet: proving the contract
-        // needs a read, and a first integration should not also be the first
-        // credential able to mint an agent token.
+        // Deliberately not extended to POST or DELETE: a first integration should not also be the
+        // first credential able to mint an agent token.
+        //
+        // PATCH is, and the reason above is exactly why it is safe to. That sentence is about
+        // CREDENTIALS, and a PATCH mints none — it changes what an agent IS. Leaving it out had a
+        // cost that showed up immediately: `supi` carries a hub token and nothing else, so the
+        // queueing policy shipped with a setter the only client written for it answered 401 to,
+        // while `supi agents` beside it answered 200. A permission nobody can set is the failure
+        // that setter existed to fix.
+        //
+        // `externalId` is carved back out below. Mapping an agent to a principal is what makes an
+        // agent-kind hub token resolve at all (`resolveHubAgent` finds the agent BY that mapping),
+        // so a credential able to write it could point an agent row at any principal and grant
+        // itself identities.
         let u = await resolveUser(request, env);
-        if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
+        const viaHubToken = !u;
+        if (!u && (request.method === 'GET' || request.method === 'PATCH')) {
+          u = await resolveHubUser(request, env);
+        }
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const agentId = agentsMatch[1];
         const tokenId = agentsMatch[3];
@@ -1323,6 +1337,18 @@ export default {
             }
             if (Object.keys(patch).length > 0) await updateAgent(env.DB, u.tenantId, agentId, patch);
 
+            if (body.externalId !== undefined && viaHubToken) {
+              // The one field a hub token may not write, and the refusal is explicit rather than a
+              // silent drop: a caller that asked to link a principal and got `{ok:true}` would
+              // believe it had.
+              return Response.json(
+                {
+                  error:
+                    'externalId cannot be set with a hub token — mapping an agent to a principal is what makes an agent token resolve, so it is a session-only act',
+                },
+                { status: 403 },
+              );
+            }
             if (body.externalId === undefined) {
               // A patch that only touched the agent's own fields is complete. Only a request that
               // named NOTHING at all is a mistake worth reporting.
