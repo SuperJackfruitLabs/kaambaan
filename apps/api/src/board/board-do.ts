@@ -653,6 +653,20 @@ export interface GateView {
 export interface GatePendingBody {
   event: 'gate.pending';
   boardId: string | null;
+  /**
+   * What the board is CALLED, as opposed to what it is keyed by.
+   *
+   * Carried because the hub cannot find out any other way: its only route to board
+   * metadata resolves a user session, which a service credential does not have — the
+   * same wall that makes the hub's `humansFor` an injected dependency. Without this
+   * every board's chat room was named after the product rather than the board, so a
+   * person with four boards saw four rooms with one name.
+   *
+   * Always present, empty string when the board has no name, never absent: a reader
+   * distinguishing "no name" from "a build that does not send one" would be
+   * distinguishing two things that call for the same fallback.
+   */
+  boardName: string;
   cardId: string;
   gateId: string;
   stageKey: string;
@@ -663,6 +677,50 @@ export interface GatePendingBody {
   handoffSummary: string | null;
   options: Array<{ id: string; label: string }>;
   /** When the gate opened. The gate's own clock, so a re-read is byte-identical. */
+  ts: string;
+}
+
+/**
+ * What an `elicitation.pending` carries — an agent is blocked on a person.
+ *
+ * The mirror of {@link GatePendingBody}, and deliberately so: both are "a human must
+ * answer something before this card moves", both travel by push and are read back by a
+ * sweep, and one builder serves both paths for the reason given above.
+ *
+ * It exists because nothing outside the web app could previously learn that a run had
+ * stopped to ask. `openElicitation` emitted an internal event and filed an in-app
+ * notification; neither leaves the board. Every permission prompt therefore meant
+ * opening a browser, however the operator was carrying the question around.
+ */
+export interface ElicitationPendingBody {
+  event: 'elicitation.pending';
+  boardId: string | null;
+  boardName: string;
+  cardId: string;
+  cardTitle: string;
+  elicitationId: string;
+  runId: string;
+  stageKey: string;
+  /**
+   * The agent that is waiting — and, at the answer route, the one identity that may
+   * not answer. Carried so a projection can say who is blocked rather than just that
+   * something is.
+   */
+  agentId: string;
+  /** The question. May be empty: an agent can stop on options alone. */
+  question: string;
+  /**
+   * The options the agent offered, in the order it offered them.
+   *
+   * **May be empty, and the body is still sent.** An elicitation with no options cannot
+   * be answered with a button, and a reader needs to know one exists in order to say
+   * where it CAN be answered. Omitting the unanswerable case would make silence mean
+   * both "no question" and "a question you cannot tap".
+   *
+   * `id`/`label`, not the board's `name`/`title`, for the same reason the gate's are.
+   */
+  options: Array<{ id: string; label: string }>;
+  /** When the question was asked. The row's own clock, so a re-read is byte-identical. */
   ts: string;
 }
 
@@ -964,6 +1022,7 @@ export interface BoardStub {
   registerPushConfig(input: PushConfigInput): Promise<Result<{ configId: string }>>;
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
+  pendingElicitationDeliveries(): Promise<ElicitationPendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
   createSchedule(input: {
@@ -4609,6 +4668,7 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.emit('elicitation.opened', { elicitationId: id, cardId, runId: input.runId, signal: input.signal ?? null });
     this.notify('input', cardId, question === '' ? 'An agent is waiting on you' : question);
+    this.notifyElicitationPending(id);
   }
 
   /**
@@ -4673,12 +4733,27 @@ export class BoardDO extends DurableObject<Env> {
       .map((r) => this.rowToElicitation(r));
   }
 
-  /** Every question currently waiting on a human, board-wide — the human's view. */
-  private pendingElicitations(): ElicitationView[] {
+  /**
+   * The rows of every question currently waiting on a human, board-wide, oldest first.
+   *
+   * One query with two readers, which is why it is rows rather than either shape: the
+   * board's own `ElicitationView` for a person looking at the board, and the wire's
+   * `ElicitationPendingBody` for a projection somewhere else. A second copy of this
+   * `WHERE` would be a second answer to "what is still waiting", and the two would
+   * diverge on the day one of them learned about a new status.
+   *
+   * `rowid` breaks the tie because `created_at` is a formatted timestamp and two
+   * questions asked in the same tick would otherwise come back in an arbitrary order.
+   */
+  private pendingElicitationRows(): Row[] {
     return this.sql
       .exec(`SELECT * FROM elicitations WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC`)
-      .toArray()
-      .map((r) => this.rowToElicitation(r));
+      .toArray() as Row[];
+  }
+
+  /** Every question currently waiting on a human, board-wide — the human's view. */
+  private pendingElicitations(): ElicitationView[] {
+    return this.pendingElicitationRows().map((r) => this.rowToElicitation(r));
   }
 
   /**
@@ -5015,6 +5090,8 @@ export class BoardDO extends DurableObject<Env> {
     return {
       event: 'gate.pending',
       boardId: this.getMeta('boardId'),
+      // `?? ''` rather than omitted: see `GatePendingBody.boardName`.
+      boardName: this.getMeta('name') ?? '',
       cardId,
       gateId: gate.id as string,
       stageKey: gate.stage_key as string,
@@ -5037,6 +5114,95 @@ export class BoardDO extends DurableObject<Env> {
       })),
       ts: gate.created_at as string,
     };
+  }
+
+  /**
+   * The body a question travels in, built once from the elicitation's own row.
+   *
+   * Read from the row rather than from the activity that produced it, for the reason
+   * `gatePendingBody` gives about gates: a question must keep the options it was ASKED
+   * with. An agent that re-posted different options would otherwise change a question
+   * out from under the person answering it.
+   *
+   * `null` when the card is gone — a question about a deleted card has nothing to ask
+   * about, and is the same case the gate builder already handles.
+   */
+  private elicitationPendingBody(row: Row): ElicitationPendingBody | null {
+    const cardId = row.card_id as string;
+    const card = this.getCard(cardId);
+    if (!card) return null;
+    return {
+      event: 'elicitation.pending',
+      boardId: this.getMeta('boardId'),
+      boardName: this.getMeta('name') ?? '',
+      cardId,
+      cardTitle: card.title,
+      elicitationId: row.id as string,
+      runId: row.run_id as string,
+      stageKey: row.stage_key as string,
+      agentId: row.agent_id as string,
+      question: (row.question as string) ?? '',
+      options: (JSON.parse(row.options_json as string) as GateOption[]).map((o) => ({
+        id: o.name,
+        label: o.title,
+      })),
+      ts: row.created_at as string,
+    };
+  }
+
+  /**
+   * Queue `elicitation.pending` for a question that just opened.
+   *
+   * **Fan-out is by subscription only** — the same rule as `notifyGatePending` and for
+   * the same reason, which is worth restating because the temptation is to copy
+   * `notifyWorkAvailable` instead. `work.available` is addressed to whoever could
+   * *claim* a stage, so it matches on capability. A question is addressed to a
+   * **human**. Matching on capability would send it to whichever agents happen to
+   * advertise the stage's capability, and to nobody at all when the stage is one a
+   * person owns.
+   */
+  private notifyElicitationPending(elicitationId: string): void {
+    const row = this.sql.exec(`SELECT * FROM elicitations WHERE id = ?`, elicitationId).toArray()[0] as
+      | Row
+      | undefined;
+    if (!row) return;
+    const payload = this.elicitationPendingBody(row);
+    if (!payload) return;
+    const body = JSON.stringify(payload);
+    const ts = this.now();
+    for (const cfg of this.sql.exec(`SELECT * FROM push_configs`).toArray()) {
+      const events = JSON.parse(cfg.events_json as string) as string[];
+      if (!events.includes('elicitation.pending')) continue;
+      this.sql.exec(
+        `INSERT INTO push_deliveries (config_id, url, body, status, attempts, created_at) VALUES (?, ?, ?, 'pending', 0, ?)`,
+        cfg.id,
+        cfg.url,
+        body,
+        ts,
+      );
+    }
+  }
+
+  /**
+   * Every question still waiting on a human, in the body a push carries.
+   *
+   * The floor beneath push, exactly as `pendingGateDeliveries` is: a delivery is retried
+   * five times and then dead-lettered, at which point the card is blocked on an answer
+   * nobody was told about and neither side is looking. This is what lets a reader ask
+   * rather than wait to be told, and it is why the per-board push-config rollout does
+   * not block the feature — a board whose config predates the event is served late
+   * rather than not at all.
+   *
+   * It carries a second meaning the gate version does not need as badly. A question is
+   * superseded by the next question on the same card (`openElicitation` retires the
+   * previous one), so **absence from this list** is how a reader learns that a question
+   * it already showed can no longer be answered. A stale question that still looks
+   * tappable is a question that will be tapped.
+   */
+  async pendingElicitationDeliveries(): Promise<ElicitationPendingBody[]> {
+    return this.pendingElicitationRows()
+      .map((r) => this.elicitationPendingBody(r))
+      .filter((b): b is ElicitationPendingBody => b !== null);
   }
 
   /** The gate row, or null. */
