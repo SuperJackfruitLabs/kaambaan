@@ -3054,6 +3054,23 @@ export default {
         return Response.json({ card: result.value });
       }
 
+      // GET /v1/boards/:id/elicitations/pending — every question still waiting on a human.
+      //
+      // The read half of a projection's reconciliation sweep, and the mirror of
+      // `gates/pending` above. Push carries a question when it opens and dead-letters
+      // after five attempts; this is how a question that was never delivered is found
+      // rather than waited for.
+      //
+      // It also carries a meaning the gate version does not need as badly: a question is
+      // retired by the next question on the same card, so ABSENCE from this list is how a
+      // reader learns that a question it already showed can no longer be answered.
+      //
+      // Matched before the answer route below, which it cannot collide with — that one
+      // ends in `/answer` — but kept adjacent so the pair reads together.
+      if (rest === 'elicitations/pending' && request.method === 'GET') {
+        return Response.json({ elicitations: await stub.pendingElicitationDeliveries() });
+      }
+
       // POST /v1/boards/:id/elicitations/:elicitationId/answer — the signed-in human answers an
       // agent's question (docs/04 §4), which returns the card to `working` and unblocks the agent.
       //

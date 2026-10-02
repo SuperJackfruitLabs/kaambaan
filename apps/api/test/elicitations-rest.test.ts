@@ -244,3 +244,80 @@ describe('who may answer, over the wire', () => {
     expect(res.status).toBe(403);
   });
 });
+
+/**
+ * `GET /v1/boards/:id/elicitations/pending` — the read half of the hub's sweep.
+ *
+ * The mirror of `gates/pending`, and it exists for the same stated reason: a push is
+ * retried five times and then dead-lettered, at which point the card is blocked on an
+ * answer nobody was told about and neither side is looking.
+ *
+ * It carries one meaning the gate version does not need as badly. A question is retired
+ * by the next question on the same card, so **absence** from this list is how a reader
+ * learns a question it already showed can no longer be answered — and a stale question
+ * that still looks answerable is one that will be answered.
+ */
+describe('every question still waiting on a human, over REST', () => {
+  it('lists a pending question in the shape a push carries', async () => {
+    const tenantId = 'tnt_elc_pending';
+    const boardId = await createBoard(tenantId);
+    await addCard(tenantId, boardId, 'Ship the docs');
+    const { token } = await connectAgent(tenantId, ['research'], 'researcher');
+    const claim = await claimAndAsk(boardId, token);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${boardId}/elicitations/pending`, {
+      headers: human(tenantId),
+    });
+    expect(res.status).toBe(200);
+    const { elicitations } = (await res.json()) as { elicitations: Array<Record<string, unknown>> };
+
+    expect(elicitations).toHaveLength(1);
+    expect(elicitations[0]).toMatchObject({
+      event: 'elicitation.pending',
+      boardId,
+      boardName: 'Elicitations',
+      cardTitle: 'Ship the docs',
+      runId: claim.runId,
+      stageKey: 'research',
+      question: 'May I run the test suite?',
+      // `id`/`label` on the wire, never the board's `name`/`title`.
+      options: [
+        { id: 'run_them', label: 'Run the tests' },
+        { id: 'skip', label: 'Skip them' },
+      ],
+    });
+  });
+
+  it('stops listing a question once it is answered', async () => {
+    const tenantId = 'tnt_elc_pending_gone';
+    const boardId = await createBoard(tenantId);
+    await addCard(tenantId, boardId, 'Ship the docs');
+    const { token } = await connectAgent(tenantId, ['research'], 'researcher');
+    const claim = await claimAndAsk(boardId, token);
+    const run = await pollRun(boardId, claim.runId, token);
+
+    const answered = await answer(boardId, run.elicitations[0]!.id, human(tenantId, 'usr_h'), {
+      option: 'run_them',
+    });
+    expect(answered.status).toBe(200);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${boardId}/elicitations/pending`, {
+      headers: human(tenantId),
+    });
+    expect(((await res.json()) as { elicitations: unknown[] }).elicitations).toHaveLength(0);
+  });
+
+  it('is not shadowed by the answer route', async () => {
+    // `pending` sits where an elicitation id goes. An empty board must answer with an
+    // empty list rather than "elicitation not found", or the sweep would read a 404 on
+    // every quiet board and have no way to tell that apart from a broken one.
+    const tenantId = 'tnt_elc_pending_empty';
+    const boardId = await createBoard(tenantId);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${boardId}/elicitations/pending`, {
+      headers: human(tenantId),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { elicitations: unknown[] }).elicitations).toEqual([]);
+  });
+});
