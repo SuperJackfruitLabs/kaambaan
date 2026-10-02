@@ -37,6 +37,7 @@ import {
   type Project,
 } from '$lib/api';
 import { passesArchivedFilter, passesProjectFilter } from './card-filters';
+import { feedIsStalled, STALL_CHECK_MS } from '../feed-liveness';
 
 const BOARD_KEY = 'superpipeline.boardId';
 const THEME_KEY = 'superpipeline.theme';
@@ -156,6 +157,18 @@ class AppStore {
   #reconnectAttempt = 0;
   #feedListeners = new Set<(event: BoardFeedEvent) => void>();
   #socketGeneration = 0;
+  /**
+   * When the socket last delivered anything, and the watchdog that reads it.
+   *
+   * `connected` was set true on `open` and false on `close`, and a socket that stops DELIVERING
+   * without closing fires neither. Measured on a live card: the API went 311 → 318 activities over 45
+   * seconds while the open panel sat at 298 and never caught up — `connected` still true, no
+   * "offline", no reconnect, and a reload fixed it. An idle proxy dropping the connection or a Worker
+   * rotating underneath does not necessarily produce a `close` the page sees, so liveness has to be
+   * OBSERVED rather than trusted (`feed-liveness.ts`).
+   */
+  #lastMessageAt: number | null = null;
+  #stallTimer: ReturnType<typeof setInterval> | undefined;
 
   // ---- derived reads (methods stay reactive when read in templates) ----
   boardStates(): string[] {
@@ -338,6 +351,7 @@ class AppStore {
     this.#closeSocket();
     const generation = this.#socketGeneration;
     const sock = openBoardSocket(boardId, (event) => {
+      this.#lastMessageAt = Date.now();
       void this.refresh();
       // Fan the event out to whoever is watching one card. The board snapshot that `refresh`
       // reloads does not carry activities, so without this the open card learns nothing.
@@ -347,6 +361,10 @@ class AppStore {
       if (generation !== this.#socketGeneration) return;
       this.connected = true;
       this.#reconnectAttempt = 0;
+      // Null, not now(): there is nothing to measure until the first event, and starting the clock
+      // here would make a slow first message look like a stall.
+      this.#lastMessageAt = null;
+      this.#watchForStall(boardId, generation);
     });
     sock.addEventListener('close', () => {
       if (generation !== this.#socketGeneration) return;
@@ -381,11 +399,37 @@ class AppStore {
     return () => this.#feedListeners.delete(fn);
   }
 
+  /**
+   * Notice a feed that has stopped carrying anything, and treat it as the disconnection it is.
+   *
+   * Only ever acts while a card is `working`: a board with nothing running is legitimately silent for
+   * hours, and reconnecting every viewer of every quiet board on a timer is a thundering herd this
+   * class already jitters its backoff to avoid.
+   *
+   * It reconnects through the same path a `close` does — flip `connected` false so the UI stops
+   * claiming to be live, then re-open — because the failure is indistinguishable from a close that
+   * never fired, and inventing a second recovery route would mean two things to keep in step.
+   */
+  #watchForStall(boardId: string, generation: number): void {
+    if (this.#stallTimer !== undefined) clearInterval(this.#stallTimer);
+    this.#stallTimer = setInterval(() => {
+      if (generation !== this.#socketGeneration) return;
+      const working = (this.board?.cards ?? []).some((c) => c.state === 'working');
+      if (!feedIsStalled({ now: Date.now(), lastMessageAt: this.#lastMessageAt, hasWorkInFlight: working })) {
+        return;
+      }
+      this.connected = false;
+      this.#connect(boardId);
+    }, STALL_CHECK_MS);
+  }
+
   /** Close the socket and cancel any pending reconnect, invalidating both for good measure. */
   #closeSocket(): void {
     this.#socketGeneration += 1;
     if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
+    if (this.#stallTimer !== undefined) clearInterval(this.#stallTimer);
+    this.#stallTimer = undefined;
     this.#socket?.close();
     this.#socket = undefined;
   }
