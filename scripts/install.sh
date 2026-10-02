@@ -6,7 +6,7 @@
 # Optional env:
 #   VERSION     pin a release tag (e.g. v0.0.2); default: the latest release
 #   BIN_DIR     where to install; default: ~/.local/bin
-#   SKILL_DIR   also install the agent skill here (e.g. ~/.hermes/profiles/super-chotu/skills);
+#   SKILL_DIR   also install the agent skill here (e.g. an agent's own skills directory);
 #               omitted by default, because most callers are people and a person needs no skill
 #
 # Installs one binary under two names, `supi` and `superpipeline`, matching the `bin` entries in

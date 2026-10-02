@@ -1,13 +1,13 @@
 ---
 name: superpipeline-boards
-description: "Read the guild's boards and queue work with supi, the superpipeline CLI. Use when asked who is busy, what is blocked, what is waiting on a human, or to put a shaped card on a board."
-tags: [superpipeline, supi, boards, cards, coordination, guild]
+description: "Read your workspace's boards and queue work with supi, the superpipeline CLI. Use when asked who is busy, what is blocked, what is waiting on a human, or to put a shaped card on a board."
+tags: [superpipeline, supi, boards, cards, coordination]
 platforms: [linux, macos]
 ---
 
 # The boards, from a terminal
 
-`supi` is how you see the guild's work and add to it. You hold an **agent** credential, which is
+`supi` is how you see your workspace's work and add to it. You hold an **agent** credential, which is
 not the same thing as the operator's — the board records which of you asked for a card, and that
 record is the point.
 
@@ -65,7 +65,7 @@ supi create-card <boardId> "<title>" [--spec <file|->] [--priority <n>] [--due Y
 A card you queue carries **your** authority, not the operator's. The board records you as the
 queuer and stores the dispatch grant you held at that moment, so the card can only ever be claimed
 by an agent you were permitted to dispatch. That is a feature: it means you cannot spend the
-guild's time on principals the operator did not hand you.
+workspace's time on principals the operator did not hand you.
 
 Four things refuse a queue, each by name. Read the code and act on it rather than retrying:
 

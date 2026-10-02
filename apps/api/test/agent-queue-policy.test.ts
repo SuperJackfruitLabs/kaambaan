@@ -42,7 +42,7 @@ describe('an agent carries a queueing policy, and its default is to queue nothin
   });
 
   it('the operator names an owner, the boards, and a ceiling — and the token path reads them', async () => {
-    const agent = await createAgent(env.DB, TENANT, { name: 'Chotu', capabilities: ['command'] });
+    const agent = await createAgent(env.DB, TENANT, { name: 'Coordinator', capabilities: ['command'] });
     const { token } = await createAgentToken(env.DB, TENANT, agent.id, ['read', 'queue']);
     await updateAgent(env.DB, TENANT, agent.id, {
       ownerUserId: 'usr_owner',

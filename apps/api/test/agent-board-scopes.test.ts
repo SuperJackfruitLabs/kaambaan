@@ -21,7 +21,7 @@ describe('requiredScope names the scope a board route needs', () => {
 
   it('gates card creation on `queue`, which is a different scope from reading', () => {
     // `cards` (create) and `cards/:id` (read one) differ by one path segment and by the whole
-    // question of whether an agent may spend the guild's time.
+    // question of whether an agent may spend other agents' time.
     expect(requiredScope('cards', 'POST')).toBe('queue');
     expect(requiredScope('cards', 'POST')).not.toBe(requiredScope('cards/card_1', 'GET'));
   });

@@ -49,7 +49,7 @@ async function board(tenant: string, name = 'Q'): Promise<string> {
 /** A local agent row, mapped to a suite principal so a hub token can resolve to it. */
 async function agentRow(tenant: string, agentId: string, principalId: string): Promise<void> {
   await env.DB.prepare(`INSERT OR IGNORE INTO agents (id, tenant_id, name) VALUES (?, ?, ?)`)
-    .bind(agentId, tenant, 'Super Chotu')
+    .bind(agentId, tenant, 'Coordinator')
     .run();
   await env.DB.prepare(`UPDATE agents SET external_id = ?, external_source = 'org-plane' WHERE id = ?`)
     .bind(principalId, agentId)
@@ -120,14 +120,14 @@ describe('a coordinator queues a card', () => {
     const t = 'tnt_q1';
     await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES ('usr_rakesh','r@example.test','Rakesh')`).run();
     const boardId = await board(t);
-    await agentRow(t, 'agt_chotu', 'prn_chotu0000000000q1');
-    await updateAgent(env.DB, t, 'agt_chotu', {
+    await agentRow(t, 'agt_coord', 'prn_coord000000000001');
+    await updateAgent(env.DB, t, 'agt_coord', {
       ownerUserId: 'usr_rakesh',
       mayQueueTo: [boardId],
     });
 
     await withIssuer(t, async () => {
-      const token = await agentToken('prn_chotu0000000000q1', ['prn_kai', 'prn_tim']);
+      const token = await agentToken('prn_coord000000000001', ['prn_kai', 'prn_tim']);
       const { status, body } = await queue(boardId, token, 'Shape the release');
       expect(status).toBe(201);
       const card = (body as unknown as { card: Record<string, unknown> }).card;
@@ -137,9 +137,9 @@ describe('a coordinator queues a card', () => {
       expect(card.queuedGrant).toEqual(['prn_kai', 'prn_tim']);
       // Answerable: the human. Authorised by: the agent's principal. Two different questions.
       expect(card.ownerUserId).toBe('usr_rakesh');
-      expect(card.queuedBy).toBe('prn_chotu0000000000q1');
+      expect(card.queuedBy).toBe('prn_coord000000000001');
       // And distinguishable from a human-queued card forever, in the row.
-      expect(card.queuedByAgentId).toBe('agt_chotu');
+      expect(card.queuedByAgentId).toBe('agt_coord');
     });
   });
 

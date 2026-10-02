@@ -26,7 +26,7 @@ ALTER TABLE agents ADD COLUMN owner_user_id TEXT;
 ALTER TABLE agents ADD COLUMN may_queue_to_json TEXT;
 
 -- Cards per hour. A scope says whether an agent may queue; it says nothing about volume, and an
--- agent that can spend the guild's time unasked is the hazard the scope was split out for.
+-- agent that can spend OTHER agents' time unasked is the hazard the scope was split out for.
 ALTER TABLE agents ADD COLUMN queue_ceiling_per_hour INTEGER NOT NULL DEFAULT 20;
 
 -- Every card an agent queued, in one place.

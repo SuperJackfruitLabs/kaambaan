@@ -8,12 +8,12 @@ import { cardProvenance } from './card-provenance';
  * `queuedBy` was carried on every card, deliberately preserved when ownership is reassigned, and
  * then shown nowhere a person could see it. That was survivable while every card was queued by the
  * same human. It stops being survivable the moment an agent can queue work, because then "Super
- * Chotu asked for this" and "the operator asked for this" are different facts and the audit trail
+ * an agent asked for this" and "the operator asked for this" are different facts and the audit trail
  * silently credits the operator with work they never requested.
  */
 const MEMBERS = [{ userId: 'usr_rakesh', email: 'r@example.test', name: 'Rakesh', role: 'owner' }];
 const AGENTS = [
-  { id: 'agt_chotu', name: 'Super Chotu', capabilities: ['command'], externalId: 'prn_chotu0000000000q1', iconUrl: null },
+  { id: 'agt_coord', name: 'Coordinator', capabilities: ['command'], externalId: 'prn_coord000000000001', iconUrl: null },
   { id: 'agt_kai', name: 'Coder Kai', capabilities: ['code'], externalId: 'prn_kai', iconUrl: null },
   { id: 'agt_tim', name: 'Tester Tim', capabilities: ['test'], externalId: 'prn_tim', iconUrl: null },
 ];
@@ -49,14 +49,14 @@ describe('a human-queued card', () => {
 
 describe('an agent-queued card', () => {
   const agentCard = card({
-    queuedBy: 'prn_chotu0000000000q1',
-    queuedByAgentId: 'agt_chotu',
+    queuedBy: 'prn_coord000000000001',
+    queuedByAgentId: 'agt_coord',
     queuedGrant: ['prn_kai', 'prn_tim'],
   });
 
   it('reads as a NAME, never an id (U2)', () => {
     const p = cardProvenance(agentCard, MEMBERS as never, AGENTS as never);
-    expect(p.queuedByName).toBe('Super Chotu');
+    expect(p.queuedByName).toBe('Coordinator');
     expect(p.queuedByName).not.toContain('prn_');
   });
 
@@ -69,7 +69,7 @@ describe('an agent-queued card', () => {
 
   it('carries the agent row, so a tile can show its avatar and colour (U4)', () => {
     const p = cardProvenance(agentCard, MEMBERS as never, AGENTS as never);
-    expect(p.agent?.id).toBe('agt_chotu');
+    expect(p.agent?.id).toBe('agt_coord');
   });
 
   it('is STILL agent-queued when the agent row is gone', () => {
@@ -79,14 +79,14 @@ describe('an agent-queued card', () => {
     expect(p.byAgent).toBe(true);
     expect(p.agent).toBeNull();
     // And it falls back to the short id rather than to a blank or to the operator's name.
-    expect(p.queuedByName).toBe('prn_…0000q1');
+    expect(p.queuedByName).toBe('prn_…000001');
   });
 });
 
 describe('the grant is inspectable, not just stored (U7)', () => {
   it('counts the principals, because a 55-principal grant and a 3-principal grant differ', () => {
     const p = cardProvenance(
-      card({ queuedBy: 'prn_chotu0000000000q1', queuedByAgentId: 'agt_chotu', queuedGrant: ['prn_kai', 'prn_tim'] }),
+      card({ queuedBy: 'prn_coord000000000001', queuedByAgentId: 'agt_coord', queuedGrant: ['prn_kai', 'prn_tim'] }),
       MEMBERS as never,
       AGENTS as never,
     );
