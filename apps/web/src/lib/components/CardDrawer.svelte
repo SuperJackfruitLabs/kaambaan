@@ -296,17 +296,29 @@
     }
   });
 
+  /**
+   * Reload the four things the drawer fetches, each on its own terms.
+   *
+   * It was one `Promise.all` inside a silent catch, which meant ANY of the four failing threw away
+   * all four results — so a transient blip on `estimate` froze the activity stream, the attempts and
+   * the links as well, with nothing logged and nothing on screen to say so. The panel simply stopped
+   * being current while continuing to look it.
+   *
+   * `allSettled`, and each result applied only if it arrived. A failure now costs exactly the thing
+   * that failed, and the other three stay fresh — which matters most for the activity stream, the one
+   * a person actually watches.
+   */
   async function refreshDrawer(id: string, bid: string): Promise<void> {
-    try {
-      [cardDetail, drawerAttempts, cardEstimate, cardLinks] = await Promise.all([
-        getCardActivities(bid, id),
-        getAttempts(bid, id),
-        getEstimate(bid, id),
-        listLinks(bid, id),
-      ]);
-    } catch {
-      /* best-effort */
-    }
+    const [acts, atts, est, links] = await Promise.allSettled([
+      getCardActivities(bid, id),
+      getAttempts(bid, id),
+      getEstimate(bid, id),
+      listLinks(bid, id),
+    ]);
+    if (acts.status === 'fulfilled') cardDetail = acts.value;
+    if (atts.status === 'fulfilled') drawerAttempts = atts.value;
+    if (est.status === 'fulfilled') cardEstimate = est.value;
+    if (links.status === 'fulfilled') cardLinks = links.value;
   }
 
   /**
