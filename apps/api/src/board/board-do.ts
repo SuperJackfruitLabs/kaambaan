@@ -370,6 +370,14 @@ export interface CardView {
   currentStageKey: string;
   state: TaskState;
   delegateAgentId: string | null;
+  /**
+   * The run currently holding this card, or null when nobody is working it.
+   *
+   * On the row since runs existed and never projected. Exposed so a caller that must attribute
+   * something to "the run working this card" — an agent attaching evidence mid-run — can do it
+   * without being handed a run id it could have made up.
+   */
+  currentRunId: string | null;
   priority: number;
   contextId: string;
   createdAt: string;
@@ -511,6 +519,16 @@ export interface AttemptView {
   profileKey: string | null;
   /** The completion verdict, when the stage asked for something. Null when it asked for nothing. */
   completion: Record<string, unknown> | null;
+  /**
+   * What THIS run handed on. Null when it failed, or when it completed with nothing to say.
+   *
+   * The card's `handoff` is one value overwritten at every stage, so it only ever shows the latest.
+   * This is per-run, which is what lets a reader see the account stage by stage rather than the last
+   * line of it.
+   */
+  handoff: JsonValue | null;
+  /** Why this run died, when it did. Null for a run that completed or is still open. */
+  failureReason: string | null;
 }
 
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
@@ -686,6 +704,14 @@ export interface ReferenceView {
   syncState: 'synced' | 'stale' | 'error';
   lastSyncedAt: string | null;
   addedBy: 'agent' | 'user';
+  /**
+   * The run that attached this, when an agent did it mid-run.
+   *
+   * NULL for a reference a human added, and for every reference attached before this column existed.
+   * `addedBy` already said 'agent' or 'user'; it never said WHICH agent or WHEN, so "what did the
+   * audit stage attach" was unanswerable even though the references were all still here.
+   */
+  runId: string | null;
   createdAt: string;
   updatedAt: string | null;
 }
@@ -693,6 +719,8 @@ export interface ReferenceView {
 export interface ReferenceInput {
   cardId: string;
   url: string;
+  /** The run attaching it, when an agent is. Omitted by a human path, and NULL is the honest value. */
+  runId?: string | null;
   provider: string;
   sourceType: string;
   title?: string;
@@ -766,6 +794,20 @@ export type ClaimResult =
       card: CardView;
       stage: StageDef;
       handoff: JsonValue | null;
+      /**
+       * Why the LAST attempt at this stage died, when there was one.
+       *
+       * The agent about to repeat the work was the only party not told. The human got a
+       * notification, the event stream got an event, the dead run kept a label — and the retry
+       * started from a card indistinguishable from the one the first attempt saw. An agent that
+       * knows "the browser could not start last time" can do something different; one that does not
+       * walks into the same wall until the circuit breaker parks the card.
+       *
+       * Scoped to THIS stage. A failure at `audit` tells an agent claiming `audit` something; handed
+       * to one claiming `measure` it would read as "your work has already failed once" about work
+       * that has not started. Null when the last run here succeeded, or when there was none.
+       */
+      lastFailure: { reason: string; agentId: string; stageKey: string; endedAt: string } | null;
     }
   | { claimed: false };
 
@@ -1200,6 +1242,26 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * What this run handed on, and why it died — kept on the RUN rather than only on the card.
+     *
+     * `cards.handoff_json` is one column, overwritten by every `complete()`, so stage N+1 destroyed
+     * stage N's handoff the moment the card advanced. And `fail()` stored a LABEL
+     * (`outcome = 'crashed'`) while the reason went to a human's notification and the event stream —
+     * never to the agent about to repeat the work.
+     *
+     * The card's copy is unchanged: it is the live INPUT the next claim reads. These are the record.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE runs ADD COLUMN handoff_json TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE runs ADD COLUMN failure_reason TEXT`);
+    } catch {
+      // column already exists
+    }
     /** The queuer, pinned onto the run, so an attempt records whose work it was. */
     try {
       this.sql.exec(`ALTER TABLE runs ADD COLUMN queued_by TEXT`);
@@ -1368,6 +1430,20 @@ export class BoardDO extends DurableObject<Env> {
         UNIQUE(card_id, url)
       )`,
     );
+    /**
+     * Which run attached a reference. NULL means a human did it, or that it predates this column —
+     * both honest, and neither invented.
+     *
+     * Placed AFTER the CREATE above, not with the `runs` migrations: an ALTER that runs before its
+     * table exists throws into the guard's catch and is silently skipped, which is exactly what
+     * happened on the first attempt — the insert then failed with "no column named run_id" on a
+     * migration that looked like it had succeeded.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE card_references ADD COLUMN run_id TEXT`);
+    } catch {
+      // column already exists
+    }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_card ON card_references(card_id)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_refs_external ON card_references(external_id)`);
     // Dependencies AND sub-task containment, in one table (spec §3.4). Same-board only: an edge
@@ -2311,8 +2387,8 @@ export class BoardDO extends DurableObject<Env> {
     const id = newId('ref');
     this.sql.exec(
       `INSERT INTO card_references
-        (id, card_id, url, title, subtitle, provider, source_type, external_id, metadata_json, sync_state, last_synced_at, added_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, card_id, url, title, subtitle, provider, source_type, external_id, metadata_json, sync_state, last_synced_at, added_by, run_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.cardId,
       input.url,
@@ -2325,6 +2401,7 @@ export class BoardDO extends DurableObject<Env> {
       input.syncState ?? 'synced',
       input.lastSyncedAt ?? null,
       input.addedBy ?? 'agent',
+      input.runId ?? null,
       now,
     );
     const ref = this.mustGetReference(id);
@@ -3730,6 +3807,8 @@ export class BoardDO extends DurableObject<Env> {
           costUsd: cost,
           model: modelRow ? (modelRow.model as string) : null,
           profileKey: (r.profile_key as string | null) ?? null,
+          handoff: r.handoff_json ? (JSON.parse(r.handoff_json as string) as JsonValue) : null,
+          failureReason: (r.failure_reason as string | null) ?? null,
           /**
            * Why this run ended as it did, when a stage asked for something.
            *
@@ -3867,7 +3946,15 @@ export class BoardDO extends DurableObject<Env> {
 
     const stage = this.stages().find((s) => s.key === card.currentStageKey)!;
     const handoff = row.handoff_json ? (JSON.parse(row.handoff_json as string) as JsonValue) : null;
-    return { claimed: true, runId, leaseEpoch, card: this.mustGetCard(card.id), stage, handoff };
+    return {
+      claimed: true,
+      runId,
+      leaseEpoch,
+      card: this.mustGetCard(card.id),
+      stage,
+      handoff,
+      lastFailure: this.lastFailureAt(card.id, stage.key, runId),
+    };
   }
 
   async heartbeat(input: RunVerbInput): Promise<Result<{ acknowledged: true }>> {
@@ -3955,7 +4042,18 @@ export class BoardDO extends DurableObject<Env> {
     const run = auth.run;
     const cardId = run.card_id as string;
     const now = this.now();
-    this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ? WHERE id = ?`, now, input.runId);
+    // Computed here rather than further down, because the run's own record needs it too. Same
+    // expression the card gets below; `undefined` (no handoff given) stays NULL in both.
+    const handoffJson = input.handoff !== undefined ? JSON.stringify(input.handoff) : null;
+    // The handoff lands on the RUN as well as the card: the card's copy is what the next claim
+    // reads and is overwritten at every stage; this one is the permanent record of what this stage
+    // said when it finished.
+    this.sql.exec(
+      `UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ?, handoff_json = ? WHERE id = ?`,
+      now,
+      handoffJson,
+      input.runId,
+    );
     this.cancelElicitationsForRun(input.runId);
 
     const card = this.mustGetCard(cardId);
@@ -4014,7 +4112,6 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
-    const handoffJson = input.handoff !== undefined ? JSON.stringify(input.handoff) : null;
     this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
@@ -4229,7 +4326,14 @@ export class BoardDO extends DurableObject<Env> {
     if (!auth.ok) return auth;
     const run = auth.run;
     const cardId = run.card_id as string;
-    this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'crashed', ended_at = ? WHERE id = ?`, this.now(), input.runId);
+    // The reason, on the run. `outcome = 'crashed'` is a label; the next agent at this stage needs
+    // the sentence, and `claim()` reads it from here.
+    this.sql.exec(
+      `UPDATE runs SET status = 'ended', outcome = 'crashed', ended_at = ?, failure_reason = ? WHERE id = ?`,
+      this.now(),
+      input.reason || null,
+      input.runId,
+    );
     this.cancelElicitationsForRun(input.runId);
     this.endAttempt(cardId, 'card.failed', input.reason);
     this.notify('failed', cardId, input.reason || 'Run failed');
@@ -4575,6 +4679,50 @@ export class BoardDO extends DurableObject<Env> {
       .exec(`SELECT * FROM elicitations WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC`)
       .toArray()
       .map((r) => this.rowToElicitation(r));
+  }
+
+  /**
+   * The most recent ENDED run at this card and stage, if it failed.
+   *
+   * "The last attempt" has to mean the last one, so a failure followed by a success reports nothing.
+   * Reporting the older failure would have an agent working around a problem already solved.
+   *
+   * Ordered by `rowid`, not by `started_at`. `started_at` is a formatted timestamp, and two runs at
+   * the same stage can carry the SAME one — a fail and an immediate reclaim do, which is precisely
+   * the case this function exists for. Ordering on it then picks arbitrarily between them, and the
+   * test for "does not resurrect a failure after a success" caught exactly that. `rowid` is
+   * insertion order and cannot tie.
+   *
+   * `excludeRunId` is the run being handed out right now — it exists by the time this is called, and
+   * without excluding it a reclaim could read its own row.
+   */
+  private lastFailureAt(
+    cardId: string,
+    stageKey: string,
+    excludeRunId: string,
+  ): { reason: string; agentId: string; stageKey: string; endedAt: string } | null {
+    const rows = this.sql
+      .exec(
+        `SELECT agent_id, outcome, failure_reason, ended_at FROM runs
+         WHERE card_id = ? AND stage_key = ? AND id != ? AND ended_at IS NOT NULL
+         ORDER BY rowid DESC LIMIT 1`,
+        cardId,
+        stageKey,
+        excludeRunId,
+      )
+      .toArray();
+    const r = rows[0];
+    if (!r) return null;
+    // A run that ended well reports nothing — and a failed one with no recorded reason reports
+    // nothing either, rather than an empty sentence that reads as information.
+    const reason = (r.failure_reason as string | null) ?? null;
+    if (r.outcome === 'completed' || !reason) return null;
+    return {
+      reason,
+      agentId: r.agent_id as string,
+      stageKey,
+      endedAt: (r.ended_at as string) ?? '',
+    };
   }
 
   private isAgentClaimable(stage: StageDef): boolean {
@@ -5114,6 +5262,7 @@ export class BoardDO extends DurableObject<Env> {
       ownerUserId: row.owner_user_id as string,
       queuedBy: (row.queued_by as string | null) ?? null,
       queuedByAgentId: (row.queued_by_agent_id as string | null) ?? null,
+      currentRunId: (row.current_run_id as string | null) ?? null,
       queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
       labels: row.labels ? (JSON.parse(row.labels as string) as string[]) : [],
       // Columns on the card row, same as `dueAt` below — no query, no `pre` entry, read straight
@@ -5161,6 +5310,7 @@ export class BoardDO extends DurableObject<Env> {
       syncState: row.sync_state as 'synced' | 'stale' | 'error',
       lastSyncedAt: (row.last_synced_at as string | null) ?? null,
       addedBy: row.added_by as 'agent' | 'user',
+      runId: (row.run_id as string | null) ?? null,
       createdAt: row.created_at as string,
       updatedAt: (row.updated_at as string | null) ?? null,
     };

@@ -34,6 +34,10 @@ const attempt = (runId: string, stageKey: string, outcome = 'completed'): Attemp
   costUsd: 0,
   model: null,
   profileKey: null,
+  // Per-run handoff and failure reason (spec 2026-10-02-a-card-remembers-its-stages). Null here:
+  // this file is about GROUPING the stream, and how a run ended is `stage-account.ts`'s subject.
+  handoff: null,
+  failureReason: null,
 });
 
 describe('groupActivities', () => {

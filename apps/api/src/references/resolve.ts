@@ -21,6 +21,8 @@ export interface ReferenceArgs {
   externalId?: string;
   metadata?: Record<string, unknown>;
   addedBy?: 'agent' | 'user';
+  /** The run attaching it, when an agent is. */
+  runId?: string | null;
 }
 
 export function resolveReferenceInput(args: ReferenceArgs, forgeHost?: string | null): ReferenceInput {
@@ -35,5 +37,6 @@ export function resolveReferenceInput(args: ReferenceArgs, forgeHost?: string | 
     subtitle: args.subtitle,
     metadata: args.metadata as JsonValue | undefined,
     addedBy: args.addedBy ?? 'agent',
+    runId: args.runId ?? null,
   };
 }
