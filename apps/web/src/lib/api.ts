@@ -81,7 +81,15 @@ export interface Stage {
   gate?: 'none' | 'approval';
   wipLimit?: number;
   routing?: 'pipeline' | 'manager';
-  ownerKind?: 'capability' | 'human';
+  /**
+   * Who works this stage.
+   *
+   * `'agent'` was missing here while the server has always had it — `StageDef.ownerKind` is
+   * `'capability' | 'agent' | 'human'` and `isAgentClaimable` tests for exactly that value. So a
+   * board with a stage pinned to ONE agent was a board this client's types said could not exist, and
+   * any code branching on it was unreachable by the compiler's reckoning rather than by the data's.
+   */
+  ownerKind?: 'capability' | 'agent' | 'human';
   owner?: string;
   /**
    * A multi-capability requirement: `all` every member, `any` at least one. Wins over `owner`

@@ -390,6 +390,17 @@
     color: var(--coral);
   }
 
+  /*
+    Who works a lane, under its name. One quiet line, fixed in each lane so a reader can scan DOWN a
+    board and compare owners rather than hunting a chip in a wrapping header.
+  */
+  .lane-owner {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.5;
+    padding-bottom: 2px;
+  }
+
   /* cost bar */
   .costbar {
     height: 3px;

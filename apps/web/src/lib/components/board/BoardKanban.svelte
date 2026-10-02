@@ -5,6 +5,7 @@
   import StageStepper from '$lib/components/plan/StageStepper.svelte';
   import { blockedCountInStage } from './board-counts';
   import { childCountsByParent } from './card-children';
+  import { stageOwner } from './stage-owner';
 
   /** The lane scroller, so the stepper can observe which lane is on screen and scroll to one. */
   let scroller = $state<HTMLElement | null>(null);
@@ -47,6 +48,7 @@
       {@const cards = cardsInStage(stage.key)}
       {@const overLimit = stage.wipLimit !== undefined && cards.length >= stage.wipLimit}
       {@const blocked = blockedCountInStage(cards)}
+      {@const owner = stageOwner(stage, app.agents)}
 
       {#if i > 0}
         <!-- The flow arrow, thinner. It used to take ~50px between every pair of 288px lanes,
@@ -103,6 +105,33 @@
               <span class="eyebrow" title="Manager routing">mgr</span>
             {/if}
           </span>
+        </div>
+
+        <!--
+          Who works this lane.
+          ────────────────────
+          A second line rather than more chips on the first: the head already wraps on a phone, and
+          the owner is the thing a reader scans down a board for, so it wants its own row at a fixed
+          place in each lane.
+
+          A capability nobody DECLARES is marked, because a card in such a lane sits in `submitted`
+          forever and looks queued — the commonest cause of "why is nothing happening", and until now
+          indistinguishable from a lane nobody had got to. The wording is "declares", not "can claim":
+          the board does not load the implication graph, so an agent may still qualify, and the title
+          says so rather than letting a reader conclude the lane is dead.
+        -->
+        <div class="lane-owner px-1.5">
+          {#if owner.undeclared}
+            <span class="text-coral" title={owner.caveat}>⚠ {owner.label} — nobody declares it</span>
+          {:else}
+            <span class="text-muted-foreground">{owner.label}</span>
+            {#if owner.declaredBy.length > 0}
+              <span
+                class="text-muted-foreground/70"
+                title={owner.declaredBy.join(', ')}
+              >· {owner.declaredBy.length === 1 ? owner.declaredBy[0] : `${owner.declaredBy.length} agents`}</span>
+            {/if}
+          {/if}
         </div>
 
         <!-- cards -->
