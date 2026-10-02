@@ -103,6 +103,27 @@ export interface Card {
   overBudget: boolean;
   attemptCount: number;
   delegateAgentId?: string | null;
+  /**
+   * Who authorised this card's dispatch — the third of a card's three identities, and the one this
+   * client never declared.
+   *
+   * It has been on the wire since the control pair shipped and is deliberately preserved when
+   * ownership is reassigned, which means the API has always distinguished "who is answerable" from
+   * "who asked" while the board showed only the first. Null on a card created before it was
+   * recorded.
+   */
+  queuedBy: string | null;
+  /**
+   * The AGENT that queued it, when one did — `agt_…`, not a principal. Null means a person did,
+   * which is every card that existed before agents could queue work.
+   */
+  queuedByAgentId: string | null;
+  /**
+   * What the queuer was permitted to dispatch when they queued it. Null is "no authority was
+   * captured"; `[]` is "somebody decided nobody" — both refuse a claim under enforcement, and they
+   * are different facts about why.
+   */
+  queuedGrant: string[] | null;
   /** Applied label ids; the catalogue itself is fetched separately (`listLabels`). */
   labels: string[];
   dueAt: string | null;

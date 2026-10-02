@@ -43,8 +43,16 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById } from './db/catalog';
-import { AGENT_TOKEN_SCOPES, isAgentScope, requiredScope, scopePermits, type AgentScope } from './auth/scopes';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue } from './db/catalog';
+import { authorizeAgentQueue } from './auth/agent-queue';
+import {
+  AGENT_TOKEN_SCOPES,
+  isAgentScope,
+  requiredScope,
+  scopePermits,
+  SCOPE_FORBIDDEN,
+  type AgentScope,
+} from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
 import {
@@ -1375,45 +1383,66 @@ export default {
     // stops offering buttons for a decision already made. Deciding a gate stays human-only.
     const isEitherRoute =
       !!boardId && (rest === 'gates/pending' || /^gates\/[^/]+$/.test(rest));
+    /**
+     * What a COORDINATOR agent reaches: the board, one card, and creating a card.
+     *
+     * These are routes PEOPLE live on, so they join `gates/pending` as open to either — never as
+     * agent-only. The first cut of this classified them as agent routes, and the comment three
+     * paragraphs up had already written down why that is wrong: "classifying it as agent-only
+     * then refused the people whose decisions it lists, because agent routes reject human
+     * credentials." The failure was worse than a refusal. `resolveAgent`'s dev-header path
+     * manufactures an agent out of `X-Tenant-Id` alone, and a dev-header agent carries no scopes
+     * — which `scopePermits` reads as unscoped-and-therefore-unrestricted — so a VIEWER posting
+     * to `cards` skipped `refuseByRole` entirely and got a 201. A role gate that a path can route
+     * around is not a role gate.
+     *
+     * Method-scoped here as well as in `requiredScope`: a credential that may read a board must
+     * not reach the agent branch to DELETE it. The two checks fail differently — this one picks
+     * the branch, that one picks the scope — and a route admitted here with no scope opinion
+     * would be a route an agent reaches unchecked.
+     */
+    const isCoordinatorRoute =
+      // Listing the workspace's boards. No `boardId`, and `rest` is empty for both this and the
+      // board read below — which is why `requiredScope` says `read` for both without needing to
+      // tell them apart. POST here CREATES a board and stays human-only.
+      (!boardId && request.method === 'GET' && rest === '') ||
+      (!!boardId &&
+        ((request.method === 'GET' && (rest === '' || /^cards\/[^/]+$/.test(rest))) ||
+          (request.method === 'POST' && rest === 'cards')));
+    /**
+     * Was an agent credential actually OFFERED?
+     *
+     * On a route open to both, the credential decides the branch rather than the path. A person
+     * carries a session cookie or dev headers and must land in the human branch with its role
+     * check; only a bearer token can be an agent's. A bearer that turns out to be a HUMAN's hub
+     * token resolves no agent and falls through to the human branch, which knows how to read it.
+     */
+    const offersBearer = /^Bearer\s+\S/i.test(request.headers.get('Authorization') ?? '');
     const isAgentRoute =
-      !!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute);
+      (!!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute)) ||
+      (isCoordinatorRoute && offersBearer);
     // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
     const isWebhook = !!boardId && (rest === 'webhooks/github' || rest === 'webhooks/forge');
     let tenantId: string;
     let user: UserPrincipal | null = null;
     let agent: AgentPrincipal | null = null;
 
-    if (isWebhook) {
-      const t = url.searchParams.get('tenant');
-      if (!t || t.trim() === '') return Response.json({ error: 'tenant required' }, { status: 400 });
-      tenantId = t;
-    } else if (isAgentRoute) {
-      agent = await resolveAgent(request, env);
-      // Mirrors the human fallback below: a node can now exchange its own credential for a
-      // short-lived hub token whose sub is an agent principal, and superpipeline must accept it as
-      // that agent — capabilities still come from superpipeline's own agents row, never the claim.
-      if (!agent) agent = await resolveHubAgent(request, env);
-      // A route open to both resolves as a human when no agent credential was offered, and falls
-      // through to the human branch's own 401 rather than reporting "a valid agent token is
-      // required" to a person who holds no agent token and needs none.
-      if (!agent && isEitherRoute) {
-        user = (await resolveUser(request, env)) ?? (await resolveHubUser(request, env));
-        if (!user) return Response.json({ error: 'sign in to continue' }, { status: 401 });
-        tenantId = user.tenantId;
-      } else {
-        if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
-        // Scopes stop being decoration here. Every `spa_` token has carried a scope set since
-        // migration 0001, the resolver has always returned it, and nothing compared it to the action
-        // being attempted — so a token minted to claim drove every run verb. A recorded permission
-        // nobody checks reads as protection that does not exist (auth/scopes.ts).
-        const needed = requiredScope(rest);
-        if (needed && !scopePermits(agent.scopes, needed)) {
-          return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
-        }
-        tenantId = agent.tenantId;
-      }
-    } else {
-      user = await resolveUser(request, env);
+    /**
+     * Resolve the person behind this request and check their role, or return the refusal.
+     *
+     * One function because TWO arms need it. A route open to both agents and humans reaches the
+     * agent arm first, and when no agent credential resolves there, the person on the other end
+     * must get the whole human treatment — not a shortened version of it. The shortened version
+     * is what let a viewer create a card.
+     *
+     * Returns the principal, or the `Response` to send instead. Returned rather than assigned to
+     * `user` from inside the closure: TypeScript's control-flow analysis cannot see a write made
+     * in a callback, so it kept `user` narrowed to `null` and every later `user?.userId` in this
+     * handler became an error on type `never`. The compiler was right — a value set in a closure
+     * is not a value this flow can prove is set.
+     */
+    const resolveHumanOrRefuse = async (): Promise<UserPrincipal | Response> => {
+      let user = await resolveUser(request, env);
       // A hub-issued token is accepted on the human routes too, because the
       // routes that QUEUE work are where authority has to arrive: the grant is
       // recorded with the card and outlives the token that carried it.
@@ -1434,9 +1463,54 @@ export default {
           : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles' || rest.startsWith('schedules')
             ? 'manage'
             : 'work';
-      const refusedByRole = refuseByRole(user, needed);
-      if (refusedByRole) return refusedByRole;
-      tenantId = user.tenantId;
+      return refuseByRole(user, needed) ?? user;
+    };
+
+    if (isWebhook) {
+      const t = url.searchParams.get('tenant');
+      if (!t || t.trim() === '') return Response.json({ error: 'tenant required' }, { status: 400 });
+      tenantId = t;
+    } else if (isAgentRoute) {
+      agent = await resolveAgent(request, env);
+      // Mirrors the human fallback below: a node can now exchange its own credential for a
+      // short-lived hub token whose sub is an agent principal, and superpipeline must accept it as
+      // that agent — capabilities still come from superpipeline's own agents row, never the claim.
+      if (!agent) agent = await resolveHubAgent(request, env);
+      // A route open to both resolves as a human when no agent credential was offered, and falls
+      // through to the human branch's own 401 rather than reporting "a valid agent token is
+      // required" to a person who holds no agent token and needs none.
+      if (!agent && (isEitherRoute || isCoordinatorRoute)) {
+        // Not a shortcut past the human branch — the SAME branch. A coordinator route reached
+        // with a bearer that names no agent is still a person creating a card, and a person
+        // creating a card is `work`. The earlier version of this resolved a user and stopped,
+        // which on a GET was survivable and on `POST cards` would have been a role check skipped.
+        const resolved = await resolveHumanOrRefuse();
+        if (resolved instanceof Response) return resolved;
+        user = resolved;
+        tenantId = resolved.tenantId;
+      } else {
+        if (!agent) return Response.json({ error: 'a valid agent token is required' }, { status: 401 });
+        // Scopes stop being decoration here. Every `spa_` token has carried a scope set since
+        // migration 0001, the resolver has always returned it, and nothing compared it to the action
+        // being attempted — so a token minted to claim drove every run verb. A recorded permission
+        // nobody checks reads as protection that does not exist (auth/scopes.ts).
+        const needed = requiredScope(rest, request.method);
+        if (needed === SCOPE_FORBIDDEN) {
+          return Response.json(
+            { error: `an agent token cannot ${request.method} this route` },
+            { status: 403 },
+          );
+        }
+        if (needed && !scopePermits(agent.scopes, needed)) {
+          return Response.json({ error: `this token is not permitted to ${needed}` }, { status: 403 });
+        }
+        tenantId = agent.tenantId;
+      }
+    } else {
+      const resolved = await resolveHumanOrRefuse();
+      if (resolved instanceof Response) return resolved;
+      user = resolved;
+      tenantId = resolved.tenantId;
     }
 
     try {
@@ -1627,15 +1701,48 @@ export default {
         // alone, board-do.ts) would have had it spread straight through to the DO. A cast is not
         // validation, so the route has to name what it accepts rather than forward what it
         // received.
+        /**
+         * Who is answerable for this card, and on whose authority it may be dispatched.
+         *
+         * Two callers now reach here. For a person the two have always been the same value and
+         * `ownerUserId` ended with `?? 'usr_dev'`; for an AGENT that literal would have owned real
+         * work to a user that exists in no workspace, and `user?.mayDispatch` would have been
+         * `undefined` — a null grant, which the control pair refuses at claim time. So an agent
+         * could have created cards that nothing could ever claim: queued-looking, and dead.
+         */
+        const queueing = agent
+          ? await authorizeAgentQueue(env.DB, agent, boardId, body.ownerUserId)
+          : null;
+        if (queueing && !queueing.ok) {
+          return Response.json(
+            { error: { code: queueing.code, message: queueing.message } },
+            { status: queueing.status },
+          );
+        }
         const result = await stub.createCard({
           title: body.title,
           spec: body.spec,
           priority: body.priority,
           dueAt: body.dueAt,
-          ownerUserId: body.ownerUserId ?? user?.userId ?? 'usr_dev',
-          queuedGrant: user?.mayDispatch ?? null,
+          ownerUserId: queueing ? queueing.ownerUserId : body.ownerUserId ?? user!.userId,
+          queuedGrant: queueing ? queueing.queuedGrant : user?.mayDispatch ?? null,
+          // Null for a person, and that is the whole signal: every card on every board today was
+          // queued by one, and a reader must be able to see at a glance which ones were not.
+          queuedBy: queueing ? queueing.queuedBy : null,
+          queuedByAgentId: agent?.agentId ?? null,
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        // Written AFTER the card exists, so the ceiling counts cards that were actually created
+        // rather than attempts — and so a board that refused the card does not spend the agent's
+        // hourly budget on nothing.
+        if (agent?.agentId) {
+          await recordAgentQueue(env.DB, {
+            tenantId,
+            agentId: agent.agentId,
+            boardId,
+            cardId: result.value.id,
+          });
+        }
         return Response.json({ card: result.value }, { status: 201 });
       }
 

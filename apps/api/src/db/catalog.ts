@@ -411,17 +411,128 @@ export async function findAgentByExternal(
   db: D1Database,
   source: string,
   externalId: string,
-): Promise<{ tenantId: string; agentId: string; capabilities: string[]; concurrency: number } | null> {
+): Promise<({ tenantId: string; agentId: string; capabilities: string[]; concurrency: number } & AgentQueueingPolicy) | null> {
   if (!source || !externalId) return null;
   const row = await db
     .prepare(
-      `SELECT tenant_id AS tenantId, id AS agentId, capabilities_json AS caps, concurrency
+      `SELECT tenant_id AS tenantId, id AS agentId, capabilities_json AS caps, concurrency,
+              owner_user_id AS ownerUserId, may_queue_to_json AS mayQueueTo, queue_ceiling_per_hour AS ceiling
        FROM agents WHERE external_source = ? AND external_id = ?`,
     )
     .bind(source, externalId)
-    .first<{ tenantId: string; agentId: string; caps: string; concurrency: number }>();
+    .first<{ tenantId: string; agentId: string; caps: string; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }>();
   if (!row) return null;
-  return { tenantId: row.tenantId, agentId: row.agentId, capabilities: JSON.parse(row.caps), concurrency: row.concurrency };
+  return {
+    tenantId: row.tenantId,
+    agentId: row.agentId,
+    capabilities: JSON.parse(row.caps),
+    concurrency: row.concurrency,
+    ...queueingPolicyOf(row),
+  };
+}
+
+/**
+ * What bounds an agent that queues work of its own (migration 0015).
+ *
+ * The dispatch grant is deliberately absent. It is AgentPod's — `fleet grants set` — and arrives
+ * in a token's claims, so a copy here would be a second source of truth that keeps permitting a
+ * dispatch after the operator revoked it.
+ */
+export interface AgentQueueingPolicy {
+  /** The human an agent-queued card belongs to. Null means this agent may not queue at all. */
+  ownerUserId: string | null;
+  /**
+   * Board ids this agent may queue onto. **Null means NONE**, not "all": an agent that gains the
+   * scope without the operator naming a board must be able to create exactly zero cards.
+   *
+   * An empty array means the same thing by a different route, and the difference is worth keeping
+   * — one is "nobody has decided", the other is "somebody decided no" — the same distinction
+   * `queued_grant` draws between a missing grant and an empty one.
+   */
+  mayQueueTo: string[] | null;
+  /** Cards per hour. A scope bounds whether; only this bounds how much. */
+  queueCeilingPerHour: number;
+}
+
+/** The three queueing columns, off a row that already selected them under these aliases. */
+function queueingPolicyOf(row: { ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }): AgentQueueingPolicy {
+  return {
+    ownerUserId: row.ownerUserId ?? null,
+    // `JSON.parse(null)` is `null` by accident rather than by intent, so the absence is tested for
+    // rather than relied on.
+    mayQueueTo: row.mayQueueTo === null ? null : (JSON.parse(row.mayQueueTo) as string[]),
+    queueCeilingPerHour: Number(row.ceiling ?? 20),
+  };
+}
+
+/**
+ * Set what an agent may do when it queues. Every field is optional and only what is passed changes,
+ * so naming a board does not silently reset the ceiling somebody else tuned.
+ */
+export async function setAgentQueueingPolicy(
+  db: D1Database,
+  tenantId: string,
+  agentId: string,
+  input: { ownerUserId?: string | null; mayQueueTo?: string[] | null; queueCeilingPerHour?: number },
+): Promise<void> {
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if ('ownerUserId' in input) {
+    sets.push('owner_user_id = ?');
+    binds.push(input.ownerUserId ?? null);
+  }
+  if ('mayQueueTo' in input) {
+    sets.push('may_queue_to_json = ?');
+    binds.push(input.mayQueueTo === null || input.mayQueueTo === undefined ? null : JSON.stringify(input.mayQueueTo));
+  }
+  if (input.queueCeilingPerHour !== undefined) {
+    sets.push('queue_ceiling_per_hour = ?');
+    binds.push(input.queueCeilingPerHour);
+  }
+  if (sets.length === 0) return;
+  await db
+    .prepare(`UPDATE agents SET ${sets.join(', ')}, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
+    .bind(...binds, agentId, tenantId)
+    .run();
+}
+
+/**
+ * Write down that an agent queued a card.
+ *
+ * Two jobs in one row: it is what the hourly ceiling counts, and it is the only place an operator
+ * can ask "what has this agent asked for today" without opening every board. Cards live in
+ * per-board Durable Objects, so counting them instead would be a fan-out over ten of them.
+ */
+export async function recordAgentQueue(
+  db: D1Database,
+  input: { tenantId: string; agentId: string; boardId: string; cardId: string },
+): Promise<void> {
+  await db
+    .prepare(`INSERT INTO agent_card_queues (id, tenant_id, agent_id, board_id, card_id) VALUES (?, ?, ?, ?, ?)`)
+    .bind(newId('aqu'), input.tenantId, input.agentId, input.boardId, input.cardId)
+    .run();
+}
+
+/**
+ * How many cards this agent has queued since `sinceIso`.
+ *
+ * A moving window, not a counter: the caller passes "an hour ago" on every request, so an agent
+ * that hits the ceiling recovers as the hour rolls rather than being refused forever.
+ *
+ * `datetime(?)` rather than a bare `?`, and the difference is a ceiling that works against one
+ * that never fires. `created_at` defaults to `datetime('now')`, which SQLite writes as
+ * `2026-10-02 10:45:00` — a SPACE, and no zone. An ISO bound is `2026-10-02T09:45:00.000Z`, and
+ * these are compared as TEXT: `' '` sorts below `'T'`, so every row read as older than any bound
+ * and the count was always zero. A rate limit that counts nothing is not a loose rate limit, it is
+ * an absent one, and it fails in the direction that grants more. Normalising the bound into
+ * SQLite's own spelling puts both sides in one format.
+ */
+export async function countAgentQueuesSince(db: D1Database, agentId: string, sinceIso: string): Promise<number> {
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS n FROM agent_card_queues WHERE agent_id = ? AND created_at >= datetime(?)`)
+    .bind(agentId, sinceIso)
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
 }
 
 /** Mint a per-agent bearer token. The plaintext is returned once; only the hash is stored. */
@@ -468,16 +579,20 @@ export async function revokeAgentToken(db: D1Database, tenantId: string, agentId
 export async function findAgentByTokenHash(
   db: D1Database,
   hash: string,
-): Promise<{ tenantId: string; agentId: string; scopes: string[]; capabilities: string[]; externalId: string | null; concurrency: number } | null> {
+): Promise<
+  | ({ tenantId: string; agentId: string; scopes: string[]; capabilities: string[]; externalId: string | null; concurrency: number } & AgentQueueingPolicy)
+  | null
+> {
   const row = await db
     .prepare(
       `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps,
-              a.external_id AS externalId, a.concurrency AS concurrency
+              a.external_id AS externalId, a.concurrency AS concurrency,
+              a.owner_user_id AS ownerUserId, a.may_queue_to_json AS mayQueueTo, a.queue_ceiling_per_hour AS ceiling
        FROM agent_tokens at JOIN agents a ON a.id = at.agent_id
        WHERE at.token_hash = ? AND at.revoked_at IS NULL`,
     )
     .bind(hash)
-    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null; concurrency: number }>();
+    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }>();
   if (!row) return null;
   return {
     tenantId: row.tenantId,
@@ -486,6 +601,7 @@ export async function findAgentByTokenHash(
     capabilities: JSON.parse(row.caps),
     externalId: row.externalId,
     concurrency: Number(row.concurrency ?? 1),
+    ...queueingPolicyOf(row),
   };
 }
 

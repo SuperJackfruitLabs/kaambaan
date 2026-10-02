@@ -52,7 +52,7 @@ describe("fleet credential compatibility", () => {
     vi.stubEnv("SUPERPIPELINE_TOKEN", token);
     vi.stubEnv("AGENTPOD_TOKEN", fresh());
     device();
-    expect(await resolveCredential()).toEqual({ token, source: "env:SUPERPIPELINE_TOKEN" });
+    expect(await resolveCredential()).toEqual({ token, source: "env:SUPERPIPELINE_TOKEN", kind: "human" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -9,6 +9,7 @@
   import { overdue } from './card-due';
   import { enforcedBadge } from './card-blocked';
   import { childCounter } from './card-children';
+  import { cardProvenance } from './card-provenance';
 
   interface Props {
     card: Card;
@@ -120,6 +121,21 @@
   const avatarColor = $derived(agentColor(card.delegateAgentId));
   const avatarInitial = $derived(
     card.delegateAgentId ? initialOf(card.delegateAgentId).toUpperCase() : null,
+  );
+
+  /**
+   * Who asked for this card. Shown on the TILE and not only in the drawer, because a board full of
+   * cards is where someone notices that an agent has queued twenty things; the drawer is where they
+   * go afterwards.
+   *
+   * Rendered only when an AGENT queued it, which keeps the promise the meta row below makes: the
+   * board's default state — a person queued this, nobody has picked it up — stays its quietest. A
+   * "queued by Rakesh" chip on all three hundred cards would be the loudest thing on the board and
+   * would say nothing.
+   */
+  const provenance = $derived(cardProvenance(card, app.members, app.agents));
+  const queuerInitial = $derived(
+    provenance.agent ? initialOf(provenance.agent.id).toUpperCase() : null,
   );
 
   /**
@@ -342,6 +358,26 @@
       >{avatarInitial}</span>
     {:else}
       <span class="text-muted-foreground" aria-hidden="true">—</span>
+    {/if}
+
+    <!--
+      Queued by an agent. Not a hover title alone: the audit requirement is that the operator can
+      see which cards they did not ask for while scanning the board, and a fact only reachable by
+      pointing at it is a fact the board does not show.
+    -->
+    {#if provenance.byAgent}
+      <span class="queuedchip queuedchip-tile" title={`Queued by ${provenance.queuedByName}, not by you`}>
+        {#if provenance.agent?.iconUrl}
+          <img src={provenance.agent.iconUrl} alt="" class="size-3.5 shrink-0 rounded-full object-cover" />
+        {:else if queuerInitial}
+          <span
+            class="inline-grid size-3.5 shrink-0 place-items-center rounded-full text-[8px] font-semibold"
+            style="background:{agentColor(provenance.agent?.id ?? null)}; color: #0f1118"
+            aria-hidden="true"
+          >{queuerInitial}</span>
+        {/if}
+        <span class="truncate">asked by {provenance.queuedByName}</span>
+      </span>
     {/if}
 
     <span class="spacer ml-auto"></span>

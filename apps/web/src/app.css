@@ -335,6 +335,35 @@
     color: #b48bff;
   }
 
+  /*
+    "asked by <agent>" on a tile whose card an AGENT queued.
+
+    Violet rather than the muted grey every other chip uses, because this one exists to be noticed
+    while scanning: it is the only thing on the board that says "you did not ask for this". Absent
+    on a human-queued card, which is every card that existed before agents could queue work.
+  */
+  .queuedchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: #b48bff;
+    background: color-mix(in srgb, #b48bff 12%, transparent);
+    border: 1px solid color-mix(in srgb, #b48bff 34%, transparent);
+    border-radius: 999px;
+    padding: 0 5px;
+  }
+  /*
+    The TILE's copy is width-capped and its label truncates, because a tile is scanned and a long
+    agent name would push the cost and due date off the row. The drawer's is not: it has the width,
+    and a cap there would clip inside a fixed box — which on a phone is an element whose scrollWidth
+    exceeds its clientWidth, i.e. exactly what `mobile-overflow.spec.ts` exists to catch.
+  */
+  .queuedchip-tile {
+    max-width: 11rem;
+  }
+
   /* cost bar */
   .costbar {
     height: 3px;

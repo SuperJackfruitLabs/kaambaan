@@ -34,13 +34,37 @@ import type { AgentScope } from '@superpipeline/contract';
 export { AGENT_TOKEN_SCOPES, isAgentScope, type AgentScope } from '@superpipeline/contract';
 
 /**
- * The scope a board route requires, or null when the route is not scope-gated.
+ * Refused outright: the route is reachable by an agent on SOME method and not on this one.
  *
- * `rest` is the path beneath `/v1/boards/:id/`, exactly as the Worker computes it.
+ * A distinct value rather than `null`, because `null` means "not scope-gated" and is a pass. The
+ * two must not be spelled the same: `GET /v1/boards/:id` is a `read` and `DELETE` on that exact
+ * path destroys the board and everything it held, and a gate that returned `null` for the method
+ * it had no opinion about would have let the second through on the strength of the first.
  */
-export function requiredScope(rest: string): AgentScope | null {
+export const SCOPE_FORBIDDEN = '__forbidden__' as const;
+export type ScopeVerdict = AgentScope | typeof SCOPE_FORBIDDEN | null;
+
+/**
+ * The scope a board route requires, `SCOPE_FORBIDDEN`, or null when it is not scope-gated.
+ *
+ * `rest` is the path beneath `/v1/boards/:id/`, exactly as the Worker computes it, and `method`
+ * is the request's. The method is part of the gate and not a detail: an agent reaching a path is
+ * never the same question as what it may do there.
+ */
+export function requiredScope(rest: string, method: string): ScopeVerdict {
   if (rest === 'claims') return 'claim';
   if (rest.startsWith('runs/')) return 'run';
+
+  // The board itself, and one card: readable by a coordinator, never editable or deletable.
+  if (rest === '' || /^cards\/[^/]+$/.test(rest)) {
+    return method === 'GET' ? 'read' : SCOPE_FORBIDDEN;
+  }
+  // Creating a card is the one write an agent gets, and it is its own scope. What bounds it is
+  // not this function but the queuer's own `mayDispatch`, recorded on the card.
+  if (rest === 'cards') {
+    return method === 'POST' ? 'queue' : SCOPE_FORBIDDEN;
+  }
+
   // `gates/pending` is routed as an agent route but names nobody and carries no authority — a read
   // the hub's reconciliation sweep makes. It is not gated on a scope for the same reason it is not
   // gated on an agent identity.

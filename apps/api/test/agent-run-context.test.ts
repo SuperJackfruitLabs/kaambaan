@@ -226,16 +226,29 @@ describe('agent read surface — GET /v1/boards/:id/runs/:runId', () => {
     await expect(intruder.context(work)).rejects.toMatchObject({ status: 403 });
   });
 
-  it('does not widen the token: the whole-board snapshot stays human-only', async () => {
+  it('does not widen the WORKER token: a claim/run credential still cannot read the board', async () => {
+    // This test used to assert the snapshot was human-only outright, and that is no longer the
+    // rule: a coordinator with the `read` scope reads it deliberately (spec
+    // 2026-10-02-an-agent-queues-work). What it protects is unchanged and is the thing that
+    // matters — a token minted to CLAIM AND RUN gains nothing from that widening. The status moved
+    // from 401 to 403 because the refusal became more honest: the credential authenticates fine,
+    // and it is the scope that is missing.
     const tenantId = 'tnt_read8';
     const boardId = await createBoard(tenantId);
     await addCard(tenantId, boardId, 'Other work');
     const { token } = await connectAgent(tenantId, ['research']);
 
-    // The board snapshot (every card, gate, cost total and the github config) is not agent-readable.
-    expect((await SELF.fetch(`${base}/v1/boards/${boardId}`, { headers: auth(token) })).status).toBe(401);
-    // Nor is the card list / a card by id, so an agent cannot enumerate a shared board.
+    // The board snapshot (every card, gate, cost total and the github config) needs `read`.
+    expect((await SELF.fetch(`${base}/v1/boards/${boardId}`, { headers: auth(token) })).status).toBe(403);
+    // The card LIST was never opened to agents at all, by any scope — the table in the spec names
+    // four routes and this is not one of them, so it stays on the human branch and 401s.
     expect((await SELF.fetch(`${base}/v1/boards/${boardId}/cards`, { headers: auth(token) })).status).toBe(401);
-    expect((await SELF.fetch(`${base}/v1/boards`, { headers: auth(token) })).status).toBe(401);
+    // And creating work needs `queue`, which a worker does not hold either.
+    const created = await SELF.fetch(`${base}/v1/boards/${boardId}/cards`, {
+      method: 'POST',
+      headers: { ...auth(token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Work I was not asked to make' }),
+    });
+    expect(created.status).toBe(403);
   });
 });

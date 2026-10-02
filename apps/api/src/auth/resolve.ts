@@ -8,7 +8,13 @@
 import type { Env } from '../env';
 import { readSessionToken, verifySession } from './session';
 import { hashToken } from './agent-token';
-import { findAgentByExternal, findAgentByTokenHash, findTenantByExternal, findUserByExternal } from '../db/catalog';
+import {
+  findAgentByExternal,
+  findAgentByTokenHash,
+  findTenantByExternal,
+  findUserByExternal,
+  type AgentQueueingPolicy,
+} from '../db/catalog';
 import { roleFor, type Role } from '../db/members';
 import { verifyHubToken, planeAudience } from './hub-jwt';
 
@@ -68,6 +74,28 @@ export interface AgentPrincipal {
    * Absent on the paths that never read the catalog row.
    */
   concurrency?: number;
+  /**
+   * The control pair's first half, as THIS agent holds it — the principals it may itself dispatch.
+   *
+   * Present only from the hub-token path, because only the hub knows it: the grant is set with
+   * `fleet grants set` and travels in the token's claims, exactly as a human's does. A `spa_`
+   * token carries no claims, so this is **absent** there — and absent is not `[]`. The hub's own
+   * contract says so ("ABSENT from one that does not, and the difference matters — absent must not
+   * be read as 'permitted nothing'"), and the queueing route reads the two differently: an empty
+   * grant is an operator's decision, an absent one is a credential that cannot speak to the
+   * question at all.
+   *
+   * This is what an agent-queued card's `queuedGrant` is built from. Nothing copies it into this
+   * plane: a stored copy would keep authorising dispatches after the operator revoked them.
+   */
+  mayDispatch?: string[];
+  /**
+   * What the operator set on the agent row for queueing work of its own (migration 0015): the
+   * human an agent-queued card belongs to, which boards may receive one, and how many per hour.
+   *
+   * Absent on the dev-header path, which reads no catalog row at all.
+   */
+  queueing?: AgentQueueingPolicy;
 }
 
 function devAuth(env: Env): boolean {
@@ -133,6 +161,13 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
           externalId: found.externalId,
           scopes: found.scopes,
           concurrency: found.concurrency,
+          queueing: {
+            ownerUserId: found.ownerUserId,
+            mayQueueTo: found.mayQueueTo,
+            queueCeilingPerHour: found.queueCeilingPerHour,
+          },
+          // No `mayDispatch`. A `spa_` token carries no claims, so this credential cannot say what
+          // the agent may dispatch — which is different from saying it may dispatch nothing.
         }
       : null;
   }
@@ -276,5 +311,22 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
   const claimTenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
   if (!claimTenantId || claimTenantId !== found.tenantId) return null;
 
-  return { tenantId: found.tenantId, agentId: found.agentId, capabilities: found.capabilities, concurrency: found.concurrency, externalId: claims.sub };
+  return {
+    tenantId: found.tenantId,
+    agentId: found.agentId,
+    capabilities: found.capabilities,
+    concurrency: found.concurrency,
+    externalId: claims.sub,
+    // Carried, not dropped. This function has always received the grant and thrown it away, which
+    // left the one credential that KNOWS what an agent may dispatch unable to say so — the mirror
+    // image of the field-with-no-consumer this estate keeps hitting. `?? []` is deliberately NOT
+    // written here: an issuer that does not speak this claim must stay distinguishable from one
+    // that speaks it and grants nothing.
+    mayDispatch: claims.mayDispatch,
+    queueing: {
+      ownerUserId: found.ownerUserId,
+      mayQueueTo: found.mayQueueTo,
+      queueCeilingPerHour: found.queueCeilingPerHour,
+    },
+  };
 }

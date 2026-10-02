@@ -24,7 +24,7 @@
  */
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
-import { baseUrl, expired, inspect, resolveCredential, ENV_TOKEN } from "./credential.ts";
+import { baseUrl, describeCredential, expired, inspect, resolveCredential, ENV_AGENT_TOKEN, ENV_TOKEN } from "./credential.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
@@ -108,6 +108,8 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                readable; a shape with no renderer prints JSON either way)
 
 Credential: $${ENV_TOKEN}, else $AGENTPOD_TOKEN, else the token \`fleet login\` writes.
+An agent acts with $${ENV_AGENT_TOKEN} (spa_…), which outranks all three. It reads
+boards and queues cards; everything else on this list stays a person's.
 Expired file tokens renew through the device credential from fleet login.
 Explicit environment tokens are used as supplied; superpipeline verifies them offline.
 
@@ -143,9 +145,14 @@ async function credentialOrExit() {
     fail(
       "Not signed in.",
       `  fleet login          sign in once, for both planes\n` +
-        `  ${ENV_TOKEN}=…   supply a token directly`,
+        `  ${ENV_TOKEN}=…   supply a token directly\n` +
+        `  ${ENV_AGENT_TOKEN}=spa_…   act as an agent, not as a person`,
     );
   }
+  // An agent's token is an opaque secret with no claims and no expiry to read. Running it through
+  // the expiry check below would find none and pass, which is the right outcome by accident; saying
+  // so is better than relying on it.
+  if (c.kind === "agent") return c;
   const claims = inspect(c.token);
   if (claims && expired(claims)) {
     const hint = c.source.startsWith("env:")
@@ -312,24 +319,20 @@ async function main(argv: string[]): Promise<void> {
 
     case "whoami": {
       const c = await credentialOrExit();
-      const claims = inspect(c.token);
-      if (!claims) fail("The stored credential is not a token this can read.");
+      const described = describeCredential(c);
+      if (!described) fail("The stored credential is not a token this can read.");
       if (json) {
-        out({
-          principal: claims.subject,
-          kind: claims.principalKind,
-          source: c.source,
-          superpipeline: baseUrl(),
-          expires: claims.expiry?.toISOString() ?? null,
-        });
+        out({ ...described, superpipeline: baseUrl() });
         return;
       }
       process.stdout.write(
-        `principal  ${claims.subject}\n` +
-          `kind       ${claims.principalKind}\n` +
+        // An agent token carries no principal id — it is an opaque secret, and the agent it names
+        // lives in superpipeline's catalog. Saying so beats printing an empty field.
+        `principal  ${described.principal ?? "(not carried by an agent token)"}\n` +
+          `kind       ${described.kind}\n` +
           `superpipeline   ${baseUrl()}\n` +
           `token from ${c.source}\n` +
-          (claims.expiry ? `expires    ${claims.expiry.toLocaleString()}\n` : ""),
+          (described.expires ? `expires    ${new Date(described.expires).toLocaleString()}\n` : ""),
       );
       return;
     }

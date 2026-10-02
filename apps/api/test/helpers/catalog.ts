@@ -10,6 +10,7 @@ import labelsOrigin from '../../migrations/0011_labels_origin.sql?raw';
 import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw';
 import projectsAndMilestones from '../../migrations/0013_projects_and_milestones.sql?raw';
 import projectRollupPartial from '../../migrations/0014_project_rollup_partial.sql?raw';
+import agentQueueing from '../../migrations/0015_agent_queueing.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -131,5 +132,11 @@ export async function setupCatalog(): Promise<void> {
   // on the column, same as every other ALTER-TABLE migration mirrored above.
   if (!(await tableHasColumn('project_rollups', 'partial'))) {
     for (const s of statementsOf(projectRollupPartial)) await env.DB.prepare(s).run();
+  }
+  // 0015 adds the three queueing columns to `agents` and the `agent_card_queues` ledger. Guarded
+  // on the first column rather than on the table, because the ALTERs and the CREATE ship as one
+  // file: a guard on the table alone would re-run the ALTERs and fail on "duplicate column".
+  if (!(await tableHasColumn('agents', 'may_queue_to_json'))) {
+    for (const s of statementsOf(agentQueueing)) await env.DB.prepare(s).run();
   }
 }
