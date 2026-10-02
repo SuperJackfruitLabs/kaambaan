@@ -98,6 +98,11 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
 
   supi forge [<host>|none]     this workspace's forge host, shown or set
   supi agents                  the workspace's agents and what they declare
+  supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id,…>|none]
+                               [--ceiling <n>]
+                               what an agent may queue of its OWN: whose work it owns,
+                               which boards may receive it, how many cards an hour.
+                               --boards none is the default and means NO board
   supi capabilities            the capability registry, with each one's origin
   supi implications            what one capability implies about another
 
@@ -653,6 +658,43 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       out(await api("/v1/agents"));
       return;
+
+    /**
+     * What bounds an agent that queues work of its own (superpipeline migration 0015).
+     *
+     * A separate verb from `agents` because it WRITES, and the three fields it writes are the whole
+     * blast radius of a coordinator: without them the policy could only be set by opening a
+     * database, which is both unauditable and the kind of manual step this CLI exists to remove.
+     *
+     * The dispatch grant is deliberately NOT here. It lives in AgentPod — `fleet grants set` — and
+     * reaches superpipeline in the token's claims, so a copy here would keep authorising dispatches
+     * after the operator revoked them.
+     */
+    case "agent": {
+      if (pos[0] !== "queueing" || !pos[1]) {
+        fail("usage: supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id>|none] [--ceiling <n>]");
+      }
+      const body: Record<string, unknown> = {};
+      const owner = flag(rest, "--owner");
+      // `none` rather than an empty value, so clearing is something the caller TYPED. `flag` returns
+      // null both for "absent" and for "present with no value", so a bare `--owner` must not be read
+      // as "clear the owner" — that would make a typo into a revocation.
+      if (owner !== null) body.ownerUserId = owner === "none" ? null : owner;
+      const boards = flag(rest, "--boards");
+      if (boards !== null) {
+        body.mayQueueTo =
+          boards === "none" ? null : boards.split(",").map((b) => b.trim()).filter((b) => b !== "");
+      }
+      const ceiling = flag(rest, "--ceiling");
+      if (ceiling !== null) {
+        const n = Number(ceiling);
+        if (!Number.isInteger(n) || n < 1) fail("--ceiling must be a whole number of at least 1");
+        body.queueCeilingPerHour = n;
+      }
+      if (Object.keys(body).length === 0) fail("nothing to change: pass --owner, --boards or --ceiling");
+      out(await api(`/v1/agents/${pos[1]}`, { method: "PATCH", body: JSON.stringify(body) }));
+      return;
+    }
 
     case "capabilities":
       out(await api("/v1/capabilities"));

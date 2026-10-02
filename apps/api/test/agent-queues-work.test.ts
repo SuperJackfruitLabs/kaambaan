@@ -1,7 +1,7 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
-import { setAgentQueueingPolicy } from '../src/db/catalog';
+import { updateAgent } from '../src/db/catalog';
 
 /**
  * A coordinator agent queues work.
@@ -121,7 +121,7 @@ describe('a coordinator queues a card', () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES ('usr_rakesh','r@example.test','Rakesh')`).run();
     const boardId = await board(t);
     await agentRow(t, 'agt_chotu', 'prn_chotu0000000000q1');
-    await setAgentQueueingPolicy(env.DB, t, 'agt_chotu', {
+    await updateAgent(env.DB, t, 'agt_chotu', {
       ownerUserId: 'usr_rakesh',
       mayQueueTo: [boardId],
     });
@@ -151,7 +151,7 @@ describe('a coordinator queues a card', () => {
     const t = 'tnt_q2';
     const boardId = await board(t);
     await agentRow(t, 'agt_noowner', 'prn_noowner000000000q2');
-    await setAgentQueueingPolicy(env.DB, t, 'agt_noowner', { mayQueueTo: [boardId] });
+    await updateAgent(env.DB, t, 'agt_noowner', { mayQueueTo: [boardId] });
 
     await withIssuer(t, async () => {
       const token = await agentToken('prn_noowner000000000q2', ['prn_kai']);
@@ -166,7 +166,7 @@ describe('a coordinator queues a card', () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES ('usr_r3','r3@example.test','R')`).run();
     const boardId = await board(t);
     await agentRow(t, 'agt_ungranted', 'prn_ungranted00000q3');
-    await setAgentQueueingPolicy(env.DB, t, 'agt_ungranted', { ownerUserId: 'usr_r3', mayQueueTo: [boardId] });
+    await updateAgent(env.DB, t, 'agt_ungranted', { ownerUserId: 'usr_r3', mayQueueTo: [boardId] });
 
     await withIssuer(t, async () => {
       // An issuer that speaks the claim and grants nothing. That is a decision, and the decision
@@ -191,10 +191,10 @@ describe('a coordinator queues a card', () => {
 
       // Unset. The design doc proposed defaulting to "rostered boards"; this plane has no roster,
       // so the default is the fail-closed half of what that section required.
-      await setAgentQueueingPolicy(env.DB, t, 'agt_bounded', { ownerUserId: 'usr_r4', mayQueueTo: null });
+      await updateAgent(env.DB, t, 'agt_bounded', { ownerUserId: 'usr_r4', mayQueueTo: null });
       expect((await queue(allowed, token, 'Unset')).status).toBe(403);
 
-      await setAgentQueueingPolicy(env.DB, t, 'agt_bounded', { mayQueueTo: [allowed] });
+      await updateAgent(env.DB, t, 'agt_bounded', { mayQueueTo: [allowed] });
       expect((await queue(allowed, token, 'Named')).status).toBe(201);
       const refused = await queue(forbidden, token, 'Not named');
       expect(refused.status).toBe(403);
@@ -207,7 +207,7 @@ describe('a coordinator queues a card', () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES ('usr_r5','r5@example.test','R')`).run();
     const boardId = await board(t);
     await agentRow(t, 'agt_eager', 'prn_eager00000000000q5');
-    await setAgentQueueingPolicy(env.DB, t, 'agt_eager', {
+    await updateAgent(env.DB, t, 'agt_eager', {
       ownerUserId: 'usr_r5',
       mayQueueTo: [boardId],
       queueCeilingPerHour: 2,
@@ -230,7 +230,7 @@ describe('a coordinator queues a card', () => {
     await env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, name) VALUES ('usr_r6','r6@example.test','R')`).run();
     const boardId = await board(t);
     await agentRow(t, 'agt_silent', 'prn_silent0000000000q6');
-    await setAgentQueueingPolicy(env.DB, t, 'agt_silent', { ownerUserId: 'usr_r6', mayQueueTo: [boardId] });
+    await updateAgent(env.DB, t, 'agt_silent', { ownerUserId: 'usr_r6', mayQueueTo: [boardId] });
 
     await withIssuer(t, async () => {
       const token = await agentToken('prn_silent0000000000q6');

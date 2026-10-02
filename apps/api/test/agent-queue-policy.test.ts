@@ -6,7 +6,7 @@ import {
   createAgentToken,
   findAgentByTokenHash,
   recordAgentQueue,
-  setAgentQueueingPolicy,
+  updateAgent,
 } from '../src/db/catalog';
 import { hashToken } from '../src/auth/agent-token';
 
@@ -44,7 +44,7 @@ describe('an agent carries a queueing policy, and its default is to queue nothin
   it('the operator names an owner, the boards, and a ceiling — and the token path reads them', async () => {
     const agent = await createAgent(env.DB, TENANT, { name: 'Chotu', capabilities: ['command'] });
     const { token } = await createAgentToken(env.DB, TENANT, agent.id, ['read', 'queue']);
-    await setAgentQueueingPolicy(env.DB, TENANT, agent.id, {
+    await updateAgent(env.DB, TENANT, agent.id, {
       ownerUserId: 'usr_owner',
       mayQueueTo: ['brd_planning', 'brd_devex'],
       queueCeilingPerHour: 6,
@@ -60,7 +60,7 @@ describe('an agent carries a queueing policy, and its default is to queue nothin
     // missing one: somebody looked at this agent and said "no boards".
     const agent = await createAgent(env.DB, TENANT, { name: 'Benched', capabilities: ['research'] });
     const { token } = await createAgentToken(env.DB, TENANT, agent.id, ['queue']);
-    await setAgentQueueingPolicy(env.DB, TENANT, agent.id, { mayQueueTo: [] });
+    await updateAgent(env.DB, TENANT, agent.id, { mayQueueTo: [] });
     const found = await findAgentByTokenHash(env.DB, await hashToken(token));
     expect(found?.mayQueueTo).toEqual([]);
   });
