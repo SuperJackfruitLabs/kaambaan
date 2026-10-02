@@ -24,7 +24,7 @@
  */
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
-import { baseUrl, describeCredential, expired, inspect, resolveCredential, ENV_AGENT_TOKEN, ENV_TOKEN } from "./credential.ts";
+import { baseUrl, describeCredential, expired, inspect, refusalHint, resolveCredential, ENV_AGENT_TOKEN, ENV_TOKEN } from "./credential.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
@@ -192,12 +192,8 @@ async function api(path: string, init: RequestInit = {}): Promise<unknown> {
     // being true on 2026-09-20: a token whose subject is mapped to a local user reads that
     // user's real role. `member` is now the FALLBACK for an unmapped principal, not a ceiling,
     // so the honest hint names the thing that is actually missing.
-    fail(
-      `Refused by superpipeline (403). ${body.trim()}`,
-      "Your seat in this workspace does not permit that.\n" +
-        "An AgentPod identity reads as `member` until it is linked to a superpipeline account —\n" +
-        "sign in once at the web app with the same address to link them. See packages/cli/README.md.",
-    );
+    // Which dead end this is depends on what is holding the credential — see `refusalHint`.
+    fail(`Refused by superpipeline (403). ${body.trim()}`, refusalHint(c.kind));
   }
   if (!res.ok) fail(`superpipeline returned ${res.status}: ${body.trim()}`);
 
