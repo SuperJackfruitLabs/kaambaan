@@ -1851,6 +1851,20 @@ export class BoardDO extends DurableObject<Env> {
     // they are the one dispatching it now, which is not necessarily the person
     // who created it. Without an actor (an internal move) the previous queuer
     // stands: COALESCE leaves it alone rather than blanking it.
+    /**
+     * Moving a card to a last stage nobody can act on finishes it — which is what a person means
+     * when they drag a card to `done`. Same rule as the agent path (`completesOnArrival`), because
+     * the question it answers is about the STAGE, not about who put the card there.
+     *
+     * After the gate-cancel and blocker checks above, so a move that would have been refused still
+     * is: an unresolved blocker or an open child stops this exactly as before.
+     */
+    if (this.completesOnArrival(target)) {
+      this.resolveCard(cardId, this.getCardHandoffJson(cardId), target.key);
+      const resolved = this.mustGetCard(cardId);
+      this.emit('card.moved', { cardId, from: card.currentStageKey, to: target.key });
+      return { ok: true, value: resolved };
+    }
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
               failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
@@ -3224,6 +3238,26 @@ export class BoardDO extends DurableObject<Env> {
     // it runs. The flag stays unset on failure — a failure still retries the whole pass next
     // sweep, which is deliberate and tested (`backfillLabelNames` above) — but the deferred error
     // is re-thrown at the end so a caller still sees the sweep failed.
+    /**
+     * Cards stranded in a terminal stage nobody can act on, resolved once per board.
+     *
+     * Its OWN flag, not `dueBackfillDone`'s: that flag is already set on every existing board, so
+     * sharing it would mean this migration never ran anywhere it is needed — which is every board
+     * made from a shipped template. Guarded for the same reason the other is, and in its own
+     * try/catch for the reason this sweep's comments give three times over: one job's failure must
+     * not abort the two after it.
+     */
+    let terminalBackfillError: unknown = null;
+    if (!this.getMeta('terminalBackfillDone')) {
+      try {
+        const { completed } = await this.backfillTerminalStageCards();
+        this.setMeta('terminalBackfillDone', '1');
+        if (completed > 0) this.emit('cards.terminal_backfilled', { completed });
+      } catch (err) {
+        terminalBackfillError = err;
+      }
+    }
+
     let backfillError: unknown = null;
     if (!this.getMeta('dueBackfillDone')) {
       try {
@@ -3285,6 +3319,9 @@ export class BoardDO extends DurableObject<Env> {
     // that they have, surface the deferred failure so a caller (the cron loop) still learns the
     // sweep was not clean.
     if (backfillError) throw backfillError;
+    // Reported after the sweep's own work, same as `backfillError` above: a migration that failed
+    // must be visible to the caller, and must not have cost the overdue pass or the schedules.
+    if (terminalBackfillError) throw terminalBackfillError;
 
     return { overdueNotified, schedulesFired };
   }
@@ -4336,27 +4373,14 @@ export class BoardDO extends DurableObject<Env> {
     const next = stages[idx + 1];
     const now = this.now();
     if (!next) {
-      this.sql.exec(
-        `UPDATE cards SET state = 'completed', delegate_agent_id = NULL, current_run_id = NULL, failure_count = 0, handoff_json = ?, updated_at = ? WHERE id = ?`,
-        handoffJson,
-        now,
-        cardId,
-      );
-      this.emit('card.completed', { cardId });
-      // This card just became genuinely resolved (Task 13's rule: `completed`/`canceled` only) —
-      // anything it held back may now be claimable. `notifyWorkAvailable` alone only ever fires for
-      // the card that just changed, never for its dependents, so without this fan-out a
-      // push-subscribed agent waiting on a blocked card never hears it unblocked; only `list_work`
-      // polling would find it. Any FUTURE path that writes `state = 'completed'` or `'canceled'` to
-      // a card needs this same call — there is no `'canceled'`-writing verb today, so this is the
-      // only site, but that will not stay true.
-      this.notifyDependents(cardId);
-      // This card may itself be the last open child of a parent parked by the deferral above — the
-      // ONLY reachable resolution today (`TERMINAL_STATES` also has `rejected`/`failed`, but no
-      // verb writes either to a card, and nothing writes `canceled` either; see the state-machine
-      // note on `RESOLVED_SQL`). Checked here, not in `complete()`/`resolveGate()`, so it fires
-      // for every path through this branch, current and future.
-      this.resumeDeferredParentAdvance(cardId);
+      this.resolveCard(cardId, handoffJson);
+      return;
+    }
+    // Arriving at a last stage nobody can act on IS finishing — see `completesOnArrival`. Checked
+    // before the gate branch because a stage cannot be both.
+    if (this.completesOnArrival(next)) {
+      this.emit('card.advanced', { cardId, from: fromStageKey, to: next.key });
+      this.resolveCard(cardId, handoffJson, next.key);
       return;
     }
     const gated = next.gate === 'approval' && !this.isAgentClaimable(next);
@@ -4538,6 +4562,126 @@ export class BoardDO extends DurableObject<Env> {
 
   private isAgentClaimable(stage: StageDef): boolean {
     return stage.ownerKind === 'capability' || stage.ownerKind === 'agent';
+  }
+
+  /**
+   * Is this the last stage, and can anybody act on it?
+   *
+   * A terminal stage that is human-owned and declares no approval gate is a stage from which a card
+   * can never leave. No agent may claim it (`isAgentClaimable` is false for `human`), no gate will
+   * ever be created to ask anyone (`advanceCard` only creates one for `gate: 'approval'`), and no
+   * route writes card state. Cards reached it and read `submitted` forever — and ALL FOUR shipped
+   * templates end in exactly that shape (`shipped`, `published`, `closed`, `ready`), so every board
+   * made from one was born unable to express completion.
+   *
+   * So arriving there IS finishing, and the card is resolved on arrival.
+   *
+   * Narrow on purpose. The two stages this deliberately excludes are excluded because something can
+   * still act, and completing on arrival would destroy that act without a trace:
+   *
+   *   - a CAPABILITY-owned last stage still has its run to do. Completing on arrival would mean the
+   *     final publish or deploy never happens while the board says it did.
+   *   - a GATED last stage still has its review. That approval is where a person confirms the work;
+   *     deleting it silently is worse than the stall this fixes.
+   */
+  private completesOnArrival(stage: StageDef): boolean {
+    const stages = this.stages();
+    if (stages[stages.length - 1]?.key !== stage.key) return false;
+    return !this.isAgentClaimable(stage) && stage.gate !== 'approval';
+  }
+
+  /**
+   * Resolve a card: the ONE place `state = 'completed'` is written.
+   *
+   * Extracted because the comment that used to live inline asked for exactly this — "any FUTURE
+   * path that writes `state = 'completed'` or `'canceled'` to a card needs this same call" — and
+   * there are now three such paths (a run ending on the last stage, an agent advancing into a
+   * terminal stage nobody can act on, and a human moving a card there). Three copies of the
+   * bookkeeping is three chances to forget `notifyDependents`, which is how a blocked card stays
+   * blocked after the thing blocking it finished.
+   *
+   * `stageKey` is passed when the card is being moved into its final stage at the same moment it
+   * resolves, so the row never exists in an in-between state a reader could observe.
+   */
+  private resolveCard(cardId: string, handoffJson: string | null, stageKey?: string): void {
+    const now = this.now();
+    if (stageKey === undefined) {
+      this.sql.exec(
+        `UPDATE cards SET state = 'completed', delegate_agent_id = NULL, current_run_id = NULL, failure_count = 0, handoff_json = ?, updated_at = ? WHERE id = ?`,
+        handoffJson,
+        now,
+        cardId,
+      );
+    } else {
+      this.sql.exec(
+        `UPDATE cards SET current_stage_key = ?, state = 'completed', delegate_agent_id = NULL, current_run_id = NULL, failure_count = 0, handoff_json = ?, updated_at = ? WHERE id = ?`,
+        stageKey,
+        handoffJson,
+        now,
+        cardId,
+      );
+    }
+    this.emit('card.completed', { cardId });
+    // This card just became genuinely resolved (Task 13's rule: `completed`/`canceled` only) —
+    // anything it held back may now be claimable. `notifyWorkAvailable` alone only ever fires for
+    // the card that just changed, never for its dependents, so without this fan-out a
+    // push-subscribed agent waiting on a blocked card never hears it unblocked.
+    this.notifyDependents(cardId);
+    // This card may itself be the last open child of a parent parked by a deferred advance.
+    this.resumeDeferredParentAdvance(cardId);
+  }
+
+  /**
+   * Complete every card already stranded in a terminal stage nobody can act on.
+   *
+   * `completesOnArrival` fixes arrivals from now on and can do nothing for a card that arrived
+   * before it existed. There were seven such cards across two boards when this was written, and
+   * EIGHT of ten boards were shaped to keep producing them — every board made from a shipped
+   * template is, since all four end in a gateless human stage.
+   *
+   * Keyed on the STAGE, not on the state alone: a `submitted` card in a working stage is a normal
+   * queued card and must not be touched. Cards with open children are skipped for the same reason
+   * `advanceCard` defers them — "a parent with half-finished children would read as done".
+   *
+   * Idempotent: the second pass finds nothing, because the first resolved them.
+   */
+  async backfillTerminalStageCards(): Promise<{ completed: number }> {
+    const stages = this.stages();
+    const last = stages[stages.length - 1];
+    if (!last || !this.completesOnArrival(last)) return { completed: 0 };
+
+    const rows = this.sql
+      .exec(
+        `SELECT id FROM cards WHERE current_stage_key = ? AND state NOT IN ('completed', 'canceled', 'rejected', 'failed')`,
+        last.key,
+      )
+      .toArray();
+
+    let completed = 0;
+    for (const row of rows) {
+      const cardId = row.id as string;
+      if (this.openChildCount(cardId) > 0) continue;
+      this.resolveCard(cardId, this.getCardHandoffJson(cardId));
+      completed++;
+    }
+    if (completed > 0) this.emit('cards.terminal_backfilled', { completed });
+    return { completed };
+  }
+
+  /**
+   * Put a card into an arbitrary stage/state. **Tests only** — it exists so a test can reproduce the
+   * pre-rule shape (`submitted`, in a terminal stage) that no live verb can produce any more.
+   * Nothing in the Worker calls it; building the state through real verbs is impossible precisely
+   * because the rule being tested now prevents it.
+   */
+  async debugForceCardState(cardId: string, stageKey: string, state: TaskState): Promise<void> {
+    this.sql.exec(
+      `UPDATE cards SET current_stage_key = ?, state = ?, updated_at = ? WHERE id = ?`,
+      stageKey,
+      state,
+      this.now(),
+      cardId,
+    );
   }
 
   private getCardHandoffJson(cardId: string): string | null {
