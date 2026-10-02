@@ -1,5 +1,6 @@
 <script lang="ts">
   import { displayAgent, displayPrincipal } from '$lib/names';
+  import { cardProvenance } from '$lib/components/board/card-provenance';
   import { onDestroy } from 'svelte';
   import { groupActivities, isNarrative, defaultOpen, visibleActivities } from '$lib/activity-groups';
   import { app } from '$lib/stores/app.svelte';
@@ -763,6 +764,38 @@
   const delegateName = $derived(displayAgent(delegateId, app.agents));
   const delegateInitial = $derived(initialOf(delegateName));
 
+  /**
+   * Who asked for this card, and what they were permitted to dispatch when they did.
+   *
+   * Same function the tile uses. The alternative — a `find()` per component — is the failure
+   * `names.ts` was written to end: "the lookup existed and five sites did it the long way or not at
+   * all".
+   */
+  const provenance = $derived(
+    card ? cardProvenance(card, app.members, app.agents) : null,
+  );
+
+  /**
+   * The grant, in words.
+   *
+   * `queuedGrant` is stored on every card and rendered nowhere, and a card carrying a 55-principal
+   * grant is a very different object from one carrying three. Two facts are worth saying: how wide
+   * the authority was, and whether it actually covered the agent that ended up working the card —
+   * which under enforcement should always be yes, so a no means enforcement is off or the grant was
+   * narrowed after the claim.
+   */
+  const grantSummary = $derived.by(() => {
+    if (!provenance) return '';
+    if (provenance.grantSize === null) return 'no dispatch authority was recorded';
+    if (provenance.grantSize === 0) return 'authorised to dispatch nobody';
+    const n = provenance.grantSize;
+    const base = `authorised to dispatch ${n} principal${n === 1 ? '' : 's'}`;
+    if (provenance.grantCoversDelegate === null) return base;
+    return provenance.grantCoversDelegate
+      ? `${base}, including the one working it`
+      : `${base} — NOT including the one working it`;
+  });
+
   // state pill
   function statePillClass(state: string): string {
     if (state === 'working') return 'statepill statepill-working';
@@ -956,6 +989,29 @@
 
             <!-- owner -->
             <span class="delegate inline-flex items-center gap-1 font-mono text-[11px]" style="color:var(--muted)" title={card.ownerUserId}>owner · {displayPrincipal(card.ownerUserId, app.members)}</span>
+
+            <!--
+              Queued by — the third identity, and the one that was carried on every card and shown
+              nowhere. A reader has to be able to answer all three questions here without opening a
+              terminal: who asked for this, who is answerable for it, and who is doing it.
+
+              Shown for a person too, not only for an agent: the row's job is to make the three
+              identities legible, and omitting the common case would leave a reader unable to tell
+              "a person queued this" from "nobody recorded who did". The violet chip is reserved for
+              the agent case, which is the one that needs to be noticed.
+            -->
+            {#if provenance?.known}
+              {#if provenance.byAgent}
+                <span class="queuedchip" title={`Queued by ${provenance.queuedByName} — ${grantSummary}`}>
+                  {#if provenance.agent?.iconUrl}
+                    <img src={provenance.agent.iconUrl} alt="" class="size-4 shrink-0 rounded-full object-cover" />
+                  {/if}
+                  <span>asked by {provenance.queuedByName}</span>
+                </span>
+              {:else}
+                <span class="delegate inline-flex items-center gap-1 font-mono text-[11px]" style="color:var(--muted)" title={card.queuedBy ?? ''}>asked by · {provenance.queuedByName}</span>
+              {/if}
+            {/if}
             {#if app.user && card.ownerUserId !== app.user.userId}
               <button
                 onclick={() => void assignToMe()}
@@ -1457,6 +1513,22 @@
         <!-- activity stream -->
         <section class="sec">
           <div class="sec-h eyebrow">session activity</div>
+          <!--
+            The timeline opens with provenance, so the first thing read is the frame for everything
+            after it: who asked for this card, on what authority, and who holds it now.
+
+            Above the empty-state branch deliberately. A card an agent queued and nobody has picked
+            up is precisely where "who asked for this" matters most — that is the shape of an agent
+            queueing work that no capability can claim, and the version of this that sat inside the
+            `{#else}` would have hidden it on every such card.
+          -->
+          {#if provenance?.known}
+            <p class="mono text-muted-foreground mb-1.5 text-[10.5px]">
+              asked by {provenance.queuedByName}{provenance.byAgent ? ' (an agent)' : ''}
+              · {grantSummary}
+              · {delegateId ? `held by ${delegateName}` : 'held by nobody'}
+            </p>
+          {/if}
           {#if !cardDetail || cardDetail.activities.length === 0}
             <p class="text-muted-foreground text-xs">No recorded activity yet — this card hasn't been worked.</p>
           {:else}

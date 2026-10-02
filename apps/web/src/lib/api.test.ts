@@ -39,6 +39,12 @@ describe('Card', () => {
       costUsd: 0,
       overBudget: false,
       attemptCount: 0,
+      // The three provenance fields. Required rather than optional on purpose: this literal is the
+      // compile-time lock, and a fixture that still typechecks after a wire field is added is a
+      // fixture that would not have noticed `queuedBy` going unrendered for as long as it did.
+      queuedBy: 'u1',
+      queuedByAgentId: null,
+      queuedGrant: null,
       labels: [],
       dueAt: null,
       archivedAt: null,

@@ -38,17 +38,46 @@ export function displayAgent(agentId: string | null | undefined, agents: AgentSu
 }
 
 /**
- * A person's name, their email, or a short id.
+ * A person's name, an AGENT's name, an email, or a short id.
  *
- * A gate decided through AgentPod records a `prn_…` principal whose directory lives in another
- * product entirely, so it will not be found here. Shortening it is honest; inventing a name for
- * it would not be.
+ * A principal is not always a person. A card queued by a coordinator records that agent's
+ * `prn_…` — and `queued by prn_d8178f4a…` is precisely the id-instead-of-a-name this module
+ * exists to stop. The agents list already carries the same `externalId`, so the lookup is here
+ * rather than in the one component that noticed.
+ *
+ * `agents` is optional so the six existing call sites keep their exact behaviour: a gate decided
+ * through AgentPod by a PERSON records a `prn_…` whose directory lives in another product, and
+ * shortening it is honest where inventing a name would not be.
  */
-export function displayPrincipal(userId: string | null | undefined, members: Member[]): string {
+export function displayPrincipal(
+  userId: string | null | undefined,
+  members: Member[],
+  agents?: AgentSummary[],
+): string {
   if (!userId) return '';
   const m = members.find((x) => x.userId === userId);
   const name = m?.name?.trim();
   if (name) return name;
   if (m?.email) return m.email;
+  // A member first: the two id spaces never overlap, so order is about cost rather than ambiguity.
+  // The `!!a.externalId` guard matters — an unmapped agent carries null, and a loose comparison
+  // would match a null principal to the first unmapped agent in the workspace.
+  const agentName = agents?.find((a) => !!a.externalId && a.externalId === userId)?.name?.trim();
+  if (agentName) return agentName;
   return shortId(userId);
+}
+
+/**
+ * The agent behind a principal id, when one is behind it.
+ *
+ * Separate from `displayPrincipal` because the callers want different things from the same lookup:
+ * a name to print, or the agent row itself — for its avatar, its colour, and for the one fact that
+ * cannot be derived from a name at all, which is that an agent is there.
+ */
+export function agentForPrincipal(
+  principalId: string | null | undefined,
+  agents: AgentSummary[],
+): AgentSummary | null {
+  if (!principalId) return null;
+  return agents.find((a) => !!a.externalId && a.externalId === principalId) ?? null;
 }

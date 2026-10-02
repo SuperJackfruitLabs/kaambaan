@@ -97,6 +97,34 @@ describe('BoardDO — a card records the agent that queued it', () => {
     });
   });
 
+  it('REASSIGNING THE OWNER DOES NOT TOUCH AUTHORSHIP (U5)', async () => {
+    // Existing behaviour, asserted because the whole distinction collapses if an ownership edit
+    // overwrites it — and because the board now renders both, so a regression here would show a
+    // reader the wrong author rather than merely storing one. `updateCard`'s own comment makes the
+    // promise: "who is answerable for a card and who authorised its dispatch are different
+    // questions, and reassignment must not silently rewrite the recorded authority a claim is
+    // checked against."
+    await runInDurableObject(stubFor('qba-6'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_q6', tenantId: 'tnt_a', name: 'Q', stages: PIPE });
+      const c = await board.createCard({
+        title: 'Handed over',
+        ownerUserId: 'usr_rakesh',
+        queuedBy: 'prn_chotu',
+        queuedByAgentId: 'agt_chotu',
+        queuedGrant: ['prn_kai'],
+      });
+      if (!c.ok) throw new Error('card');
+
+      const up = await board.updateCard(c.value.id, { ownerUserId: 'usr_someone_else' });
+      if (!up.ok) throw new Error('update failed');
+      expect(up.value.ownerUserId).toBe('usr_someone_else');
+      // All three unchanged: who asked, which agent asked, and what they were permitted to dispatch.
+      expect(up.value.queuedBy).toBe('prn_chotu');
+      expect(up.value.queuedByAgentId).toBe('agt_chotu');
+      expect(up.value.queuedGrant).toEqual(['prn_kai']);
+    });
+  });
+
   it('a child inherits it, because a split of agent-queued work is agent-queued', async () => {
     // `createChildCard` already inherits `queuedGrant` non-optionally: a child created with a null
     // grant was unclaimable under enforcement. Authorship follows the same logic — a sub-task of
