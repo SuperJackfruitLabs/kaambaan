@@ -20,6 +20,12 @@
  * - `queue` — create a card.
  * - `plan`  — rearrange work that already exists: projects, milestones, a card's own fields, which
  *             stage it sits in, and the links between cards.
+ * - `compose` — make a PLACE for work, and write the runbook for doing it: create a board, and set a
+ *             stage's `instructions`. Not routing on a board that already has cards: a new board is
+ *             empty, so bad routing there strands nothing, while changing a live stage re-routes
+ *             every card on it. Its own scope rather than part of `plan` because most planners should
+ *             not create boards, and the agent who should write runbooks needs neither card edits nor
+ *             moves to do it.
  *
  * These are separate from the worker pair, and separate from each other, because they are different
  * kinds of trust. A worker needs none of them. A verifier wants `read` and must never have the
@@ -33,12 +39,12 @@
  * an agent holding both halves makes every "a human decided this" record unverifiable — including
  * the record of that agent's own work.
  */
-export type AgentScope = 'claim' | 'run' | 'read' | 'queue' | 'plan';
+export type AgentScope = 'claim' | 'run' | 'read' | 'queue' | 'plan' | 'compose';
 
 /**
  * What a freshly minted agent token carries when the caller asks for nothing narrower.
  *
- * Deliberately NOT widened when `read`, `queue` and `plan` were added. Every existing mint site
+ * Deliberately NOT widened when `read`, `queue`, `plan` and `compose` were added. Every existing mint site
  * passes this unchanged, so a fleet of worker agents gains nothing from the new vocabulary — a
  * coordinator's credential has to be asked for by name.
  */
@@ -47,6 +53,11 @@ export const AGENT_TOKEN_SCOPES: AgentScope[] = ['claim', 'run'];
 /** Is this an agent scope, whatever a caller sent? The one place that decides. */
 export function isAgentScope(value: unknown): value is AgentScope {
   return (
-    value === 'claim' || value === 'run' || value === 'read' || value === 'queue' || value === 'plan'
+    value === 'claim' ||
+    value === 'run' ||
+    value === 'read' ||
+    value === 'queue' ||
+    value === 'plan' ||
+    value === 'compose'
   );
 }

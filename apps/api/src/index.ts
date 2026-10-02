@@ -43,8 +43,9 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday } from './db/catalog';
 import { authorizeAgentQueue } from './auth/agent-queue';
+import { stagePatchRefusal } from './auth/scopes';
 import {
   AGENT_TOKEN_SCOPES,
   isAgentScope,
@@ -1589,10 +1590,10 @@ export default {
      * would be a route an agent reaches unchecked.
      */
     const isCoordinatorRoute =
-      // Listing the workspace's boards. No `boardId`, and `rest` is empty for both this and the
-      // board read below — which is why `requiredScope` says `read` for both without needing to
-      // tell them apart. POST here CREATES a board and stays human-only.
-      (!boardId && request.method === 'GET' && rest === '') ||
+      // `/v1/boards` itself: GET lists them on `read`, POST composes one on `compose`.
+      // `requiredScope` tells them apart from the board-scoped routes via `hasBoardId`, because
+      // `rest` is empty for both `/v1/boards` and `/v1/boards/:id`.
+      (!boardId && rest === '' && (request.method === 'GET' || request.method === 'POST')) ||
       (!!boardId &&
         ((request.method === 'GET' &&
           (rest === '' ||
@@ -1603,7 +1604,10 @@ export default {
           // needs which scope, and refuses the methods none of them may use.
           (request.method === 'PATCH' && /^cards\/[^/]+$/.test(rest)) ||
           (request.method === 'POST' && /^cards\/[^/]+\/move$/.test(rest)) ||
-          ((request.method === 'POST' || request.method === 'DELETE') && rest === 'links')));
+          ((request.method === 'POST' || request.method === 'DELETE') && rest === 'links') ||
+          // ONE stage's prose, on `compose`. The body is then authorised field by field, so this
+          // door opens for `instructions` and refuses every routing key behind it.
+          (request.method === 'PATCH' && /^stages\/[^/]+$/.test(rest))));
     /**
      * Was an agent credential actually OFFERED?
      *
@@ -1689,7 +1693,7 @@ export default {
         // migration 0001, the resolver has always returned it, and nothing compared it to the action
         // being attempted — so a token minted to claim drove every run verb. A recorded permission
         // nobody checks reads as protection that does not exist (auth/scopes.ts).
-        const needed = requiredScope(rest, request.method);
+        const needed = requiredScope(rest, request.method, { hasBoardId: !!boardId });
         if (needed === SCOPE_FORBIDDEN) {
           return Response.json(
             { error: `an agent token cannot ${request.method} this route` },
@@ -1750,9 +1754,58 @@ export default {
         const name = body.name;
         const stages = body.stages as StageDef[];
 
+        /**
+         * An AGENT composing a board: owned by a real human, and bounded per day.
+         *
+         * A new board has no cards, which is why this is reachable at all — bad routing on an empty
+         * board strands nothing, where changing a live stage re-routes every card on it. What still
+         * has to hold is the rest of the queueing argument: somebody is answerable for it, and a loop
+         * cannot make five hundred.
+         */
+        let composedByAgentId: string | null = null;
+        let composedFor: string | null = user?.userId ?? null;
+        if (agent) {
+          const owner = agent.queueing?.ownerUserId ?? null;
+          if (!owner) {
+            return Response.json(
+              {
+                error: {
+                  code: 'AGENT_HAS_NO_OWNER',
+                  message: 'this agent has no owner, so there is nobody to be answerable for the board',
+                },
+              },
+              { status: 403 },
+            );
+          }
+          const ceiling = agent.queueing?.boardCeilingPerDay ?? 3;
+          const already = await countBoardsComposedToday(env.DB, agent.agentId!);
+          if (already >= ceiling) {
+            return Response.json(
+              {
+                error: {
+                  code: 'BOARD_CEILING_REACHED',
+                  message: `this agent has composed ${already} boards today, at its ceiling of ${ceiling}`,
+                },
+              },
+              { status: 429 },
+            );
+          }
+          composedByAgentId = agent.agentId;
+          composedFor = owner;
+        }
+
         const id = newId('brd');
         const snapshot = await boardStub(env, tenantId, id).init({ id, tenantId, name, stages });
-        await recordBoard(env.DB, tenantId, { id, name, stagesJson: JSON.stringify(snapshot.stages) });
+        await recordBoard(env.DB, tenantId, {
+          id,
+          name,
+          stagesJson: JSON.stringify(snapshot.stages),
+          // `boards` recorded no creator at all before this. An agent-composed board would otherwise
+          // be indistinguishable from the operator's, which is the gap `queued_by_agent_id` closed
+          // for cards.
+          createdBy: composedFor,
+          createdByAgentId: composedByAgentId,
+        });
         // A stage naming a capability IS the act of declaring the workspace needs that work done,
         // so it registers the capability. Read from the SNAPSHOT rather than the request, because
         // the DO normalised the owners on the way in and the registry must record what was
@@ -1794,6 +1847,20 @@ export default {
         const body = (await request.json().catch(() => null)) as StagePatch | null;
         if (!body || typeof body !== 'object' || Array.isArray(body)) {
           return Response.json({ error: 'a stage patch must be a JSON object' }, { status: 400 });
+        }
+        /**
+         * An agent may set a stage's `instructions` and nothing else.
+         *
+         * `compose` opened this route for prose; the body is where the rest is refused. `instructions`
+         * is what an agent is handed when it claims the stage, and wrong prose is bad work — visible
+         * in a handoff, recoverable, costing one card. `owner`, `requires`, `gate` and `wipLimit` are
+         * routing, and wrong routing strands every card in the lane with nothing to see.
+         */
+        if (agent) {
+          const refusal = stagePatchRefusal(body as Record<string, unknown>);
+          if (refusal) {
+            return Response.json({ error: { code: 'FIELD_NOT_COMPOSABLE', message: refusal } }, { status: 403 });
+          }
         }
         // Named rather than ignored. A caller sending `key` means to rename the stage, and
         // silently dropping it would report success for a change that did not happen.

@@ -15,7 +15,7 @@ import { AGENT_TOKEN_SCOPES, isAgentScope, type AgentScope } from '../src/scopes
  */
 describe('agent scopes', () => {
   it('names four things an agent can be permitted', () => {
-    for (const s of ['claim', 'run', 'read', 'queue', 'plan'] satisfies AgentScope[]) {
+    for (const s of ['claim', 'run', 'read', 'queue', 'plan', 'compose'] satisfies AgentScope[]) {
       expect(isAgentScope(s)).toBe(true);
     }
   });
@@ -32,6 +32,10 @@ describe('agent scopes', () => {
     expect(isAgentScope('plan')).toBe(true);
   });
 
+  it('names `compose` — making a place for work, and the runbook for doing it', () => {
+    expect(isAgentScope('compose')).toBe(true);
+  });
+
   it('a default token still carries exactly claim and run', () => {
     // The new scopes are opt-in. Every caller that mints without asking for something narrower
     // must keep getting a worker's credential, not a coordinator's — this is the line between
@@ -40,5 +44,6 @@ describe('agent scopes', () => {
     expect(AGENT_TOKEN_SCOPES).not.toContain('read');
     expect(AGENT_TOKEN_SCOPES).not.toContain('queue');
     expect(AGENT_TOKEN_SCOPES).not.toContain('plan');
+    expect(AGENT_TOKEN_SCOPES).not.toContain('compose');
   });
 });

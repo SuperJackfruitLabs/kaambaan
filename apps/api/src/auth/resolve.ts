@@ -165,6 +165,7 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
             ownerUserId: found.ownerUserId,
             mayQueueTo: found.mayQueueTo,
             queueCeilingPerHour: found.queueCeilingPerHour,
+            boardCeilingPerDay: found.boardCeilingPerDay,
           },
           // No `mayDispatch`. A `spa_` token carries no claims, so this credential cannot say what
           // the agent may dispatch — which is different from saying it may dispatch nothing.
@@ -327,6 +328,7 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
       ownerUserId: found.ownerUserId,
       mayQueueTo: found.mayQueueTo,
       queueCeilingPerHour: found.queueCeilingPerHour,
+      boardCeilingPerDay: found.boardCeilingPerDay,
     },
   };
 }

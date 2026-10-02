@@ -51,7 +51,26 @@ export type ScopeVerdict = AgentScope | typeof SCOPE_FORBIDDEN | null;
  * is the request's. The method is part of the gate and not a detail: an agent reaching a path is
  * never the same question as what it may do there.
  */
-export function requiredScope(rest: string, method: string): ScopeVerdict {
+export function requiredScope(
+  rest: string,
+  method: string,
+  opts?: {
+    /**
+     * Whether the path named a board. `rest` is empty for BOTH `/v1/boards` and `/v1/boards/:id`, so
+     * without this the create route and the board read are indistinguishable — and they are a
+     * `compose` and a `read`.
+     *
+     * Defaults to true, which is the board-scoped reading every existing caller meant.
+     */
+    hasBoardId?: boolean;
+  },
+): ScopeVerdict {
+  if (opts?.hasBoardId === false) {
+    // `/v1/boards` itself: list them, or make one.
+    if (method === 'GET') return 'read';
+    if (method === 'POST') return 'compose';
+    return SCOPE_FORBIDDEN;
+  }
   if (rest === 'claims') return 'claim';
   if (rest.startsWith('runs/')) return 'run';
 
@@ -106,8 +125,21 @@ export function requiredScope(rest: string, method: string): ScopeVerdict {
    * A coordinator RAISES decisions instead, as cards (spec 2026-10-02-a-coordinator-plans-the-work).
    */
   if (/^gates\/[^/]+\/resolve$/.test(rest)) return SCOPE_FORBIDDEN;
-  // Restructuring the board. Changing a stage re-routes every card on it, and can strand work
-  // outright — a terminal stage nobody could act on did exactly that to seven live cards.
+  /**
+   * Stages. ONE stage's prose is composable; the pipeline is not.
+   *
+   * `PATCH stages/:key` is reached on `compose` and then authorised FIELD by field
+   * (`stagePatchRefusal`): `instructions` is prose handed to whoever claims there, and getting it
+   * wrong is bad work — visible in a handoff, recoverable, one card at a time. `owner`, `requires`,
+   * `order`, `gate` and `wipLimit` are ROUTING, and getting those wrong strands every card in the
+   * lane silently, which a terminal stage nobody could act on did to seven live cards.
+   *
+   * `POST stages` replaces the whole pipeline and stays refused: it is the same hazard wholesale, and
+   * it has already destroyed stage instructions once.
+   */
+  if (/^stages\/[^/]+$/.test(rest)) {
+    return method === 'PATCH' ? 'compose' : SCOPE_FORBIDDEN;
+  }
   if (rest === 'stages' || rest.startsWith('stages/')) return SCOPE_FORBIDDEN;
 
   // `gates/pending` is routed as an agent route but names nobody and carries no authority — a read
@@ -138,4 +170,33 @@ export function scopePermits(
   // one line and belongs with the verbs, not here: see `CREATES_WORK` in `mcp/tools.ts`.
   if (opts?.grandfather === false) return false;
   return needed === 'run' && scopes.includes('claim');
+}
+
+/**
+ * Which fields of a stage PATCH an agent may send, and which it may not.
+ *
+ * **The first field-level authorisation in this codebase**, and recorded as a precedent rather than
+ * slipped in: every other scope gates a route and a method, so a reviewer should know that a scope
+ * can now permit a route and still refuse a body.
+ *
+ * It exists because one route carries two different kinds of power. `instructions` is the prose an
+ * agent is handed when it claims the stage — wrong prose is bad work, which shows up in a handoff and
+ * costs one card. Everything else is routing, and wrong routing strands every card in the lane with
+ * nothing to see.
+ *
+ * Returns null when the body is allowed, or a sentence NAMING the offending field — a caller that
+ * sends `owner` should learn which key was the problem, not that the route is shut.
+ */
+const COMPOSABLE_STAGE_FIELDS = new Set(['instructions']);
+
+export function stagePatchRefusal(body: Record<string, unknown>): string | null {
+  const sent = Object.keys(body);
+  if (sent.length === 0) {
+    return 'nothing to change: send instructions';
+  }
+  const refused = sent.filter((k) => !COMPOSABLE_STAGE_FIELDS.has(k));
+  if (refused.length > 0) {
+    return `an agent may only set a stage's instructions; refused: ${refused.join(', ')}`;
+  }
+  return null;
 }

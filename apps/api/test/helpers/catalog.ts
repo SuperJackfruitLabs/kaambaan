@@ -11,6 +11,7 @@ import cardLinksExternal from '../../migrations/0012_card_links_external.sql?raw
 import projectsAndMilestones from '../../migrations/0013_projects_and_milestones.sql?raw';
 import projectRollupPartial from '../../migrations/0014_project_rollup_partial.sql?raw';
 import agentQueueing from '../../migrations/0015_agent_queueing.sql?raw';
+import boardProvenance from '../../migrations/0016_board_provenance.sql?raw';
 
 /** Create the catalog tables on the test D1 (mirrors migrations/0001_catalog.sql). */
 const STATEMENTS = [
@@ -138,5 +139,11 @@ export async function setupCatalog(): Promise<void> {
   // file: a guard on the table alone would re-run the ALTERs and fail on "duplicate column".
   if (!(await tableHasColumn('agents', 'may_queue_to_json'))) {
     for (const s of statementsOf(agentQueueing)) await env.DB.prepare(s).run();
+  }
+  // 0016 records who made a board, and caps how many an agent may make in a day. Guarded on the
+  // first column: the ALTERs and the CREATE INDEX ship as one file, so a guard on the index alone
+  // would re-run the ALTERs and fail on "duplicate column".
+  if (!(await tableHasColumn('boards', 'created_by_agent_id'))) {
+    for (const s of statementsOf(boardProvenance)) await env.DB.prepare(s).run();
   }
 }
