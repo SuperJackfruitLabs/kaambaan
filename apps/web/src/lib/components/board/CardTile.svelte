@@ -366,7 +366,7 @@
       pointing at it is a fact the board does not show.
     -->
     {#if provenance.byAgent}
-      <span class="queuedchip" title={`Queued by ${provenance.queuedByName}, not by you`}>
+      <span class="queuedchip queuedchip-tile" title={`Queued by ${provenance.queuedByName}, not by you`}>
         {#if provenance.agent?.iconUrl}
           <img src={provenance.agent.iconUrl} alt="" class="size-3.5 shrink-0 rounded-full object-cover" />
         {:else if queuerInitial}
