@@ -27,6 +27,7 @@ import {
   expired,
   inspect,
   loadCredential,
+  refusalHint,
   fleetConfigDir,
 } from "./credential";
 
@@ -217,5 +218,30 @@ describe("describeCredential", () => {
 
   it("returns null for a human credential it cannot parse, so the caller can still refuse", () => {
     expect(describeCredential({ token: "not-a-jwt", source: "env:Y", kind: "human" })).toBeNull();
+  });
+});
+
+describe("refusalHint", () => {
+  /**
+   * A 403 sends the reader somewhere. Which somewhere depends on what is holding the credential.
+   *
+   * Observed live: Super Chotu, holding a `read`-scoped agent token, was refused card creation with
+   * `this token is not permitted to queue` — correctly — and then told "Your seat in this workspace
+   * does not permit that. An AgentPod identity reads as `member` until it is linked to a
+   * superpipeline account — sign in once at the web app." Every word of that is about a HUMAN's
+   * role, and none of it is actionable by an agent whose scopes are the actual answer. An error that
+   * sends somebody looking in the wrong place costs more than no error.
+   */
+  it("points an AGENT at its scopes and its grant, not at account linking", () => {
+    const hint = refusalHint("agent");
+    expect(hint).toMatch(/scope/i);
+    expect(hint).not.toMatch(/sign in/i);
+    expect(hint).not.toMatch(/seat/i);
+  });
+
+  it("still points a PERSON at the seat and the account link", () => {
+    const hint = refusalHint("human");
+    expect(hint).toMatch(/seat/i);
+    expect(hint).toMatch(/link/i);
   });
 });

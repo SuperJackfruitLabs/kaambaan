@@ -284,3 +284,30 @@ export function describeCredential(c: Credential): {
     expires: claims.expiry?.toISOString() ?? null,
   };
 }
+
+/**
+ * What to tell someone refused with a 403, given what is holding the credential.
+ *
+ * Two different dead ends wear the same status code. A PERSON is refused by their role, and the
+ * remedy is their seat or an unlinked account. An AGENT is refused by its token's scopes or by what
+ * its operator permitted it, and none of the human advice is actionable by it.
+ *
+ * Observed live: a coordinator holding a `read`-scoped token was refused card creation with `this
+ * token is not permitted to queue` — correctly — and then advised to "sign in once at the web app".
+ * An error that sends somebody looking in the wrong place costs more than no error at all.
+ */
+export function refusalHint(kind: Credential["kind"]): string {
+  if (kind === "agent") {
+    return (
+      "This agent token does not permit that.\n" +
+      "Reading a board needs the `read` scope; creating a card needs `queue` — a token minted\n" +
+      "without them is refused here rather than at claim time. What an agent may queue, and onto\n" +
+      "which boards, is also set per agent: `supi agent queueing <agentId>`."
+    );
+  }
+  return (
+    "Your seat in this workspace does not permit that.\n" +
+    "An AgentPod identity reads as `member` until it is linked to a superpipeline account —\n" +
+    "sign in once at the web app with the same address to link them. See packages/cli/README.md."
+  );
+}
