@@ -92,11 +92,11 @@ describe("loadCredential", () => {
 
 describe("an agent credential", () => {
   it("is read from the variable that names it, and labelled an agent's", () => {
-    // The operator does not drive this CLI; Super Chotu does. A coordinator that can read ten
+    // The operator does not drive this CLI; their coordinator agent does. One that can read ten
     // boards and put a shaped card on one is the whole point of the change this supports.
-    vi.stubEnv(ENV_AGENT_TOKEN, "spa_chotu0000");
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_coord0000");
     expect(loadCredential()).toMatchObject({
-      token: "spa_chotu0000",
+      token: "spa_coord0000",
       kind: "agent",
       source: `env:${ENV_AGENT_TOKEN}`,
     });
@@ -107,7 +107,7 @@ describe("an agent credential", () => {
     // the agent would act as the operator — indistinguishably, which is the exact failure the
     // control pair and `queued_by_agent_id` exist to make impossible.
     vi.stubEnv(ENV_TOKEN, "eyJhbGciOi.payload.sig");
-    vi.stubEnv(ENV_AGENT_TOKEN, "spa_chotu0000");
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_coord0000");
     expect(loadCredential()).toMatchObject({ kind: "agent" });
   });
 
@@ -120,7 +120,7 @@ describe("an agent credential", () => {
   });
 
   it("REFUSES a spa_ token in the human slot, for the same reason in reverse", () => {
-    vi.stubEnv(ENV_TOKEN, "spa_chotu0000");
+    vi.stubEnv(ENV_TOKEN, "spa_coord0000");
     expect(() => loadCredential()).toThrow(new RegExp(ENV_AGENT_TOKEN));
   });
 
@@ -225,7 +225,7 @@ describe("refusalHint", () => {
   /**
    * A 403 sends the reader somewhere. Which somewhere depends on what is holding the credential.
    *
-   * Observed live: Super Chotu, holding a `read`-scoped agent token, was refused card creation with
+   * Observed live: a coordinator agent, holding a `read`-scoped token, was refused card creation with
    * `this token is not permitted to queue` — correctly — and then told "Your seat in this workspace
    * does not permit that. An AgentPod identity reads as `member` until it is linked to a
    * superpipeline account — sign in once at the web app." Every word of that is about a HUMAN's

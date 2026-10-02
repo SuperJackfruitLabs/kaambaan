@@ -93,27 +93,27 @@ describe('initialOf, given what the card drawer used to pass it', () => {
 });
 
 describe('displayPrincipal resolves an AGENT principal too', () => {
-  // A card queued by Super Chotu records his `prn_…`, not a user id, so the members list can never
+  // A card queued by an agent records ITS `prn_…`, not a user id, so the members list can never
   // name it — and `queued by prn_d8178f4a…` is exactly the id-instead-of-a-name this module exists
   // to stop. The agents list already carries `externalId`, which is that same principal.
-  const CHOTU = [
-    { id: 'agt_chotu', name: 'Super Chotu', capabilities: ['command'], externalId: 'prn_chotu0000000000q1' },
+  const COORDINATOR = [
+    { id: 'agt_coord', name: 'Coordinator', capabilities: ['command'], externalId: 'prn_coord000000000001' },
   ];
 
   it('names the agent behind a principal id', () => {
-    expect(displayPrincipal('prn_chotu0000000000q1', MEMBERS as never, CHOTU as never)).toBe('Super Chotu');
+    expect(displayPrincipal('prn_coord000000000001', MEMBERS as never, COORDINATOR as never)).toBe('Coordinator');
   });
 
   it('prefers a member, because a human and an agent never share an id space', () => {
-    expect(displayPrincipal('usr_b19776fac3c94df4', MEMBERS as never, CHOTU as never)).toBe('Rakesh');
+    expect(displayPrincipal('usr_b19776fac3c94df4', MEMBERS as never, COORDINATOR as never)).toBe('Rakesh');
   });
 
   it('still shortens a principal nothing here knows', () => {
-    expect(displayPrincipal('prn_34935f04668e4d089749', MEMBERS as never, CHOTU as never)).toBe('prn_…089749');
+    expect(displayPrincipal('prn_34935f04668e4d089749', MEMBERS as never, COORDINATOR as never)).toBe('prn_…089749');
   });
 
   it('is unchanged when no agents are passed, so every existing call site behaves as before', () => {
-    expect(displayPrincipal('prn_chotu0000000000q1', MEMBERS as never)).toBe('prn_…0000q1');
+    expect(displayPrincipal('prn_coord000000000001', MEMBERS as never)).toBe('prn_…000001');
   });
 
   it('ignores an agent with no mapping rather than matching null to null', () => {

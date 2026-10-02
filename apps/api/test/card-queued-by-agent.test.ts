@@ -37,35 +37,35 @@ describe('BoardDO — a card records the agent that queued it', () => {
         // The human who owns the agent is answerable for the card...
         ownerUserId: 'usr_rakesh',
         // ...the agent's principal is the authority the control pair checks...
-        queuedBy: 'prn_chotu',
+        queuedBy: 'prn_coord',
         // ...and the local row is what the UI can turn into a name and an avatar.
-        queuedByAgentId: 'agt_chotu',
+        queuedByAgentId: 'agt_coord',
         queuedGrant: ['prn_kai', 'prn_tim'],
       });
       if (!c.ok) throw new Error('card');
       expect(c.value.ownerUserId).toBe('usr_rakesh');
-      expect(c.value.queuedBy).toBe('prn_chotu');
-      expect(c.value.queuedByAgentId).toBe('agt_chotu');
+      expect(c.value.queuedBy).toBe('prn_coord');
+      expect(c.value.queuedByAgentId).toBe('agt_coord');
       expect(c.value.queuedGrant).toEqual(['prn_kai', 'prn_tim']);
 
       // And it survives the trip through the snapshot the board renders from — a field the DO
       // stores but `snapshot()` drops is the defect this estate has hit eight times.
       const snap = await board.getState();
-      expect(snap.cards.find((x) => x.id === c.value.id)?.queuedByAgentId).toBe('agt_chotu');
+      expect(snap.cards.find((x) => x.id === c.value.id)?.queuedByAgentId).toBe('agt_coord');
     });
   });
 
   it('A HUMAN RE-QUEUEING CLEARS IT: the tile must stop crediting the agent', async () => {
     // Without this, moving an agent-queued card into another stage leaves `queued_by_agent_id`
     // standing while `queued_by` becomes the mover — so the card would read "queued by Super
-    // Chotu" about a dispatch the operator personally authorised. The pair has to move together.
+    // agent" about a dispatch the operator personally authorised. The pair has to move together.
     await runInDurableObject(stubFor('qba-3'), async (board: BoardDO) => {
       await board.init({ id: 'brd_q3', tenantId: 'tnt_a', name: 'Q', stages: PIPE });
       const c = await board.createCard({
         title: 'Taken over',
         ownerUserId: 'usr_rakesh',
-        queuedBy: 'prn_chotu',
-        queuedByAgentId: 'agt_chotu',
+        queuedBy: 'prn_coord',
+        queuedByAgentId: 'agt_coord',
       });
       if (!c.ok) throw new Error('card');
 
@@ -85,15 +85,15 @@ describe('BoardDO — a card records the agent that queued it', () => {
       const c = await board.createCard({
         title: 'Advanced by the machine',
         ownerUserId: 'usr_rakesh',
-        queuedBy: 'prn_chotu',
-        queuedByAgentId: 'agt_chotu',
+        queuedBy: 'prn_coord',
+        queuedByAgentId: 'agt_coord',
       });
       if (!c.ok) throw new Error('card');
 
       const moved = await board.moveCard(c.value.id, 'build');
       if (!moved.ok) throw new Error('move failed');
-      expect(moved.value.queuedBy).toBe('prn_chotu');
-      expect(moved.value.queuedByAgentId).toBe('agt_chotu');
+      expect(moved.value.queuedBy).toBe('prn_coord');
+      expect(moved.value.queuedByAgentId).toBe('agt_coord');
     });
   });
 
@@ -109,8 +109,8 @@ describe('BoardDO — a card records the agent that queued it', () => {
       const c = await board.createCard({
         title: 'Handed over',
         ownerUserId: 'usr_rakesh',
-        queuedBy: 'prn_chotu',
-        queuedByAgentId: 'agt_chotu',
+        queuedBy: 'prn_coord',
+        queuedByAgentId: 'agt_coord',
         queuedGrant: ['prn_kai'],
       });
       if (!c.ok) throw new Error('card');
@@ -119,8 +119,8 @@ describe('BoardDO — a card records the agent that queued it', () => {
       if (!up.ok) throw new Error('update failed');
       expect(up.value.ownerUserId).toBe('usr_someone_else');
       // All three unchanged: who asked, which agent asked, and what they were permitted to dispatch.
-      expect(up.value.queuedBy).toBe('prn_chotu');
-      expect(up.value.queuedByAgentId).toBe('agt_chotu');
+      expect(up.value.queuedBy).toBe('prn_coord');
+      expect(up.value.queuedByAgentId).toBe('agt_coord');
       expect(up.value.queuedGrant).toEqual(['prn_kai']);
     });
   });
@@ -128,21 +128,21 @@ describe('BoardDO — a card records the agent that queued it', () => {
   it('a child inherits it, because a split of agent-queued work is agent-queued', async () => {
     // `createChildCard` already inherits `queuedGrant` non-optionally: a child created with a null
     // grant was unclaimable under enforcement. Authorship follows the same logic — a sub-task of
-    // a card Chotu asked for was not asked for by a person.
+    // a card a coordinator asked for was not asked for by a person.
     await runInDurableObject(stubFor('qba-5'), async (board: BoardDO) => {
       await board.init({ id: 'brd_q5', tenantId: 'tnt_a', name: 'Q', stages: PIPE });
       const parent = await board.createCard({
         title: 'Parent',
         ownerUserId: 'usr_rakesh',
-        queuedBy: 'prn_chotu',
-        queuedByAgentId: 'agt_chotu',
+        queuedBy: 'prn_coord',
+        queuedByAgentId: 'agt_coord',
         queuedGrant: ['prn_kai'],
       });
       if (!parent.ok) throw new Error('parent');
 
       const child = await board.createChildCard(parent.value.id, { title: 'Piece one', ownerUserId: 'usr_rakesh' });
       if (!child.ok) throw new Error('child');
-      expect(child.value.queuedByAgentId).toBe('agt_chotu');
+      expect(child.value.queuedByAgentId).toBe('agt_coord');
       expect(child.value.queuedGrant).toEqual(['prn_kai']);
     });
   });

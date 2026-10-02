@@ -71,7 +71,7 @@ describe('PATCH /v1/agents/:id — the queueing policy', () => {
 
   it('sets all three, and GET reports them so the operator can verify', async () => {
     // Readable as well as writable. A permission you can set and cannot see is one nobody audits.
-    const id = await agent('Chotu');
+    const id = await agent('Coordinator');
     const res = await patch(id, {
       ownerUserId: 'usr_qr',
       mayQueueTo: [boardA, boardB],

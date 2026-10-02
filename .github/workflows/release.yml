@@ -111,4 +111,7 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "$TAG" --generate-notes
           fi
-          gh release upload "$TAG" dist/supi-* dist/SHA256SUMS scripts/install.sh --clobber
+          # The skill ships with the binaries it documents. `install.sh` fetches it by tag, so a
+          # station always gets the skill that matches its supi rather than whatever is on main.
+          gh release upload "$TAG" dist/supi-* dist/SHA256SUMS scripts/install.sh \
+            packages/cli/skills/superpipeline-boards/SKILL.md --clobber

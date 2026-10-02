@@ -1856,7 +1856,7 @@ export class BoardDO extends DurableObject<Env> {
               failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
               -- Moves WITH the pair, never apart. A human re-queueing an agent-queued card
               -- becomes its queuer, and leaving the agent id standing would make the card read
-              -- "queued by Super Chotu" about a dispatch the operator personally authorised.
+              -- "queued by <some agent>" about a dispatch the operator personally authorised.
               -- An internal move (no actor) dispatches nothing new, so both values stand.
               queued_by_agent_id = CASE WHEN ? IS NULL THEN queued_by_agent_id ELSE NULL END,
               queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END WHERE id = ?`,

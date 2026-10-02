@@ -14,7 +14,7 @@ import { agentForPrincipal, displayPrincipal, shortId } from '../../names';
  * preserved when ownership is reassigned — "who is answerable for a card and who authorised its
  * dispatch are different questions" — and then appeared nowhere a person could see. That gap was
  * survivable while every card was queued by the same human. It stops being survivable the moment an
- * agent can queue work, because "Super Chotu asked for this" and "the operator asked for this" must
+ * agent can queue work, because "an agent asked for this" and "the operator asked for this" must
  * be distinguishable at a glance or the audit trail credits the operator with work they never
  * requested.
  *
