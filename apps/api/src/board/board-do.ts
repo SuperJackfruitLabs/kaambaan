@@ -338,6 +338,19 @@ export interface CardView {
    * at claim time; without it a claim has no principal to check.
    */
   queuedBy: string | null;
+  /**
+   * The AGENT that queued this card, when one did — superpipeline's own `agt_…`, not a principal.
+   *
+   * `queuedBy` cannot answer this. It holds one id, a `prn_…` from a plane whose directory lives
+   * in another product, and nothing about the string says whether a person or a coordinator wrote
+   * it. Null means a human queued it, which is every card that existed before this column.
+   *
+   * It is stored rather than derived because the derivation would be a join nobody owns: the
+   * agent row can be deleted, renamed or unmapped, and the card still has to be able to say who
+   * asked for it. An audit trail that forgets is one that credits the operator with work they
+   * never requested.
+   */
+  queuedByAgentId: string | null;
   /** What the queuer was permitted to dispatch, as granted when they queued it. */
   queuedGrant: string[] | null;
   /** Applied label ids; the catalogue lives in D1 (`src/db/labels.ts`). */
@@ -805,6 +818,10 @@ export interface BoardStub {
   createCard(input: {
     /** What the queuer was permitted to dispatch, as granted at this moment. */
     queuedGrant?: string[] | null;
+    /** The principal who dispatched it, when that is not the owner (the agent case). */
+    queuedBy?: string | null;
+    /** The agent that queued it, if an agent did. */
+    queuedByAgentId?: string | null;
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
@@ -1165,6 +1182,17 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * Which agent queued the card, as distinct from which principal authorised it.
+     *
+     * Guarded ALTER, like `queued_by` above: every existing card reads NULL, which is exactly
+     * right — all of them were queued by a person.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN queued_by_agent_id TEXT`);
+    } catch {
+      // column already exists
+    }
     /** The queuer, pinned onto the run, so an attempt records whose work it was. */
     try {
       this.sql.exec(`ALTER TABLE runs ADD COLUMN queued_by TEXT`);
@@ -1430,6 +1458,17 @@ export class BoardDO extends DurableObject<Env> {
   async createCard(input: {
     /** What the queuer was permitted to dispatch, as granted at this moment. */
     queuedGrant?: string[] | null;
+    /**
+     * The principal who dispatched this card, when it is not the owner.
+     *
+     * Defaults to `ownerUserId`, which is what it has always been: a person creating a card is
+     * both answerable for it and the authority behind it. An agent-queued card is the case where
+     * the two come apart — the human owns it, the agent's principal authorised it — and the
+     * control pair checks THIS value at claim time, so conflating them would check the wrong one.
+     */
+    queuedBy?: string | null;
+    /** The agent that queued it, if an agent did. See `CardView.queuedByAgentId`. */
+    queuedByAgentId?: string | null;
     title: string;
     ownerUserId: string;
     spec?: JsonValue;
@@ -1458,8 +1497,8 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(
       `INSERT INTO cards
-        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_grant, due_at, project_id)
-       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, title, spec_json, owner_user_id, current_stage_key, state, priority, context_id, created_at, updated_at, queued_by, queued_by_agent_id, queued_grant, due_at, project_id)
+       VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       input.title,
       JSON.stringify((this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(input.spec) : input.spec) ?? {}),
@@ -1470,8 +1509,10 @@ export class BoardDO extends DurableObject<Env> {
       now,
       now,
       // Creating a card in the first stage IS queueing it: it is claimable the
-      // moment it exists, so the creator is the principal who dispatched it.
-      input.ownerUserId,
+      // moment it exists, so the creator is the principal who dispatched it —
+      // unless the caller names a different one, which is the agent case.
+      input.queuedBy ?? input.ownerUserId,
+      input.queuedByAgentId ?? null,
       input.queuedGrant ? JSON.stringify(input.queuedGrant) : null,
       input.dueAt ?? null,
       input.projectId ?? null,
@@ -1525,6 +1566,11 @@ export class BoardDO extends DurableObject<Env> {
       spec: input.spec,
       priority: input.priority ?? parent.priority,
       queuedGrant: parent.queuedGrant,
+      // Same reasoning one step further: a sub-task of a card the coordinator asked for was not
+      // asked for by a person, and `queuedBy` has to follow or the child's authority would be the
+      // owner's rather than the authority the parent's grant was issued against.
+      queuedBy: parent.queuedBy,
+      queuedByAgentId: parent.queuedByAgentId,
       projectId: parent.projectId,
     });
     if (!created.ok) return created;
@@ -1808,9 +1854,15 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
               failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
+              -- Moves WITH the pair, never apart. A human re-queueing an agent-queued card
+              -- becomes its queuer, and leaving the agent id standing would make the card read
+              -- "queued by Super Chotu" about a dispatch the operator personally authorised.
+              -- An internal move (no actor) dispatches nothing new, so both values stand.
+              queued_by_agent_id = CASE WHEN ? IS NULL THEN queued_by_agent_id ELSE NULL END,
               queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END WHERE id = ?`,
       target.key,
       now,
+      actorUserId ?? null,
       actorUserId ?? null,
       // Same COALESCE reasoning as the queuer: an internal move leaves the
       // recorded authority standing rather than blanking it.
@@ -4900,6 +4952,7 @@ export class BoardDO extends DurableObject<Env> {
       spec: JSON.parse(row.spec_json as string),
       ownerUserId: row.owner_user_id as string,
       queuedBy: (row.queued_by as string | null) ?? null,
+      queuedByAgentId: (row.queued_by_agent_id as string | null) ?? null,
       queuedGrant: row.queued_grant ? (JSON.parse(row.queued_grant as string) as string[]) : null,
       labels: row.labels ? (JSON.parse(row.labels as string) as string[]) : [],
       // Columns on the card row, same as `dueAt` below — no query, no `pre` entry, read straight
