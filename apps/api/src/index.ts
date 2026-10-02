@@ -54,7 +54,7 @@ import {
   type AgentScope,
 } from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
-import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, type Capability } from './db/members';
+import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, mayOwnWork, type Capability } from './db/members';
 import {
   listCapabilities,
   createCapability,
@@ -1211,6 +1211,10 @@ export default {
               capabilities?: string[];
               iconUrl?: string | null;
               concurrency?: number;
+              /** The queueing policy (migration 0015). `unknown` because both are validated below. */
+              ownerUserId?: unknown;
+              mayQueueTo?: unknown;
+              queueCeilingPerHour?: unknown;
             };
 
             // The agent's OWN properties, which until now could be set exactly once — in the
@@ -1221,7 +1225,15 @@ export default {
             // Handled before the externalId branch, and independently of it: linking a principal
             // and editing an agent are different acts that happen to share a route, and a PATCH
             // carrying only `capabilities` must not be refused for want of an `externalId`.
-            const patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number } = {};
+            const patch: {
+              name?: string;
+              capabilities?: string[];
+              iconUrl?: string | null;
+              concurrency?: number;
+              ownerUserId?: string | null;
+              mayQueueTo?: string[] | null;
+              queueCeilingPerHour?: number;
+            } = {};
             if (body.name !== undefined) {
               if (typeof body.name !== 'string' || body.name.trim() === '') {
                 return Response.json({ error: 'name must be a non-empty string' }, { status: 400 });
@@ -1258,13 +1270,70 @@ export default {
               }
               patch.concurrency = body.concurrency;
             }
+            /**
+             * What bounds this agent when it queues work of its own (migration 0015).
+             *
+             * Both ids are checked against this workspace rather than trusted. An owner who is not
+             * a user would own real work to somebody who does not exist — the `usr_dev` failure
+             * with extra steps — and an allowlist naming a board that is not here permits nothing,
+             * silently, while reading as configured. Both would surface only when an agent tried to
+             * queue, which is the wrong end of the system to learn about a typo.
+             */
+            if ('ownerUserId' in body) {
+              if (body.ownerUserId !== null) {
+                if (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '') {
+                  return Response.json({ error: 'ownerUserId must be a user id, or null to clear it' }, { status: 400 });
+                }
+                if (!(await mayOwnWork(env.DB, u.tenantId, body.ownerUserId))) {
+                  return Response.json(
+                    { error: `${body.ownerUserId} is not a user in this workspace` },
+                    { status: 400 },
+                  );
+                }
+              }
+              patch.ownerUserId = body.ownerUserId as string | null;
+            }
+            if ('mayQueueTo' in body) {
+              if (body.mayQueueTo !== null) {
+                if (!Array.isArray(body.mayQueueTo) || body.mayQueueTo.some((b) => typeof b !== 'string' || b.trim() === '')) {
+                  return Response.json(
+                    { error: 'mayQueueTo must be an array of board ids, [] for none, or null to clear it' },
+                    { status: 400 },
+                  );
+                }
+                const known = new Set((await listBoards(env.DB, u.tenantId)).map((b) => b.id));
+                const unknown = (body.mayQueueTo as string[]).filter((b) => !known.has(b));
+                if (unknown.length > 0) {
+                  return Response.json(
+                    { error: `not a board in this workspace: ${unknown.join(', ')}` },
+                    { status: 400 },
+                  );
+                }
+              }
+              patch.mayQueueTo = body.mayQueueTo as string[] | null;
+            }
+            if (body.queueCeilingPerHour !== undefined) {
+              const ceiling = body.queueCeilingPerHour;
+              if (typeof ceiling !== 'number' || !Number.isInteger(ceiling) || ceiling < 1) {
+                // Zero would be an agent that holds the scope and silently cannot use it. If that
+                // is what the operator means, `mayQueueTo: []` is where they say so.
+                return Response.json({ error: 'queueCeilingPerHour must be a whole number of at least 1' }, { status: 400 });
+              }
+              patch.queueCeilingPerHour = ceiling;
+            }
             if (Object.keys(patch).length > 0) await updateAgent(env.DB, u.tenantId, agentId, patch);
 
             if (body.externalId === undefined) {
               // A patch that only touched the agent's own fields is complete. Only a request that
               // named NOTHING at all is a mistake worth reporting.
               if (Object.keys(patch).length > 0) return Response.json({ ok: true });
-              return Response.json({ error: 'nothing to change: send name, capabilities, iconUrl, concurrency, or externalId' }, { status: 400 });
+              return Response.json(
+                {
+                  error:
+                    'nothing to change: send name, capabilities, iconUrl, concurrency, ownerUserId, mayQueueTo, queueCeilingPerHour, or externalId',
+                },
+                { status: 400 },
+              );
             }
             if (body.externalId === null) {
               await setAgentExternalMapping(env.DB, u.tenantId, agentId, null);

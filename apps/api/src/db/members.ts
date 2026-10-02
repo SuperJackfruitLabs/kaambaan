@@ -147,3 +147,24 @@ export async function removeMember(db: D1Database, tenantId: string, userId: str
   const res = await db.prepare(`DELETE FROM memberships WHERE tenant_id = ? AND user_id = ?`).bind(tenantId, userId).run();
   return (res.meta?.changes ?? 0) > 0;
 }
+
+/**
+ * May this user be made answerable for work in this workspace?
+ *
+ * Used where an id is RECORDED as an owner rather than authenticated — setting which human an
+ * agent's queued cards belong to (`agents.owner_user_id`, migration 0015). An id that names nobody
+ * would own real work to a user that does not exist, which is the `usr_dev` failure with extra
+ * steps, and it would surface only when an agent tried to queue.
+ *
+ * Two conditions, and the second is conditional for the same reason `resolveUser`'s dev path makes
+ * it conditional: a workspace with NO members at all is a bare dev or test workspace, where
+ * requiring a membership would refuse everyone. Once a workspace HAS members, the id must name one
+ * — otherwise this would quietly admit someone the workspace has not let in.
+ */
+export async function mayOwnWork(db: D1Database, tenantId: string, userId: string): Promise<boolean> {
+  const user = await db.prepare(`SELECT 1 FROM users WHERE id = ?`).bind(userId).first();
+  if (!user) return false;
+  if (await roleFor(db, tenantId, userId)) return true;
+  const populated = await db.prepare(`SELECT 1 FROM memberships WHERE tenant_id = ? LIMIT 1`).bind(tenantId).first();
+  return populated === null;
+}

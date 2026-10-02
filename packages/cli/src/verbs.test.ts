@@ -75,6 +75,14 @@ describe("verb surface", () => {
     }
   });
 
+  it("dispatches the verb that bounds what an agent may queue", () => {
+    // Migration 0015 shipped three columns, the route that READS them, and for one commit nothing
+    // that could write them — so a coordinator's blast radius could only be set by opening a
+    // database. A permission whose only setter is a SQL prompt is a permission nobody audits, and
+    // it is also one `Route everything through Claude` forbids handing back as a manual step.
+    expect(dispatched().has("agent"), "agent is not dispatched").toBe(true);
+  });
+
   it("lists exactly what it dispatches, in both directions", () => {
     expect([...listed()].sort()).toEqual([...dispatched()].sort());
   });

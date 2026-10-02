@@ -71,6 +71,9 @@ export interface AgentRecord {
   tokenIds: string[];
 }
 
+/** An agent record, plus what bounds it when it queues work of its own (migration 0015). */
+export type AgentRecordWithQueueing = AgentRecord & AgentQueueingPolicy;
+
 /** Where an agent is also known, as a suite principal outside superpipeline. */
 export interface AgentExternalMapping {
   externalId: string;
@@ -333,7 +336,20 @@ export async function updateAgent(
   db: D1Database,
   tenantId: string,
   agentId: string,
-  patch: { name?: string; capabilities?: string[]; iconUrl?: string | null; concurrency?: number },
+  patch: {
+    name?: string;
+    capabilities?: string[];
+    iconUrl?: string | null;
+    concurrency?: number;
+    /**
+     * The queueing policy (migration 0015). Here rather than in a setter of its own because two
+     * writers for one table is how they drift — and because this is the route an operator already
+     * uses to say what an agent IS.
+     */
+    ownerUserId?: string | null;
+    mayQueueTo?: string[] | null;
+    queueCeilingPerHour?: number;
+  },
 ): Promise<void> {
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -352,6 +368,21 @@ export async function updateAgent(
   if (patch.concurrency !== undefined) {
     sets.push('concurrency = ?');
     vals.push(patch.concurrency);
+  }
+  // `'x' in patch` rather than `!== undefined`: null is a MEANINGFUL value for both of these — it
+  // clears the owner, and it returns the allowlist to "no board" — so an explicit null must reach
+  // the UPDATE rather than being read as "not mentioned".
+  if ('ownerUserId' in patch) {
+    sets.push('owner_user_id = ?');
+    vals.push(patch.ownerUserId ?? null);
+  }
+  if ('mayQueueTo' in patch) {
+    sets.push('may_queue_to_json = ?');
+    vals.push(patch.mayQueueTo === null || patch.mayQueueTo === undefined ? null : JSON.stringify(patch.mayQueueTo));
+  }
+  if (patch.queueCeilingPerHour !== undefined) {
+    sets.push('queue_ceiling_per_hour = ?');
+    vals.push(patch.queueCeilingPerHour);
   }
   if (sets.length === 0) return;
   sets.push(`updated_at = datetime('now')`);
@@ -466,37 +497,6 @@ function queueingPolicyOf(row: { ownerUserId: string | null; mayQueueTo: string 
 }
 
 /**
- * Set what an agent may do when it queues. Every field is optional and only what is passed changes,
- * so naming a board does not silently reset the ceiling somebody else tuned.
- */
-export async function setAgentQueueingPolicy(
-  db: D1Database,
-  tenantId: string,
-  agentId: string,
-  input: { ownerUserId?: string | null; mayQueueTo?: string[] | null; queueCeilingPerHour?: number },
-): Promise<void> {
-  const sets: string[] = [];
-  const binds: unknown[] = [];
-  if ('ownerUserId' in input) {
-    sets.push('owner_user_id = ?');
-    binds.push(input.ownerUserId ?? null);
-  }
-  if ('mayQueueTo' in input) {
-    sets.push('may_queue_to_json = ?');
-    binds.push(input.mayQueueTo === null || input.mayQueueTo === undefined ? null : JSON.stringify(input.mayQueueTo));
-  }
-  if (input.queueCeilingPerHour !== undefined) {
-    sets.push('queue_ceiling_per_hour = ?');
-    binds.push(input.queueCeilingPerHour);
-  }
-  if (sets.length === 0) return;
-  await db
-    .prepare(`UPDATE agents SET ${sets.join(', ')}, updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`)
-    .bind(...binds, agentId, tenantId)
-    .run();
-}
-
-/**
  * Write down that an agent queued a card.
  *
  * Two jobs in one row: it is what the hourly ceiling counts, and it is the only place an operator
@@ -608,16 +608,17 @@ export async function findAgentByTokenHash(
 // The token ids are a correlated subquery, not a JOIN: an agent with several tokens must not
 // multiply into several rows, and one with none must still list (COALESCE — json_group_array
 // over zero matching rows is NULL, not '[]').
-export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecord[]> {
+export async function listAgents(db: D1Database, tenantId: string): Promise<AgentRecordWithQueueing[]> {
   const { results } = await db
     .prepare(
       `SELECT id, tenant_id AS tenantId, name, capabilities_json AS caps, icon_url AS iconUrl, concurrency,
               external_id AS externalId, external_source AS externalSource,
+              owner_user_id AS ownerUserId, may_queue_to_json AS mayQueueTo, queue_ceiling_per_hour AS ceiling,
               COALESCE((SELECT json_group_array(t.id) FROM agent_tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL), '[]') AS tokenIdsJson
        FROM agents a WHERE tenant_id = ? ORDER BY created_at ASC`,
     )
     .bind(tenantId)
-    .all<{ id: string; tenantId: string; name: string; caps: string; iconUrl: string | null; concurrency: number; externalId: string | null; externalSource: string | null; tokenIdsJson: string }>();
+    .all<{ id: string; tenantId: string; name: string; caps: string; iconUrl: string | null; concurrency: number; externalId: string | null; externalSource: string | null; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null; tokenIdsJson: string }>();
   return results.map((r) => ({
     id: r.id,
     tenantId: r.tenantId,
@@ -628,6 +629,10 @@ export async function listAgents(db: D1Database, tenantId: string): Promise<Agen
     externalId: r.externalId,
     externalSource: r.externalSource,
     tokenIds: JSON.parse(r.tokenIdsJson),
+    // Reported, not just stored. A permission an operator can set and cannot see is one nobody
+    // audits — and `mayQueueTo` in particular is the difference between a coordinator that can put
+    // work on ten boards and one that can put it nowhere.
+    ...queueingPolicyOf(r),
   }));
 }
 
