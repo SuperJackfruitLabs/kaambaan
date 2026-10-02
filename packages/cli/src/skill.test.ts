@@ -55,6 +55,30 @@ describe("the superpipeline-boards skill", () => {
     }
   });
 
+  it("teaches the PLANNING surface, not only the reads", () => {
+    /**
+     * The omission this exists to stop, and it is not hypothetical.
+     *
+     * The coordinator surface shipped and this skill still described the world before it, so the
+     * agent told its operator it had no project-creation access — correctly, by its instructions,
+     * while the API answered 201. A capability nothing tells the agent about is a capability the
+     * agent does not have, and the agent's own instructions are the consumer that was missing.
+     */
+    for (const verb of ["project", "milestone", "link", "move"]) {
+      expect(taught().has(verb), `${verb} is not taught`).toBe(true);
+    }
+    // And the one fact that makes setting a project worth doing at all.
+    expect(skill.toLowerCase()).toContain("rollup");
+  });
+
+  it("explains that raising a decision has a mechanism, since gates do not", () => {
+    // "You cannot resolve a gate" on its own reads as a dead end, and an agent that believes it has
+    // one stops. The mechanism — a card on a human-owned stage, plus a `blocks` link — has to travel
+    // with the refusal, or the refusal is all the agent learns.
+    expect(skill).toMatch(/blocks/);
+    expect(skill.toLowerCase()).toMatch(/human half of the control pair/);
+  });
+
   it("names the refusals by code, so a reader acts instead of retrying", () => {
     // Each of these is a distinct dead end with a distinct remedy, and the whole reason they are
     // separate codes is that an agent should be able to tell them apart without a human.
