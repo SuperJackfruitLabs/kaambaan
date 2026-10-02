@@ -20,6 +20,7 @@ import {
   DEFAULT_BASE,
   ENV_BASE,
   ENV_AGENT_TOKEN,
+  ENV_AGENT_TOKEN_FILE,
   ENV_HUB_TOKEN,
   ENV_TOKEN,
   baseUrl,
@@ -33,7 +34,7 @@ import {
 
 let home: string;
 beforeEach(() => {
-  for (const k of [ENV_TOKEN, ENV_HUB_TOKEN, ENV_AGENT_TOKEN, ENV_BASE]) vi.stubEnv(k, "");
+  for (const k of [ENV_TOKEN, ENV_HUB_TOKEN, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_BASE]) vi.stubEnv(k, "");
   // Redirect every platform's config directory, never the developer's real credentials.
   home = mkdtempSync(join(tmpdir(), "supi-"));
   for (const k of ["HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME"]) vi.stubEnv(k, home);
@@ -216,6 +217,20 @@ describe("describeCredential", () => {
     });
   });
 
+  it("reports a STATION token's principal and expiry, which it CAN read", () => {
+    // An `spa_` token is opaque and has neither. A station token is a JWT and has both, and the
+    // expiry matters: it is five minutes, so `whoami` saying when it dies is how somebody notices a
+    // refresher has stopped.
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const token = `aGRy.${Buffer.from(JSON.stringify({ sub: "prn_chotu", principalKind: "agent", exp })).toString("base64url")}.c2ln`;
+    expect(describeCredential({ token, source: "file:/x.jwt", kind: "agent" })).toMatchObject({
+      principal: "prn_chotu",
+      kind: "agent",
+      source: "file:/x.jwt",
+    });
+    expect(describeCredential({ token, source: "file:/x.jwt", kind: "agent" })!.expires).not.toBeNull();
+  });
+
   it("returns null for a human credential it cannot parse, so the caller can still refuse", () => {
     expect(describeCredential({ token: "not-a-jwt", source: "env:Y", kind: "human" })).toBeNull();
   });
@@ -243,5 +258,100 @@ describe("refusalHint", () => {
     const hint = refusalHint("human");
     expect(hint).toMatch(/seat/i);
     expect(hint).toMatch(/link/i);
+  });
+});
+
+describe("a station token is an agent credential too", () => {
+  /**
+   * The gap this closes, and it was self-inflicted.
+   *
+   * `$SUPERPIPELINE_AGENT_TOKEN` demanded an `spa_` prefix, to stop a HUMAN's hub token being used
+   * as an agent's. But the credential that actually carries an agent's dispatch grant is a hub JWT
+   * with `principalKind: "agent"` — a station token — so the guard blocked the one credential that
+   * can queue work. The right discriminator was never the prefix; it is `principalKind`.
+   */
+  const jwt = (payload: Record<string, unknown>) =>
+    `aGRy.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.c2ln`;
+  const future = Math.floor(Date.now() / 1000) + 300;
+
+  it("accepts a JWT whose principalKind is agent", () => {
+    const token = jwt({ sub: "prn_chotu", principalKind: "agent", exp: future });
+    vi.stubEnv(ENV_AGENT_TOKEN, token);
+    expect(loadCredential()).toMatchObject({ token, kind: "agent" });
+  });
+
+  it("still refuses a HUMAN's token in the agent slot", () => {
+    // The original protection, kept — just tested on the claim rather than the shape. A human token
+    // here would act as the person it names while the caller believed it was acting as the agent.
+    vi.stubEnv(ENV_AGENT_TOKEN, jwt({ sub: "usr_1", principalKind: "human", exp: future }));
+    expect(() => loadCredential()).toThrow(/human/i);
+  });
+
+  it("refuses a token it cannot read at all, rather than guessing", () => {
+    vi.stubEnv(ENV_AGENT_TOKEN, "not-a-token");
+    expect(() => loadCredential()).toThrow(/spa_|agent/i);
+  });
+
+  it("still accepts an opaque spa_ token, which carries no claims to read", () => {
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_coord0000");
+    expect(loadCredential()).toMatchObject({ kind: "agent" });
+  });
+});
+
+describe("an agent credential can come from a FILE", () => {
+  /**
+   * A station token lives five minutes — "the expiry IS the revocation SLA" — so a value pasted into
+   * a long-lived process's environment is stale within minutes. Something has to refresh it, and the
+   * thing that can is the node-agent, which holds the node credential. It writes a file; `supi` reads
+   * that file on every invocation and therefore always spends a fresh token.
+   *
+   * The same shape agentpod already uses for `OpenClawTokenFile`: "the token is passed as a FILE
+   * PATH, never inline — argv is world-readable."
+   */
+  const jwt = (payload: Record<string, unknown>) =>
+    `aGRy.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.c2ln`;
+  const future = Math.floor(Date.now() / 1000) + 300;
+
+  it("reads the token from the file the variable names", () => {
+    const token = jwt({ sub: "prn_chotu", principalKind: "agent", exp: future });
+    const p = join(home, "station.jwt");
+    writeFileSync(p, `${token}\n`);
+    vi.stubEnv(ENV_AGENT_TOKEN_FILE, p);
+    expect(loadCredential()).toMatchObject({ token, kind: "agent", source: `file:${p}` });
+  });
+
+  it("OUTRANKS every other slot, because it is the only one kept fresh", () => {
+    const token = jwt({ sub: "prn_chotu", principalKind: "agent", exp: future });
+    const p = join(home, "fresh.jwt");
+    writeFileSync(p, token);
+    vi.stubEnv(ENV_AGENT_TOKEN, "spa_stale0000");
+    vi.stubEnv(ENV_TOKEN, jwt({ sub: "usr_1", principalKind: "human", exp: future }));
+    vi.stubEnv(ENV_AGENT_TOKEN_FILE, p);
+    expect(loadCredential()).toMatchObject({ token, source: `file:${p}` });
+  });
+
+  it("REFUSES when the file is named but unreadable — never falls back to a person", () => {
+    // The hazard worth naming: a silent fallback here would have the agent act as the operator,
+    // indistinguishably, the moment its token file went missing. A missing file is a broken refresher,
+    // and the honest answer is to say so rather than to borrow somebody else's identity.
+    vi.stubEnv(ENV_AGENT_TOKEN_FILE, join(home, "absent.jwt"));
+    vi.stubEnv(ENV_TOKEN, jwt({ sub: "usr_1", principalKind: "human", exp: future }));
+    expect(() => loadCredential()).toThrow(/absent\.jwt|could not read/i);
+  });
+
+  it("refuses a file holding a human's token, same rule as the env slot", () => {
+    const p = join(home, "wrong.jwt");
+    writeFileSync(p, jwt({ sub: "usr_1", principalKind: "human", exp: future }));
+    vi.stubEnv(ENV_AGENT_TOKEN_FILE, p);
+    expect(() => loadCredential()).toThrow(/human/i);
+  });
+
+  it("treats an empty file as a refusal, not as absence", () => {
+    // An empty file is a refresher that ran and produced nothing. Falling through would be the same
+    // identity swap as the missing-file case.
+    const p = join(home, "empty.jwt");
+    writeFileSync(p, "   \n");
+    vi.stubEnv(ENV_AGENT_TOKEN_FILE, p);
+    expect(() => loadCredential()).toThrow(/empty/i);
   });
 });

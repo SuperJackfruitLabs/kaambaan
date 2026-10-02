@@ -39,6 +39,19 @@ export const ENV_HUB_TOKEN = "AGENTPOD_TOKEN";
  * the token's shape is a mistake worth reporting rather than resolving.
  */
 export const ENV_AGENT_TOKEN = "SUPERPIPELINE_AGENT_TOKEN";
+/**
+ * A FILE holding an agent credential, re-read on every invocation.
+ *
+ * A station token — the only agent credential that carries a dispatch grant — lives five minutes:
+ * "the expiry IS the revocation SLA". So a value baked into a long-lived process's environment is
+ * stale within minutes, and something has to keep it fresh. The thing that can is the node-agent,
+ * which holds the node credential and mints these on the station's behalf; it writes the file and
+ * this reads it each run.
+ *
+ * A path rather than a value, for the reason agentpod's `OpenClawTokenFile` already gives: "the
+ * token is passed as a FILE PATH, never inline — argv is world-readable."
+ */
+export const ENV_AGENT_TOKEN_FILE = "SUPERPIPELINE_AGENT_TOKEN_FILE";
 export const ENV_BASE = "SUPERPIPELINE_URL";
 
 /**
@@ -65,9 +78,32 @@ export interface Credential {
   kind: "human" | "agent";
 }
 
-/** A superpipeline agent token, by its prefix — the same test `resolveAgent` applies server-side. */
-function isAgentToken(value: string): boolean {
-  return value.startsWith("spa_");
+/**
+ * Is this value an AGENT's credential, and if not, why not?
+ *
+ * Two shapes are agent credentials and they look nothing alike:
+ *
+ *   - `spa_…` — superpipeline's own token. Opaque: a random secret with no claims to read, which is
+ *     why it cannot carry a dispatch grant and cannot queue work.
+ *   - a hub JWT whose `principalKind` is `"agent"` — a STATION token. This is the one that carries
+ *     `mayDispatch`, so it is the only credential an agent can queue with.
+ *
+ * The first cut of this tested the `spa_` PREFIX, which refused the second shape outright — the
+ * guard meant to stop a human's token being used as an agent's also blocked the only credential
+ * that could do the job. The discriminator was never the prefix; it is the claim.
+ *
+ * Returns the reason on refusal, so each caller can name the slot in its own message.
+ */
+function agentCredentialRefusal(value: string): string | null {
+  if (value.startsWith("spa_")) return null;
+  const claims = inspect(value);
+  if (!claims) {
+    return "it is neither a superpipeline agent token (spa_…) nor a token this can read";
+  }
+  if (claims.principalKind !== "agent") {
+    return `it names a ${claims.principalKind || "unknown"} principal, not an agent — such a token would act as whoever it names`;
+  }
+  return null;
 }
 
 /** Match Go os.UserConfigDir(), used by fleet on every supported platform. */
@@ -85,14 +121,46 @@ function fleetTokenPath(): string {
 }
 
 export function loadCredential(): Credential | null {
-  // First, and deliberately: a station's shell can hold a leftover hub token from `fleet login`,
+  /**
+   * The token FILE first, because it is the only slot anything keeps fresh.
+   *
+   * Named but unreadable is a REFUSAL, never a fall-through. A refresher that stopped writing would
+   * otherwise send this straight down to a human slot, and the agent would act as the operator —
+   * indistinguishably, which is the exact failure `queued_by_agent_id` and this whole precedence
+   * order exist to prevent. A broken refresher must read as broken.
+   */
+  const tokenFile = (process.env[ENV_AGENT_TOKEN_FILE] ?? "").trim();
+  if (tokenFile !== "") {
+    let raw: string;
+    try {
+      raw = readFileSync(tokenFile, "utf8");
+    } catch {
+      throw new Error(
+        `${ENV_AGENT_TOKEN_FILE} names ${tokenFile}, which could not be read. ` +
+          `Refusing rather than falling back to another credential: that would act as somebody else.`,
+      );
+    }
+    const token = raw.trim();
+    if (token === "") {
+      throw new Error(
+        `${ENV_AGENT_TOKEN_FILE} names ${tokenFile}, which is empty — a refresher that produced nothing. ` +
+          `Refusing rather than falling back to another credential.`,
+      );
+    }
+    const refusal = agentCredentialRefusal(token);
+    if (refusal) throw new Error(`${tokenFile} does not hold an agent credential: ${refusal}.`);
+    return { token, source: `file:${tokenFile}`, kind: "agent" };
+  }
+
+  // Then the environment slot: a station's shell can hold a leftover hub token from `fleet login`,
   // and if that won the agent would act as the operator — indistinguishably.
   const agentToken = (process.env[ENV_AGENT_TOKEN] ?? "").trim();
   if (agentToken !== "") {
-    if (!isAgentToken(agentToken)) {
+    const refusal = agentCredentialRefusal(agentToken);
+    if (refusal) {
       throw new Error(
-        `${ENV_AGENT_TOKEN} must hold a superpipeline agent token (spa_…). ` +
-          `A hub token here would act as the person it names, not as this agent — put it in ${ENV_TOKEN} instead.`,
+        `${ENV_AGENT_TOKEN} does not hold an agent credential: ${refusal}. ` +
+          `A person's token belongs in ${ENV_TOKEN}.`,
       );
     }
     return { token: agentToken, source: `env:${ENV_AGENT_TOKEN}`, kind: "agent" };
@@ -100,7 +168,7 @@ export function loadCredential(): Credential | null {
   for (const name of [ENV_TOKEN, ENV_HUB_TOKEN]) {
     const v = (process.env[name] ?? "").trim();
     if (v === "") continue;
-    if (isAgentToken(v)) {
+    if (v.startsWith("spa_")) {
       throw new Error(
         `${name} holds an agent token (spa_…), which names an agent rather than a person. ` +
           `Set ${ENV_AGENT_TOKEN} instead, so what acts is what the board records.`,
@@ -273,6 +341,18 @@ export function describeCredential(c: Credential): {
   expires: string | null;
 } | null {
   if (c.kind === "agent") {
+    // A STATION token is a JWT and says both. An `spa_` token is an opaque secret and says neither,
+    // and reporting that as a fact beats reporting it as a failure — which is what this did before
+    // it distinguished the two.
+    const claims = inspect(c.token);
+    if (claims) {
+      return {
+        principal: claims.subject || null,
+        kind: claims.principalKind || "agent",
+        source: c.source,
+        expires: claims.expiry?.toISOString() ?? null,
+      };
+    }
     return { principal: null, kind: "agent", source: c.source, expires: null };
   }
   const claims = inspect(c.token);
