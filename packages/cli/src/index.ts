@@ -24,7 +24,7 @@
  */
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
-import { baseUrl, describeCredential, expired, inspect, refusalHint, resolveCredential, ENV_AGENT_TOKEN, ENV_TOKEN } from "./credential.ts";
+import { baseUrl, describeCredential, expired, inspect, refusalHint, resolveCredential, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
@@ -113,8 +113,10 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                readable; a shape with no renderer prints JSON either way)
 
 Credential: $${ENV_TOKEN}, else $AGENTPOD_TOKEN, else the token \`fleet login\` writes.
-An agent acts with $${ENV_AGENT_TOKEN} (spa_…), which outranks all three. It reads
-boards and queues cards; everything else on this list stays a person's.
+An agent acts with $${ENV_AGENT_TOKEN_FILE} (a file, re-read every run) or
+$${ENV_AGENT_TOKEN}, either outranking all three. An spa_ token reads and plans; only a
+hub-issued STATION token carries the dispatch grant that queues work and moves cards, and
+it lives minutes — so point the FILE at something the node-agent keeps fresh.
 Expired file tokens renew through the device credential from fleet login.
 Explicit environment tokens are used as supplied; superpipeline verifies them offline.
 
@@ -151,13 +153,30 @@ async function credentialOrExit() {
       "Not signed in.",
       `  fleet login          sign in once, for both planes\n` +
         `  ${ENV_TOKEN}=…   supply a token directly\n` +
-        `  ${ENV_AGENT_TOKEN}=spa_…   act as an agent, not as a person`,
+        `  ${ENV_AGENT_TOKEN}=spa_…   act as an agent, not as a person\n` +
+        `  ${ENV_AGENT_TOKEN_FILE}=…   a file something keeps fresh (a station token lives minutes)`,
     );
   }
-  // An agent's token is an opaque secret with no claims and no expiry to read. Running it through
-  // the expiry check below would find none and pass, which is the right outcome by accident; saying
-  // so is better than relying on it.
-  if (c.kind === "agent") return c;
+  /**
+   * An agent credential, and whether it has already died.
+   *
+   * An `spa_` token is opaque: no claims, no expiry, nothing to check. A STATION token is a JWT that
+   * lives five minutes — "the expiry IS the revocation SLA" — so an expired one is the ordinary
+   * symptom of a refresher that has stopped, and it must read as that rather than as a 401 from the
+   * far end. The remedy is never "sign in": an agent cannot.
+   */
+  if (c.kind === "agent") {
+    const agentClaims = inspect(c.token);
+    if (agentClaims && expired(agentClaims)) {
+      fail(
+        `This agent token expired at ${agentClaims.expiry!.toLocaleString()}.`,
+        c.source.startsWith("file:")
+          ? `  Nothing refreshed ${c.source.slice(5)} — check the node-agent on this host.`
+          : `  A station token lives minutes. Point ${ENV_AGENT_TOKEN_FILE} at a file something keeps fresh.`,
+      );
+    }
+    return c;
+  }
   const claims = inspect(c.token);
   if (claims && expired(claims)) {
     const hint = c.source.startsWith("env:")

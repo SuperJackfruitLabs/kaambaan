@@ -68,6 +68,39 @@ Superpipeline verifies the resulting token and its audience/authority at the API
 This reuses the existing fleet credential protocol; it does not add a separate
 Superpipeline login or change the suite's identity agreements.
 
+## When an AGENT is the one running it
+
+`supi` is driven by agents as well as people, and the two must never be confused: the board
+records which of them asked for a card, and that record is the point.
+
+An agent credential comes from one of two places, both outranking every human slot:
+
+| | |
+|---|---|
+| `SUPERPIPELINE_AGENT_TOKEN_FILE` | a path, re-read on **every** invocation |
+| `SUPERPIPELINE_AGENT_TOKEN` | a value in the environment |
+
+Two kinds of token count as an agent's, and they look nothing alike:
+
+- **`spa_…`** — superpipeline's own token. Opaque: a random secret with no claims. It reads and
+  plans, and it cannot queue work, because it carries no dispatch grant.
+- **a hub JWT whose `principalKind` is `agent`** — a *station token*. This one carries
+  `mayDispatch`, so it is the only credential that can queue a card or move one.
+
+A station token lives about five minutes, deliberately: verification is offline and there is no
+revocation list, so the expiry *is* the revocation window. That is why the FILE exists — something
+has to keep it fresh, and `supi` reads it afresh each run. On an AgentPod node, the node-agent does
+that: set `stationTokens` in its config and point this variable at the path it writes.
+
+Two refusals rather than guesses, both for the same reason — a credential that silently becomes
+somebody else's is the worst outcome available:
+
+- a **human's** token in either agent slot is refused, by its `principalKind` and not by its shape
+- a token **file that is named but missing or empty** is refused outright, never fallen back from.
+  A refresher that stopped must read as broken, not as "act as the operator instead".
+
+`supi whoami` says which identity is in force, where the credential came from, and when it dies.
+
 ## What it can do
 
 The CLI reads boards, cards and pending gates, moves cards, lists templates, and
