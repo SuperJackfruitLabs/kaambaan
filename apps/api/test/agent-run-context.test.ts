@@ -240,8 +240,8 @@ describe('agent read surface — GET /v1/boards/:id/runs/:runId', () => {
 
     // The board snapshot (every card, gate, cost total and the github config) needs `read`.
     expect((await SELF.fetch(`${base}/v1/boards/${boardId}`, { headers: auth(token) })).status).toBe(403);
-    // The card LIST was never opened to agents at all, by any scope — the table in the spec names
-    // four routes and this is not one of them, so it stays on the human branch and 401s.
+    // There is no card-LIST route at all — `rest === 'cards'` serves POST only, for every caller.
+    // So this falls to the human branch and 401s, exactly as it always has.
     expect((await SELF.fetch(`${base}/v1/boards/${boardId}/cards`, { headers: auth(token) })).status).toBe(401);
     // And creating work needs `queue`, which a worker does not hold either.
     const created = await SELF.fetch(`${base}/v1/boards/${boardId}/cards`, {
