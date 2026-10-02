@@ -16,26 +16,37 @@
  *
  * What a COORDINATOR does to the board itself:
  *
- * - `read`  — list boards, read a board, read a card.
+ * - `read`  — the read surface: boards, cards, projects, milestones, labels, capabilities, agents.
  * - `queue` — create a card.
+ * - `plan`  — rearrange work that already exists: projects, milestones, a card's own fields, which
+ *             stage it sits in, and the links between cards.
  *
- * The second pair is separate from the first, and separate from each other, because they are
- * different kinds of trust. A worker needs neither. A verifier wants `read` and must never have
- * `queue`. And `queue` is the only agent scope that spends other agents' time, which is why it is
- * its own grant and why it is bounded by the queuer's own `mayDispatch` rather than by a flag.
+ * These are separate from the worker pair, and separate from each other, because they are different
+ * kinds of trust. A worker needs none of them. A verifier wants `read` and must never have the
+ * others. `queue` is the only agent scope that SPENDS other agents' time, which is why it is bounded
+ * by the queuer's own `mayDispatch` rather than by a flag. `plan` spends nobody's time — it
+ * rearranges — with one exception that is handled where it arises rather than here: moving a card
+ * into a dispatchable stage IS dispatching it, so that one act carries the same grant check a create
+ * does (`auth/agent-queue.ts`).
+ *
+ * Deliberately NOT in this list: resolving a gate. That is the human half of the control pair, and
+ * an agent holding both halves makes every "a human decided this" record unverifiable — including
+ * the record of that agent's own work.
  */
-export type AgentScope = 'claim' | 'run' | 'read' | 'queue';
+export type AgentScope = 'claim' | 'run' | 'read' | 'queue' | 'plan';
 
 /**
  * What a freshly minted agent token carries when the caller asks for nothing narrower.
  *
- * Deliberately NOT widened when `read` and `queue` were added. Every existing mint site passes
- * this unchanged, so a fleet of worker agents gains nothing from the new vocabulary — a
+ * Deliberately NOT widened when `read`, `queue` and `plan` were added. Every existing mint site
+ * passes this unchanged, so a fleet of worker agents gains nothing from the new vocabulary — a
  * coordinator's credential has to be asked for by name.
  */
 export const AGENT_TOKEN_SCOPES: AgentScope[] = ['claim', 'run'];
 
 /** Is this an agent scope, whatever a caller sent? The one place that decides. */
 export function isAgentScope(value: unknown): value is AgentScope {
-  return value === 'claim' || value === 'run' || value === 'read' || value === 'queue';
+  return (
+    value === 'claim' || value === 'run' || value === 'read' || value === 'queue' || value === 'plan'
+  );
 }

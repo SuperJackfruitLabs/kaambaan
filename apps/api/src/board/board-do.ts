@@ -849,6 +849,13 @@ export interface BoardStub {
     actorUserId?: string,
     /** What the mover was permitted to dispatch, recorded with the card. */
     queuedGrant?: string[] | null,
+    /**
+     * The AGENT doing the moving, when one is. A move re-queues the card, so the pair
+     * `queued_by`/`queued_by_agent_id` must move together here exactly as on a create — otherwise a
+     * card an agent re-queued reads as the operator's, or one a HUMAN re-queued keeps crediting the
+     * agent that queued it first.
+     */
+    queuedByAgentId?: string | null,
   ): Promise<Result<CardView>>;
   /** One card, in the same projection the board snapshot carries. */
   getCardView(cardId: string): Promise<Result<CardView>>;
@@ -1806,6 +1813,13 @@ export class BoardDO extends DurableObject<Env> {
     toStageKey: string,
     actorUserId?: string,
     queuedGrant?: string[] | null,
+    /**
+     * The AGENT doing the moving, when one is. A move re-queues the card, so the pair
+     * `queued_by`/`queued_by_agent_id` must move together here exactly as on a create — otherwise a
+     * card an agent re-queued reads as the operator's, or one a HUMAN re-queued keeps crediting the
+     * agent that queued it first.
+     */
+    queuedByAgentId?: string | null,
   ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) {
       return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
@@ -1871,13 +1885,16 @@ export class BoardDO extends DurableObject<Env> {
               -- Moves WITH the pair, never apart. A human re-queueing an agent-queued card
               -- becomes its queuer, and leaving the agent id standing would make the card read
               -- "queued by <some agent>" about a dispatch the operator personally authorised.
-              -- An internal move (no actor) dispatches nothing new, so both values stand.
-              queued_by_agent_id = CASE WHEN ? IS NULL THEN queued_by_agent_id ELSE NULL END,
+              -- An internal move (no actor) dispatches nothing new, so both values stand. An AGENT
+              -- mover sets it to ITSELF, for the same reason it sets queued_by: whoever re-queued
+              -- the card is who the record has to name.
+              queued_by_agent_id = CASE WHEN ? IS NULL THEN queued_by_agent_id ELSE ? END,
               queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END WHERE id = ?`,
       target.key,
       now,
       actorUserId ?? null,
       actorUserId ?? null,
+      queuedByAgentId ?? null,
       // Same COALESCE reasoning as the queuer: an internal move leaves the
       // recorded authority standing rather than blanking it.
       queuedGrant === undefined || queuedGrant === null ? null : JSON.stringify(queuedGrant),

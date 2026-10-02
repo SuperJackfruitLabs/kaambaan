@@ -289,6 +289,64 @@ function refuseByRole(user: UserPrincipal | null, capability: Capability): Respo
   return null;
 }
 
+/**
+ * A caller on a WORKSPACE route — a person, or an agent.
+ *
+ * These routes (`/v1/projects`, `/v1/milestones`, `/v1/labels`, `/v1/capabilities`, `/v1/agents`)
+ * resolved a human and only a human, and that was never a decision about agents: `resolveAgent` is
+ * called in exactly one other place in this file, inside the board router, so an agent credential
+ * never ARRIVED here to be refused. The cost was concrete — a coordinator that can queue a card
+ * could not set its project, so the work fell out of every rollup and `costUsd` under-counted.
+ *
+ * A person is resolved first and keeps the role check they always had. Only if no human resolves is
+ * an agent tried, and then the scope decides. `agentScope: null` means the route is human-only on
+ * purpose, and an agent credential there is refused by name rather than with "sign in to continue",
+ * which would send a thing that cannot sign in round a loop.
+ */
+async function resolveWorkspaceCaller(
+  request: Request,
+  env: Env,
+  needed: {
+    human: Capability;
+    agentScope: AgentScope | null;
+    /**
+     * Which credentials count as a PERSON here.
+     *
+     * `'session'` means a session cookie only — the boundary `/v1/capabilities` keeps on its writes:
+     * "writes fall through to `resolveUser` alone, which is the boundary this keeps." Collapsing that
+     * into an unconditional hub fallback let a hub token DEFINE a capability, which its own test
+     * caught. Default is `'session-or-hub'`, because `supi` carries a hub JWT and most routes are
+     * meant to answer it.
+     */
+    humanVia?: 'session' | 'session-or-hub';
+  },
+): Promise<{ tenantId: string; user: UserPrincipal | null; agent: AgentPrincipal | null } | Response> {
+  const user =
+    (await resolveUser(request, env)) ??
+    (needed.humanVia === 'session' ? null : await resolveHubUser(request, env));
+  if (user) {
+    const refused = refuseByRole(user, needed.human);
+    if (refused) return refused;
+    return { tenantId: user.tenantId, user, agent: null };
+  }
+
+  const agent = (await resolveAgent(request, env)) ?? (await resolveHubAgent(request, env));
+  if (!agent) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+  if (needed.agentScope === null) {
+    return Response.json(
+      { error: 'this is not something an agent may do in this workspace' },
+      { status: 403 },
+    );
+  }
+  if (!scopePermits(agent.scopes, needed.agentScope)) {
+    return Response.json(
+      { error: `this token is not permitted to ${needed.agentScope}` },
+      { status: 403 },
+    );
+  }
+  return { tenantId: agent.tenantId, user: null, agent };
+}
+
 /** Would changing or removing this member leave the workspace with no owner at all? */
 async function isLastOwner(db: D1Database, tenantId: string, userId: string): Promise<boolean> {
   const members = await listMembers(db, tenantId);
@@ -642,21 +700,25 @@ export default {
         // lanes ask for", and that included nobody at a terminal. Defining the vocabulary stays
         // session-only: it is "the same class of act as managing its agents", which is human-only
         // on purpose, so the fallback is scoped to GET and nothing below it changes.
-        let u = await resolveUser(request, env);
-        if (!u && request.method === 'GET') u = await resolveHubUser(request, env);
-        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        // Reads open to an agent: routing is exact string equality between a stage's owner and an
+        // agent's capabilities, so this is HALF the diagnosis of a card that will not move. Declaring
+        // the vocabulary stays a person's act, which the route's own comment already argued.
+        const caller = await resolveWorkspaceCaller(request, env, {
+          human: request.method === 'GET' ? 'read' : 'manage',
+          agentScope: request.method === 'GET' ? 'read' : null,
+          // Writes stay session-only, which is the boundary this route already kept.
+          humanVia: request.method === 'GET' ? 'session-or-hub' : 'session',
+        });
+        if (caller instanceof Response) return caller;
+        const { tenantId: wsTenantId, user: u } = caller;
         const capId = capsMatch[1];
 
         if (request.method === 'GET' && !capId) {
           // A read: anyone who can see the board needs to know what its lanes ask for.
-          const refused = refuseByRole(u, 'read');
-          if (refused) return refused;
-          return Response.json({ capabilities: await listCapabilities(env.DB, u.tenantId) });
+          return Response.json({ capabilities: await listCapabilities(env.DB, wsTenantId) });
         }
 
         // Defining the workspace's vocabulary is the same class of act as managing its agents.
-        const refused = refuseByRole(u, 'manage');
-        if (refused) return refused;
 
         if (request.method === 'POST' && !capId) {
           const body = (await request.json()) as {
@@ -674,14 +736,14 @@ export default {
           // Existing keys that look like the one being created, computed BEFORE the write so the
           // candidate does not match itself. A hint on the response, never a refusal: only a
           // person knows whether `cdoe` was a typo for `code` or a word they meant.
-          const existing = (await listCapabilities(env.DB, u.tenantId)).map((c) => c.key);
+          const existing = (await listCapabilities(env.DB, wsTenantId)).map((c) => c.key);
           const similar = similarKeys(body.key, existing);
 
           // Built from named fields rather than `{ ...body, key: body.key, createdBy: u.userId }`:
           // `createdBy` already won that field (it was placed after the spread), but the cast
           // above does not stop a body from carrying other keys `createCapability` happens to
           // read — safe today only because its input type coincides with this one.
-          const made = await createCapability(env.DB, u.tenantId, {
+          const made = await createCapability(env.DB, wsTenantId, {
             key: body.key,
             name: body.name,
             description: body.description,
@@ -689,7 +751,11 @@ export default {
             examples: body.examples,
             externalId: body.externalId,
             externalSource: body.externalSource,
-            createdBy: u.userId,
+            // `u?.`, not `u!.`: the helper above refuses an agent on every non-GET here, so this is
+            // always a person — but the guarantee lives in that call's arguments rather than in the
+            // type, and `created_by` is nullable precisely so a caller without a user id is
+            // representable. Same shape `registerStageCapabilities` already uses.
+            createdBy: u?.userId ?? null,
           });
           if (!made) {
             // A collision reads as a sentence rather than a raw UNIQUE failure — and re-declaring
@@ -718,7 +784,7 @@ export default {
           // Built from named fields rather than forwarding `body` whole: the cast above strips
           // nothing at runtime, so the route has to name what `updateCapability` accepts.
           if (
-            !(await updateCapability(env.DB, u.tenantId, capId, {
+            !(await updateCapability(env.DB, wsTenantId, capId, {
               name: body.name,
               description: body.description,
               tags: body.tags,
@@ -729,16 +795,16 @@ export default {
           ) {
             return Response.json({ error: 'capability not found, or nothing to change' }, { status: 404 });
           }
-          return Response.json({ capability: await capabilityById(env.DB, u.tenantId, capId) });
+          return Response.json({ capability: await capabilityById(env.DB, wsTenantId, capId) });
         }
 
         if (capId && request.method === 'DELETE') {
-          const cap = await capabilityById(env.DB, u.tenantId, capId);
+          const cap = await capabilityById(env.DB, wsTenantId, capId);
           if (!cap) return Response.json({ error: 'capability not found' }, { status: 404 });
           // Removing one that is still named would silently stop the registry describing the
           // product: the strings stay on the stage and the agent, matching carries on, and the
           // list quietly goes wrong. So the refusal names who still refers to it.
-          const used = await capabilityUsage(env.DB, u.tenantId, cap.key);
+          const used = await capabilityUsage(env.DB, wsTenantId, cap.key);
           if (used.agents.length > 0 || used.boards.length > 0 || used.implications.length > 0) {
             const who = [
               used.boards.length > 0 ? `boards ${used.boards.join(', ')}` : null,
@@ -749,7 +815,7 @@ export default {
             ].filter(Boolean).join(' and ');
             return Response.json({ error: `${cap.key} is still used by ${who}`, usage: used }, { status: 409 });
           }
-          await deleteCapability(env.DB, u.tenantId, capId);
+          await deleteCapability(env.DB, wsTenantId, capId);
           return new Response(null, { status: 204 });
         }
 
@@ -773,20 +839,22 @@ export default {
         // GET-only fallback on `/v1/capabilities`: those verbs are CLI-reachable too, and
         // `refuseByRole(u, 'manage')` below is what actually gates the writes, exactly as it
         // already gates a session-authenticated write.
-        let u = await resolveUser(request, env);
-        if (!u) u = await resolveHubUser(request, env);
-        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        // A person, or an agent READING the catalogue — a card's labels are ids until something resolves
+        // them, and an agent that cannot read them cannot report what a card is. Writing the
+        // catalogue stays a person's.
+        const caller = await resolveWorkspaceCaller(request, env, {
+          human: request.method === 'GET' ? 'read' : 'manage',
+          agentScope: request.method === 'GET' ? 'read' : null,
+        });
+        if (caller instanceof Response) return caller;
+        const { tenantId: wsTenantId, user: u } = caller;
         const labelId = labelsMatch[1];
 
         if (request.method === 'GET' && !labelId) {
-          const refused = refuseByRole(u, 'read');
-          if (refused) return refused;
-          return Response.json({ labels: await listLabels(env.DB, u.tenantId) });
+          return Response.json({ labels: await listLabels(env.DB, wsTenantId) });
         }
 
         // Defining the workspace's labels is the same class of act as managing its capabilities.
-        const refused = refuseByRole(u, 'manage');
-        if (refused) return refused;
 
         if (request.method === 'POST' && !labelId) {
           const body = (await request.json()) as { name?: string; colour?: string };
@@ -798,7 +866,7 @@ export default {
             return Response.json({ error: 'colour is required' }, { status: 400 });
           }
           try {
-            const made = await createLabel(env.DB, u.tenantId, { name, colour: body.colour });
+            const made = await createLabel(env.DB, wsTenantId, { name, colour: body.colour });
             return Response.json({ label: made }, { status: 201 });
           } catch (err) {
             // Narrowed to the exact UNIQUE(tenant_id, name) collision — anything else (a transient
@@ -826,7 +894,7 @@ export default {
           try {
             // Built from named fields rather than forwarding `body` whole, same as the capability
             // PATCH above: the cast strips nothing at runtime.
-            const updated = await updateLabel(env.DB, u.tenantId, labelId, { name: body.name, colour: body.colour });
+            const updated = await updateLabel(env.DB, wsTenantId, labelId, { name: body.name, colour: body.colour });
             if (!updated) return Response.json({ error: 'label not found' }, { status: 404 });
             return Response.json({ label: updated });
           } catch (err) {
@@ -840,7 +908,7 @@ export default {
         }
 
         if (labelId && request.method === 'DELETE') {
-          if (!(await deleteLabel(env.DB, u.tenantId, labelId))) {
+          if (!(await deleteLabel(env.DB, wsTenantId, labelId))) {
             return Response.json({ error: 'label not found' }, { status: 404 });
           }
           return new Response(null, { status: 204 });
@@ -859,56 +927,59 @@ export default {
     const projectsMatch = path.match(/^\/v1\/projects(?:\/([^/]+)(?:\/(milestones|rollup))?)?$/);
     if (projectsMatch) {
       try {
-        // Same fallback as `/v1/labels`: `supi project ...` sends a hub JWT, never a session
-        // cookie, so `resolveUser` alone cannot authenticate it. Unconditional on method —
-        // `refuseByRole` below is what actually gates the writes.
-        let u = await resolveUser(request, env);
-        if (!u) u = await resolveHubUser(request, env);
-        if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
+        /**
+         * A person, or a coordinator agent.
+         *
+         * `supi project ...` sends a hub JWT and never a session cookie, so `resolveUser` alone
+         * cannot authenticate a person here — that fallback is unchanged. What is new is the agent:
+         * reading a project is `read`, and creating or editing one is `plan`. DELETE stays a
+         * person's, because a project is a record and removing one is not shaping work.
+         *
+         * The role check for a human is identical to before; it has simply moved into the helper.
+         */
+        const caller = await resolveWorkspaceCaller(request, env, {
+          human: request.method === 'GET' ? 'read' : 'manage',
+          agentScope:
+            request.method === 'GET' ? 'read' : request.method === 'DELETE' ? null : 'plan',
+        });
+        if (caller instanceof Response) return caller;
+        const { tenantId: wsTenantId, user: u } = caller;
         const projectId = projectsMatch[1];
         const subSeg = projectsMatch[2];
 
         if (request.method === 'GET' && !projectId) {
-          const refused = refuseByRole(u, 'read');
-          if (refused) return refused;
-          return Response.json({ projects: await listProjects(env.DB, u.tenantId) });
+          return Response.json({ projects: await listProjects(env.DB, wsTenantId) });
         }
 
         if (request.method === 'GET' && projectId && subSeg === 'rollup') {
-          const refused = refuseByRole(u, 'read');
-          if (refused) return refused;
           // Same cross-tenant-reads-as-404 reasoning as the project read just below.
-          if (!(await projectById(env.DB, u.tenantId, projectId))) {
+          if (!(await projectById(env.DB, wsTenantId, projectId))) {
             return Response.json({ error: 'project not found' }, { status: 404 });
           }
           // The cached row, reused inside 60s; recomputed (and re-cached) once it is older than
           // that. `computeRollup` is the one fan-out in this design — see its own comment in
           // `db/projects.ts` for why it is tenant-scoped and why `partial` exists at all.
-          const cached = await cachedRollup(env.DB, u.tenantId, projectId);
+          const cached = await cachedRollup(env.DB, wsTenantId, projectId);
           const STALE_MS = 60_000;
           const fresh = cached && Date.now() - new Date(cached.computedAt).getTime() < STALE_MS;
-          const rollup = fresh ? cached! : await computeRollup(env.DB, env, u.tenantId, projectId);
+          const rollup = fresh ? cached! : await computeRollup(env.DB, env, wsTenantId, projectId);
           return Response.json({ rollup });
         }
 
         if (request.method === 'GET' && projectId && !subSeg) {
-          const refused = refuseByRole(u, 'read');
-          if (refused) return refused;
-          const project = await projectById(env.DB, u.tenantId, projectId);
+          const project = await projectById(env.DB, wsTenantId, projectId);
           // A cross-tenant read answers 404, not 403: a 403 confirms the row exists under some
           // tenant, which is exactly the oracle that would let a caller enumerate another
           // tenant's project ids one guess at a time. `projectById` already scopes on
           // `tenant_id`, so "not mine" and "does not exist" are indistinguishable here, which is
           // the point — they must read the same to the caller too.
           if (!project) return Response.json({ error: 'project not found' }, { status: 404 });
-          const milestones = await listMilestones(env.DB, u.tenantId, projectId);
+          const milestones = await listMilestones(env.DB, wsTenantId, projectId);
           return Response.json({ project, milestones });
         }
 
         // Every write below is the same class of act as managing the workspace's capabilities or
         // labels.
-        const refused = refuseByRole(u, 'manage');
-        if (refused) return refused;
 
         if (request.method === 'POST' && !projectId) {
           const body = (await request.json()) as {
@@ -923,7 +994,7 @@ export default {
             return Response.json({ error: 'targetDate must be YYYY-MM-DD' }, { status: 400 });
           }
           try {
-            const made = await createProject(env.DB, u.tenantId, {
+            const made = await createProject(env.DB, wsTenantId, {
               name,
               description: body.description ?? null,
               targetDate: body.targetDate ?? null,
@@ -966,7 +1037,7 @@ export default {
             return Response.json({ error: `unknown project health: "${body.health}"` }, { status: 400 });
           }
           try {
-            const updated = await updateProject(env.DB, u.tenantId, projectId, {
+            const updated = await updateProject(env.DB, wsTenantId, projectId, {
               ...(body.name !== undefined ? { name: body.name.trim() } : {}),
               ...(body.description !== undefined ? { description: body.description } : {}),
               ...(body.targetDate !== undefined ? { targetDate: body.targetDate } : {}),
@@ -994,7 +1065,7 @@ export default {
           // so refusing while one might exist would mean exactly the cross-DO read the spec
           // forbids on a write path. See the comment on `deleteProject` in db/projects.ts for the
           // full reasoning.
-          if (!(await deleteProject(env.DB, u.tenantId, projectId))) {
+          if (!(await deleteProject(env.DB, wsTenantId, projectId))) {
             return Response.json({ error: 'project not found' }, { status: 404 });
           }
           return new Response(null, { status: 204 });
@@ -1014,10 +1085,10 @@ export default {
           // unrelated failure (a transient D1 error, say) still falls through to the outer
           // `unexpected(err)` instead of being misreported as "project not found". Same 404 an
           // enumeration attempt on `GET /v1/projects/:id` would get, for the same reason.
-          if (!(await projectById(env.DB, u.tenantId, projectId))) {
+          if (!(await projectById(env.DB, wsTenantId, projectId))) {
             return Response.json({ error: 'project not found' }, { status: 404 });
           }
-          const made = await createMilestone(env.DB, u.tenantId, projectId, {
+          const made = await createMilestone(env.DB, wsTenantId, projectId, {
             name,
             targetDate: body.targetDate ?? null,
             sortOrder: body.sortOrder,
@@ -1127,6 +1198,27 @@ export default {
         const viaHubToken = !u;
         if (!u && (request.method === 'GET' || request.method === 'PATCH')) {
           u = await resolveHubUser(request, env);
+        }
+        /**
+         * An AGENT may READ this list, on `read`, and nothing more.
+         *
+         * It is half of any routing diagnosis — a card that will not move is almost always a stage
+         * asking for a capability nobody declares, and this is the side that says who declares what.
+         * The row carries `tokenIds` and the queueing policy but never a token, so reading which
+         * credentials exist is not holding one.
+         *
+         * Writes stay exactly as they were: PATCH needs a person (hub token included, since `supi`
+         * carries one), and minting or revoking a credential needs a session — charter Decision 3.
+         */
+        let listingAgent: AgentPrincipal | null = null;
+        if (!u && request.method === 'GET' && !agentsMatch[2]) {
+          listingAgent = (await resolveAgent(request, env)) ?? (await resolveHubAgent(request, env));
+          if (listingAgent && !scopePermits(listingAgent.scopes, 'read')) {
+            return Response.json({ error: 'this token is not permitted to read' }, { status: 403 });
+          }
+          if (listingAgent) {
+            return Response.json({ agents: await listAgents(env.DB, listingAgent.tenantId) });
+          }
         }
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
         const agentId = agentsMatch[1];
@@ -1502,8 +1594,16 @@ export default {
       // tell them apart. POST here CREATES a board and stays human-only.
       (!boardId && request.method === 'GET' && rest === '') ||
       (!!boardId &&
-        ((request.method === 'GET' && (rest === '' || /^cards\/[^/]+$/.test(rest))) ||
-          (request.method === 'POST' && rest === 'cards')));
+        ((request.method === 'GET' &&
+          (rest === '' ||
+            /^cards\/[^/]+$/.test(rest) ||
+            /^cards\/[^/]+\/(activities|attempts|estimate)$/.test(rest))) ||
+          (request.method === 'POST' && rest === 'cards') ||
+          // `plan`: rearranging work that already exists. `requiredScope` decides which of these
+          // needs which scope, and refuses the methods none of them may use.
+          (request.method === 'PATCH' && /^cards\/[^/]+$/.test(rest)) ||
+          (request.method === 'POST' && /^cards\/[^/]+\/move$/.test(rest)) ||
+          ((request.method === 'POST' || request.method === 'DELETE') && rest === 'links')));
     /**
      * Was an agent credential actually OFFERED?
      *
@@ -1849,7 +1949,29 @@ export default {
         // stage is the one dispatching it now, and the control pair needs a
         // principal to check at claim time. `moveCard` has always accepted an
         // actor; this route never sent one, so every move looked anonymous.
-        const result = await stub.moveCard(moveMatch[1]!, body.toStageKey, user!.userId, user!.mayDispatch ?? null);
+        /**
+         * Moving a card into a dispatchable stage IS dispatching it — `moveCard` stamps `queued_by`
+         * and `queued_grant` for exactly that reason. So an AGENT mover goes through the same gate a
+         * create does: the board allowlist, an owner, a real grant, and the hourly ceiling.
+         *
+         * Without this an agent could launder authority: move a card it could never have queued, and
+         * the card would keep the last human's grant while the agent chose the work. `user!` here
+         * would also have thrown — a 500 rather than a refusal — the moment this route admitted one.
+         */
+        const mover = agent ? await authorizeAgentQueue(env.DB, agent, boardId) : null;
+        if (mover && !mover.ok) {
+          return Response.json(
+            { error: { code: mover.code, message: mover.message } },
+            { status: mover.status },
+          );
+        }
+        const result = await stub.moveCard(
+          moveMatch[1]!,
+          body.toStageKey,
+          mover ? mover.queuedBy : user!.userId,
+          mover ? mover.queuedGrant : user?.mayDispatch ?? null,
+          mover ? agent!.agentId : null,
+        );
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
       }

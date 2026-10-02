@@ -42,7 +42,6 @@ must read to answer a question about the workspace:
 
 | route | why |
 |---|---|
-| `GET /v1/boards/:id/cards` | the snapshot already returns every card; closing the list protects nothing |
 | `GET /v1/projects`, `/v1/projects/:id`, `/v1/projects/:id/milestones`, `/v1/projects/:id/rollup` | "what body of work is this part of" |
 | `GET /v1/labels` | a card's labels are ids until this resolves them |
 | `GET /v1/capabilities`, `/v1/capabilities/implications` | half of the routing diagnosis |

@@ -55,15 +55,60 @@ export function requiredScope(rest: string, method: string): ScopeVerdict {
   if (rest === 'claims') return 'claim';
   if (rest.startsWith('runs/')) return 'run';
 
-  // The board itself, and one card: readable by a coordinator, never editable or deletable.
-  if (rest === '' || /^cards\/[^/]+$/.test(rest)) {
+  // The BOARD itself: readable, never edited or deleted by an agent. Renaming a board and deleting
+  // one are both `manage`/`admin` acts for a person; neither is a coordinator's.
+  if (rest === '') {
     return method === 'GET' ? 'read' : SCOPE_FORBIDDEN;
   }
-  // Creating a card is the one write an agent gets, and it is its own scope. What bounds it is
-  // not this function but the queuer's own `mayDispatch`, recorded on the card.
+  // ONE card. Read on `read`, edited on `plan`, and never deleted — the same path answering three
+  // different questions, which is why the method is part of the gate.
+  if (/^cards\/[^/]+$/.test(rest)) {
+    if (method === 'GET') return 'read';
+    if (method === 'PATCH') return 'plan';
+    return SCOPE_FORBIDDEN;
+  }
+  // `cards` serves POST and nothing else — there is no card-LIST route in this product, for anyone:
+  // the board snapshot IS the list, and a `read` token already fetches it. Recorded because the
+  // first draft of this claimed a `GET` no handler serves, which would have refused an agent on a
+  // scope for a route that answers 405 to everybody.
   if (rest === 'cards') {
+    // Creating a card is the one act that spends other agents' time, and it is its own scope. What
+    // bounds it is not this function but the queuer's own `mayDispatch`, recorded on the card.
     return method === 'POST' ? 'queue' : SCOPE_FORBIDDEN;
   }
+  if (/^cards\/[^/]+\/(activities|attempts|estimate)$/.test(rest)) {
+    return method === 'GET' ? 'read' : SCOPE_FORBIDDEN;
+  }
+  /**
+   * Moving a card between stages. `plan`, but NOT only `plan`.
+   *
+   * A move into a dispatchable stage IS a dispatch — `moveCard` stamps `queued_by` and
+   * `queued_grant`, because "whoever moves a card into a dispatchable stage is the one dispatching
+   * it now". So the route also puts an agent mover through `authorizeAgentQueue`, the same board
+   * allowlist, owner, grant and hourly ceiling a create passes. The scope says who may rearrange;
+   * the grant says on whose authority. Without the second, an agent could launder a human's grant
+   * onto work it chose itself.
+   */
+  if (/^cards\/[^/]+\/move$/.test(rest)) {
+    return method === 'POST' ? 'plan' : SCOPE_FORBIDDEN;
+  }
+  // Edges between cards — "this waits on that" is a coordinator's main tool for saying what order
+  // work happens in, and it is the mechanism behind raising a decision that must block something.
+  if (rest === 'links') {
+    return method === 'POST' || method === 'DELETE' ? 'plan' : SCOPE_FORBIDDEN;
+  }
+  /**
+   * Deciding a gate: refused on every scope, and this is the one refusal here that is a product
+   * boundary rather than a scoping choice.
+   *
+   * It is the human half of the control pair. An agent that holds both halves makes every "a human
+   * decided this" record in the estate unverifiable — including the record of that agent's own work.
+   * A coordinator RAISES decisions instead, as cards (spec 2026-10-02-a-coordinator-plans-the-work).
+   */
+  if (/^gates\/[^/]+\/resolve$/.test(rest)) return SCOPE_FORBIDDEN;
+  // Restructuring the board. Changing a stage re-routes every card on it, and can strand work
+  // outright — a terminal stage nobody could act on did exactly that to seven live cards.
+  if (rest === 'stages' || rest.startsWith('stages/')) return SCOPE_FORBIDDEN;
 
   // `gates/pending` is routed as an agent route but names nobody and carries no authority — a read
   // the hub's reconciliation sweep makes. It is not gated on a scope for the same reason it is not
