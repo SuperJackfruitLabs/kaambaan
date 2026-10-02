@@ -349,6 +349,7 @@ export async function updateAgent(
     ownerUserId?: string | null;
     mayQueueTo?: string[] | null;
     queueCeilingPerHour?: number;
+    boardCeilingPerDay?: number;
   },
 ): Promise<void> {
   const sets: string[] = [];
@@ -383,6 +384,10 @@ export async function updateAgent(
   if (patch.queueCeilingPerHour !== undefined) {
     sets.push('queue_ceiling_per_hour = ?');
     vals.push(patch.queueCeilingPerHour);
+  }
+  if (patch.boardCeilingPerDay !== undefined) {
+    sets.push('board_ceiling_per_day = ?');
+    vals.push(patch.boardCeilingPerDay);
   }
   if (sets.length === 0) return;
   sets.push(`updated_at = datetime('now')`);
@@ -447,11 +452,12 @@ export async function findAgentByExternal(
   const row = await db
     .prepare(
       `SELECT tenant_id AS tenantId, id AS agentId, capabilities_json AS caps, concurrency,
-              owner_user_id AS ownerUserId, may_queue_to_json AS mayQueueTo, queue_ceiling_per_hour AS ceiling
+              owner_user_id AS ownerUserId, may_queue_to_json AS mayQueueTo, queue_ceiling_per_hour AS ceiling,
+              board_ceiling_per_day AS boardCeiling
        FROM agents WHERE external_source = ? AND external_id = ?`,
     )
     .bind(source, externalId)
-    .first<{ tenantId: string; agentId: string; caps: string; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }>();
+    .first<{ tenantId: string; agentId: string; caps: string; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null; boardCeiling: number | null }>();
   if (!row) return null;
   return {
     tenantId: row.tenantId,
@@ -483,16 +489,27 @@ export interface AgentQueueingPolicy {
   mayQueueTo: string[] | null;
   /** Cards per hour. A scope bounds whether; only this bounds how much. */
   queueCeilingPerHour: number;
+  /**
+   * Boards per DAY. A day because boards are rare where cards are hourly, and because the hazard is
+   * a loop making five hundred of them rather than one agent making three.
+   */
+  boardCeilingPerDay: number;
 }
 
 /** The three queueing columns, off a row that already selected them under these aliases. */
-function queueingPolicyOf(row: { ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }): AgentQueueingPolicy {
+function queueingPolicyOf(row: {
+  ownerUserId: string | null;
+  mayQueueTo: string | null;
+  ceiling: number | null;
+  boardCeiling?: number | null;
+}): AgentQueueingPolicy {
   return {
     ownerUserId: row.ownerUserId ?? null,
     // `JSON.parse(null)` is `null` by accident rather than by intent, so the absence is tested for
     // rather than relied on.
     mayQueueTo: row.mayQueueTo === null ? null : (JSON.parse(row.mayQueueTo) as string[]),
     queueCeilingPerHour: Number(row.ceiling ?? 20),
+    boardCeilingPerDay: Number(row.boardCeiling ?? 3),
   };
 }
 
@@ -587,12 +604,13 @@ export async function findAgentByTokenHash(
     .prepare(
       `SELECT at.tenant_id AS tenantId, at.agent_id AS agentId, at.scopes_json AS scopes, a.capabilities_json AS caps,
               a.external_id AS externalId, a.concurrency AS concurrency,
-              a.owner_user_id AS ownerUserId, a.may_queue_to_json AS mayQueueTo, a.queue_ceiling_per_hour AS ceiling
+              a.owner_user_id AS ownerUserId, a.may_queue_to_json AS mayQueueTo, a.queue_ceiling_per_hour AS ceiling,
+              a.board_ceiling_per_day AS boardCeiling
        FROM agent_tokens at JOIN agents a ON a.id = at.agent_id
        WHERE at.token_hash = ? AND at.revoked_at IS NULL`,
     )
     .bind(hash)
-    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null }>();
+    .first<{ tenantId: string; agentId: string; scopes: string; caps: string; externalId: string | null; concurrency: number; ownerUserId: string | null; mayQueueTo: string | null; ceiling: number | null; boardCeiling: number | null }>();
   if (!row) return null;
   return {
     tenantId: row.tenantId,
@@ -637,10 +655,42 @@ export async function listAgents(db: D1Database, tenantId: string): Promise<Agen
 }
 
 /** Index a board in the catalog so a workspace can list its boards (the DO holds the live state). */
-export async function recordBoard(db: D1Database, tenantId: string, input: { id: string; name: string; stagesJson: string }): Promise<void> {
+/**
+ * How many boards this agent has composed since midnight UTC.
+ *
+ * Counted from `boards.created_by_agent_id`, so the provenance column IS the ledger — there is no
+ * second table to keep in step with it, and the number can never disagree with the boards that exist.
+ *
+ * `date('now')` is midnight UTC, which is a real choice: a rolling 24 hours would be kinder to an
+ * agent that composed three boards late yesterday, and a calendar day is what an operator reading
+ * "three a day" expects. Comparison uses `datetime(...)` for the reason
+ * `countAgentQueuesSince` records: `created_at` is written by `datetime('now')` and an ISO bound
+ * sorts below it as text.
+ */
+export async function countBoardsComposedToday(db: D1Database, agentId: string): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM boards WHERE created_by_agent_id = ? AND created_at >= datetime(date('now'))`,
+    )
+    .bind(agentId)
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
+export async function recordBoard(
+  db: D1Database,
+  tenantId: string,
+  input: { id: string; name: string; stagesJson: string; createdBy?: string | null; createdByAgentId?: string | null },
+): Promise<void> {
   await db
-    .prepare(`INSERT INTO boards (id, tenant_id, name, stages_json) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = datetime('now')`)
-    .bind(input.id, tenantId, input.name, input.stagesJson)
+    .prepare(
+      // The creator is set on INSERT only, never on the conflict path: this doubles as the board's
+      // rename/re-index writer, and a later rename must not rewrite who made it.
+      `INSERT INTO boards (id, tenant_id, name, stages_json, created_by, created_by_agent_id)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = datetime('now')`,
+    )
+    .bind(input.id, tenantId, input.name, input.stagesJson, input.createdBy ?? null, input.createdByAgentId ?? null)
     .run();
 }
 
