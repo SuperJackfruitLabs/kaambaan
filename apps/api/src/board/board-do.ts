@@ -324,6 +324,22 @@ export interface BoardInit {
   stages: StageDef[];
 }
 
+/**
+ * Why a card is waiting on a person.
+ *
+ * `reason` is the discriminator and the only field a reader must handle; the rest are
+ * there so the board can say something useful instead of "needs you".
+ */
+export interface CardNeedsHuman {
+  reason: 'question' | 'repeated-failure';
+  /** The question, when there is one to answer. */
+  elicitationId?: string;
+  /** The run's own words for why it failed. Never summarised. */
+  detail?: string;
+  /** How many attempts have failed, when the breaker tripped. */
+  failureCount?: number;
+}
+
 export interface CardView {
   id: string;
   title: string;
@@ -366,6 +382,11 @@ export interface CardView {
   milestoneId: string | null;
   /** ISO date (no time), or null. */
   dueAt: string | null;
+  /**
+   * Why this card is waiting on a person, when it is. Absent whenever it is not —
+   * so a reader that does nothing with it behaves exactly as it does today.
+   */
+  needsHuman?: CardNeedsHuman;
   archivedAt: string | null;
   currentStageKey: string;
   state: TaskState;
@@ -1408,6 +1429,25 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * WHY this card needs a human, when it does.
+     *
+     * `input-required` says that one is needed and not what for, and the two reasons
+     * want opposite things from the reader: a question wants answering, a tripped
+     * circuit breaker wants looking at. Card `a9619fe` sat in `input-required` with no
+     * pending elicitation and a handoff reading "Verification is in progress", which to
+     * a person is a card demanding input that offers nothing to input.
+     *
+     * JSON rather than columns because the arms differ — a question carries an id, a
+     * failure carries a count and the run's own words — and because this is read, never
+     * filtered on. Null whenever the card is not waiting on anybody, which is the
+     * normal case and is what every existing reader already assumes.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN needs_human_json TEXT`);
+    } catch {
+      // column already exists
+    }
     try {
       this.sql.exec(`ALTER TABLE cards ADD COLUMN milestone_id TEXT`);
     } catch {
@@ -1996,6 +2036,9 @@ export class BoardDO extends DurableObject<Env> {
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
     this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
     this.cancelElicitationsForCard(cardId);
+    // The person moving it IS the human attention the card was waiting for; carrying
+    // the request across the move would ask for something already given.
+    this.setNeedsHuman(cardId, null);
     // A move by a person re-queues the card, so the mover becomes the queuer —
     // they are the one dispatching it now, which is not necessarily the person
     // who created it. Without an actor (an internal move) the previous queuer
@@ -4329,6 +4372,8 @@ export class BoardDO extends DurableObject<Env> {
       elicitation.id,
     );
     this.sql.exec(`UPDATE cards SET state = ?, updated_at = ? WHERE id = ?`, resumed, now, card.id);
+    // Answered: the card is not waiting on anybody any more.
+    this.setNeedsHuman(card.id, null);
 
     // The answer joins the card's replay as a `prompt` — the human-authored activity type, which is
     // exactly what "resumes working" means in the activity vocabulary (docs/04 §4).
@@ -4479,6 +4524,22 @@ export class BoardDO extends DurableObject<Env> {
 
   // ----- internals -----
 
+  /**
+   * Record, or clear, why a card is waiting on a person.
+   *
+   * One writer so the field cannot drift out of step with the state that implies it.
+   * Clearing is the common case and happens wherever a card stops waiting — answered,
+   * moved, claimed — because a stale "needs you" is worse than none: it sends somebody
+   * to a card that wants nothing.
+   */
+  private setNeedsHuman(cardId: string, needs: CardNeedsHuman | null): void {
+    this.sql.exec(
+      `UPDATE cards SET needs_human_json = ? WHERE id = ?`,
+      needs ? JSON.stringify(needs) : null,
+      cardId,
+    );
+  }
+
   /** End the current attempt on a card: bump failures and either re-queue or trip the breaker. */
   private endAttempt(cardId: string, event: string, reason: string | null, runId?: string): void {
     const cardRow = this.getCardRow(cardId);
@@ -4492,6 +4553,15 @@ export class BoardDO extends DurableObject<Env> {
       failures,
       now,
       cardId,
+    );
+    // The breaker is the only thing here that makes a card wait on a person. Below it
+    // the card is simply queued again, and any earlier reason — a question this run
+    // asked and never got answered — is no longer the thing to look at.
+    this.setNeedsHuman(
+      cardId,
+      state === 'input-required'
+        ? { reason: 'repeated-failure', failureCount: failures, ...(reason ? { detail: reason } : {}) }
+        : null,
     );
     this.emit(event, { cardId, runId: runId ?? null, reason, failures, brokeCircuit: state === 'input-required' });
     // Central re-queue point (fail + reclaim): a card returned to the queue is claimable again.
@@ -4666,6 +4736,7 @@ export class BoardDO extends DurableObject<Env> {
       JSON.stringify(parseElicitationOptions(input.parameter)),
       now,
     );
+    this.setNeedsHuman(cardId, { reason: 'question', elicitationId: id });
     this.emit('elicitation.opened', { elicitationId: id, cardId, runId: input.runId, signal: input.signal ?? null });
     this.notify('input', cardId, question === '' ? 'An agent is waiting on you' : question);
     this.notifyElicitationPending(id);
@@ -5438,6 +5509,11 @@ export class BoardDO extends DurableObject<Env> {
       projectId: (row.project_id as string | null) ?? null,
       milestoneId: (row.milestone_id as string | null) ?? null,
       dueAt: (row.due_at as string | null) ?? null,
+      // Omitted rather than null when absent: the field means "there is a reason", and
+      // a present-but-empty one would make every reader check two things.
+      ...(row.needs_human_json
+        ? { needsHuman: JSON.parse(row.needs_human_json as string) as CardNeedsHuman }
+        : {}),
       archivedAt: (row.archived_at as string | null) ?? null,
       currentStageKey: row.current_stage_key as string,
       state: row.state as TaskState,
