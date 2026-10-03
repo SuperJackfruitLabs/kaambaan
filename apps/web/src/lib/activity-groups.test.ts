@@ -131,3 +131,67 @@ describe('visibleActivities — the run that is all tool calls', () => {
     expect(shownBecauseNoNarrative).toBe(false);
   });
 });
+
+/**
+ * A permission exchange is an interruption, not the story.
+ *
+ * Reported twice from a live card. A verify run streamed nothing but tool calls, so the
+ * "no narrative" fallback showed them and the panel read as live. The agent then asked
+ * permission, the operator answered "Allow once", and every tool call in that run
+ * disappeared — the ones already on screen and all the ones after. It survived a hard
+ * refresh, because this is a pure function of the data rather than a stale subscription.
+ *
+ * The cause is that the fallback depends on data that arrives over time: a run crosses
+ * from "has no narrative" to "has narrative" mid-flight and the whole panel inverts. An
+ * `elicitation` and the `prompt` answering it are control rows — they are how the run
+ * was interrupted, not what the run has to say — so they must not be what silences the
+ * only content a reader had.
+ */
+describe('visibleActivities — a run whose only narrative is a permission exchange', () => {
+  const narrative = (a: { type: string }) => a.type !== 'action';
+  const control = (a: { type: string }) => a.type === 'elicitation' || a.type === 'prompt';
+  const toolsOnly = [
+    { type: 'action', id: 1 },
+    { type: 'action', id: 2 },
+  ];
+
+  it('shows the tool calls before the question, as it always did', () => {
+    const { rows, shownBecauseNoNarrative } = visibleActivities(toolsOnly, narrative, false, control);
+    expect(rows).toHaveLength(2);
+    expect(shownBecauseNoNarrative).toBe(true);
+  });
+
+  it('keeps showing them once a question and its answer arrive', () => {
+    // The regression, exactly: before this the panel dropped to the two control rows and
+    // the reader watched a live run appear to stop.
+    const withExchange = [
+      ...toolsOnly,
+      { type: 'elicitation', id: 3 },
+      { type: 'prompt', id: 4 },
+      { type: 'action', id: 5 },
+    ];
+
+    const { rows } = visibleActivities(withExchange, narrative, false, control);
+
+    expect(rows.map((r) => r.id)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('still hides tool calls once the agent actually says something', () => {
+    // The filter earns its place the moment there is a story to read instead.
+    const withResponse = [
+      ...toolsOnly,
+      { type: 'elicitation', id: 3 },
+      { type: 'prompt', id: 4 },
+      { type: 'response', id: 5 },
+    ];
+
+    const { rows } = visibleActivities(withResponse, narrative, false, control);
+
+    expect(rows.map((r) => r.id)).toEqual([3, 4, 5]);
+  });
+
+  it('shows everything when the reader asked for tool calls', () => {
+    const { rows } = visibleActivities(toolsOnly, narrative, true, control);
+    expect(rows).toHaveLength(2);
+  });
+});
