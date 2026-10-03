@@ -2,7 +2,7 @@
   import { displayAgent, displayPrincipal } from '$lib/names';
   import { cardProvenance } from '$lib/components/board/card-provenance';
   import { onDestroy } from 'svelte';
-  import { groupActivities, isNarrative, defaultOpen, visibleActivities } from '$lib/activity-groups';
+  import { groupActivities, isNarrative, isControlRow, defaultOpen, visibleActivities } from '$lib/activity-groups';
   import { stageAccount, formatHandoff } from '$lib/stage-account';
   import { app } from '$lib/stores/app.svelte';
   import {
@@ -1576,7 +1576,7 @@
             -->
             <div class="stream flex flex-col gap-1.5">
               {#each activityGroups as g, gi (g.runId)}
-                {@const view = visibleActivities(g.activities, isNarrative, showToolCalls)}
+                {@const view = visibleActivities(g.activities, isNarrative, showToolCalls, isControlRow)}
                 {@const rows = view.rows}
                 <details open={defaultOpen(activityGroups, gi)} class="border-border rounded-[7px] border">
                   <summary

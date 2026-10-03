@@ -29,6 +29,22 @@ export function isNarrative(a: Activity): boolean {
   return a.type !== 'action';
 }
 
+/**
+ * Rows that are how a run was INTERRUPTED, not what it has to say.
+ *
+ * An `elicitation` and the `prompt` that answers it are narrative — a reader must see the
+ * question and the decision — but they are not the run having said anything, and they must
+ * not be what decides whether a run has a story worth showing instead of its tool calls.
+ *
+ * Reported twice from a live card: a run streaming nothing but tool calls was readable
+ * through the no-narrative fallback, and the moment the agent asked permission and the
+ * operator answered, every tool call in it disappeared. The run had crossed from "no
+ * narrative" to "has narrative" mid-flight on two rows that are not the story.
+ */
+export function isControlRow(a: Activity): boolean {
+  return a.type === 'elicitation' || a.type === 'prompt';
+}
+
 export function groupActivities(activities: Activity[], attempts: Attempt[]): ActivityGroup[] {
   const meta = new Map(attempts.map((a) => [a.runId, a]));
   const order: string[] = [];
@@ -98,9 +114,17 @@ export function visibleActivities<T>(
   activities: T[],
   isNarrativeRow: (a: T) => boolean,
   showToolCalls: boolean,
+  /**
+   * Which rows are a control exchange rather than the run's own words. Defaulted to "none"
+   * so existing callers keep their exact behaviour; the drawer passes `isControlRow`.
+   */
+  isControlRowFn: (a: T) => boolean = () => false,
 ): { rows: T[]; shownBecauseNoNarrative: boolean } {
   if (showToolCalls) return { rows: activities, shownBecauseNoNarrative: false };
   const narrative = activities.filter(isNarrativeRow);
-  if (narrative.length > 0) return { rows: narrative, shownBecauseNoNarrative: false };
+  // A permission exchange does not count toward "this run has a story". If it did, asking a
+  // question would silence the only content a reader had — which is the bug this guards.
+  const substantive = narrative.filter((a) => !isControlRowFn(a));
+  if (substantive.length > 0) return { rows: narrative, shownBecauseNoNarrative: false };
   return { rows: activities, shownBecauseNoNarrative: activities.length > 0 };
 }
