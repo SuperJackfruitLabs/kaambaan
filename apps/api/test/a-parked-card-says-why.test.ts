@@ -207,3 +207,87 @@ describe('a card parked by the circuit breaker says so', () => {
     });
   });
 });
+
+/**
+ * Every way a card comes to rest on a person, not just the two I shipped.
+ *
+ * Found in production on 2026-10-03. A verify agent asked permission, got no answer
+ * (delivery was broken), and blocked its own run. `block()` cancels the run's pending
+ * questions — so the question was gone, and the card went on reporting
+ *
+ *     needsHuman: { reason: "question", elicitationId: "elc_51635924cfa34d8a" }
+ *
+ * pointing at a question that no longer existed, while saying nothing about the block
+ * that was the actual reason it stopped. That is the exact failure the first commit
+ * named: "a stale 'needs you' is worse than none — it sends somebody to a card that
+ * wants nothing."
+ *
+ * Five places write `state = 'input-required'`. The rule is that every one of them says
+ * why, because a card that stops without a reason is a card somebody has to reverse
+ * engineer from the activity log.
+ */
+describe('every way a card comes to rest on a person', () => {
+  it('an agent that blocks says so, and replaces its own question', async () => {
+    await runInDurableObject(await board('park-blocked', 'brd_pb1'), async (b: BoardDO) => {
+      const card = await mustCreate(b);
+      const c = await b.claim(CODER);
+      if (!c.claimed) throw new Error('expected a claim');
+      await b.postActivity({
+        runId: c.runId,
+        leaseEpoch: c.leaseEpoch,
+        agentId: CODER.agentId,
+        type: 'elicitation',
+        body: 'May I run the test suite?',
+        signal: 'select',
+        parameter: { options: OPTIONS } as never,
+      });
+      expect((await read(b, card.id)).needsHuman?.reason).toBe('question');
+
+      await b.block({ runId: c.runId, leaseEpoch: c.leaseEpoch, reason: 'no permission to run the script' });
+
+      const got = await read(b, card.id);
+      expect(got.state).toBe('input-required');
+      expect(got.needsHuman?.reason).toBe('blocked');
+      expect(got.needsHuman?.detail).toContain('no permission');
+      // The question it asked is cancelled, so nothing may still point at it.
+      expect(got.needsHuman?.elicitationId).toBeUndefined();
+    });
+  });
+
+  it('a card submitted for human review says it is waiting for review', async () => {
+    await runInDurableObject(await board('park-review', 'brd_pb2'), async (b: BoardDO) => {
+      const card = await mustCreate(b);
+      const c = await b.claim(CODER);
+      if (!c.claimed) throw new Error('expected a claim');
+
+      await b.submitForReview({ runId: c.runId, leaseEpoch: c.leaseEpoch });
+
+      const got = await read(b, card.id);
+      expect(got.state).toBe('input-required');
+      expect(got.needsHuman?.reason).toBe('review');
+    });
+  });
+
+  it('a stage whose completion was not met says what was missing', async () => {
+    // The D1 refusal: blocked rather than failed, so a retry loop cannot burn budget
+    // re-asserting the same untrue claim. A person has to see it, which means the card
+    // has to say it.
+    await runInDurableObject(await board('park-unmet', 'brd_pb3'), async (b: BoardDO) => {
+      await b.setStages([
+        { key: 'build', name: 'Build', order: 0, ownerKind: 'capability', owner: 'code',
+          completion: { handoff: ['verdict'] } },
+        { key: 'verify', name: 'Verify', order: 1, ownerKind: 'capability', owner: 'test' },
+      ]);
+      const card = await mustCreate(b);
+      const c = await b.claim(CODER);
+      if (!c.claimed) throw new Error('expected a claim');
+
+      await b.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'in progress' } });
+
+      const got = await read(b, card.id);
+      expect(got.state).toBe('input-required');
+      expect(got.needsHuman?.reason).toBe('blocked');
+      expect(got.needsHuman?.detail).toContain('verdict');
+    });
+  });
+});

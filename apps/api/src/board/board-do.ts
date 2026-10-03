@@ -331,7 +331,15 @@ export interface BoardInit {
  * there so the board can say something useful instead of "needs you".
  */
 export interface CardNeedsHuman {
-  reason: 'question' | 'repeated-failure';
+  /**
+   * Every way a card comes to rest on a person.
+   *
+   * Five places write `state = 'input-required'` and each one knows why; the first cut
+   * of this carried two of them, so a card blocked by its own agent went on reporting
+   * the question that block had just cancelled. A card that stops without a reason is
+   * one somebody has to reverse engineer from the activity log.
+   */
+  reason: 'question' | 'repeated-failure' | 'blocked' | 'review' | 'not-authorised';
   /** The question, when there is one to answer. */
   elicitationId?: string;
   /** The run's own words for why it failed. Never summarised. */
@@ -4004,11 +4012,12 @@ export class BoardDO extends DurableObject<Env> {
         const why = grant
           ? `the operator who queued this card may not dispatch ${input.agentId}`
           : 'this card was queued without an authorising token, so no one with permission asked for it to run';
-        this.sql.exec(
-          `UPDATE cards SET state = 'input-required', updated_at = ? WHERE id = ?`,
-          this.now(),
-          row.id as string,
-        );
+        // Parked without ending a run — there is no run; this stops a dispatch rather
+        // than finishing one, which is why the run is left named.
+        // `row.id`: this runs inside the claim loop, where the candidate card is the row
+        // in hand and there is no `cardId` in scope. Parked without releasing a run
+        // because there is no run — this stops a dispatch rather than ending one.
+        this.parkForHuman(row.id as string, { reason: 'not-authorised', detail: why }, false);
         this.notify('control-pair', row.id as string, `Not dispatched: ${why}`);
         this.emit('card.blocked', { cardId: row.id as string, reason: why });
         return { claimed: false };
@@ -4191,11 +4200,10 @@ export class BoardDO extends DurableObject<Env> {
         // Blocked, not failed (D1): the agent asserted something untrue, and a retry loop would
         // burn budget re-asserting it. A person should see this.
         this.sql.exec(`UPDATE runs SET outcome = 'blocked' WHERE id = ?`, input.runId);
-        this.sql.exec(
-          `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
-          now,
-          cardId,
-        );
+        // Named, not just recorded on the run: the whole point of D1 is that a person
+        // sees this, and a reader who has to open the run to find out what was missing
+        // is a reader who will not.
+        this.parkForHuman(cardId, { reason: 'blocked', detail: `this stage was not finished: ${verdict.reason}` });
         const reason = `this stage was not finished: ${verdict.reason}`;
         this.emit('card.blocked', { cardId, reason });
         // On the card's own replay, as an `error`: a refusal a reader has to reconstruct from
@@ -4233,6 +4241,9 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'submitted', ended_at = ? WHERE id = ?`, now, input.runId);
     this.cancelElicitationsForRun(input.runId);
+    // Waiting to be looked at, which is a different thing from being stuck — and the
+    // only one of the five that is a healthy, expected place for a card to rest.
+    this.parkForHuman(cardId, { reason: 'review' });
     const card = this.mustGetCard(cardId);
     this.sql.exec(
       `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
@@ -4414,6 +4425,10 @@ export class BoardDO extends DurableObject<Env> {
     const now = this.now();
     this.sql.exec(`UPDATE runs SET status = 'ended', outcome = 'blocked', ended_at = ? WHERE id = ?`, now, input.runId);
     this.cancelElicitationsForRun(input.runId);
+    // The block is the reason now, and it REPLACES any question this run asked — those
+    // were just cancelled, and a card pointing at a cancelled question sends somebody
+    // to something that no longer exists.
+    this.parkForHuman(cardId, { reason: 'blocked', detail: input.reason });
     this.sql.exec(
       `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
       now,
@@ -4536,6 +4551,29 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `UPDATE cards SET needs_human_json = ? WHERE id = ?`,
       needs ? JSON.stringify(needs) : null,
+      cardId,
+    );
+  }
+
+  /**
+   * Bring a card to rest on a person, saying why in the same write.
+   *
+   * The state and the reason are set together so they cannot drift: a card parked
+   * without a reason is the bug this exists to prevent, and leaving the two as separate
+   * statements is how that happened the first time.
+   *
+   * `releaseRun` for the cases where the run is over (blocked, submitted, refused) and
+   * false where the card is parked with its run still named — the control-pair refusal,
+   * which stops a dispatch rather than ending one.
+   */
+  private parkForHuman(cardId: string, needs: CardNeedsHuman, releaseRun = true): void {
+    this.sql.exec(
+      releaseRun
+        ? `UPDATE cards SET state = 'input-required', needs_human_json = ?, delegate_agent_id = NULL,
+             current_run_id = NULL, updated_at = ? WHERE id = ?`
+        : `UPDATE cards SET state = 'input-required', needs_human_json = ?, updated_at = ? WHERE id = ?`,
+      JSON.stringify(needs),
+      this.now(),
       cardId,
     );
   }
