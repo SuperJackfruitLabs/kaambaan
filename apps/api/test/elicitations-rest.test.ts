@@ -321,3 +321,38 @@ describe('every question still waiting on a human, over REST', () => {
     expect(((await res.json()) as { elicitations: unknown[] }).elicitations).toEqual([]);
   });
 });
+
+/**
+ * The sweep reads this with an AGENT token, so an agent must be able to.
+ *
+ * Found in production on 2026-10-03, minutes after the feature went live: every pass of the
+ * hub's elicitation sweep logged
+ *
+ *   GET /v1/boards/:id/elicitations/pending failed with 401: sign in to continue
+ *
+ * because the route was classified human-only while `gates/pending` — its exact twin, read by
+ * the same sweep for the same reason — had been widened to either. The reasoning was already
+ * written down beside `isEitherRoute`: a read that names nobody and carries no authority, made
+ * by the service that relays the answer, and by the people whose decisions it lists.
+ *
+ * No damage was done, because the sweep refuses to settle anything for a board it could not
+ * read. That guard is the only reason this was a silent no-op rather than every projected
+ * question being closed.
+ */
+describe('who may read the questions still waiting', () => {
+  it('answers an agent token, as the sweep uses', async () => {
+    const tenantId = 'tnt_elc_pending_agent';
+    const boardId = await createBoard(tenantId);
+    await addCard(tenantId, boardId, 'Ship the docs');
+    const { token } = await connectAgent(tenantId, ['research'], 'researcher');
+    await claimAndAsk(boardId, token);
+
+    const res = await SELF.fetch(`${base}/v1/boards/${boardId}/elicitations/pending`, {
+      headers: agentAuth(token),
+    });
+
+    expect(res.status).toBe(200);
+    const { elicitations } = (await res.json()) as { elicitations: unknown[] };
+    expect(elicitations).toHaveLength(1);
+  });
+});

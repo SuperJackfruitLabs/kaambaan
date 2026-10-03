@@ -1569,8 +1569,16 @@ export default {
     // gate names nobody and carries no authority, and the caller that needs it is the hub asking
     // "is the gate I put in a room still open, and if not, what was decided?" — after which it
     // stops offering buttons for a decision already made. Deciding a gate stays human-only.
+    // `elicitations/pending` joins them, and for exactly the reasons written above: it is the
+    // same reconciliation read made by the same sweep, it names nobody and carries no authority,
+    // and the people whose answers it lists have at least as much business reading it. Classifying
+    // it human-only shipped on 2026-10-03 and every sweep pass 401'd within minutes — silently,
+    // because the sweep settles nothing for a board it could not read.
     const isEitherRoute =
-      !!boardId && (rest === 'gates/pending' || /^gates\/[^/]+$/.test(rest));
+      !!boardId &&
+      (rest === 'gates/pending' ||
+        rest === 'elicitations/pending' ||
+        /^gates\/[^/]+$/.test(rest));
     /**
      * What a COORDINATOR agent reaches: the board, one card, and creating a card.
      *
