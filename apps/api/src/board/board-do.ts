@@ -1494,6 +1494,18 @@ export class BoardDO extends DurableObject<Env> {
       )`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_card ON gates(card_id)`);
+    /**
+     * The run whose work this gate judges (charter -> decisions/2026-09-29-evidence-joins-on-the-
+     * work-run.md, decision 4), so a human's rejection can be attributed to the run and the
+     * configuration that produced it. Nullable on purpose: gates opened before this column have
+     * none, and the evidence route reads a null as "a legacy gate on this card and stage".
+     */
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN run_id TEXT`);
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_run ON gates(run_id)`);
     // An agent's open question to a human (docs/04 §4). Persisting it is what makes an answer
     // possible: the activity stream is append-only history, and history cannot be replied to.
     this.sql.exec(
@@ -4222,7 +4234,7 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
-    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson);
+    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4251,7 +4263,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     // request_changes returns to the same (worked) stage so the agent can redo it.
-    this.createGate(cardId, card.currentStageKey, card.currentStageKey, run.agent_id as string);
+    this.createGate(cardId, card.currentStageKey, card.currentStageKey, run.agent_id as string, input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4283,7 +4295,8 @@ export class BoardDO extends DurableObject<Env> {
     );
     if (input.decision === 'approve') {
       // The approver becomes the producer of any chained gate (keeps separation-of-duties intact).
-      this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId));
+      // An approval produces no new work, so a chained gate judges the same run's work.
+      this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
     } else if (input.decision === 'request_changes') {
       // Keep the agent's prior handoff and add the reviewer's feedback so rework has full context.
       const prior = this.parseHandoff(this.getCardHandoffJson(cardId));
@@ -4629,13 +4642,13 @@ export class BoardDO extends DurableObject<Env> {
    * `TaskState`. It is not literally true here ("a human must act"); `openChildCount > 0` is what a
    * reader (Task 17's UI) uses to tell this park apart from a real review gate.
    */
-  private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null): void {
+  private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null, runId: string | null): void {
     const openChildren = this.openChildCount(cardId);
     if (openChildren > 0) {
       this.sql.exec(
         `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL,
                 pending_advance_json = ?, updated_at = ? WHERE id = ?`,
-        JSON.stringify({ fromStageKey, producedBy, handoffJson }),
+        JSON.stringify({ fromStageKey, producedBy, handoffJson, runId }),
         this.now(),
         cardId,
       );
@@ -4681,7 +4694,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     this.emit('card.advanced', { cardId, from: fromStageKey, to: next.key });
-    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy);
+    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy, runId);
     else this.notifyWorkAvailable(cardId);
   }
 
@@ -4725,17 +4738,17 @@ export class BoardDO extends DurableObject<Env> {
     const pendingJson = (row?.pending_advance_json as string | null | undefined) ?? null;
     if (!pendingJson) return;
     if (this.openChildCount(parentId) > 0) return; // another child is still open
-    const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null };
+    const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null; runId?: string | null };
     this.sql.exec(`UPDATE cards SET pending_advance_json = NULL WHERE id = ?`, parentId);
-    this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson);
+    this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson, pending.runId ?? null);
   }
 
-  private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string): string {
+  private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string, runId: string | null): string {
     const id = newId('gate');
     const now = this.now();
     this.sql.exec(
-      `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at, run_id)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
       id,
       cardId,
       stageKey,
@@ -4743,6 +4756,7 @@ export class BoardDO extends DurableObject<Env> {
       producedBy,
       JSON.stringify(DEFAULT_GATE_OPTIONS),
       now,
+      runId,
     );
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);
