@@ -26,6 +26,7 @@ const RUN_PATH = /^\/v1\/boards\/([^/]+)\/runs\/([^/]+)(?:\/([^/]+))?$/;
 const ACTION = /^[a-z][a-z_-]{0,31}$/;
 
 const MAX_ID = 128;
+const TRACEPARENT = /^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
 
 /** Decode a path segment without ever throwing, and cap its length (ids come from the unauthenticated URL). */
 function safeId(segment: string): string {
@@ -90,17 +91,25 @@ export async function withRunTelemetry(
       setAttr(span, 'http.response.status_code', status);
       return res;
     } finally {
-      console.log({
-        level: status >= 500 ? 'error' : 'info',
-        msg: 'run route',
-        'run.id': f.runId,
-        'board.id': f.boardId,
-        route: f.route,
-        ...(f.action ? { 'run.action': f.action } : {}),
-        method: request.method,
-        status,
-        traceparent: request.headers.get('traceparent') ?? undefined,
-      });
+      try {
+        const tp = request.headers.get('traceparent')?.toLowerCase();
+        const entry = {
+          level: status >= 500 ? 'error' : 'info',
+          msg: 'run route',
+          'run.id': f.runId,
+          'board.id': f.boardId,
+          route: f.route,
+          ...(f.action ? { 'run.action': f.action } : {}),
+          method: request.method,
+          status,
+          ...(tp && TRACEPARENT.test(tp) ? { traceparent: tp } : {}),
+        };
+        // Workers derives the exported severity from the console method.
+        if (status >= 500) console.error(entry);
+        else console.log(entry);
+      } catch {
+        /* a logging failure must never fail the request */
+      }
     }
   };
 

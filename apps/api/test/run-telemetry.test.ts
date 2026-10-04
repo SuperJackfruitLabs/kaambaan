@@ -31,7 +31,8 @@ describe('runRouteFacts', () => {
 
 describe('withRunTelemetry', () => {
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-  afterEach(() => log.mockClear());
+  const errLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+  afterEach(() => { log.mockClear(); errLog.mockClear(); });
 
   it('puts run.id on the span and one structured line in the log, never the body', async () => {
     const { tracing, names, attrs } = fakeTracing();
@@ -56,8 +57,8 @@ describe('withRunTelemetry', () => {
     const { tracing } = fakeTracing();
     const req = new Request('https://api.test/v1/boards/brd_1/runs/run_2');
     await expect(withRunTelemetry(req, async () => { throw new Error(MARKER); }, tracing)).rejects.toThrow(MARKER);
-    expect(log.mock.calls[0]![0]).toMatchObject({ 'run.id': 'run_2', status: 500, level: 'error' });
-    expect(JSON.stringify(log.mock.calls)).not.toContain(MARKER);
+    expect(errLog.mock.calls[0]![0]).toMatchObject({ 'run.id': 'run_2', status: 500, level: 'error' });
+    expect(JSON.stringify(errLog.mock.calls)).not.toContain(MARKER);
   });
 
   it('works when the runtime offers no tracing API', async () => {
@@ -118,5 +119,25 @@ describe('withRunTelemetry', () => {
     const res = await withRunTelemetry(req, async () => { calls += 1; return new Response('ok', { status: 202 }); }, tracing);
     expect(calls).toBe(1);
     expect(res.status).toBe(202);
+  });
+
+  it('logs only a well-formed traceparent', async () => {
+    const { tracing } = fakeTracing();
+    for (const bad of ['garbage', '00-' + 'a'.repeat(5000)]) {
+      await withRunTelemetry(new Request('https://api.test/v1/boards/b/runs/r', { headers: { traceparent: bad } }), async () => new Response('ok'), tracing);
+      expect(log.mock.calls.at(-1)![0]).not.toHaveProperty('traceparent');
+    }
+    await withRunTelemetry(new Request('https://api.test/v1/boards/b/runs/r', { headers: { traceparent: '00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01' } }), async () => new Response('ok'), tracing);
+    expect(log.mock.calls.at(-1)![0]).toMatchObject({ traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' });
+  });
+
+  it('uses console.error for 5xx responses and survives a throwing logger', async () => {
+    const { tracing } = fakeTracing();
+    await withRunTelemetry(new Request('https://api.test/v1/boards/b/runs/r'), async () => new Response('x', { status: 503 }), tracing);
+    expect(errLog).toHaveBeenCalledTimes(1);
+    expect(log).not.toHaveBeenCalled();
+    log.mockImplementationOnce(() => { throw new Error('log down'); });
+    const res = await withRunTelemetry(new Request('https://api.test/v1/boards/b/runs/r'), async () => new Response('ok'), tracing);
+    expect(res.status).toBe(200);
   });
 });
