@@ -335,6 +335,12 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
 
 /** Read a run's evidence (superwitness contract C4). */
 export const EVIDENCE_READ = 'evidence:read';
+/**
+ * Create a card on a board whose queue-list names this service (superwitness's nightly canary).
+ * Holding it is never enough alone: card create also requires the `service` kind and the board's
+ * queue-list entry (`index.ts`, `serviceQueueCard`).
+ */
+export const CARDS_QUEUE = 'cards:queue';
 
 export interface ServicePrincipal {
   /** The hub's `prn_…`. Not a local user or agent: a service has neither here. */
@@ -346,14 +352,22 @@ export interface ServicePrincipal {
    * (the hub's TOKEN_TTL).
    */
   scopes: string[];
+  /**
+   * The token's `mayDispatch` — bare `prn_…` ids this service may dispatch. Required on a service
+   * token: one without it is refused outright rather than read as `[]`, because absent and empty
+   * are different answers (see `AgentPrincipal.mayDispatch`). A card the service queues records
+   * this as its `queuedGrant`; nothing else reads it.
+   */
+  mayDispatch: string[];
 }
 
 /**
- * Resolve a SERVICE-kind hub token — superwitness, reading evidence.
+ * Resolve a SERVICE-kind hub token — superwitness, reading evidence and queueing its canary card.
  *
  * The third sibling of `resolveHubUser` and `resolveHubAgent`, with the same refusals: no issuer
- * configured, a kind that is not `service`, a fleet that maps to no tenant here. It grants nothing
- * by itself; a route checks `scopes` for the one permission it needs.
+ * configured, a kind that is not `service`, a fleet that maps to no tenant here — plus a missing or
+ * malformed `mayDispatch` claim. It grants nothing by itself; a route checks `scopes` for the one
+ * permission it needs.
  */
 export async function resolveHubService(request: Request, env: Env): Promise<ServicePrincipal | null> {
   const issuer = env.HUB_ISSUER;
@@ -367,6 +381,10 @@ export async function resolveHubService(request: Request, env: Env): Promise<Ser
   const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
   if (!tenantId) return null;
 
+  // Required claim. A service token that does not carry it is not one this plane accepts.
+  const mayDispatch: unknown = claims.mayDispatch;
+  if (!Array.isArray(mayDispatch) || !mayDispatch.every((p) => typeof p === 'string')) return null;
+
   const scopes = typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
-  return { principalId: claims.sub, tenantId, scopes };
+  return { principalId: claims.sub, tenantId, scopes, mayDispatch: mayDispatch as string[] };
 }

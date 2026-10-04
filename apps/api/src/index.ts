@@ -40,7 +40,7 @@ import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExtern
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
-import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
+import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ, CARDS_QUEUE, type ServicePrincipal } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor } from './db/catalog';
@@ -436,6 +436,82 @@ async function runEvidence(request: Request, env: Env, boardId: string, runId: s
     if (result.code === 'NOT_INITIALIZED') return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
     if (result.code === 'RUN_NOT_FOUND') return Response.json({ error: { code: 'RUN_NOT_FOUND' } }, { status: 404 });
     return Response.json({ error: { code: result.code } }, { status: statusForCode(result.code) });
+  } catch (err) {
+    return unexpected(err);
+  }
+}
+
+/**
+ * POST /v1/boards/:id/cards from a SERVICE principal — superwitness's canary queueing its nightly
+ * card. Reached only from the coordinator-route fallback below, only for `POST cards`, and only
+ * once no agent credential resolved; every other route still refuses a service.
+ *
+ * Three things must all hold, and none is enough alone: the kind is `service` (`resolveHubService`),
+ * the token's scope carries `cards:queue`, and its `sub` is on THIS board's queue-list. The hub can
+ * put the scope on any grant, so the scope says what was asked for; the list says a human admin of
+ * this board agreed to it.
+ *
+ * The card is owned by the admin who listed the service (`addedBy`) — a human answerable for it, as
+ * every card has — dispatched on the token's `mayDispatch`, and queued by the service principal
+ * itself, which is what the board's event trail (`card.created`'s card) and a card reader show.
+ * Refusals mirror `authorizeAgentQueue`: an empty grant is refused here, at creation, because a card
+ * created on one sits on the board looking queued and can never be claimed.
+ */
+async function serviceQueueCard(
+  request: Request,
+  env: Env,
+  boardId: string,
+  service: ServicePrincipal,
+): Promise<Response> {
+  const forbid = (code: string, message: string) => Response.json({ error: { code, message } }, { status: 403 });
+  if (!service.scopes.includes(CARDS_QUEUE)) return forbid('FORBIDDEN', 'this principal does not hold cards:queue');
+  try {
+    // The caller's OWN tenant: a board in another tenant is simply not found.
+    const stub = boardStub(env, service.tenantId, boardId);
+    const entry = await stub.getQueuer(service.principalId);
+    if (!entry) {
+      // `getQueuer` answers null for an unknown board too; tell the two apart only on refusal.
+      const board = await stub.listQueuers();
+      if (!board.ok && board.code === 'NOT_INITIALIZED') {
+        return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
+      }
+      return forbid('FORBIDDEN', "this principal is not on this board's queue-list");
+    }
+    if (service.mayDispatch.length === 0) {
+      return forbid('NO_DISPATCH_AUTHORITY', 'this service may dispatch nobody, so any card it queued could never be claimed');
+    }
+
+    const body = (await request.json()) as {
+      title: string;
+      ownerUserId?: string;
+      spec?: JsonValue;
+      priority?: number;
+      dueAt?: string;
+    };
+    // The same rule as the human and agent path, from the same function.
+    if (isInvalidDueAt(body.dueAt)) {
+      return Response.json(
+        { error: { code: 'INVALID_DUE_AT', message: 'dueAt must be null or a date in YYYY-MM-DD form' } },
+        { status: 400 },
+      );
+    }
+    if (body.ownerUserId !== undefined && body.ownerUserId !== entry.addedBy) {
+      return forbid('SERVICE_CANNOT_SET_OWNER', "a service may not name anyone but the admin who listed it as a card's owner");
+    }
+
+    const result = await stub.createCard({
+      title: body.title,
+      spec: body.spec,
+      priority: body.priority,
+      dueAt: body.dueAt,
+      ownerUserId: entry.addedBy,
+      queuedGrant: service.mayDispatch,
+      queuedBy: service.principalId,
+      // Null: no superpipeline agent queued this. `queuedBy` alone names the service.
+      queuedByAgentId: null,
+    });
+    if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+    return Response.json({ card: result.value }, { status: 201 });
   } catch (err) {
     return unexpected(err);
   }
@@ -1762,6 +1838,14 @@ export default {
         // with a bearer that names no agent is still a person creating a card, and a person
         // creating a card is `work`. The earlier version of this resolved a user and stopped,
         // which on a GET was survivable and on `POST cards` would have been a role check skipped.
+        //
+        // One exception, and only on `POST cards` exactly: a SERVICE token (superwitness) queueing
+        // onto a board whose queue-list names it. Anything else a service sends falls through to
+        // the human refusal, as before.
+        if (boardId && rest === 'cards' && request.method === 'POST') {
+          const service = await resolveHubService(request, env);
+          if (service) return serviceQueueCard(request, env, boardId, service);
+        }
         const resolved = await resolveHumanOrRefuse();
         if (resolved instanceof Response) return resolved;
         user = resolved;

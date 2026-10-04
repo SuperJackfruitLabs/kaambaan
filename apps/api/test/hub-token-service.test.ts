@@ -42,7 +42,22 @@ const req = (t: string) => new Request('https://api.test/v1/boards/brd_x/runs/ru
 describe('resolveHubService', () => {
   it('resolves a service token to its mapped tenant and its scopes', async () => {
     const svc = await withIssuer(async () => resolveHubService(req(await token({ scope: 'evidence:read other:thing' })), env));
-    expect(svc).toEqual({ principalId: 'prn_0123456789abcdef0123', tenantId: TENANT, scopes: ['evidence:read', 'other:thing'] });
+    expect(svc).toEqual({ principalId: 'prn_0123456789abcdef0123', tenantId: TENANT, scopes: ['evidence:read', 'other:thing'], mayDispatch: [] });
+  });
+
+  it('carries the mayDispatch grant, and splits cards:queue out of the scope like any other', async () => {
+    const svc = await withIssuer(async () =>
+      resolveHubService(req(await token({ scope: 'evidence:read cards:queue', mayDispatch: ['prn_aaaaaaaaaaaaaaaaaaaa'] })), env),
+    );
+    expect(svc?.scopes).toEqual(['evidence:read', 'cards:queue']);
+    expect(svc?.mayDispatch).toEqual(['prn_aaaaaaaaaaaaaaaaaaaa']);
+  });
+
+  it('a service token without a well-formed mayDispatch claim is refused — absent is not read as []', async () => {
+    for (const mayDispatch of [undefined, null, 'prn_aaaaaaaaaaaaaaaaaaaa', [42]]) {
+      const svc = await withIssuer(async () => resolveHubService(req(await token({ scope: 'evidence:read', mayDispatch })), env));
+      expect(svc, JSON.stringify(mayDispatch)).toBeNull();
+    }
   });
 
   it('a token with no scope claim holds no scopes', async () => {

@@ -1,8 +1,8 @@
 /**
  * The per-board queue-list: which SERVICE principals (`prn_…`) a board accepts cards from.
  *
- * This file covers the list and its management route only. Card creation does not consult it yet;
- * that is a later change, which reads one entry through `BoardDO.getQueuer`.
+ * This file covers the list and its management route only. Card creation reads one entry through
+ * `BoardDO.getQueuer`; that path is tested in service-card-queue.test.ts.
  *
  * Managing the list is a HUMAN act at the same role as every other board setting (`manage`, i.e.
  * admin). Reading it is `read`. No agent or service credential reaches either.
@@ -162,7 +162,7 @@ describe('/v1/boards/:id/queuers', () => {
         sub: PRN,
         principalKind: 'service',
         tenant: FLEET,
-        mayDispatch: [],
+        mayDispatch: [PRN2],
         mayGrantReach: false,
         scope: 'evidence:read cards:queue',
       })
@@ -170,6 +170,10 @@ describe('/v1/boards/:id/queuers', () => {
         .setIssuedAt().setIssuer(ISSUER).setAudience([ISSUER, PLANE]).setExpirationTime('5m')
         .sign(signingKey);
       const bearer = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+      // Positive control: this token is a working service credential — it creates a card on this
+      // board — so the 401s below are refusals of the route, not of a broken token.
+      const made = await SELF.fetch(`https://api.test/v1/boards/${b}/cards`, { method: 'POST', headers: bearer, body: JSON.stringify({ title: 'control' }) });
+      expect(made.status).toBe(201);
       expect((await list(b, bearer)).status).toBe(401);
       expect((await add(b, bearer, PRN2)).status).toBe(401);
       expect((await remove(b, bearer, PRN)).status).toBe(401);
