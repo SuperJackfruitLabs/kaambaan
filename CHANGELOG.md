@@ -1,8 +1,14 @@
 # Changelog
 
-All notable changes to Kaambaan are documented here. The format follows
+All notable changes to superpipeline are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+> **The product was called Kaambaan until 2026-09-16.** Entries below that
+> predate the rename name the packages and hosts they actually shipped with —
+> `@kaambaan/*`, `kaambaan-api.…` — because that is what existed at the time.
+> Everything current is `superpipeline`, and an agent token now starts `spa_`
+> rather than `kbn_`, with no fallback.
 
 ## [0.0.1] — 2026-06-21
 
@@ -11,7 +17,7 @@ project's first commit on 2026-06-20 — **P0 → P14, 21 merged PRs, 72 commits
 Every phase was built docs-first and TDD-first (RED → GREEN) and code-reviewed
 before merge.
 
-Kaambaan is a multi-tenant Kanban board that orchestrates **external** AI agents
+superpipeline is a multi-tenant Kanban board that orchestrates **external** AI agents
 through pipeline stages with human approval gates. It is the orchestration
 **control plane**, not an agent runtime — agents run anywhere, under any harness,
 and connect over one shared contract (MCP **and** REST/webhook) to pull work,
@@ -97,4 +103,4 @@ full-text search or command palette, no saved views, no sub-cards / card
 relations, no human↔human comments / @mentions, no labels-management UI, and no
 due dates. These are the next milestones, not regressions.
 
-[0.0.1]: https://github.com/rakeshgangwar/kaambaan/releases/tag/v0.0.1
+[0.0.1]: https://github.com/SuperJackfruitLabs/superpipeline/releases/tag/v0.0.1
