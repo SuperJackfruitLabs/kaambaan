@@ -306,3 +306,102 @@ describe('a queue-listed cards:queue service is refused everywhere else', () => 
     expect(queuers.map((q) => q.principalId)).toEqual([SVC]);
   });
 });
+
+describe('GET /v1/boards/:id/cards/:cardId/attempts — a queuing service reads the cards it queued', () => {
+  const attempts = (b: string, cardId: string, headers: Record<string, string>) =>
+    SELF.fetch(`https://api.test/v1/boards/${b}/cards/${cardId}/attempts`, { headers });
+  const humanCard = async (b: string) => {
+    const res = await SELF.fetch(`https://api.test/v1/boards/${b}/cards`, { method: 'POST', headers: ADMIN, body: JSON.stringify({ title: 'by a human' }) });
+    expect(res.status).toBe(201);
+    return (await res.json<{ card: Card }>()).card;
+  };
+
+  it('own card: 200 with exactly the body a human gets', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const token = await hubToken();
+      const { card } = await (await create(b, token)).json<{ card: Card }>();
+      const res = await attempts(b, card.id, bearer(token));
+      expect(res.status).toBe(200);
+      const body = await res.json<{ attempts: unknown[] }>();
+      expect(Array.isArray(body.attempts)).toBe(true);
+      const human = await attempts(b, card.id, ADMIN);
+      expect(body).toEqual(await human.json());
+    });
+  });
+
+  it('a card queued by a human → 403 FORBIDDEN', async () => {
+    const b = await board();
+    await list(b);
+    const card = await humanCard(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const res = await attempts(b, card.id, bearer(await hubToken()));
+      expect(res.status).toBe(403);
+      expect((await res.json<ErrorBody>()).error.code).toBe('FORBIDDEN');
+    });
+  });
+
+  it('a card queued by a different listed service → 403 FORBIDDEN', async () => {
+    const b = await board();
+    await list(b);
+    await list(b, OTHER_SVC);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const { card } = await (await create(b, await hubToken({ sub: OTHER_SVC }))).json<{ card: Card }>();
+      const res = await attempts(b, card.id, bearer(await hubToken()));
+      expect(res.status).toBe(403);
+    });
+  });
+
+  it('not on the queue-list (even for its own card, after removal) → 403 FORBIDDEN', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const token = await hubToken();
+      const { card } = await (await create(b, token)).json<{ card: Card }>();
+      expect((await attempts(b, card.id, bearer(token))).status).toBe(200);
+      await SELF.fetch(`https://api.test/v1/boards/${b}/queuers/${SVC}`, { method: 'DELETE', headers: ADMIN });
+      const res = await attempts(b, card.id, bearer(token));
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: { code: 'FORBIDDEN', message: "this principal is not on this board's queue-list" } });
+    });
+  });
+
+  it('without cards:queue → 403 FORBIDDEN', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const { card } = await (await create(b, await hubToken())).json<{ card: Card }>();
+      const res = await attempts(b, card.id, bearer(await hubToken({ scope: 'evidence:read' })));
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: { code: 'FORBIDDEN', message: 'this principal does not hold cards:queue' } });
+    });
+  });
+
+  it('unknown card → 404; unknown board → 404 BOARD_NOT_FOUND', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const token = await hubToken();
+      expect((await attempts(b, 'card_nope', bearer(token))).status).toBe(404);
+      const res = await attempts('brd_0000000000000000', 'card_nope', bearer(token));
+      expect(res.status).toBe(404);
+      expect((await res.json<ErrorBody>()).error.code).toBe('BOARD_NOT_FOUND');
+    });
+  });
+
+  it('no other GET opens: one card, activities, estimate, board snapshot all still refuse the service', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const token = await hubToken();
+      const { card } = await (await create(b, token)).json<{ card: Card }>();
+      expect((await attempts(b, card.id, bearer(token))).status).toBe(200); // positive control
+      for (const rest of [`cards/${card.id}`, `cards/${card.id}/activities`, `cards/${card.id}/estimate`, '']) {
+        const res = await SELF.fetch(`https://api.test/v1/boards/${b}${rest ? `/${rest}` : ''}`, { headers: bearer(token) });
+        expect(res.status, rest).toBe(401);
+        expect(await res.json(), rest).toEqual({ error: 'sign in to continue' });
+      }
+    });
+  });
+});

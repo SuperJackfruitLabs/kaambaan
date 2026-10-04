@@ -442,6 +442,54 @@ async function runEvidence(request: Request, env: Env, boardId: string, runId: s
 }
 
 /**
+ * The check both service doors share: the token holds `cards:queue` AND its `sub` is on THIS board's
+ * queue-list. Returns the list entry, or the refusal (403 FORBIDDEN, or 404 for an unknown board).
+ * The caller's OWN tenant is used: a board in another tenant is simply not found.
+ */
+async function authorizeServiceQueuer(
+  env: Env,
+  boardId: string,
+  service: ServicePrincipal,
+): Promise<{ principalId: string; addedBy: string; addedAt: string } | Response> {
+  const forbid = (message: string) => Response.json({ error: { code: 'FORBIDDEN', message } }, { status: 403 });
+  if (!service.scopes.includes(CARDS_QUEUE)) return forbid('this principal does not hold cards:queue');
+  const stub = boardStub(env, service.tenantId, boardId);
+  const entry = await stub.getQueuer(service.principalId);
+  if (entry) return entry;
+  // `getQueuer` answers null for an unknown board too; tell the two apart only on refusal.
+  const board = await stub.listQueuers();
+  if (!board.ok && board.code === 'NOT_INITIALIZED') {
+    return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
+  }
+  return forbid("this principal is not on this board's queue-list");
+}
+
+/**
+ * GET /v1/boards/:id/cards/:cardId/attempts from a SERVICE principal: the canary reading back the
+ * card it queued. Allowed only when the shared check passes AND the card's `queuedBy` is this very
+ * principal — a service reads what it queued, never a human's card or another service's. The body is
+ * the human route's, from the same `getAttempts`.
+ */
+async function serviceReadAttempts(env: Env, boardId: string, cardId: string, service: ServicePrincipal): Promise<Response> {
+  try {
+    const gate = await authorizeServiceQueuer(env, boardId, service);
+    if (gate instanceof Response) return gate;
+    const stub = boardStub(env, service.tenantId, boardId);
+    const card = await stub.getCardView(cardId);
+    if (!card.ok) return Response.json({ error: card }, { status: statusForCode(card.code) });
+    if (card.value.queuedBy !== service.principalId) {
+      return Response.json(
+        { error: { code: 'FORBIDDEN', message: 'this principal did not queue this card' } },
+        { status: 403 },
+      );
+    }
+    return Response.json({ attempts: await stub.getAttempts(cardId) });
+  } catch (err) {
+    return unexpected(err);
+  }
+}
+
+/**
  * POST /v1/boards/:id/cards from a SERVICE principal — superwitness's canary queueing its nightly
  * card. Reached only from the coordinator-route fallback below, only for `POST cards`, and only
  * once no agent credential resolved; every other route still refuses a service.
@@ -464,19 +512,11 @@ async function serviceQueueCard(
   service: ServicePrincipal,
 ): Promise<Response> {
   const forbid = (code: string, message: string) => Response.json({ error: { code, message } }, { status: 403 });
-  if (!service.scopes.includes(CARDS_QUEUE)) return forbid('FORBIDDEN', 'this principal does not hold cards:queue');
   try {
-    // The caller's OWN tenant: a board in another tenant is simply not found.
     const stub = boardStub(env, service.tenantId, boardId);
-    const entry = await stub.getQueuer(service.principalId);
-    if (!entry) {
-      // `getQueuer` answers null for an unknown board too; tell the two apart only on refusal.
-      const board = await stub.listQueuers();
-      if (!board.ok && board.code === 'NOT_INITIALIZED') {
-        return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
-      }
-      return forbid('FORBIDDEN', "this principal is not on this board's queue-list");
-    }
+    const gate = await authorizeServiceQueuer(env, boardId, service);
+    if (gate instanceof Response) return gate;
+    const entry = gate;
     if (service.mayDispatch.length === 0) {
       return forbid('NO_DISPATCH_AUTHORITY', 'this service may dispatch nobody, so any card it queued could never be claimed');
     }
@@ -1845,6 +1885,12 @@ export default {
         if (boardId && rest === 'cards' && request.method === 'POST') {
           const service = await resolveHubService(request, env);
           if (service) return serviceQueueCard(request, env, boardId, service);
+        }
+        // And `GET cards/:cardId/attempts` exactly: the same service reading back its own card.
+        const attemptsRoute = boardId && request.method === 'GET' ? rest.match(/^cards\/([^/]+)\/attempts$/) : null;
+        if (attemptsRoute) {
+          const service = await resolveHubService(request, env);
+          if (service) return serviceReadAttempts(env, boardId!, attemptsRoute[1]!, service);
         }
         const resolved = await resolveHumanOrRefuse();
         if (resolved instanceof Response) return resolved;
