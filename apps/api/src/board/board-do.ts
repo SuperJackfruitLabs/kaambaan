@@ -3953,7 +3953,8 @@ export class BoardDO extends DurableObject<Env> {
   /**
    * A run as evidence (superwitness contract C4; charter evidence-joins-on-the-work-run decisions
    * 4 and 5). Read-only. Gates: those this run opened, plus legacy gates (null run_id) on the same
-   * card and the run's stage. Usage: `unreported` with null numbers when no record exists — a
+   * card whose `stage_key` is the run's stage or whose `return_stage_key` is (advanceCard opens a
+   * gate on the NEXT stage and records the stage the work came from as its return stage). Usage: `unreported` with null numbers when no record exists — a
    * bridge-dispatched run's cost is not zero, it is unknown.
    */
   async getRunEvidence(runId: string): Promise<Result<RunEvidence>> {
@@ -3969,10 +3970,11 @@ export class BoardDO extends DurableObject<Env> {
 
     const gates = this.sql
       .exec(
-        `SELECT * FROM gates WHERE card_id = ? AND (run_id = ? OR (run_id IS NULL AND stage_key = ?))
+        `SELECT * FROM gates WHERE card_id = ? AND (run_id = ? OR (run_id IS NULL AND (stage_key = ? OR return_stage_key = ?)))
          ORDER BY created_at ASC, rowid ASC`,
         cardId,
         runId,
+        row.stage_key as string,
         row.stage_key as string,
       )
       .toArray()

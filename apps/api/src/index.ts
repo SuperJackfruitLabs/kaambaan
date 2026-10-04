@@ -431,7 +431,7 @@ async function runEvidence(request: Request, env: Env, boardId: string, runId: s
     }
     if (result.code === 'NOT_INITIALIZED') return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
     if (result.code === 'RUN_NOT_FOUND') return Response.json({ error: { code: 'RUN_NOT_FOUND' } }, { status: 404 });
-    return Response.json({ error: result }, { status: statusForCode(result.code) });
+    return Response.json({ error: { code: result.code } }, { status: statusForCode(result.code) });
   } catch (err) {
     return unexpected(err);
   }

@@ -340,7 +340,11 @@ export interface ServicePrincipal {
   /** The hub's `prn_…`. Not a local user or agent: a service has neither here. */
   principalId: string;
   tenantId: string;
-  /** From the token's `scope` claim, split on spaces. Empty when absent. */
+  /**
+   * From the token's `scope` claim, split on spaces. Empty when absent. These are the scopes as
+   * minted: a hub-side narrowing or revocation reaches superpipeline only when the token expires
+   * (the hub's TOKEN_TTL).
+   */
   scopes: string[];
 }
 
