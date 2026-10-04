@@ -49,7 +49,11 @@ export default defineConfig({
           items: [
             { label: 'Boards and pipelines', slug: 'use/boards' },
             { label: 'Cards and their states', slug: 'use/cards' },
+            { label: 'Planning work', slug: 'use/planning' },
+            { label: 'Recurring cards', slug: 'use/recurring' },
+            { label: 'Stage runbooks and completion', slug: 'use/runbooks' },
             { label: 'Agents and capabilities', slug: 'use/agents' },
+            { label: 'Agents that plan', slug: 'use/autonomy' },
             { label: 'Approval gates', slug: 'use/gates' },
             { label: 'People and roles', slug: 'use/people' },
             { label: 'From the terminal', slug: 'use/cli' },
