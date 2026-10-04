@@ -517,7 +517,9 @@ async function serviceQueueCard(
     const gate = await authorizeServiceQueuer(env, boardId, service);
     if (gate instanceof Response) return gate;
     const entry = gate;
-    if (service.mayDispatch.length === 0) {
+    // Unrecognised values are ignored (the hub claim contract), so only principal ids count.
+    const grant = service.mayDispatch.filter((p) => /^prn_[0-9a-f]{20}$/.test(p));
+    if (grant.length === 0) {
       return forbid('NO_DISPATCH_AUTHORITY', 'this service may dispatch nobody, so any card it queued could never be claimed');
     }
 
@@ -545,7 +547,7 @@ async function serviceQueueCard(
       priority: body.priority,
       dueAt: body.dueAt,
       ownerUserId: entry.addedBy,
-      queuedGrant: service.mayDispatch,
+      queuedGrant: grant,
       queuedBy: service.principalId,
       // Null: no superpipeline agent queued this. `queuedBy` alone names the service.
       queuedByAgentId: null,

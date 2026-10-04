@@ -219,4 +219,15 @@ describe('BoardDO.getQueuer — the lookup card creation will use', () => {
       expect(await doi.getQueuer(PRN)).toBeNull();
     });
   });
+
+  it("deleting the board empties its queue-list: destroy() leaves no listed service behind", async () => {
+    const b = await board();
+    await add(b, ADMIN, PRN);
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${TENANT}:${b}`)) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (doi: BoardDO) => {
+      expect(await doi.getQueuer(PRN)).not.toBeNull();
+      await doi.destroy();
+      expect(await doi.getQueuer(PRN)).toBeNull();
+    });
+  });
 });

@@ -67,16 +67,30 @@ describe("positionals", () => {
   });
 });
 
+const VALID = "prn_45e839063d7b4a588152";
+
 describe("queuerAction", () => {
+  it("refuses an id that is not a principal id, for --add and --remove, before it reaches a URL", () => {
+    for (const bad of ["..", "%2e%2e", "../cards/x", "prn_x", "prn_45e839063d7b4a588152/..", "", "PRN_45E839063D7B4A588152"]) {
+      for (const f of ["--add", "--remove"] as const) {
+        const r = queuerAction(["brd_1", `${f}=${bad}`]);
+        expect(r.kind === "invalid" || r.kind === "missing").toBe(true);
+        expect(r.kind).not.toBe("add");
+        expect(r.kind).not.toBe("remove");
+      }
+    }
+    expect(queuerAction(["brd_1", "--remove", ".."])).toEqual({ kind: "invalid", flag: "--remove", value: ".." });
+    expect(queuerAction(["brd_1", "--add", "../cards/x"])).toEqual({ kind: "invalid", flag: "--add", value: "../cards/x" });
+  });
   it("is a list when neither flag is given", () => {
     expect(queuerAction(["brd_1"])).toEqual({ kind: "list" });
   });
   it("reads --add and --remove in both spellings", () => {
-    expect(queuerAction(["brd_1", "--add", "prn_x"])).toEqual({ kind: "add", principalId: "prn_x" });
-    expect(queuerAction(["brd_1", "--remove=prn_x"])).toEqual({ kind: "remove", principalId: "prn_x" });
+    expect(queuerAction(["brd_1", "--add", VALID])).toEqual({ kind: "add", principalId: VALID });
+    expect(queuerAction(["brd_1", "--remove=" + VALID])).toEqual({ kind: "remove", principalId: VALID });
   });
   it("refuses both flags together", () => {
-    expect(queuerAction(["brd_1", "--add", "prn_a", "--remove", "prn_b"])).toEqual({ kind: "conflict" });
+    expect(queuerAction(["brd_1", "--add", VALID, "--remove", VALID])).toEqual({ kind: "conflict" });
   });
   it("refuses a flag with no value rather than listing", () => {
     expect(queuerAction(["brd_1", "--add"])).toEqual({ kind: "missing", flag: "--add" });

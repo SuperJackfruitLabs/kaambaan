@@ -2502,6 +2502,7 @@ export class BoardDO extends DurableObject<Env> {
       'push_deliveries',
       'push_configs',
       'profiles',
+      'queuers',
       'webhook_deliveries',
       'events',
       'cards',

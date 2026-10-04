@@ -243,6 +243,28 @@ describe('POST /v1/boards/:id/cards — a queue-listed service holding cards:que
     });
   });
 
+  it('mayDispatch values that are not principal ids are ignored: only-unrecognised → 403 NO_DISPATCH_AUTHORITY', async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      for (const md of [[''], ['not-a-prn'], ['', 'agt_x']]) {
+        const res = await create(b, await hubToken({ mayDispatch: md }));
+        expect(res.status).toBe(403);
+        expect((await res.json<ErrorBody>()).error.code).toBe('NO_DISPATCH_AUTHORITY');
+      }
+    });
+  });
+
+  it("the card's queuedGrant is the recognised subset of mayDispatch", async () => {
+    const b = await board();
+    await list(b);
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const res = await create(b, await hubToken({ mayDispatch: ['', KAI, 'junk'] }));
+      expect(res.status).toBe(201);
+      expect((await res.json<{ card: Card }>()).card.queuedGrant).toEqual([KAI]);
+    });
+  });
+
   it('a token with no mayDispatch claim at all is not an acceptable service credential (401)', async () => {
     const b = await board();
     await list(b);

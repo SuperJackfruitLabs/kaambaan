@@ -722,6 +722,7 @@ async function main(argv: string[]): Promise<void> {
       const action = queuerAction(rest);
       if (action.kind === "conflict") fail("--add and --remove cannot be used together.", usage);
       if (action.kind === "missing") fail(`${action.flag} needs a principal id.`, usage);
+      if (action.kind === "invalid") fail(`${action.flag} needs a principal id (prn_ and 20 hex characters), not "${action.value}".`, usage);
       if (action.kind === "add") {
         out(
           await api(`/v1/boards/${boardId}/queuers`, {

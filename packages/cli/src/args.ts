@@ -71,7 +71,11 @@ export type QueuerAction =
   | { kind: "add"; principalId: string }
   | { kind: "remove"; principalId: string }
   | { kind: "conflict" }
-  | { kind: "missing"; flag: "--add" | "--remove" };
+  | { kind: "missing"; flag: "--add" | "--remove" }
+  | { kind: "invalid"; flag: "--add" | "--remove"; value: string };
+
+/** A hub service principal id. Anything else would be spliced into a URL path, so it is refused. */
+const PRINCIPAL_ID = /^prn_[0-9a-f]{20}$/;
 
 export function queuerAction(args: string[]): QueuerAction {
   const present = (name: string) => args.some((a) => a === name || a.startsWith(`${name}=`));
@@ -80,11 +84,13 @@ export function queuerAction(args: string[]): QueuerAction {
   if (adding && removing) return { kind: "conflict" };
   if (adding) {
     const v = flag(args, "--add");
-    return v ? { kind: "add", principalId: v } : { kind: "missing", flag: "--add" };
+    if (!v) return { kind: "missing", flag: "--add" };
+    return PRINCIPAL_ID.test(v) ? { kind: "add", principalId: v } : { kind: "invalid", flag: "--add", value: v };
   }
   if (removing) {
     const v = flag(args, "--remove");
-    return v ? { kind: "remove", principalId: v } : { kind: "missing", flag: "--remove" };
+    if (!v) return { kind: "missing", flag: "--remove" };
+    return PRINCIPAL_ID.test(v) ? { kind: "remove", principalId: v } : { kind: "invalid", flag: "--remove", value: v };
   }
   return { kind: "list" };
 }

@@ -83,6 +83,7 @@ documented statement will fail CI if it stops being true.
 | **A token minted from a device credential (`amr: ["device"]`) authenticates API calls but never becomes a session here** | `apps/api/test/hub-signin.test.ts` |
 | **A hub token must name THIS plane in `aud`, not merely the issuer — a token minted for another client, or another product on the same issuer, is refused** | `apps/api/test/hub-jwt-audience.test.ts` |
 | **`POST /v1/boards` answers a malformed body with 400 and a message naming the field the caller got wrong, never a 500 from inside the board** | `apps/api/test/board-create-validation.test.ts` |
+| **A service token reaches only run evidence, card create on a board whose queue-list names it, and the attempts of cards it queued** | `apps/api/test/service-card-queue.test.ts`, `apps/api/test/run-evidence.test.ts` |
 
 CI (`.github/workflows/ci.yml`) runs `pnpm typecheck` + `pnpm test`, and the Playwright e2e, on
 every PR. Both must pass before merge.
