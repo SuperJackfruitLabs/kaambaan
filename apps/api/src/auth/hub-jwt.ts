@@ -108,6 +108,11 @@ export interface HubClaims extends JWTPayload {
    */
   email?: string;
   email_verified?: boolean;
+  /**
+   * OAuth's space-delimited scope list — agentpod token_claims.json v7, `conditional`. Read only by
+   * `resolveHubService`. Absent means no scope; a value this plane does not know is ignored.
+   */
+  scope?: string;
 }
 
 export interface VerifyOptions {
