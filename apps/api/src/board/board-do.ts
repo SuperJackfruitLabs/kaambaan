@@ -569,6 +569,12 @@ export interface RunEvidenceGate {
   decision: 'approved' | 'changes_requested' | 'rejected' | null;
   decided_by: string | null;
   produced_by: string;
+  /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+  produced_by_principal_id: string | null;
+  /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+  decided_by_principal_id: string | null;
+  /** Hub token `sub` the decider is known by, set only when `decided_by_principal_id` is null. Filled by the Worker. */
+  decided_by_hub_sub: string | null;
   created_at: string;
   resolved_at: string | null;
 }
@@ -577,6 +583,8 @@ export interface RunEvidenceGate {
 export interface RunEvidence {
   run: {
     id: string; board_id: string; card_id: string; stage_key: string; agent_id: string;
+    /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+    agent_principal_id: string | null;
     status: string; outcome: string | null; started_at: string; ended_at: string | null;
   };
   card: { id: string; title: string; stage_key: string };
@@ -3976,6 +3984,10 @@ export class BoardDO extends DurableObject<Env> {
         decision: g.decision ? (EVIDENCE_DECISION[g.decision as string] ?? null) : null,
         decided_by: (g.decided_by as string | null) ?? null,
         produced_by: g.produced_by as string,
+        // Not resolved here: the Durable Object has no catalog. The Worker fills these in.
+        produced_by_principal_id: null,
+        decided_by_principal_id: null,
+        decided_by_hub_sub: null,
         created_at: g.created_at as string,
         resolved_at: (g.resolved_at as string | null) ?? null,
       }));
@@ -4002,6 +4014,7 @@ export class BoardDO extends DurableObject<Env> {
           card_id: cardId,
           stage_key: row.stage_key as string,
           agent_id: row.agent_id as string,
+          agent_principal_id: null,
           status: row.status as string,
           outcome: (row.outcome as string | null) ?? null,
           started_at: row.started_at as string,

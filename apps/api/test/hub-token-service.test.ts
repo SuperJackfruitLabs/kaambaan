@@ -8,6 +8,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { setupCatalog } from './helpers/catalog';
 import { resolveHubService } from '../src/auth/resolve';
 import { __resetJwksCacheForTests } from '../src/auth/hub-jwt';
+import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
 const ISSUER = 'https://issuer-svc.test';
 const PLANE = 'https://api.test';
@@ -25,20 +26,10 @@ beforeAll(async () => {
   await env.DB.prepare(`UPDATE tenants SET external_source='agentpod', external_id=? WHERE id=?`).bind(FLEET, TENANT).run();
 });
 
-async function withIssuer<T>(fn: () => Promise<T>): Promise<T> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
+/** Each call starts from a cold JWKS cache. */
+function withIssuer<T>(fn: () => Promise<T>): Promise<T> {
   __resetJwksCacheForTests();
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
-    String(input) === `${ISSUER}/api/auth/jwks`
-      ? new Response(jwksBody, { headers: { 'content-type': 'application/json' } })
-      : realFetch(input as RequestInfo, init)) as typeof fetch;
-  try {
-    return await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
+  return withHubIssuer(ISSUER, jwksBody, fn);
 }
 
 const token = (over: Record<string, unknown>) =>

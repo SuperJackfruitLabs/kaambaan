@@ -27,6 +27,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { setupCatalog } from './helpers/catalog';
 import { resolveHubAgent } from '../src/auth/resolve';
 import { createAgent, setAgentExternalMapping } from '../src/db/catalog';
+import { withIssuer } from './helpers/hub-issuer';
 
 const ISSUER = 'https://issuer.test';
 
@@ -47,24 +48,6 @@ beforeAll(async () => {
   signingKey = pair.privateKey;
   jwksBody = JSON.stringify({ keys: [{ ...(await exportJWK(pair.publicKey)), alg: 'EdDSA', kid: 'hta-kid' }] });
 });
-
-async function withIssuer(fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
-}
 
 async function hubToken(over: Record<string, unknown>): Promise<string> {
   return new SignJWT({ tenant: FLEET, ...over })
@@ -99,7 +82,7 @@ describe('resolving an agent-kind hub token', () => {
     });
     await mapTenant(FLEET, 'tnt_hta');
 
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken({ sub: 'prn_0000000000000000hbtaA', principalKind: 'agent' });
       const resolved = await resolveHubAgent(req(token), env);
 
@@ -128,7 +111,7 @@ describe('resolving an agent-kind hub token', () => {
     const OTHER_FLEET = 'fleet_0000000000000000othr';
     await mapTenant(OTHER_FLEET, 'tnt_other_fleet');
 
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       // sub resolves to an agent in tnt_hta, but the claim's own tenant maps to tnt_other_fleet.
       const token = await hubToken({ sub: 'prn_0000000000000000wrong', principalKind: 'agent', tenant: OTHER_FLEET });
       expect(await resolveHubAgent(req(token), env)).toBeNull();
@@ -136,7 +119,7 @@ describe('resolving an agent-kind hub token', () => {
   });
 
   it('refuses a sub that maps to no local agent — not admitted with a null agent', async () => {
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken({ sub: 'prn_nobodyhome00000000000', principalKind: 'agent' });
       expect(await resolveHubAgent(req(token), env)).toBeNull();
     });
@@ -151,20 +134,20 @@ describe('resolving an agent-kind hub token', () => {
       externalSource: 'org-plane',
     });
 
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken({ sub: 'prn_humansub000000000000', principalKind: 'human' });
       expect(await resolveHubAgent(req(token), env)).toBeNull();
     });
   });
 
   it('refuses an invalid token', async () => {
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       expect(await resolveHubAgent(req('not-a-jwt'), env)).toBeNull();
     });
   });
 
   it('leaves a spa_ token untouched — it is not a JWT candidate for this path', async () => {
-    await withIssuer(async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       expect(await resolveHubAgent(req('spa_something'), env)).toBeNull();
     });
   });
@@ -175,7 +158,7 @@ describe('resolving an agent-kind hub token', () => {
       externalId: 'prn_standalone000000000',
       externalSource: 'org-plane',
     });
-    // No withIssuer() here — HUB_ISSUER is unset, as it is on a real standalone board.
+    // No withIssuer(ISSUER, jwksBody, ) here — HUB_ISSUER is unset, as it is on a real standalone board.
     const token = await new SignJWT({ sub: 'prn_standalone000000000', principalKind: 'agent', tenant: FLEET })
       .setProtectedHeader({ alg: 'EdDSA', kid: 'hta-kid' })
       .setIssuedAt()

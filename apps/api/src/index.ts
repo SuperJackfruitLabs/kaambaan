@@ -43,7 +43,7 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor } from './db/catalog';
 import { authorizeAgentQueue } from './auth/agent-queue';
 import { stagePatchRefusal } from './auth/scopes';
 import {
@@ -406,7 +406,29 @@ async function runEvidence(request: Request, env: Env, boardId: string, runId: s
   }
   try {
     const result = await boardStub(env, service.tenantId, boardId).getRunEvidence(runId);
-    if (result.ok) return Response.json(result.value);
+    if (result.ok) {
+      const ev = result.value;
+      const ids = await principalIdsFor(env.DB, service.tenantId, [
+        ev.run.agent_id,
+        ...ev.gates.flatMap((g) => [g.produced_by, g.decided_by]),
+      ]);
+      const subs = await hubSubjectsFor(env.DB, ev.gates.map((g) => g.decided_by));
+      const prn = (local: string | null) => (local ? ids.get(local) ?? null : null);
+      return Response.json({
+        ...ev,
+        run: { ...ev.run, agent_principal_id: prn(ev.run.agent_id) },
+        gates: ev.gates.map((g) => {
+          const decidedBy = prn(g.decided_by);
+          return {
+            ...g,
+            produced_by_principal_id: prn(g.produced_by),
+            decided_by_principal_id: decidedBy,
+            // Only when there is no principal id: one way to name the judge, never two.
+            decided_by_hub_sub: decidedBy === null && g.decided_by ? subs.get(g.decided_by) ?? null : null,
+          };
+        }),
+      });
+    }
     if (result.code === 'NOT_INITIALIZED') return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
     if (result.code === 'RUN_NOT_FOUND') return Response.json({ error: { code: 'RUN_NOT_FOUND' } }, { status: 404 });
     return Response.json({ error: result }, { status: statusForCode(result.code) });

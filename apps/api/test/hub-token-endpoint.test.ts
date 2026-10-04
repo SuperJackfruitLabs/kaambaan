@@ -1,6 +1,7 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
+import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
 /**
  * `GET /v1/agents` accepting a hub-issued token — the first endpoint to do so
@@ -201,23 +202,7 @@ describe('GET /v1/agents with a hub-issued token', () => {
    * `resolveHubAgent` has refused the converse from the start ("a human's token must never
    * double as an agent credential"). These two cases hold the mirror of that.
    */
-  async function withIssuer(fn: () => Promise<void>): Promise<void> {
-    const realFetch = globalThis.fetch;
-    (env as unknown as Record<string, unknown>).HUB_ISSUER = issuerOrigin;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url === `${issuerOrigin}/api/auth/jwks`) {
-        return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-      }
-      return realFetch(input as RequestInfo, init);
-    }) as typeof fetch;
-    try {
-      await fn();
-    } finally {
-      globalThis.fetch = realFetch;
-      delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-    }
-  }
+  const withIssuer = (fn: () => Promise<void>) => withHubIssuer(issuerOrigin, jwksBody, fn);
 
   /** Exactly what the station-token exchange mints: a bare principal id, kind `agent`. */
   const stationToken = () =>

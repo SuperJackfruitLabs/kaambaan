@@ -4,6 +4,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 import { addMember } from '../src/db/members';
 import { createAgent, setTenantExternalMapping, setUserExternalMapping } from '../src/db/catalog';
+import { withIssuer } from './helpers/hub-issuer';
 
 /**
  * Configuring an agent with a hub token.
@@ -39,24 +40,6 @@ function newIssuer() {
   return issuerOnce;
 }
 
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
-}
-
 async function hubToken(signingKey: CryptoKey, sub: string): Promise<string> {
   return new SignJWT({ sub, principalKind: 'human', tenant: FLEET })
     .setProtectedHeader({ alg: 'EdDSA', kid: KID })
@@ -84,7 +67,7 @@ describe('a hub token configures an agent, and still cannot touch its credential
     await linkedOwner();
     const agent = await createAgent(env.DB, TENANT, { name: 'Coordinator', capabilities: ['command'] });
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, ownerPrincipal);
       const res = await SELF.fetch(`${PLANE}/v1/agents/${agent.id}`, {
         method: 'PATCH',
@@ -103,7 +86,7 @@ describe('a hub token configures an agent, and still cannot touch its credential
     await linkedOwner();
     const agent = await createAgent(env.DB, TENANT, { name: 'Restaffable', capabilities: ['research'] });
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, ownerPrincipal);
       const res = await SELF.fetch(`${PLANE}/v1/agents/${agent.id}`, {
         method: 'PATCH',
@@ -118,7 +101,7 @@ describe('a hub token configures an agent, and still cannot touch its credential
     await linkedOwner();
     const agent = await createAgent(env.DB, TENANT, { name: 'No new creds', capabilities: ['command'] });
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, ownerPrincipal);
       const res = await SELF.fetch(`${PLANE}/v1/agents/${agent.id}/tokens`, {
         method: 'POST',
@@ -133,7 +116,7 @@ describe('a hub token configures an agent, and still cannot touch its credential
     await linkedOwner();
     const agent = await createAgent(env.DB, TENANT, { name: 'Undeletable', capabilities: ['command'] });
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, ownerPrincipal);
       const res = await SELF.fetch(`${PLANE}/v1/agents/${agent.id}`, { method: 'DELETE', headers: auth(token) });
       expect(res.status).toBe(401);
@@ -148,7 +131,7 @@ describe('a hub token configures an agent, and still cannot touch its credential
     await linkedOwner();
     const agent = await createAgent(env.DB, TENANT, { name: 'Unmappable', capabilities: ['command'] });
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, ownerPrincipal);
       const res = await SELF.fetch(`${PLANE}/v1/agents/${agent.id}`, {
         method: 'PATCH',

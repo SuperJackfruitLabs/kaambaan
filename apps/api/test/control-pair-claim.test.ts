@@ -3,6 +3,7 @@ import { describe, it, expect, afterEach, beforeAll } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { valuePermitsAgent, grantPermitsAgent } from '../src/auth/grant-match';
 import type { BoardStub } from '../src/board/board-do';
+import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
 /**
  * The control pair, enforced where work is handed out.
@@ -80,7 +81,6 @@ const PLANE = 'https://api.test';
 const FLEET = 'fleet_00000000000000000042';
 let signingKey: CryptoKey;
 let jwksBody: string;
-let realFetch: typeof fetch;
 
 beforeAll(async () => {
   const pair = await generateKeyPair('EdDSA', { extractable: true });
@@ -101,24 +101,13 @@ async function tokenGranting(mayDispatch: string[]) {
 
 /** Point the Worker at the fake issuer and map the tenant, for one test. */
 async function withIssuer(tenantId: string, fn: () => Promise<void>) {
-  realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'CP')`)
     .bind(tenantId, `slug-${tenantId}`).run();
   await env.DB.prepare(`UPDATE tenants SET external_source='agentpod', external_id=? WHERE id=?`)
     .bind(FLEET, tenantId).run();
   try {
-    await fn();
+    await withHubIssuer(ISSUER, jwksBody, fn);
   } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
     await env.DB.prepare(`UPDATE tenants SET external_source=NULL, external_id=NULL WHERE id=?`).bind(tenantId).run();
   }
 }

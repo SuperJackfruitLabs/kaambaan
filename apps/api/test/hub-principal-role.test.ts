@@ -16,6 +16,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { resolveHubUser } from '../src/auth/resolve';
 import { addMember } from '../src/db/members';
 import { setTenantExternalMapping, setUserExternalMapping } from '../src/db/catalog';
+import { withIssuer } from './helpers/hub-issuer';
 
 const ISSUER = 'https://issuer.test';
 
@@ -45,22 +46,6 @@ function newIssuer() {
   return issuerOnce;
 }
 
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
-}
-
 async function hubToken(signingKey: CryptoKey, sub: string, fleet: string = FLEET): Promise<string> {
   return new SignJWT({ sub, principalKind: 'human', tenant: fleet })
     .setProtectedHeader({ alg: 'EdDSA', kid: 'hpr-kid' })
@@ -86,7 +71,7 @@ describe('resolveHubUser reads the linked-principal mapping', () => {
     await setUserExternalMapping(env.DB, user.userId, { externalId: 'prn_1', externalSource: 'agentpod' });
 
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const p = await resolveHubUser(req(await hubToken(signingKey, 'prn_1')), env);
       expect(p?.role).toBe('owner');
       expect(p?.userId, 'the local usr_ id, not the principal id').toBe(user.userId);
@@ -100,7 +85,7 @@ describe('resolveHubUser reads the linked-principal mapping', () => {
     await setTenantExternalMapping(env.DB, TENANT, { externalId: FLEET, externalSource: 'agentpod' });
 
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const p = await resolveHubUser(req(await hubToken(signingKey, 'prn_unknown')), env);
       expect(p?.role).toBe('member');
       expect(p?.userId).toBe('prn_unknown');
@@ -123,7 +108,7 @@ describe('resolveHubUser reads the linked-principal mapping', () => {
     await setUserExternalMapping(env.DB, user.userId, { externalId: 'prn_2', externalSource: 'agentpod' });
 
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const p = await resolveHubUser(req(await hubToken(signingKey, 'prn_2', OTHER_FLEET)), env);
       expect(p?.tenantId).toBe(OTHER);
       expect(p?.role, 'linked, but not a member here — member, not owner').toBe('member');

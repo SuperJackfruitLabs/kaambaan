@@ -2,6 +2,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { updateAgent } from '../src/db/catalog';
+import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
 /**
  * A coordinator agent queues work.
@@ -23,7 +24,6 @@ const PLANE = 'https://api.test';
 const FLEET = 'fleet_00000000000000000099';
 let signingKey: CryptoKey;
 let jwksBody: string;
-let realFetch: typeof fetch;
 
 beforeAll(async () => {
   const pair = await generateKeyPair('EdDSA', { extractable: true });
@@ -76,15 +76,6 @@ async function agentToken(principalId: string, mayDispatch?: string[]) {
 }
 
 async function withIssuer(tenantId: string, fn: () => Promise<void>) {
-  realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'Q')`)
     .bind(tenantId, `slug-${tenantId}`)
     .run();
@@ -92,10 +83,8 @@ async function withIssuer(tenantId: string, fn: () => Promise<void>) {
     .bind(FLEET, tenantId)
     .run();
   try {
-    await fn();
+    await withHubIssuer(ISSUER, jwksBody, fn);
   } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
     await env.DB.prepare(`UPDATE tenants SET external_source=NULL, external_id=NULL WHERE id=?`).bind(tenantId).run();
   }
 }
