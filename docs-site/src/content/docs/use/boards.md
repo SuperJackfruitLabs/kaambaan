@@ -8,9 +8,9 @@ A board is a pipeline plus its cards. Start from a template or build the stages 
 ## Designing a pipeline
 
 Each stage declares who works it — a person, a capability, or one named agent — and optionally a
-WIP limit and an approval gate.
+WIP limit, an approval gate, a runbook, and what it demands before it believes a run finished.
 
-Two rules worth knowing before you design:
+Three rules worth knowing before you design:
 
 **The first stage should be one a person controls.** A card lands there the moment it is created,
 and an agent lane as the first stage makes it claimable before anyone has looked at it. Every
@@ -18,6 +18,12 @@ shipped template follows this.
 
 **A stage key is identity.** Cards, runs and gates all carry it. The display name can change
 whenever you like; the key cannot, for the same reason you would not renumber invoices.
+
+**The last stage decides whether a card can ever finish.** If the final stage is human-owned and
+declares no approval gate, no agent can claim there and no gate will ever ask anyone — so arriving
+there *is* finishing, and the card completes on arrival. That is what you want from a stage called
+`done`. If you want somebody to sign instead, give the stage an approval gate; if you want an agent
+to act there, give it an owner.
 
 ## Changing it later
 
@@ -33,6 +39,27 @@ Order is a property of the list, so a reorder is sent as the whole pipeline rath
 The change is validated before anything is written, so a rejected edit never leaves the board
 half-changed.
 
+**Prefer changing one stage at a time.** A whole-pipeline write discards whatever it was not told
+about — it has destroyed a board's stage instructions once — so editing a single stage goes through
+its own route and leaves every other stage, including a concurrent edit to one, alone.
+
+## Runbooks and completion
+
+A stage can carry prose telling whoever claims a card there what to do, and a declaration of what
+the board must see before it believes the stage is finished. Setting both is the difference between
+a board that records what it was told and one that records what it saw.
+
+This matters most at the **human** stages. A stage called `published` or `signed-off` is where work
+reaches the world, and if nothing there says whose act it is, the card arrives and waits — a
+pipeline that looks automated, stopping at the step nobody was told to do.
+
+See [Stage runbooks and completion](/use/runbooks/).
+
+## Recurring work
+
+A board can carry schedules: rules that create a card on a cadence. Configured in board settings or
+from the terminal — see [Recurring cards](/use/recurring/).
+
 ## Watching a board
 
 **Plan** is the pipeline: lanes with cards, or a sortable list with grouping. Below 900px the
@@ -43,7 +70,7 @@ rather than squeezed.
 
 | section | what it holds |
 |---|---|
-| Needs you | pending gates, waiting questions, over-budget cards, failed runs |
+| Needs you | pending gates, waiting questions, over-budget cards, failed runs — everything parked on a person, each saying why |
 | Running | what agents hold right now |
 | Spend | what it has cost, beside the caps that bound it |
 | Activity | the chronological record |
