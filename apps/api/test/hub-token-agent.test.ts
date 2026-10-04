@@ -158,7 +158,7 @@ describe('resolving an agent-kind hub token', () => {
       externalId: 'prn_standalone000000000',
       externalSource: 'org-plane',
     });
-    // No withIssuer(ISSUER, jwksBody, ) here — HUB_ISSUER is unset, as it is on a real standalone board.
+    // No withIssuer() here — HUB_ISSUER is unset, as it is on a real standalone board.
     const token = await new SignJWT({ sub: 'prn_standalone000000000', principalKind: 'agent', tenant: FLEET })
       .setProtectedHeader({ alg: 'EdDSA', kid: 'hta-kid' })
       .setIssuedAt()

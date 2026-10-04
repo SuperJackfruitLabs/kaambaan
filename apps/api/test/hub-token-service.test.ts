@@ -6,7 +6,7 @@ import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { setupCatalog } from './helpers/catalog';
-import { resolveHubService } from '../src/auth/resolve';
+import { resolveHubService, resolveHubUser, resolveHubAgent } from '../src/auth/resolve';
 import { __resetJwksCacheForTests } from '../src/auth/hub-jwt';
 import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
@@ -54,6 +54,12 @@ describe('resolveHubService', () => {
     for (const kind of ['human', 'agent']) {
       expect(await withIssuer(async () => resolveHubService(req(await token({ principalKind: kind, scope: 'evidence:read' })), env))).toBeNull();
     }
+  });
+
+  it('a service token is not a user or an agent either, even carrying evidence:read', async () => {
+    const t = await token({ scope: 'evidence:read' });
+    expect(await withIssuer(async () => resolveHubUser(req(t), env))).toBeNull();
+    expect(await withIssuer(async () => resolveHubAgent(req(t), env))).toBeNull();
   });
 
   it('an unmapped fleet is refused', async () => {

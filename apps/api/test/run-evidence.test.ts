@@ -154,6 +154,26 @@ describe('GET /v1/boards/:id/runs/:runId/evidence', () => {
     });
   });
 
+  it("a legacy gate opened by advanceCard (next stage, return_stage_key = the run's stage) is included", async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const { boardId, runId } = await aRun();
+      const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${TENANT}:${boardId}`)) as unknown as DurableObjectStub<BoardDO>;
+      await runInDurableObject(stub, async (_b: BoardDO, state) => {
+        const cardId = state.storage.sql.exec(`SELECT card_id FROM runs WHERE id = ?`, runId).toArray()[0]!.card_id as string;
+        for (const [id, stage, ret] of [['gate_legacyadv', 'review', 'research'], ['gate_legacyunrel', 'review', 'publish']]) {
+          state.storage.sql.exec(
+            `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at)
+             VALUES (?, ?, ?, ?, 'pending', 'agt_researcher', '[]', ?)`,
+            id, cardId, stage, ret, '2026-10-01T00:00:00.000Z',
+          );
+        }
+      });
+      const body = await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
+      expect(body.gates.map((g) => g.id)).toEqual(['gate_legacyadv']);
+      expect(body.gates[0]).toMatchObject({ run_id: null, stage_key: 'review', status: 'pending' });
+    });
+  });
+
   it('an unknown run is 404 RUN_NOT_FOUND; an unknown board is 404 BOARD_NOT_FOUND', async () => {
     await withIssuer(ISSUER, jwksBody, async () => {
       const { boardId } = await aRun();
@@ -221,6 +241,23 @@ describe('GET /v1/boards/:id/runs/:runId/evidence', () => {
   });
 });
 
+describe('an evidence:read service token reaches nothing else', () => {
+  it('is refused on the board, gate-resolve and claim routes', async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
+      const { boardId } = await aRun({ complete: true });
+      const t = await hubToken();
+      const auth = { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' };
+      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: auth })).status).toBe(401);
+      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/gate_x/resolve`, {
+        method: 'POST', headers: auth, body: JSON.stringify({ decision: 'approve' }),
+      })).status).toBe(401);
+      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}/claims`, {
+        method: 'POST', headers: auth, body: JSON.stringify({ capabilities: ['research'] }),
+      })).status).toBe(401);
+    });
+  });
+});
+
 describe('principal ids on the evidence', () => {
   it('names the executing agent and the gate producer/decider when mapped; null when not', async () => {
     await withIssuer(ISSUER, jwksBody, async () => {
@@ -236,22 +273,26 @@ describe('principal ids on the evidence', () => {
       const { boardId } = await (await SELF.fetch('https://api.test/v1/boards', {
         method: 'POST', headers: dev(), body: JSON.stringify({ name: 'ev-prn', stages: PIPELINE }),
       })).json<{ boardId: string }>();
-      await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, { method: 'POST', headers: dev(), body: JSON.stringify({ title: 't' }) });
-      const claim = await (await SELF.fetch(`https://api.test/v1/boards/${boardId}/claims`, {
+      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}/cards`, { method: 'POST', headers: dev(), body: JSON.stringify({ title: 't' }) })).status).toBeLessThan(300);
+      const claimRes = await SELF.fetch(`https://api.test/v1/boards/${boardId}/claims`, {
         method: 'POST', headers: as, body: JSON.stringify({ capabilities: ['research'] }),
-      })).json<{ runId: string; leaseEpoch: number }>();
-      await SELF.fetch(`https://api.test/v1/boards/${boardId}/runs/${claim.runId}/complete`, {
+      });
+      expect(claimRes.status).toBe(200);
+      const claim = await claimRes.json<{ runId: string; leaseEpoch: number }>();
+      const doneRes = await SELF.fetch(`https://api.test/v1/boards/${boardId}/runs/${claim.runId}/complete`, {
         method: 'POST', headers: as, body: JSON.stringify({ leaseEpoch: claim.leaseEpoch, handoff: { summary: 'x' } }),
       });
+      expect(doneRes.status).toBe(200);
 
       let body = await (await evidence(boardId, claim.runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
       expect(RunEvidence.safeParse(body).error).toBeUndefined();
       expect(body.run.agent_principal_id).toBe(AGENT_PRN);
       expect(body.gates[0]).toMatchObject({ produced_by_principal_id: AGENT_PRN, decided_by_principal_id: null });
 
-      await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${body.gates[0]!.id}/resolve`, {
+      const resolved = await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${body.gates[0]!.id}/resolve`, {
         method: 'POST', headers: dev(TENANT, reviewer.id), body: JSON.stringify({ decision: 'reject' }),
       });
+      expect(resolved.status).toBe(200);
       body = await (await evidence(boardId, claim.runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
       expect(body.gates[0]).toMatchObject({
         decision: 'rejected', decided_by: reviewer.id, decided_by_principal_id: USER_PRN, decided_by_hub_sub: null,
@@ -266,9 +307,10 @@ describe('principal ids on the evidence', () => {
       await setUserExternalMapping(env.DB, linked.id, { externalId: 'baSub0000000001', externalSource: 'agentpod' });
       const { boardId, runId } = await aRun({ complete: true });
       const gateId = (await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>()).gates[0]!.id;
-      await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${gateId}/resolve`, {
+      const resolved = await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${gateId}/resolve`, {
         method: 'POST', headers: dev(TENANT, linked.id), body: JSON.stringify({ decision: 'approve' }),
       });
+      expect(resolved.status).toBe(200);
       const body = await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
       expect(RunEvidence.safeParse(body).error).toBeUndefined();
       expect(body.gates[0]).toMatchObject({
@@ -282,10 +324,12 @@ describe('principal ids on the evidence', () => {
       for (const [decider, expected] of [['rawHubSub000001', 'rawHubSub000001'], ['usr_nolinkatall', null]] as const) {
         const { boardId, runId } = await aRun({ complete: true });
         const gateId = (await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>()).gates[0]!.id;
-        await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${gateId}/resolve`, {
+        const resolved = await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${gateId}/resolve`, {
           method: 'POST', headers: dev(TENANT, decider), body: JSON.stringify({ decision: 'reject' }),
         });
+        expect(resolved.status).toBe(200);
         const body = await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
+        expect(RunEvidence.safeParse(body).error).toBeUndefined();
         expect(body.gates[0]).toMatchObject({ decided_by: decider, decided_by_principal_id: null, decided_by_hub_sub: expected });
       }
     });
@@ -295,6 +339,7 @@ describe('principal ids on the evidence', () => {
     await withIssuer(ISSUER, jwksBody, async () => {
       const { boardId, runId } = await aRun({ complete: true });
       const body = await (await evidence(boardId, runId, await hubToken())).json<z.infer<typeof RunEvidence>>();
+      expect(RunEvidence.safeParse(body).error).toBeUndefined();
       expect(body.gates[0]).toMatchObject({ status: 'pending', decided_by_principal_id: null, decided_by_hub_sub: null });
     });
   });
