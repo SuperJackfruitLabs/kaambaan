@@ -101,6 +101,7 @@ import {
   type ProjectState,
   type ProjectHealth,
 } from './db/projects';
+import { withRunTelemetry } from './telemetry/run-telemetry';
 
 export { BoardDO };
 
@@ -384,7 +385,7 @@ function unexpected(err: unknown): Response {
   return Response.json({ error: { message } }, { status: 500 });
 }
 
-export default {
+const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -3150,3 +3151,9 @@ export default {
     );
   },
 } satisfies ExportedHandler<Env>;
+
+export default {
+  fetch: (request: Request, env: Env): Promise<Response> => withRunTelemetry(request, () => worker.fetch(request, env)),
+  scheduled: (event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> =>
+    worker.scheduled(event, env, ctx),
+};
