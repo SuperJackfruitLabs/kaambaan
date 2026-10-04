@@ -154,3 +154,10 @@ export function renderLog(value: unknown): string {
   }
   return lines.join("\n");
 }
+
+/** A board's queuer allowlist: one line per principal, `principalId  addedBy  addedAt`. */
+export function renderQueuers(value: unknown): string {
+  const rows = list<{ principalId?: string; addedBy?: string; addedAt?: string }>(value, "queuers");
+  if (rows.length === 0) return "No queuers. `supi board-queuers <boardId> --add <principalId>` adds one.";
+  return rows.map((r) => `${r.principalId ?? ""}  ${r.addedBy ?? ""}  ${r.addedAt ?? ""}`).join("\n");
+}

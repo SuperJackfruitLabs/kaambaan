@@ -7,7 +7,7 @@
  * something a person can read, and hold the JSON to being reachable on demand.
  */
 import { describe, expect, it } from "vitest";
-import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render";
+import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject, renderQueuers } from "./render";
 
 describe("boards", () => {
   it("lists a board's id beside its name", () => {
@@ -148,5 +148,21 @@ describe("a card's log", () => {
 
   it("survives an empty log without throwing", () => {
     expect(() => renderLog({ activities: [], handoff: null, gates: [] })).not.toThrow();
+  });
+});
+
+describe("board queuers", () => {
+  it("prints one line per entry with principal, adder and time", () => {
+    const text = renderQueuers({
+      queuers: [{ principalId: "prn_45e839063d7b4a588152", addedBy: "prn_aaaaaaaaaaaaaaaaaaaa", addedAt: "2026-10-05T10:00:00Z" }],
+    });
+    expect(text.split("\n")).toHaveLength(1);
+    expect(text).toContain("prn_45e839063d7b4a588152");
+    expect(text).toContain("prn_aaaaaaaaaaaaaaaaaaaa");
+    expect(text).toContain("2026-10-05T10:00:00Z");
+  });
+
+  it("says so plainly when none are listed", () => {
+    expect(renderQueuers({ queuers: [] }).toLowerCase()).toContain("no queuers");
   });
 });

@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { flag, flags, positionals } from "./args";
+import { flag, flags, positionals, queuerAction } from "./args";
 
 describe("flag", () => {
   it("reads both spellings", () => {
@@ -64,5 +64,22 @@ describe("positionals", () => {
       "brd_1",
       "A title",
     ]);
+  });
+});
+
+describe("queuerAction", () => {
+  it("is a list when neither flag is given", () => {
+    expect(queuerAction(["brd_1"])).toEqual({ kind: "list" });
+  });
+  it("reads --add and --remove in both spellings", () => {
+    expect(queuerAction(["brd_1", "--add", "prn_x"])).toEqual({ kind: "add", principalId: "prn_x" });
+    expect(queuerAction(["brd_1", "--remove=prn_x"])).toEqual({ kind: "remove", principalId: "prn_x" });
+  });
+  it("refuses both flags together", () => {
+    expect(queuerAction(["brd_1", "--add", "prn_a", "--remove", "prn_b"])).toEqual({ kind: "conflict" });
+  });
+  it("refuses a flag with no value rather than listing", () => {
+    expect(queuerAction(["brd_1", "--add"])).toEqual({ kind: "missing", flag: "--add" });
+    expect(queuerAction(["brd_1", "--remove"])).toEqual({ kind: "missing", flag: "--remove" });
   });
 });

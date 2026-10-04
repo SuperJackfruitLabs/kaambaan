@@ -83,6 +83,10 @@ describe("verb surface", () => {
     expect(dispatched().has("agent"), "agent is not dispatched").toBe(true);
   });
 
+  it("dispatches the verb that manages who may queue cards on a board", () => {
+    expect(dispatched().has("board-queuers"), "board-queuers is not dispatched").toBe(true);
+  });
+
   it("lists exactly what it dispatches, in both directions", () => {
     expect([...listed()].sort()).toEqual([...dispatched()].sort());
   });

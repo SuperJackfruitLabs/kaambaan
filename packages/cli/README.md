@@ -105,7 +105,10 @@ somebody else's is the worst outcome available:
 
 The CLI reads boards, cards and pending gates, moves cards, lists templates, and
 creates boards with `supi create-board <name> [--template <id>] [--stages <file|->]`.
-It renders the server's decisions rather than granting authority itself.
+`supi board-queuers <boardId> [--add <principalId> | --remove <principalId>]` lists, adds or
+removes the principals (for example a service token's `prn_` id) that may queue cards on a board
+besides its members; changing the list needs board admin. It renders the server's decisions
+rather than granting authority itself.
 
 A hub identity linked to a local Superpipeline account uses that account's actual
 workspace role. An unmapped principal falls back to `member`; that fallback is

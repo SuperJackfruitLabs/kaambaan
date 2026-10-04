@@ -60,3 +60,31 @@ export function positionals(args: string[]): string[] {
   }
   return out;
 }
+
+/**
+ * What `supi board-queuers <boardId>` was asked to do. A pure function so the flag rules are
+ * testable: `flag()` cannot tell a bare `--add` from an absent one, and a bare `--add` silently
+ * falling through to a list is the wrong failure.
+ */
+export type QueuerAction =
+  | { kind: "list" }
+  | { kind: "add"; principalId: string }
+  | { kind: "remove"; principalId: string }
+  | { kind: "conflict" }
+  | { kind: "missing"; flag: "--add" | "--remove" };
+
+export function queuerAction(args: string[]): QueuerAction {
+  const present = (name: string) => args.some((a) => a === name || a.startsWith(`${name}=`));
+  const adding = present("--add");
+  const removing = present("--remove");
+  if (adding && removing) return { kind: "conflict" };
+  if (adding) {
+    const v = flag(args, "--add");
+    return v ? { kind: "add", principalId: v } : { kind: "missing", flag: "--add" };
+  }
+  if (removing) {
+    const v = flag(args, "--remove");
+    return v ? { kind: "remove", principalId: v } : { kind: "missing", flag: "--remove" };
+  }
+  return { kind: "list" };
+}

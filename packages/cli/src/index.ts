@@ -25,8 +25,8 @@
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, describeCredential, expired, inspect, refusalHint, resolveCredential, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
-import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
-import { flag, flags, positionals } from "./args.ts";
+import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject, renderQueuers } from "./render.ts";
+import { flag, flags, positionals, queuerAction } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 
 const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the same command)
@@ -95,6 +95,10 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
                                remove a schedule
   supi schedule pause <boardId> <scheduleId>
   supi schedule resume <boardId> <scheduleId>
+
+  supi board-queuers <boardId> [--add <principalId> | --remove <principalId>]
+                               who may queue cards on a board besides its members: list
+                               them, or add/remove one (board admin; prn_ ids)
 
   supi forge [<host>|none]     this workspace's forge host, shown or set
   supi agents                  the workspace's agents and what they declare
@@ -708,6 +712,31 @@ async function main(argv: string[]): Promise<void> {
       }
       if (Object.keys(body).length === 0) fail("nothing to change: pass --owner, --boards or --ceiling");
       out(await api(`/v1/agents/${pos[1]}`, { method: "PATCH", body: JSON.stringify(body) }));
+      return;
+    }
+
+    case "board-queuers": {
+      const usage = "usage: supi board-queuers <boardId> [--add <principalId> | --remove <principalId>]";
+      const boardId = pos[0];
+      if (!boardId) fail(usage);
+      const action = queuerAction(rest);
+      if (action.kind === "conflict") fail("--add and --remove cannot be used together.", usage);
+      if (action.kind === "missing") fail(`${action.flag} needs a principal id.`, usage);
+      if (action.kind === "add") {
+        out(
+          await api(`/v1/boards/${boardId}/queuers`, {
+            method: "POST",
+            body: JSON.stringify({ principalId: action.principalId }),
+          }),
+        );
+        return;
+      }
+      if (action.kind === "remove") {
+        await api(`/v1/boards/${boardId}/queuers/${action.principalId}`, { method: "DELETE" });
+        out({ removed: action.principalId }, () => `Removed ${action.principalId}.`);
+        return;
+      }
+      out(await api(`/v1/boards/${boardId}/queuers`), renderQueuers);
       return;
     }
 
