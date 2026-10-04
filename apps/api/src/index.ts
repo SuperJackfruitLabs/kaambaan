@@ -185,6 +185,10 @@ function statusForCode(code: BoardErrorCode): number {
     case 'TOO_MANY_CHILDREN':
     case 'NOTHING_TO_SPLIT':
       return 400;
+    case 'INVALID_PRINCIPAL_ID':
+      return 400;
+    case 'QUEUER_NOT_FOUND':
+      return 404;
   }
 }
 
@@ -1724,7 +1728,17 @@ export default {
       const needed: Capability =
         request.method === 'GET' || rest.startsWith('notifications/')
           ? 'read'
-          : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles' || rest.startsWith('schedules')
+          : rest === '' ||
+              rest === 'stages' ||
+              rest === 'github' ||
+              rest === 'budget' ||
+              rest === 'profiles' ||
+              rest.startsWith('schedules') ||
+              // The queue-list decides which services may put work on this board, which is the
+              // same kind of decision as the rest of the board's settings. `queuers/:principalId`
+              // (DELETE) is the same setting, so it is matched by prefix like `schedules`.
+              rest === 'queuers' ||
+              rest.startsWith('queuers/')
             ? 'manage'
             : 'work';
       return refuseByRole(user, needed) ?? user;
@@ -2603,6 +2617,41 @@ export default {
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json(result.value, { status: 201 });
+      }
+
+      // GET/POST /v1/boards/:id/queuers · DELETE /v1/boards/:id/queuers/:principalId
+      //
+      // The board's queue-list: which SERVICE principals may queue cards here. Human-only — this
+      // is not an agent route, and `resolveHubUser` refuses a service token — and gated like the
+      // other board settings: `read` to list it, `manage` to change it (`resolveHumanOrRefuse`).
+      // `addedBy`/`removedBy` are the authenticated user, never read from the body.
+      const queuersMatch = rest.match(/^queuers(?:\/([^/]+))?$/);
+      if (queuersMatch) {
+        const principalId = queuersMatch[1];
+        const fail = (r: { code: BoardErrorCode; message: string }) =>
+          Response.json({ error: { code: r.code, message: r.message } }, { status: statusForCode(r.code) });
+
+        if (request.method === 'GET' && principalId === undefined) {
+          const r = await stub.listQueuers();
+          if (!r.ok) return fail(r);
+          return Response.json({ queuers: r.value });
+        }
+        if (request.method === 'POST' && principalId === undefined) {
+          const body = (await request.json().catch(() => null)) as { principalId?: unknown } | null;
+          const id = body && typeof body === 'object' ? body.principalId : undefined;
+          if (typeof id !== 'string') {
+            return fail({ code: 'INVALID_PRINCIPAL_ID', message: '`principalId` is required and must be a string like prn_…' });
+          }
+          const r = await stub.addQueuer({ principalId: id, addedBy: user!.userId });
+          if (!r.ok) return fail(r);
+          return Response.json(r.value.queuer, { status: r.value.created ? 201 : 200 });
+        }
+        if (request.method === 'DELETE' && principalId !== undefined) {
+          const r = await stub.removeQueuer({ principalId, removedBy: user!.userId });
+          if (!r.ok) return fail(r);
+          return new Response(null, { status: 204 });
+        }
+        return Response.json({ error: 'method not allowed' }, { status: 405 });
       }
 
       // GET/POST /v1/boards/:id/schedules · PATCH/DELETE /v1/boards/:id/schedules/:scheduleId

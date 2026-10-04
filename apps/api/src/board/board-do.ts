@@ -317,6 +317,21 @@ export interface ProfileView {
   capabilities: string[];
 }
 
+/**
+ * One entry on a board's queue-list: a SERVICE principal this board accepts cards from, and the
+ * human who put it there. The list is local to the board — boards are superpipeline's, so the
+ * decision about who may queue onto one is too.
+ */
+export interface QueuerView {
+  principalId: string;
+  /** The local userId of the human who added the entry. */
+  addedBy: string;
+  addedAt: string;
+}
+
+/** A hub principal id, exactly as the hub mints it. Anything else is not a principal. */
+export const PRINCIPAL_ID_RE = /^prn_[0-9a-f]{20}$/;
+
 export interface BoardInit {
   id: string;
   tenantId: string;
@@ -978,7 +993,9 @@ export type BoardErrorCode =
   | 'ALREADY_HAS_PARENT'
   | 'CARD_BLOCKED'
   | 'TOO_MANY_CHILDREN'
-  | 'NOTHING_TO_SPLIT';
+  | 'NOTHING_TO_SPLIT'
+  | 'INVALID_PRINCIPAL_ID'
+  | 'QUEUER_NOT_FOUND';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1055,6 +1072,13 @@ export interface BoardStub {
   claim(input: { agentId: string; capabilities: string[]; maxConcurrency?: number; profileKey?: string; principalId?: string | null }): Promise<ClaimResult>;
   setProfile(input: ProfileInput): Promise<Result<{ key: string }>>;
   getProfiles(): Promise<ProfileView[]>;
+  /** The board's queue-list. `NOT_INITIALIZED` means no such board here. */
+  listQueuers(): Promise<Result<QueuerView[]>>;
+  /** Idempotent: an id already listed comes back unchanged with `created: false`. */
+  addQueuer(input: { principalId: string; addedBy: string }): Promise<Result<{ queuer: QueuerView; created: boolean }>>;
+  removeQueuer(input: { principalId: string; removedBy: string }): Promise<Result<{ ok: true }>>;
+  /** One entry by principal id, or null. What card creation consults. */
+  getQueuer(principalId: string): Promise<QueuerView | null>;
   heartbeat(input: RunVerbInput): Promise<Result<{ acknowledged: true }>>;
   postActivity(input: AgentActivityInput): Promise<Result<{ accepted: true; cardState: TaskState }>>;
   complete(input: RunVerbInput & { handoff?: JsonValue }): Promise<Result<CardView>>;
@@ -1681,6 +1705,15 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    // The queue-list (see `QueuerView`). A new table rather than a column, so `IF NOT EXISTS` is the
+    // whole guard: a board created before this existed gets an empty list on its next wake.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS queuers (
+        principal_id TEXT PRIMARY KEY,
+        added_by     TEXT NOT NULL,
+        added_at     TEXT NOT NULL
+      )`,
+    );
   }
 
   // ----- RPC: board lifecycle -----
@@ -3059,6 +3092,67 @@ export class BoardDO extends DurableObject<Env> {
         autonomyLevel: (r.autonomy_level as string | null) ?? null,
         capabilities: JSON.parse(r.capabilities_json as string) as string[],
       }));
+  }
+
+  // ----- RPC: queue-list -----
+
+  /** The board's queue-list, oldest first. */
+  async listQueuers(): Promise<Result<QueuerView[]>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    return {
+      ok: true,
+      value: this.sql
+        .exec(`SELECT * FROM queuers ORDER BY added_at ASC, principal_id ASC`)
+        .toArray()
+        .map((r) => BoardDO.queuerView(r)),
+    };
+  }
+
+  /**
+   * Put a service principal on the queue-list. Idempotent: an id already listed is returned as it
+   * stands — `addedBy`/`addedAt` keep naming whoever added it first — and nothing is logged,
+   * because nothing happened.
+   */
+  async addQueuer(input: { principalId: string; addedBy: string }): Promise<Result<{ queuer: QueuerView; created: boolean }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!PRINCIPAL_ID_RE.test(input.principalId)) {
+      return { ok: false, code: 'INVALID_PRINCIPAL_ID', message: 'principalId must look like prn_ followed by 20 lowercase hex digits' };
+    }
+    const existing = await this.getQueuer(input.principalId);
+    if (existing) return { ok: true, value: { queuer: existing, created: false } };
+    const queuer: QueuerView = { principalId: input.principalId, addedBy: input.addedBy, addedAt: this.now() };
+    this.sql.exec(
+      `INSERT INTO queuers (principal_id, added_by, added_at) VALUES (?, ?, ?)`,
+      queuer.principalId,
+      queuer.addedBy,
+      queuer.addedAt,
+    );
+    this.emit('queuer.added', { principalId: queuer.principalId, addedBy: queuer.addedBy });
+    return { ok: true, value: { queuer, created: true } };
+  }
+
+  /** Take a service principal off the queue-list. */
+  async removeQueuer(input: { principalId: string; removedBy: string }): Promise<Result<{ ok: true }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!PRINCIPAL_ID_RE.test(input.principalId)) {
+      return { ok: false, code: 'INVALID_PRINCIPAL_ID', message: 'principalId must look like prn_ followed by 20 lowercase hex digits' };
+    }
+    if (!(await this.getQueuer(input.principalId))) {
+      return { ok: false, code: 'QUEUER_NOT_FOUND', message: `${input.principalId} is not on this board's queue-list` };
+    }
+    this.sql.exec(`DELETE FROM queuers WHERE principal_id = ?`, input.principalId);
+    this.emit('queuer.removed', { principalId: input.principalId, removedBy: input.removedBy });
+    return { ok: true, value: { ok: true } };
+  }
+
+  /** One queue-list entry by principal id, or null when that principal is not on the list. */
+  async getQueuer(principalId: string): Promise<QueuerView | null> {
+    const row = this.sql.exec(`SELECT * FROM queuers WHERE principal_id = ?`, principalId).toArray()[0];
+    return row ? BoardDO.queuerView(row) : null;
+  }
+
+  private static queuerView(r: Row): QueuerView {
+    return { principalId: r.principal_id as string, addedBy: r.added_by as string, addedAt: r.added_at as string };
   }
 
   /** Register/replace an agent's push subscription (docs/05 §4). Only http(s) urls (SSRF guard). */
