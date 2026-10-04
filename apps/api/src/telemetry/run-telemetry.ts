@@ -25,14 +25,27 @@ export interface RunRouteFacts {
 const RUN_PATH = /^\/v1\/boards\/([^/]+)\/runs\/([^/]+)(?:\/([^/]+))?$/;
 const ACTION = /^[a-z][a-z_-]{0,31}$/;
 
+const MAX_ID = 128;
+
+/** Decode a path segment without ever throwing, and cap its length (ids come from the unauthenticated URL). */
+function safeId(segment: string): string {
+  let v = segment;
+  try {
+    v = decodeURIComponent(segment);
+  } catch {
+    /* malformed escape: keep the raw segment */
+  }
+  return v.length > MAX_ID ? v.slice(0, MAX_ID) : v;
+}
+
 export function runRouteFacts(path: string): RunRouteFacts | null {
   const m = RUN_PATH.exec(path);
   if (!m) return null;
   const action = m[3] ?? null;
   return {
     route: action === null ? '/v1/boards/:id/runs/:runId' : '/v1/boards/:id/runs/:runId/:action',
-    runId: decodeURIComponent(m[2]!),
-    boardId: decodeURIComponent(m[1]!),
+    runId: safeId(m[2]!),
+    boardId: safeId(m[1]!),
     action: action !== null && ACTION.test(action) ? action : null,
   };
 }
@@ -47,7 +60,12 @@ export async function withRunTelemetry(
   handle: () => Promise<Response>,
   tracing: TracingLike | undefined = workersTracing(),
 ): Promise<Response> {
-  const facts = runRouteFacts(new URL(request.url).pathname);
+  let facts: RunRouteFacts | null = null;
+  try {
+    facts = runRouteFacts(new URL(request.url).pathname);
+  } catch {
+    /* products never block on telemetry */
+  }
   if (!facts) return handle();
 
   // A telemetry failure must never fail or repeat the request.
@@ -59,11 +77,12 @@ export async function withRunTelemetry(
     }
   };
 
+  const f: RunRouteFacts = facts;
   const run = async (span: SpanLike | null): Promise<Response> => {
-    setAttr(span, 'run.id', facts.runId);
-    setAttr(span, 'board.id', facts.boardId);
-    setAttr(span, 'http.route', facts.route);
-    if (facts.action) setAttr(span, 'run.action', facts.action);
+    setAttr(span, 'run.id', f.runId);
+    setAttr(span, 'board.id', f.boardId);
+    setAttr(span, 'http.route', f.route);
+    if (f.action) setAttr(span, 'run.action', f.action);
     let status = 500;
     try {
       const res = await handle();
@@ -74,10 +93,10 @@ export async function withRunTelemetry(
       console.log({
         level: status >= 500 ? 'error' : 'info',
         msg: 'run route',
-        'run.id': facts.runId,
-        'board.id': facts.boardId,
-        route: facts.route,
-        ...(facts.action ? { 'run.action': facts.action } : {}),
+        'run.id': f.runId,
+        'board.id': f.boardId,
+        route: f.route,
+        ...(f.action ? { 'run.action': f.action } : {}),
         method: request.method,
         status,
         traceparent: request.headers.get('traceparent') ?? undefined,
@@ -90,9 +109,9 @@ export async function withRunTelemetry(
   try {
     return await tracing.enterSpan('run_route', (span) => (started = run(span)));
   } catch (err) {
-    // If the handler already ran (its own error, rethrown), propagate it; if enterSpan itself failed
-    // before calling us, serve the request untraced. Either way the handler runs exactly once.
-    if (started) throw err;
+    // If enterSpan itself failed before calling us, serve the request untraced. Either way the handler runs exactly once.
+    // If enterSpan fails AFTER the handler finished (e.g. ending the span), the handler's result stands.
+    if (started) return await started;
     return run(null);
   }
 }

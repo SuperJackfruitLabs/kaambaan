@@ -3156,4 +3156,4 @@ export default {
   fetch: (request: Request, env: Env): Promise<Response> => withRunTelemetry(request, () => worker.fetch(request, env)),
   scheduled: (event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> =>
     worker.scheduled(event, env, ctx),
-};
+} satisfies ExportedHandler<Env>;

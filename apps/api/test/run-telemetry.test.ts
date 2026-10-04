@@ -90,4 +90,33 @@ describe('withRunTelemetry', () => {
     const res = await withRunTelemetry(new Request('https://api.test/v1/boards/brd_1/runs/run_2'), async () => new Response('ok'));
     expect(res.status).toBe(200);
   });
+
+  it('serves the request once on a malformed percent-escape in the path', async () => {
+    const { tracing } = fakeTracing();
+    let calls = 0;
+    const req = new Request('https://api.test/v1/boards/x/runs/%E0%A4');
+    const res = await withRunTelemetry(req, async () => { calls += 1; return new Response('routed', { status: 404 }); }, tracing);
+    expect(calls).toBe(1);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe('routed');
+  });
+
+  it('caps run.id and board.id length', async () => {
+    const { tracing, attrs } = fakeTracing();
+    await withRunTelemetry(new Request(`https://api.test/v1/boards/${'b'.repeat(500)}/runs/${'r'.repeat(500)}`), async () => new Response('ok'), tracing);
+    expect((attrs['run.id'] as string).length).toBe(128);
+    expect((attrs['board.id'] as string).length).toBe(128);
+    expect(((log.mock.calls[0]![0] as Record<string, string>)['run.id']).length).toBe(128);
+  });
+
+  it('returns the handler result when enterSpan throws after the handler completed', async () => {
+    let calls = 0;
+    const tracing: TracingLike = {
+      enterSpan: (_n, fn) => { void fn({ setAttribute: () => {} }); throw new Error('end failed'); },
+    };
+    const req = new Request('https://api.test/v1/boards/brd_1/runs/run_2');
+    const res = await withRunTelemetry(req, async () => { calls += 1; return new Response('ok', { status: 202 }); }, tracing);
+    expect(calls).toBe(1);
+    expect(res.status).toBe(202);
+  });
 });
