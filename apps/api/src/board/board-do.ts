@@ -560,6 +560,39 @@ export interface AttemptView {
   failureReason: string | null;
 }
 
+/** A gate as evidence (contract C4): decisions in past tense, the run it judged, nothing else. */
+export interface RunEvidenceGate {
+  id: string;
+  run_id: string | null;
+  stage_key: string;
+  status: 'pending' | 'resolved' | 'cancelled';
+  decision: 'approved' | 'changes_requested' | 'rejected' | null;
+  decided_by: string | null;
+  produced_by: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+/** `GET /v1/boards/:id/runs/:runId/evidence` (superwitness contract C4). snake_case: it is a cross-product wire shape. */
+export interface RunEvidence {
+  run: {
+    id: string; board_id: string; card_id: string; stage_key: string; agent_id: string;
+    status: string; outcome: string | null; started_at: string; ended_at: string | null;
+  };
+  card: { id: string; title: string; stage_key: string };
+  gates: RunEvidenceGate[];
+  usage:
+    | { status: 'reported'; input_tokens: number; output_tokens: number; cost_usd: number }
+    | { status: 'unreported'; input_tokens: null; output_tokens: null; cost_usd: null };
+  as_of: string;
+}
+
+const EVIDENCE_DECISION: Record<string, RunEvidenceGate['decision']> = {
+  approve: 'approved',
+  request_changes: 'changes_requested',
+  reject: 'rejected',
+};
+
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
 export interface UsageInput {
   model?: string;
@@ -1040,6 +1073,9 @@ export interface BoardStub {
   projectSummary(projectId: string): Promise<Result<{ total: number; done: number; overdue: number; costUsd: number }>>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
+
+  /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
+  getRunEvidence(runId: string): Promise<Result<RunEvidence>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
   /** One gate, including how it was decided. See `getGate`. */
   getGate(gateId: string): Promise<Result<GateView>>;
@@ -3902,6 +3938,79 @@ export class BoardDO extends DurableObject<Env> {
           .toArray()
           .map((r) => this.rowToReference(r)),
         elicitations: this.elicitationsForRun(input.runId),
+      },
+    };
+  }
+
+  /**
+   * A run as evidence (superwitness contract C4; charter evidence-joins-on-the-work-run decisions
+   * 4 and 5). Read-only. Gates: those this run opened, plus legacy gates (null run_id) on the same
+   * card and the run's stage. Usage: `unreported` with null numbers when no record exists — a
+   * bridge-dispatched run's cost is not zero, it is unknown.
+   */
+  async getRunEvidence(runId: string): Promise<Result<RunEvidence>> {
+    const boardId = this.getMeta('boardId');
+    if (!boardId) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const row = this.getRunRow(runId);
+    if (!row) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${runId}` };
+    const cardId = row.card_id as string;
+    const card = this.getCard(cardId);
+    // deleteCard removes a card's runs with it, so this is unreachable today; if card deletion
+    // starts keeping runs (workstream 3b) this must return the run without a card instead.
+    if (!card) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${runId}` };
+
+    const gates = this.sql
+      .exec(
+        `SELECT * FROM gates WHERE card_id = ? AND (run_id = ? OR (run_id IS NULL AND stage_key = ?))
+         ORDER BY created_at ASC, rowid ASC`,
+        cardId,
+        runId,
+        row.stage_key as string,
+      )
+      .toArray()
+      .map((g) => ({
+        id: g.id as string,
+        run_id: (g.run_id as string | null) ?? null,
+        stage_key: g.stage_key as string,
+        status: g.status as RunEvidenceGate['status'],
+        decision: g.decision ? (EVIDENCE_DECISION[g.decision as string] ?? null) : null,
+        decided_by: (g.decided_by as string | null) ?? null,
+        produced_by: g.produced_by as string,
+        created_at: g.created_at as string,
+        resolved_at: (g.resolved_at as string | null) ?? null,
+      }));
+
+    const u = this.sql
+      .exec(
+        `SELECT COUNT(*) AS n, COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,
+                COALESCE(SUM(cost_usd), 0) AS c
+           FROM usage_records WHERE run_id = ?`,
+        runId,
+      )
+      .toArray()[0]!;
+    const usage: RunEvidence['usage'] =
+      Number(u.n) > 0
+        ? { status: 'reported', input_tokens: Number(u.i), output_tokens: Number(u.o), cost_usd: Number(u.c) }
+        : { status: 'unreported', input_tokens: null, output_tokens: null, cost_usd: null };
+
+    return {
+      ok: true,
+      value: {
+        run: {
+          id: row.id as string,
+          board_id: boardId,
+          card_id: cardId,
+          stage_key: row.stage_key as string,
+          agent_id: row.agent_id as string,
+          status: row.status as string,
+          outcome: (row.outcome as string | null) ?? null,
+          started_at: row.started_at as string,
+          ended_at: (row.ended_at as string | null) ?? null,
+        },
+        card: { id: card.id, title: card.title, stage_key: card.currentStageKey },
+        gates,
+        usage,
+        as_of: this.now(),
       },
     };
   }

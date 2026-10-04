@@ -40,7 +40,7 @@ import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExtern
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
-import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent } from './auth/resolve';
+import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday } from './db/catalog';
@@ -382,6 +382,37 @@ async function registerStageCapabilities(
 function unexpected(err: unknown): Response {
   const message = (err as { message?: string })?.message ?? 'unexpected error';
   return Response.json({ error: { message } }, { status: 500 });
+}
+
+/**
+ * GET /v1/boards/:id/runs/:runId/evidence — a SERVICE principal (superwitness) reading a run
+ * (contract C4). Not an agent route and not a human route: neither kind may read it, and a
+ * service may read nothing else. The tenant comes from the token's mapped fleet, so a board in
+ * another tenant is simply not found.
+ */
+async function runEvidence(request: Request, env: Env, boardId: string, runId: string): Promise<Response> {
+  const service = await resolveHubService(request, env);
+  if (!service) {
+    return Response.json(
+      { error: { code: 'UNAUTHORIZED', message: 'a hub-issued service token for a mapped fleet is required' } },
+      { status: 401 },
+    );
+  }
+  if (!service.scopes.includes(EVIDENCE_READ)) {
+    return Response.json(
+      { error: { code: 'FORBIDDEN', message: 'this principal does not hold evidence:read' } },
+      { status: 403 },
+    );
+  }
+  try {
+    const result = await boardStub(env, service.tenantId, boardId).getRunEvidence(runId);
+    if (result.ok) return Response.json(result.value);
+    if (result.code === 'NOT_INITIALIZED') return Response.json({ error: { code: 'BOARD_NOT_FOUND' } }, { status: 404 });
+    if (result.code === 'RUN_NOT_FOUND') return Response.json({ error: { code: 'RUN_NOT_FOUND' } }, { status: 404 });
+    return Response.json({ error: result }, { status: statusForCode(result.code) });
+  } catch (err) {
+    return unexpected(err);
+  }
 }
 
 export default {
@@ -1551,6 +1582,10 @@ export default {
 
     const boardId = match[1];
     const rest = match[2] ?? '';
+
+    // Before the agent/human split below, which classifies every `runs/*` path as an agent route.
+    const evidenceMatch = boardId && request.method === 'GET' ? rest.match(/^runs\/([^/]+)\/evidence$/) : null;
+    if (evidenceMatch) return runEvidence(request, env, boardId!, evidenceMatch[1]!);
 
     // Resolve the caller by route type: agent routes carry a token; the GitHub webhook
     // self-authenticates (HMAC) and carries ?tenant=; everything else is a human (session cookie).
