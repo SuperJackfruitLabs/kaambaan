@@ -17,6 +17,7 @@
 import { SELF, env, runInDurableObject } from 'cloudflare:test';
 import { describe, it, expect, beforeAll } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
+import { withIssuer as withHubIssuer } from './helpers/hub-issuer';
 
 const PIPELINE = [
   { key: 'research', name: 'Research', order: 0, ownerKind: 'capability', owner: 'research' },
@@ -65,24 +66,13 @@ async function hubToken(sub = HUMAN): Promise<string> {
 }
 
 async function withIssuer(fn: () => Promise<void>, mapTenant = true) {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'GH')`)
     .bind(TENANT, `slug-${TENANT}`).run();
   await env.DB.prepare(`UPDATE tenants SET external_source=?, external_id=? WHERE id=?`)
     .bind(mapTenant ? 'agentpod' : null, mapTenant ? FLEET : null, TENANT).run();
   try {
-    await fn();
+    await withHubIssuer(ISSUER, jwksBody, fn);
   } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
     await env.DB.prepare(`UPDATE tenants SET external_source=NULL, external_id=NULL WHERE id=?`).bind(TENANT).run();
   }
 }

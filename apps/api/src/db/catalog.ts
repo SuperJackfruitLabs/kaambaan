@@ -468,6 +468,83 @@ export async function findAgentByExternal(
   };
 }
 
+/** The suite's principal grammar (agentpod `id_grammar.json` → `agentpod.principal`). */
+const PRINCIPAL_ID = /^prn_[0-9a-f]{20}$/;
+
+/** The distinct, non-empty strings of a list that may hold nulls. */
+function distinctIds(localIds: Array<string | null>): string[] {
+  return [...new Set(localIds.filter((v): v is string => typeof v === 'string' && v !== ''))];
+}
+
+/** Local user id → the id the hub knows that user by (`users.external_id`, source `agentpod`). Linked users only. */
+async function userExternalIds(db: D1Database, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (ids.length === 0) return out;
+  const { results } = await db
+    .prepare(`SELECT id, external_id FROM users WHERE external_source = 'agentpod' AND id IN (${ids.map(() => '?').join(',')})`)
+    .bind(...ids)
+    .all<{ id: string; external_id: string }>();
+  for (const r of results) out.set(r.id, r.external_id);
+  return out;
+}
+
+/**
+ * Local ids → suite principal ids, for evidence (superwitness contract C4). Returns only what
+ * resolves to a `prn_…`; a caller reads a missing key as `null`, never as a guess.
+ *
+ *   - `agt_…` → `agents.external_id` where `external_source = 'org-plane'`, in THIS tenant.
+ *   - any other local id → `users.external_id` where `external_source = 'agentpod'`, but only
+ *     when that value is `prn_`-shaped. It is usually a Better Auth user id (migration 0008's
+ *     header explains why), which is not a principal and is therefore left out.
+ *   - a value that already IS a `prn_…` (an unlinked station- or bridge-minted token's `sub`)
+ *     maps to itself.
+ */
+export async function principalIdsFor(
+  db: D1Database,
+  tenantId: string,
+  localIds: Array<string | null>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = distinctIds(localIds);
+  for (const id of ids) if (PRINCIPAL_ID.test(id)) out.set(id, id);
+
+  const agentIds = ids.filter((v) => v.startsWith('agt_'));
+  if (agentIds.length > 0) {
+    const { results } = await db
+      .prepare(
+        `SELECT id, external_id FROM agents
+          WHERE tenant_id = ? AND external_source = 'org-plane' AND id IN (${agentIds.map(() => '?').join(',')})`,
+      )
+      .bind(tenantId, ...agentIds)
+      .all<{ id: string; external_id: string }>();
+    for (const r of results) if (PRINCIPAL_ID.test(r.external_id)) out.set(r.id, r.external_id);
+  }
+
+  const userIds = ids.filter((v) => !v.startsWith('agt_') && !PRINCIPAL_ID.test(v));
+  for (const [id, ext] of await userExternalIds(db, userIds)) if (PRINCIPAL_ID.test(ext)) out.set(id, ext);
+  return out;
+}
+
+/**
+ * Local ids → the hub token `sub` the person is known by, when that `sub` is NOT a principal id
+ * (C4 `gates[].decided_by_hub_sub`). superwitness hands it to the hub's principals route, which
+ * resolves it through `principal_identities`.
+ *
+ *   - `usr_…` → `users.external_id` where `external_source = 'agentpod'`, unless it is a `prn_…`
+ *     (then `principalIdsFor` already answered).
+ *   - a value that is none of `usr_…`, `agt_…`, `prn_…` IS a hub `sub`: `resolveHubUser` stores
+ *     `claims.sub` as the user id when no local user is linked.
+ */
+export async function hubSubjectsFor(db: D1Database, localIds: Array<string | null>): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = distinctIds(localIds).filter((v) => !v.startsWith('agt_') && !PRINCIPAL_ID.test(v));
+  for (const id of ids) if (!id.startsWith('usr_')) out.set(id, id);
+
+  const userIds = ids.filter((v) => v.startsWith('usr_'));
+  for (const [id, ext] of await userExternalIds(db, userIds)) if (!PRINCIPAL_ID.test(ext)) out.set(id, ext);
+  return out;
+}
+
 /**
  * What bounds an agent that queues work of its own (migration 0015).
  *

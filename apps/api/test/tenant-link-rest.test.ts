@@ -30,6 +30,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { resolveHubUser, resolveHubAgent } from '../src/auth/resolve';
+import { withIssuer } from './helpers/hub-issuer';
 
 const dev = (tenant: string) => ({ 'X-Tenant-Id': tenant, 'Content-Type': 'application/json' });
 
@@ -67,22 +68,6 @@ function newIssuer() {
   return issuerOnce;
 }
 
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
-}
-
 /** The workspace row itself — NOT its mapping, which only the route ever writes here. */
 async function workspace(tenantId: string): Promise<void> {
   await env.DB.prepare(`INSERT OR IGNORE INTO tenants (id, slug, name) VALUES (?, ?, 'T')`).bind(tenantId, `slug-${tenantId}`).run();
@@ -113,7 +98,7 @@ describe('PATCH /v1/tenant — link this workspace to a hub fleet', () => {
     await workspace(tenantId);
     const { signingKey, jwksBody } = await newIssuer();
 
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, { sub: 'prn_human', tenant: FLEET, principalKind: 'human' });
       const req = () => new Request('https://api.test/v1/boards', { headers: { Authorization: `Bearer ${token}` } });
 
@@ -151,7 +136,7 @@ describe('PATCH /v1/tenant — link this workspace to a hub fleet', () => {
     expect(patched.status).toBe(200);
 
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, { sub: SUB, tenant: FLEET, principalKind: 'agent' });
       const req = () => new Request('https://api.test/v1/boards/b/cards', { headers: { Authorization: `Bearer ${token}` } });
 
@@ -174,7 +159,7 @@ describe('PATCH /v1/tenant — link this workspace to a hub fleet', () => {
     await workspace(tenantId);
     const { signingKey, jwksBody } = await newIssuer();
 
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, { sub: 'prn_h2', tenant: FLEET, principalKind: 'human' });
       const req = () => new Request('https://api.test/v1/boards', { headers: { Authorization: `Bearer ${token}` } });
 

@@ -332,3 +332,41 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
     },
   };
 }
+
+/** Read a run's evidence (superwitness contract C4). */
+export const EVIDENCE_READ = 'evidence:read';
+
+export interface ServicePrincipal {
+  /** The hub's `prn_…`. Not a local user or agent: a service has neither here. */
+  principalId: string;
+  tenantId: string;
+  /**
+   * From the token's `scope` claim, split on spaces. Empty when absent. These are the scopes as
+   * minted: a hub-side narrowing or revocation reaches superpipeline only when the token expires
+   * (the hub's TOKEN_TTL).
+   */
+  scopes: string[];
+}
+
+/**
+ * Resolve a SERVICE-kind hub token — superwitness, reading evidence.
+ *
+ * The third sibling of `resolveHubUser` and `resolveHubAgent`, with the same refusals: no issuer
+ * configured, a kind that is not `service`, a fleet that maps to no tenant here. It grants nothing
+ * by itself; a route checks `scopes` for the one permission it needs.
+ */
+export async function resolveHubService(request: Request, env: Env): Promise<ServicePrincipal | null> {
+  const issuer = env.HUB_ISSUER;
+  if (!issuer) return null;
+  const token = bearer(request);
+  if (!token || token.startsWith('spa_')) return null;
+
+  const claims = await verifyHubToken(token, { issuer, audience: planeAudience(request, env) });
+  if (!claims || claims.principalKind !== 'service') return null;
+
+  const tenantId = await findTenantByExternal(env.DB, 'agentpod', claims.tenant);
+  if (!tenantId) return null;
+
+  const scopes = typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
+  return { principalId: claims.sub, tenantId, scopes };
+}
