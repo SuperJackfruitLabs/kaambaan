@@ -1,4 +1,5 @@
 import { env } from 'cloudflare:test';
+import type { ReporterFetch } from '../../src/superwitness/client';
 
 export const SW_URL = 'https://sw.test';
 export const HUB_URL = 'https://hub.test';
@@ -35,4 +36,44 @@ export async function withReporting<T>(fn: () => Promise<T>, knobs: Partial<Reco
 
 export function runRow(state: DurableObjectState, runId: string): Record<string, SqlStorageValue> {
   return state.storage.sql.exec(`SELECT * FROM runs WHERE id = ?`, runId).one();
+}
+
+
+export interface SentBatch {
+  url: string;
+  headers: Record<string, string>;
+  raw: string;
+  body: { runs: Array<Record<string, unknown>> };
+  init: RequestInit;
+}
+
+/**
+ * A fake hub + superwitness. `runs` answers each POST /v1/runs (default: 200, every item applied);
+ * `hub` answers the service-token exchange (default: a fresh 300 s token per call).
+ */
+export function fakeSuperwitness(
+  opts: {
+    runs?: (body: SentBatch['body'], n: number) => Response | Promise<Response>;
+    hub?: (n: number) => Response | Promise<Response>;
+  } = {},
+) {
+  const batches: SentBatch[] = [];
+  let hubCalls = 0;
+  const hubInits: RequestInit[] = [];
+  const fetcher: ReporterFetch = async (url, init) => {
+    if (url === `${HUB_URL}/api/auth/service-token`) {
+      hubCalls += 1;
+      hubInits.push(init);
+      return opts.hub ? opts.hub(hubCalls) : Response.json({ token: `tok-${hubCalls}`, expiresIn: 300 });
+    }
+    if (url === `${SW_URL}/v1/runs`) {
+      const raw = String(init.body);
+      const body = JSON.parse(raw) as SentBatch['body'];
+      batches.push({ url, headers: Object.fromEntries(new Headers(init.headers).entries()), raw, body, init });
+      if (opts.runs) return opts.runs(body, batches.length);
+      return Response.json({ results: body.runs.map((r) => ({ external_ref: r.external_ref, applied: true })) });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  return { fetcher, batches, hubCalls: () => hubCalls, hubInits };
 }
