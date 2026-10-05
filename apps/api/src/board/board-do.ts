@@ -5575,7 +5575,7 @@ export class BoardDO extends DurableObject<Env> {
     if (!reportingEnabled(this.env)) return result;
     const boardId = this.getMeta('boardId') ?? '';
     for (let i = 0; i < RUN_REPORT_MAX_BATCHES_PER_DRAIN; i++) {
-      const due = this.sql
+      const rows = this.sql
         .exec(
           `SELECT run_id, gen, report_json, attempts FROM run_reports
             WHERE status = 'pending' AND next_attempt_at <= ?
@@ -5583,60 +5583,78 @@ export class BoardDO extends DurableObject<Env> {
           nowMs,
           RUN_REPORT_BATCH_MAX,
         )
-        .toArray()
-        .map((r) => ({
-          runId: r.run_id as string,
-          gen: Number(r.gen),
-          attempts: Number(r.attempts),
-          draft: JSON.parse(r.report_json as string) as RunReportDraft,
-        }));
-      if (due.length === 0) break;
-
-      const cfg = reporterConfig(this.env);
-      if ('error' in cfg) {
-        logReporter('warn', { msg: 'superwitness.reporter_misconfigured', 'board.id': boardId, code: cfg.error });
-        this.tallyRetry(result, this.retryRunReports(due, nowMs, cfg.error, null), due.length);
-        break;
+        .toArray();
+      if (rows.length === 0) break;
+      // A row that does not parse can never be sent: park it here, or it stays due and every
+      // alarm re-arms at now for it.
+      const due: Array<{ runId: string; gen: number; attempts: number; draft: RunReportDraft }> = [];
+      for (const r of rows) {
+        const d = { runId: r.run_id as string, gen: Number(r.gen), attempts: Number(r.attempts) };
+        let draft: RunReportDraft;
+        try {
+          draft = JSON.parse(r.report_json as string) as RunReportDraft;
+        } catch {
+          this.parkRunReport(d, boardId, 'corrupt_report', 0, 'corrupt_report');
+          result.parked += 1;
+          continue;
+        }
+        due.push({ ...d, draft });
       }
+      if (due.length === 0) continue;
 
-      let executors: Map<string, { principalId: string | null; name: string | null }>;
       try {
-        executors = await this.runReportExecutors(due.map((d) => d.draft.agentId));
-      } catch {
-        logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, code: 'catalog_unavailable', count: due.length });
-        this.tallyRetry(result, this.retryRunReports(due, nowMs, 'catalog_unavailable', null), due.length);
+        const cfg = reporterConfig(this.env);
+        if ('error' in cfg) {
+          logReporter('warn', { msg: 'superwitness.reporter_misconfigured', 'board.id': boardId, code: cfg.error });
+          this.tallyRetry(result, this.retryRunReports(due, nowMs, cfg.error, null), due.length);
+          break;
+        }
+
+        let executors: Map<string, { principalId: string | null; name: string | null }>;
+        try {
+          executors = await this.runReportExecutors(due.map((d) => d.draft.agentId));
+        } catch {
+          logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, code: 'catalog_unavailable', count: due.length });
+          this.tallyRetry(result, this.retryRunReports(due, nowMs, 'catalog_unavailable', null), due.length);
+          break;
+        }
+
+        // Cap by bytes as well as by count: 100 reports of multibyte text can pass 256 KiB (R12).
+        const batch: typeof due = [];
+        const reports: RunReport[] = [];
+        let bytes = '{"runs":[]}'.length;
+        for (const d of due) {
+          const report = buildRunReport(d.draft, executors.get(d.draft.agentId) ?? { principalId: null, name: null });
+          const size = new TextEncoder().encode(JSON.stringify(report)).length + 1;
+          if (batch.length > 0 && bytes + size > RUN_REPORT_BATCH_MAX_BYTES) break;
+          batch.push(d);
+          reports.push(report);
+          bytes += size;
+        }
+
+        const outcome = await postRunReports(cfg, this.reporterToken, fetcher, nowMs, reports);
+        if (outcome.kind === 'ok') {
+          // `gen` guard (R6): a row re-written while this batch was in flight holds a newer snapshot.
+          for (const d of batch) this.sql.exec(`DELETE FROM run_reports WHERE run_id = ? AND gen = ?`, d.runId, d.gen);
+          result.sent += batch.length;
+          continue;
+        }
+        if (outcome.kind === 'retry') {
+          logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, 'http.status': outcome.status, code: outcome.code, count: batch.length });
+          this.tallyRetry(result, this.retryRunReports(batch, nowMs, outcome.code, outcome.retryAfterMs), batch.length);
+          break;
+        }
+        // Refused: the one named item, or the whole batch (R11). The rest stay due and go next loop.
+        const refused = outcome.index !== null ? [batch[outcome.index]!] : batch;
+        for (const d of refused) this.parkRunReport(d, boardId, `${outcome.status} ${outcome.code}`, outcome.status, outcome.code);
+        result.parked += refused.length;
+      } catch (err) {
+        // Anything unexpected: back the rows off as for a failed send, so the alarm that
+        // `scheduleReclaim` arms next is not at now. The alarm's own catch stays the last resort.
+        logReporter('error', { msg: 'superwitness.drain_failed', 'board.id': boardId, code: err instanceof Error ? err.name : 'unknown', count: due.length });
+        this.tallyRetry(result, this.retryRunReports(due, nowMs, 'drain_error', null), due.length);
         break;
       }
-
-      // Cap by bytes as well as by count: 100 reports of multibyte text can pass 256 KiB (R12).
-      const batch: typeof due = [];
-      const reports: RunReport[] = [];
-      let bytes = '{"runs":[]}'.length;
-      for (const d of due) {
-        const report = buildRunReport(d.draft, executors.get(d.draft.agentId) ?? { principalId: null, name: null });
-        const size = new TextEncoder().encode(JSON.stringify(report)).length + 1;
-        if (batch.length > 0 && bytes + size > RUN_REPORT_BATCH_MAX_BYTES) break;
-        batch.push(d);
-        reports.push(report);
-        bytes += size;
-      }
-
-      const outcome = await postRunReports(cfg, this.reporterToken, fetcher, nowMs, reports);
-      if (outcome.kind === 'ok') {
-        // `gen` guard (R6): a row re-written while this batch was in flight holds a newer snapshot.
-        for (const d of batch) this.sql.exec(`DELETE FROM run_reports WHERE run_id = ? AND gen = ?`, d.runId, d.gen);
-        result.sent += batch.length;
-        continue;
-      }
-      if (outcome.kind === 'retry') {
-        logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, 'http.status': outcome.status, code: outcome.code, count: batch.length });
-        this.tallyRetry(result, this.retryRunReports(batch, nowMs, outcome.code, outcome.retryAfterMs), batch.length);
-        break;
-      }
-      // Refused: the one named item, or the whole batch (R11). The rest stay due and go next loop.
-      const refused = outcome.index !== null ? [batch[outcome.index]!] : batch;
-      for (const d of refused) this.parkRunReport(d, boardId, `${outcome.status} ${outcome.code}`, outcome.status, outcome.code);
-      result.parked += refused.length;
     }
     const dead = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM run_reports WHERE status = 'dead'`).one().n);
     if (dead > 0) {

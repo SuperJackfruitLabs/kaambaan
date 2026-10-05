@@ -324,6 +324,60 @@ describe('the alarm drains the outbox', () => {
     }
   });
 
+  // A corrupt row is the one row that cannot be sent: park it, send the rest, and leave nothing due.
+  it('parks a corrupt report, sends the others, and does not re-arm for it', () =>
+    withReporting(() =>
+      runInDurableObject(stubFor('swd-alarm-corrupt'), async (board: BoardDO, state) => {
+        const [good, bad] = await runs(board, 'brd_swd_alarm_corrupt', 2);
+        await state.storage.deleteAlarm();
+        state.storage.sql.exec(`UPDATE run_reports SET attempts = 0, next_attempt_at = 0`);
+        state.storage.sql.exec(`UPDATE run_reports SET report_json = '{"runId":' WHERE run_id = ?`, bad!.runId);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const sw = fakeSuperwitness();
+        expect(await board.drainRunReports({ fetcher: sw.fetcher })).toEqual({ sent: 1, retried: 0, parked: 1 });
+        expect(sw.batches.flatMap((b) => b.body.runs.map((r) => r.external_ref))).toEqual([expect.stringContaining(good!.runId)]);
+        const row = state.storage.sql.exec(`SELECT status, last_error FROM run_reports WHERE run_id = ?`, bad!.runId).one();
+        expect(row).toEqual({ status: 'dead', last_error: 'corrupt_report' });
+        expect(state.storage.sql.exec(`SELECT COUNT(*) AS n FROM run_reports WHERE run_id = ?`, good!.runId).one().n).toBe(0);
+        const lines = warn.mock.calls.map(([e]) => e as Record<string, unknown>);
+        expect(lines.some((e) => e.metric === 'run_reports_dead' && e['run.id'] === bad!.runId && e.code === 'corrupt_report')).toBe(true);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(SECRET_TITLE);
+        await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
+        expect((await state.storage.getAlarm())!).toBeGreaterThan(Date.now() + 14 * 60 * 1000); // only the reclaim deadline
+      }),
+    ));
+
+  // Any other throw inside the drain: the rows that were due back off as for a failed send, so the
+  // alarm cannot re-arm at now and fire again at once.
+  it('backs off the due rows when the drain throws, so the alarm is not re-armed at now', async () => {
+    const stub = stubFor('swd-alarm-throw');
+    const realFetch = globalThis.fetch;
+    // An answer that is not a Response: postRunReports reads `.status` off it and throws a TypeError.
+    const sw = fakeSuperwitness({ runs: () => null as unknown as Response });
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => sw.fetcher(String(input instanceof Request ? input.url : input), init ?? {})) as typeof fetch;
+    try {
+      await withReporting(() =>
+        runInDurableObject(stub, async (board: BoardDO, state) => {
+          const [r] = await runs(board, 'brd_swd_alarm_throw', 1);
+          await state.storage.deleteAlarm();
+          state.storage.sql.exec(`UPDATE run_reports SET attempts = 0, next_attempt_at = 0`);
+          vi.spyOn(console, 'error').mockImplementation(() => {});
+          vi.spyOn(console, 'warn').mockImplementation(() => {});
+          const before = Date.now();
+          await board.alarm();
+          expect(sw.batches).toHaveLength(1);
+          expect((await state.storage.getAlarm())!).toBeGreaterThanOrEqual(before + 29_000);
+          const row = state.storage.sql.exec(`SELECT status, attempts, next_attempt_at FROM run_reports WHERE run_id = ?`, r!.runId).one();
+          expect(row.status).toBe('pending');
+          expect(row.attempts).toBe(1);
+          expect(Number(row.next_attempt_at)).toBeGreaterThanOrEqual(before + 30_000);
+        }),
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   it('does not arm for reports while reporting is off', () =>
     runInDurableObject(stubFor('swd-alarm-off'), async (board: BoardDO, state) => {
       await withReporting(() => runs(board, 'brd_swd_alarm_off', 1));
