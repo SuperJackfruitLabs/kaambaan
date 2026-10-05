@@ -19,6 +19,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 import { addMember } from '../src/db/members';
 import { setTenantExternalMapping, setUserExternalMapping } from '../src/db/catalog';
+import { withIssuer } from './helpers/hub-issuer';
 
 const ISSUER = 'https://issuer.test';
 const PLANE = 'https://api.test';
@@ -34,24 +35,6 @@ function newIssuer() {
     return { signingKey: pair.privateKey, jwksBody };
   })();
   return issuerOnce;
-}
-
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
 }
 
 async function hubToken(signingKey: CryptoKey, sub: string): Promise<string> {
@@ -77,7 +60,7 @@ describe('a hub token may use the label catalogue, matching every other CLI-reac
   it('GET /v1/labels answers a hub token (this is `supi label list`)', async () => {
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_lbl_hub');
       const res = await SELF.fetch('https://api.test/v1/labels', {
         headers: { Authorization: `Bearer ${token}` },
@@ -91,7 +74,7 @@ describe('a hub token may use the label catalogue, matching every other CLI-reac
   it('POST /v1/labels answers a hub token (this is `supi label add`)', async () => {
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_lbl_hub');
       const res = await SELF.fetch('https://api.test/v1/labels', {
         method: 'POST',
@@ -105,7 +88,7 @@ describe('a hub token may use the label catalogue, matching every other CLI-reac
   it('DELETE /v1/labels/:id answers a hub token (this is `supi label rm`)', async () => {
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_lbl_hub');
       const made = await SELF.fetch('https://api.test/v1/labels', {
         method: 'POST',

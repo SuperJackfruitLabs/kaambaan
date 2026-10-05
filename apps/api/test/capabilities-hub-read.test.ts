@@ -19,6 +19,7 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 import { addMember } from '../src/db/members';
 import { setTenantExternalMapping, setUserExternalMapping } from '../src/db/catalog';
+import { withIssuer } from './helpers/hub-issuer';
 
 const ISSUER = 'https://issuer.test';
 /** The audience a hub token must name — this Worker's own origin (`auth/hub-jwt.ts`). */
@@ -36,24 +37,6 @@ function newIssuer() {
     return { signingKey: pair.privateKey, jwksBody };
   })();
   return issuerOnce;
-}
-
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) {
-      return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    }
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
 }
 
 async function hubToken(signingKey: CryptoKey, sub: string): Promise<string> {
@@ -79,7 +62,7 @@ describe('a hub token may read the capability registry', () => {
   it('GET /v1/capabilities answers a hub token', async () => {
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_caps_hub');
       const res = await SELF.fetch('https://api.test/v1/capabilities', {
         headers: { Authorization: `Bearer ${token}` },
@@ -93,7 +76,7 @@ describe('a hub token may read the capability registry', () => {
   it('GET /v1/capabilities/implications answers a hub token', async () => {
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_caps_hub');
       const res = await SELF.fetch('https://api.test/v1/capabilities/implications', {
         headers: { Authorization: `Bearer ${token}` },
@@ -111,7 +94,7 @@ describe('a hub token may read the capability registry', () => {
     // managing its agents", and managing agents is session-only on purpose.
     await linkedOwner();
     const { signingKey, jwksBody } = await newIssuer();
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await hubToken(signingKey, 'prn_caps_hub');
       const res = await SELF.fetch('https://api.test/v1/capabilities', {
         method: 'POST',

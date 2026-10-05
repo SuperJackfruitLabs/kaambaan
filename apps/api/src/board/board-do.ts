@@ -560,6 +560,47 @@ export interface AttemptView {
   failureReason: string | null;
 }
 
+/** A gate as evidence (contract C4): decisions in past tense, the run it judged, nothing else. */
+export interface RunEvidenceGate {
+  id: string;
+  run_id: string | null;
+  stage_key: string;
+  status: 'pending' | 'resolved' | 'cancelled';
+  decision: 'approved' | 'changes_requested' | 'rejected' | null;
+  decided_by: string | null;
+  produced_by: string;
+  /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+  produced_by_principal_id: string | null;
+  /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+  decided_by_principal_id: string | null;
+  /** Hub token `sub` the decider is known by, set only when `decided_by_principal_id` is null. Filled by the Worker. */
+  decided_by_hub_sub: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+/** `GET /v1/boards/:id/runs/:runId/evidence` (superwitness contract C4). snake_case: it is a cross-product wire shape. */
+export interface RunEvidence {
+  run: {
+    id: string; board_id: string; card_id: string; stage_key: string; agent_id: string;
+    /** `prn_…` or null. Filled by the Worker (`index.ts` runEvidence): only it can read the catalog. */
+    agent_principal_id: string | null;
+    status: string; outcome: string | null; started_at: string; ended_at: string | null;
+  };
+  card: { id: string; title: string; stage_key: string };
+  gates: RunEvidenceGate[];
+  usage:
+    | { status: 'reported'; input_tokens: number; output_tokens: number; cost_usd: number }
+    | { status: 'unreported'; input_tokens: null; output_tokens: null; cost_usd: null };
+  as_of: string;
+}
+
+const EVIDENCE_DECISION: Record<string, RunEvidenceGate['decision']> = {
+  approve: 'approved',
+  request_changes: 'changes_requested',
+  reject: 'rejected',
+};
+
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
 export interface UsageInput {
   model?: string;
@@ -1040,6 +1081,9 @@ export interface BoardStub {
   projectSummary(projectId: string): Promise<Result<{ total: number; done: number; overdue: number; costUsd: number }>>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
+
+  /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
+  getRunEvidence(runId: string): Promise<Result<RunEvidence>>;
   countReadyForCapabilities(agentId: string, capabilities: string[]): Promise<number>;
   /** One gate, including how it was decided. See `getGate`. */
   getGate(gateId: string): Promise<Result<GateView>>;
@@ -1494,6 +1538,18 @@ export class BoardDO extends DurableObject<Env> {
       )`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_card ON gates(card_id)`);
+    /**
+     * The run whose work this gate judges (charter -> decisions/2026-09-29-evidence-joins-on-the-
+     * work-run.md, decision 4), so a human's rejection can be attributed to the run and the
+     * configuration that produced it. Nullable on purpose: gates opened before this column have
+     * none, and the evidence route reads a null as "a legacy gate on this card and stage".
+     */
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN run_id TEXT`);
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_run ON gates(run_id)`);
     // An agent's open question to a human (docs/04 §4). Persisting it is what makes an answer
     // possible: the activity stream is append-only history, and history cannot be replied to.
     this.sql.exec(
@@ -3894,6 +3950,86 @@ export class BoardDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * A run as evidence (superwitness contract C4; charter evidence-joins-on-the-work-run decisions
+   * 4 and 5). Read-only. Gates: those this run opened, plus legacy gates (null run_id) on the same
+   * card whose `stage_key` is the run's stage or whose `return_stage_key` is (advanceCard opens a
+   * gate on the NEXT stage and records the stage the work came from as its return stage). Usage: `unreported` with null numbers when no record exists — a
+   * bridge-dispatched run's cost is not zero, it is unknown.
+   */
+  async getRunEvidence(runId: string): Promise<Result<RunEvidence>> {
+    const boardId = this.getMeta('boardId');
+    if (!boardId) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const row = this.getRunRow(runId);
+    if (!row) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${runId}` };
+    const cardId = row.card_id as string;
+    const card = this.getCard(cardId);
+    // deleteCard removes a card's runs with it, so this is unreachable today; if card deletion
+    // starts keeping runs (workstream 3b) this must return the run without a card instead.
+    if (!card) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${runId}` };
+
+    const gates = this.sql
+      .exec(
+        `SELECT * FROM gates WHERE card_id = ? AND (run_id = ? OR (run_id IS NULL AND (stage_key = ? OR return_stage_key = ?)))
+         ORDER BY created_at ASC, rowid ASC`,
+        cardId,
+        runId,
+        row.stage_key as string,
+        row.stage_key as string,
+      )
+      .toArray()
+      .map((g) => ({
+        id: g.id as string,
+        run_id: (g.run_id as string | null) ?? null,
+        stage_key: g.stage_key as string,
+        status: g.status as RunEvidenceGate['status'],
+        decision: g.decision ? (EVIDENCE_DECISION[g.decision as string] ?? null) : null,
+        decided_by: (g.decided_by as string | null) ?? null,
+        produced_by: g.produced_by as string,
+        // Not resolved here: the Durable Object has no catalog. The Worker fills these in.
+        produced_by_principal_id: null,
+        decided_by_principal_id: null,
+        decided_by_hub_sub: null,
+        created_at: g.created_at as string,
+        resolved_at: (g.resolved_at as string | null) ?? null,
+      }));
+
+    const u = this.sql
+      .exec(
+        `SELECT COUNT(*) AS n, COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,
+                COALESCE(SUM(cost_usd), 0) AS c
+           FROM usage_records WHERE run_id = ?`,
+        runId,
+      )
+      .toArray()[0]!;
+    const usage: RunEvidence['usage'] =
+      Number(u.n) > 0
+        ? { status: 'reported', input_tokens: Number(u.i), output_tokens: Number(u.o), cost_usd: Number(u.c) }
+        : { status: 'unreported', input_tokens: null, output_tokens: null, cost_usd: null };
+
+    return {
+      ok: true,
+      value: {
+        run: {
+          id: row.id as string,
+          board_id: boardId,
+          card_id: cardId,
+          stage_key: row.stage_key as string,
+          agent_id: row.agent_id as string,
+          agent_principal_id: null,
+          status: row.status as string,
+          outcome: (row.outcome as string | null) ?? null,
+          started_at: row.started_at as string,
+          ended_at: (row.ended_at as string | null) ?? null,
+        },
+        card: { id: card.id, title: card.title, stage_key: card.currentStageKey },
+        gates,
+        usage,
+        as_of: this.now(),
+      },
+    };
+  }
+
   /** The attempts (runs) for a card, newest-stage-first, with each run's cost and model (docs/07 §5). */
   async getAttempts(cardId: string): Promise<AttemptView[]> {
     return this.sql
@@ -4222,7 +4358,7 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
-    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson);
+    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4251,7 +4387,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     // request_changes returns to the same (worked) stage so the agent can redo it.
-    this.createGate(cardId, card.currentStageKey, card.currentStageKey, run.agent_id as string);
+    this.createGate(cardId, card.currentStageKey, card.currentStageKey, run.agent_id as string, input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4283,7 +4419,8 @@ export class BoardDO extends DurableObject<Env> {
     );
     if (input.decision === 'approve') {
       // The approver becomes the producer of any chained gate (keeps separation-of-duties intact).
-      this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId));
+      // An approval produces no new work, so a chained gate judges the same run's work.
+      this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
     } else if (input.decision === 'request_changes') {
       // Keep the agent's prior handoff and add the reviewer's feedback so rework has full context.
       const prior = this.parseHandoff(this.getCardHandoffJson(cardId));
@@ -4629,13 +4766,13 @@ export class BoardDO extends DurableObject<Env> {
    * `TaskState`. It is not literally true here ("a human must act"); `openChildCount > 0` is what a
    * reader (Task 17's UI) uses to tell this park apart from a real review gate.
    */
-  private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null): void {
+  private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null, runId: string | null): void {
     const openChildren = this.openChildCount(cardId);
     if (openChildren > 0) {
       this.sql.exec(
         `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL,
                 pending_advance_json = ?, updated_at = ? WHERE id = ?`,
-        JSON.stringify({ fromStageKey, producedBy, handoffJson }),
+        JSON.stringify({ fromStageKey, producedBy, handoffJson, runId }),
         this.now(),
         cardId,
       );
@@ -4681,7 +4818,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     this.emit('card.advanced', { cardId, from: fromStageKey, to: next.key });
-    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy);
+    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy, runId);
     else this.notifyWorkAvailable(cardId);
   }
 
@@ -4725,17 +4862,17 @@ export class BoardDO extends DurableObject<Env> {
     const pendingJson = (row?.pending_advance_json as string | null | undefined) ?? null;
     if (!pendingJson) return;
     if (this.openChildCount(parentId) > 0) return; // another child is still open
-    const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null };
+    const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null; runId?: string | null };
     this.sql.exec(`UPDATE cards SET pending_advance_json = NULL WHERE id = ?`, parentId);
-    this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson);
+    this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson, pending.runId ?? null);
   }
 
-  private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string): string {
+  private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string, runId: string | null): string {
     const id = newId('gate');
     const now = this.now();
     this.sql.exec(
-      `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at, run_id)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
       id,
       cardId,
       stageKey,
@@ -4743,6 +4880,7 @@ export class BoardDO extends DurableObject<Env> {
       producedBy,
       JSON.stringify(DEFAULT_GATE_OPTIONS),
       now,
+      runId,
     );
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);

@@ -25,8 +25,9 @@ import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { verifyHubToken, __resetJwksCacheForTests, type HubClaims } from '../src/auth/hub-jwt';
 
 /**
- * `version` of agentpod `fixtures/ecosystem-identity/token_claims.json`, as of 2026-09-20 — the
- * revision that added `email` / `email_verified` for the suite sign-in programme.
+ * `version` of agentpod `fixtures/ecosystem-identity/token_claims.json`, as of 2026-10-04 — the
+ * revision that added the conditional `scope` claim (superwitness service tokens). v6 added
+ * `email` / `email_verified` for the suite sign-in programme.
  *
  * Pinned as a bare number on purpose. Nothing here can read the upstream file (it lives in another
  * repository, and CI for this one never checks that one out), so this constant is the visible
@@ -34,7 +35,7 @@ import { verifyHubToken, __resetJwksCacheForTests, type HubClaims } from '../src
  * touched is a pin that was never checked, which is why the assertion below carries the
  * instructions for updating it.
  */
-const FIXTURE_VERSION = 6;
+const FIXTURE_VERSION = 7;
 
 /**
  * Every claim name this repository reads out of a hub token, and where it is read.
@@ -51,6 +52,7 @@ const CLAIMS_READ = {
   tenant: 'resolve.ts and hub-oauth.ts step 3 — the fleet mapping',
   email: 'hub-oauth.ts step 2 — the adoption key',
   email_verified: 'hub-oauth.ts step 2 — the verdict the adoption is gated on',
+  scope: 'resolve.ts resolveHubService — evidence:read for a service principal (superwitness)',
 } as const;
 
 const ISSUER = 'https://hub.claim-contract.test';
@@ -99,6 +101,7 @@ const CONTRACT_TOKEN = {
   tenant: 'fleet_0000000000000000cafe',
   email: 'contract@example.com',
   email_verified: true,
+  scope: 'evidence:read',
 } as const;
 
 describe('the hub claim contract, as this plane reads it', () => {
@@ -109,7 +112,7 @@ describe('the hub claim contract, as this plane reads it', () => {
     expect(
       FIXTURE_VERSION,
       'agentpod fixtures/ecosystem-identity/token_claims.json changed version: read the diff, fix the consumer, then bump this',
-    ).toBe(6);
+    ).toBe(7);
   });
 
   it('reads every claim it depends on, under the exact name the fixture gives it', async () => {

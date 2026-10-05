@@ -15,6 +15,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { resolveHubAgent } from '../src/auth/resolve';
+import { withIssuer } from './helpers/hub-issuer';
 
 const dev = (tenant: string) => ({ 'X-Tenant-Id': tenant, 'Content-Type': 'application/json' });
 
@@ -37,22 +38,6 @@ async function newIssuer() {
   const pair = await generateKeyPair('EdDSA', { extractable: true });
   const jwksBody = JSON.stringify({ keys: [{ ...(await exportJWK(pair.publicKey)), alg: 'EdDSA', kid: 'aprt-kid' }] });
   return { signingKey: pair.privateKey, jwksBody };
-}
-
-async function withIssuer(jwksBody: string, fn: () => Promise<void>): Promise<void> {
-  const realFetch = globalThis.fetch;
-  (env as unknown as Record<string, unknown>).HUB_ISSUER = ISSUER;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url === `${ISSUER}/api/auth/jwks`) return new Response(jwksBody, { headers: { 'content-type': 'application/json' } });
-    return realFetch(input as RequestInfo, init);
-  }) as typeof fetch;
-  try {
-    await fn();
-  } finally {
-    globalThis.fetch = realFetch;
-    delete (env as unknown as Record<string, unknown>).HUB_ISSUER;
-  }
 }
 
 async function mapTenant(fleet: string, tenantId: string): Promise<void> {
@@ -85,7 +70,7 @@ describe('PATCH /v1/agents/:id — link a suite principal', () => {
     const { signingKey, jwksBody } = await newIssuer();
     await mapTenant(FLEET, 'tnt_prt_link');
 
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await new SignJWT({ tenant: FLEET, sub, principalKind: 'agent' })
         .setProtectedHeader({ alg: 'EdDSA', kid: 'aprt-kid' })
         .setIssuedAt()
@@ -107,7 +92,7 @@ describe('PATCH /v1/agents/:id — link a suite principal', () => {
     const { signingKey, jwksBody } = await newIssuer();
     await mapTenant(FLEET, 'tnt_prt_before');
 
-    await withIssuer(jwksBody, async () => {
+    await withIssuer(ISSUER, jwksBody, async () => {
       const token = await new SignJWT({ tenant: FLEET, sub, principalKind: 'agent' })
         .setProtectedHeader({ alg: 'EdDSA', kid: 'aprt-kid' })
         .setIssuedAt()
