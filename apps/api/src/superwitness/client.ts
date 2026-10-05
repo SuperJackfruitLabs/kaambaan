@@ -10,6 +10,11 @@ import type { RunReport } from './report';
 export type ReporterFetch = (url: string, init: RequestInit) => Promise<Response>;
 export const defaultReporterFetch: ReporterFetch = (url, init) => fetch(url, init);
 
+/**
+ * Give up on a request after this long. A server that accepts and never answers would otherwise
+ * hold the drain's single-flight; the abort lands in the same catch as a network error (retryable).
+ */
+export const REPORTER_FETCH_TIMEOUT_MS = 10_000;
 /** Refresh this long before the hub says the token expires. */
 export const TOKEN_REFRESH_MARGIN_MS = 30_000;
 /** The 12th failed attempt parks the report (ruling R10). */
@@ -38,6 +43,7 @@ export class ServiceTokenCache {
         method: 'POST',
         headers: { Authorization: `Bearer ${cfg.credential}` },
         redirect: 'manual',
+        signal: AbortSignal.timeout(REPORTER_FETCH_TIMEOUT_MS),
       });
     } catch {
       return { ok: false, status: 0, code: 'hub_unreachable' };
@@ -73,10 +79,14 @@ async function readJson(res: Response): Promise<unknown> {
 
 const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 
-/** The server's error code when it is a plain token, else `http_<status>` — never free text (R16). */
+/**
+ * superwitness answers errors as `{"error":{"code","message","index"?}}`. The code is used when it is
+ * a plain token, else `http_<status>`; `message` is free text and is never read (R16).
+ */
 function errorCode(body: unknown, status: number): string {
   const e = (body as { error?: unknown } | null)?.error;
-  const code = typeof e === 'string' ? e : typeof (e as { code?: unknown } | null)?.code === 'string' ? (e as { code: string }).code : null;
+  const nested = (e as { code?: unknown } | null)?.code;
+  const code = typeof nested === 'string' ? nested : typeof e === 'string' ? e : null;
   return code !== null && SAFE_CODE.test(code) ? code : `http_${status}`;
 }
 
@@ -85,8 +95,10 @@ function retryAfterMs(header: string | null): number | null {
   return Math.min(Number(header.trim()) * 1000, BACKOFF_MAX_MS);
 }
 
+/** The rejected item of a 422, from `error.index` (R11); out of range or absent → null. */
 function itemIndex(body: unknown, n: number): number | null {
-  const i = (body as { index?: unknown } | null)?.index;
+  const e = (body as { error?: unknown } | null)?.error;
+  const i = (e as { index?: unknown } | null)?.index;
   return typeof i === 'number' && Number.isInteger(i) && i >= 0 && i < n ? i : null;
 }
 
@@ -107,6 +119,7 @@ export async function postRunReports(
       headers: { Authorization: `Bearer ${token.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runs }),
       redirect: 'manual',
+      signal: AbortSignal.timeout(REPORTER_FETCH_TIMEOUT_MS),
     });
   } catch {
     return { kind: 'retry', status: 0, code: 'network', retryAfterMs: null };

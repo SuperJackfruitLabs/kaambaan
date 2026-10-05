@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ServiceTokenCache, postRunReports, runReportBackoffMs, RUN_REPORT_MAX_ATTEMPTS } from '../src/superwitness/client';
+import { ServiceTokenCache, postRunReports, runReportBackoffMs, RUN_REPORT_MAX_ATTEMPTS, REPORTER_FETCH_TIMEOUT_MS } from '../src/superwitness/client';
 import type { ReporterConfig } from '../src/superwitness/config';
 import { buildRunReport } from '../src/superwitness/report';
 import { CREDENTIAL, HUB_URL, SW_URL, fakeSuperwitness } from './helpers/superwitness';
@@ -43,6 +43,17 @@ describe('ServiceTokenCache', () => {
     expect(sw.hubCalls()).toBe(2);
   });
 
+  it('a hub that cannot be reached is hub_unreachable, and nothing is posted', async () => {
+    const sw = fakeSuperwitness();
+    const unreachable: typeof sw.fetcher = async (url, init) => {
+      if (url.endsWith('/api/auth/service-token')) throw new TypeError('connection refused');
+      return sw.fetcher(url, init);
+    };
+    expect(await new ServiceTokenCache().get(CFG, unreachable, T0)).toEqual({ ok: false, status: 0, code: 'hub_unreachable' });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), unreachable, T0, REPORTS)).toEqual({ kind: 'retry', status: 0, code: 'hub_unreachable', retryAfterMs: null });
+    expect(sw.batches).toHaveLength(0);
+  });
+
   it('refuses a malformed hub answer', async () => {
     const sw = fakeSuperwitness({ hub: () => Response.json({ token: '', expiresIn: 300 }) });
     expect(await new ServiceTokenCache().get(CFG, sw.fetcher, T0)).toEqual({ ok: false, status: 200, code: 'hub_bad_response' });
@@ -61,7 +72,7 @@ describe('postRunReports', () => {
   });
 
   it('401 drops the token and is retryable', async () => {
-    const sw = fakeSuperwitness({ runs: (_b, n) => (n === 1 ? Response.json({ error: 'unauthorized' }, { status: 401 }) : Response.json({ results: [] })) });
+    const sw = fakeSuperwitness({ runs: (_b, n) => (n === 1 ? Response.json({ error: { code: 'unauthorized', message: 'token expired' } }, { status: 401 }) : Response.json({ results: [] })) });
     const cache = new ServiceTokenCache();
     expect(await postRunReports(CFG, cache, sw.fetcher, T0, REPORTS)).toEqual({ kind: 'retry', status: 401, code: 'unauthorized', retryAfterMs: null });
     await postRunReports(CFG, cache, sw.fetcher, T0, REPORTS);
@@ -70,7 +81,7 @@ describe('postRunReports', () => {
   });
 
   it('403 drops the token and parks', async () => {
-    const sw = fakeSuperwitness({ runs: () => Response.json({ error: 'source_not_allowed' }, { status: 403 }) });
+    const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'source_not_allowed', message: 'source is not allowed' } }, { status: 403 }) });
     const cache = new ServiceTokenCache();
     expect(await postRunReports(CFG, cache, sw.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 403, code: 'source_not_allowed', index: null });
     await postRunReports(CFG, cache, sw.fetcher, T0, REPORTS);
@@ -83,7 +94,7 @@ describe('postRunReports', () => {
   });
 
   it('5xx, 3xx and a network error are retryable', async () => {
-    const five = fakeSuperwitness({ runs: () => Response.json({ error: 'db_unavailable' }, { status: 503 }) });
+    const five = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'db_unavailable', message: 'database unavailable' } }, { status: 503 }) });
     expect(await postRunReports(CFG, new ServiceTokenCache(), five.fetcher, T0, REPORTS)).toEqual({ kind: 'retry', status: 503, code: 'db_unavailable', retryAfterMs: null });
     const three = fakeSuperwitness({ runs: () => new Response(null, { status: 302, headers: { Location: 'https://elsewhere.test/' } }) });
     expect((await postRunReports(CFG, new ServiceTokenCache(), three.fetcher, T0, REPORTS)).kind).toBe('retry');
@@ -102,15 +113,58 @@ describe('postRunReports', () => {
   });
 
   it('422 names the bad item by index; an unusable index parks the batch', async () => {
-    const named = fakeSuperwitness({ runs: () => Response.json({ error: 'invalid_report', index: 1 }, { status: 422 }) });
+    const named = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'invalid_report', message: 'runs[1].title too long', index: 1 } }, { status: 422 }) });
     expect(await postRunReports(CFG, new ServiceTokenCache(), named.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 422, code: 'invalid_report', index: 1 });
-    const outOfRange = fakeSuperwitness({ runs: () => Response.json({ error: 'invalid_report', index: 7 }, { status: 422 }) });
+    const outOfRange = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'invalid_report', message: 'bad', index: 7 } }, { status: 422 }) });
     expect(await postRunReports(CFG, new ServiceTokenCache(), outOfRange.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 422, code: 'invalid_report', index: null });
   });
 
-  it('other 4xx park, and an error code that is not a plain token is not echoed', async () => {
-    const sw = fakeSuperwitness({ runs: () => Response.json({ error: 'Title "Secret plan" too long' }, { status: 400 }) });
-    expect(await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 400, code: 'http_400', index: null });
+  it('a 422 without an index (e.g. reported_at in the future) parks the whole batch', async () => {
+    const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'invalid_report', message: 'reported_at is in the future' } }, { status: 422 }) });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 422, code: 'invalid_report', index: null });
+  });
+
+  it('a 422 index at the top level is not the contract and is ignored', async () => {
+    const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'invalid_report', message: 'bad' }, index: 1 }, { status: 422 }) });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 422, code: 'invalid_report', index: null });
+  });
+
+  it('413 body_too_large parks', async () => {
+    const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'body_too_large', message: 'body exceeds 262144 bytes' } }, { status: 413 }) });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 413, code: 'body_too_large', index: null });
+  });
+
+  it('other 4xx park; the free-text message is never echoed, nor a code that is not a plain token', async () => {
+    const msg = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "Secret plan" too long' } }, { status: 400 }) });
+    const out = await postRunReports(CFG, new ServiceTokenCache(), msg.fetcher, T0, REPORTS);
+    expect(out).toEqual({ kind: 'reject', status: 400, code: 'bad_request', index: null });
+    expect(JSON.stringify(out)).not.toContain('Secret plan');
+    const odd = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'Title "Secret plan" too long', message: 'x' } }, { status: 400 }) });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), odd.fetcher, T0, REPORTS)).toEqual({ kind: 'reject', status: 400, code: 'http_400', index: null });
+  });
+
+  it('caps a 429 Retry-After at 1 h', async () => {
+    const sw = fakeSuperwitness({ runs: () => new Response('', { status: 429, headers: { 'Retry-After': '999999' } }) });
+    expect(await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS)).toEqual({ kind: 'retry', status: 429, code: 'http_429', retryAfterMs: 3_600_000 });
+  });
+
+  it('both requests carry a timeout signal, and a timed-out request is retryable', async () => {
+    expect(REPORTER_FETCH_TIMEOUT_MS).toBe(10_000);
+    const sw = fakeSuperwitness();
+    await postRunReports(CFG, new ServiceTokenCache(), sw.fetcher, T0, REPORTS);
+    expect(sw.hubInits[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(sw.batches[0]!.init.signal).toBeInstanceOf(AbortSignal);
+
+    const timeout = () => new DOMException('The operation timed out.', 'TimeoutError');
+    const slowRuns: typeof sw.fetcher = async (url, init) => {
+      if (url.endsWith('/v1/runs')) throw timeout();
+      return sw.fetcher(url, init);
+    };
+    expect(await postRunReports(CFG, new ServiceTokenCache(), slowRuns, T0, REPORTS)).toEqual({ kind: 'retry', status: 0, code: 'network', retryAfterMs: null });
+    const slowHub: typeof sw.fetcher = async () => {
+      throw timeout();
+    };
+    expect(await postRunReports(CFG, new ServiceTokenCache(), slowHub, T0, REPORTS)).toEqual({ kind: 'retry', status: 0, code: 'hub_unreachable', retryAfterMs: null });
   });
 });
 

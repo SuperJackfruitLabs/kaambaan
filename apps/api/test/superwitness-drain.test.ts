@@ -133,7 +133,7 @@ describe('drainRunReports', () => {
       runInDurableObject(stubFor('swd-park'), async (board: BoardDO) => {
         const [r] = await runs(board, 'brd_swd_park', 1);
         vi.spyOn(console, 'warn').mockImplementation(() => {});
-        const sw = fakeSuperwitness({ runs: () => Response.json({ error: 'bad_request' }, { status: 400 }) });
+        const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "' + SECRET_TITLE + '" is not allowed' } }, { status: 400 }) });
         await board.drainRunReports({ fetcher: sw.fetcher });
         expect((await board.getRunReportOutbox())[0]).toMatchObject({ status: 'dead', attempts: 1, lastError: '400 bad_request' });
         await board.drainRunReports({ fetcher: sw.fetcher, nowMs: Date.now() + 7_200_000 });
@@ -151,7 +151,7 @@ describe('drainRunReports', () => {
         const sw = fakeSuperwitness({
           runs: (body, n) =>
             n === 1
-              ? Response.json({ error: 'invalid_report', index: 1 }, { status: 422 })
+              ? Response.json({ error: { code: 'invalid_report', message: 'bad item', index: 1 } }, { status: 422 })
               : Response.json({ results: body.runs.map((x) => ({ external_ref: x.external_ref, applied: true })) }),
         });
         const badRef = await (async () => (await board.getRunReportOutbox())[1]!.runId)();
@@ -219,7 +219,7 @@ describe('drainRunReports', () => {
         await runs(board, 'brd_swd_nocontent', 3);
         const lines: unknown[] = [];
         for (const m of ['log', 'warn', 'error', 'info'] as const) vi.spyOn(console, m).mockImplementation((...a) => void lines.push(a));
-        await board.drainRunReports({ fetcher: fakeSuperwitness({ runs: () => Response.json({ error: 'bad_request' }, { status: 400 }) }).fetcher });
+        await board.drainRunReports({ fetcher: fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "' + SECRET_TITLE + '" is not allowed' } }, { status: 400 }) }).fetcher });
         state.storage.sql.exec(`UPDATE run_reports SET status = 'pending', next_attempt_at = 0`);
         await board.drainRunReports({ fetcher: fakeSuperwitness({ runs: () => new Response('', { status: 503 }) }).fetcher });
         state.storage.sql.exec(`UPDATE run_reports SET status = 'pending', next_attempt_at = 0, attempts = 11`);
@@ -241,7 +241,7 @@ describe('the alarm drains the outbox', () => {
         await state.storage.deleteAlarm(); // no self-fired drain between here and the read
         state.storage.sql.exec(`UPDATE run_reports SET attempts = 0, next_attempt_at = 0`);
         vi.spyOn(console, 'warn').mockImplementation(() => {});
-        const sw = fakeSuperwitness({ runs: () => Response.json({ error: 'bad_request' }, { status: 400 }) });
+        const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "' + SECRET_TITLE + '" is not allowed' } }, { status: 400 }) });
         expect(await board.drainRunReports({ fetcher: sw.fetcher })).toMatchObject({ parked: 1 });
         await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
         expect((await state.storage.getAlarm())!).toBeGreaterThan(Date.now() + 14 * 60 * 1000);
