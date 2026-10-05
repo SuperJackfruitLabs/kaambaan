@@ -4418,12 +4418,15 @@ export class BoardDO extends DurableObject<Env> {
           JSON.stringify({ parameter: requirement, result: verdict, signal: null }),
           now,
         );
+        this.reportRun(input.runId);
         await this.scheduleReclaim();
         return { ok: true, value: this.mustGetCard(cardId) };
       }
     }
 
     this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId);
+    // After advanceCard: a human gate it opened judges this run, so the run reports `waiting`.
+    this.reportRun(input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4453,6 +4456,7 @@ export class BoardDO extends DurableObject<Env> {
     );
     // request_changes returns to the same (worked) stage so the agent can redo it.
     this.createGate(cardId, card.currentStageKey, card.currentStageKey, run.agent_id as string, input.runId);
+    this.reportRun(input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4637,6 +4641,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     this.emit('card.blocked', { cardId, reason: input.reason });
+    this.reportRun(input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4658,6 +4663,9 @@ export class BoardDO extends DurableObject<Env> {
     this.cancelElicitationsForRun(input.runId);
     this.endAttempt(cardId, 'card.failed', input.reason);
     this.notify('failed', cardId, input.reason || 'Run failed');
+    this.reportRun(input.runId);
+    // Re-arm: the report just queued needs the alarm, and fail() never re-armed it before.
+    await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
 
@@ -4677,6 +4685,7 @@ export class BoardDO extends DurableObject<Env> {
     );
     this.emit('run.released', { cardId, runId: input.runId });
     this.notifyWorkAvailable(cardId);
+    this.reportRun(input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
@@ -4699,6 +4708,7 @@ export class BoardDO extends DurableObject<Env> {
       this.cancelElicitationsForRun(r.id as string);
       this.endAttempt(r.card_id as string, 'run.reclaimed', null, String(r.id)); // endAttempt re-queues + notifies work.available
       this.notify('reclaimed', r.card_id as string, 'Agent went dark — run reclaimed');
+      this.reportRun(r.id as string);
     }
     return rows.length;
   }
