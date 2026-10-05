@@ -36,6 +36,7 @@ import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
+import { logReporter } from './superwitness/log';
 import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
@@ -3163,7 +3164,7 @@ const worker = {
   },
 
   /**
-   * Drain every board's push delivery queue.
+   * Drain every board's push delivery queue and superwitness run-report outbox.
    *
    * `POST /v1/boards/:id/push/dispatch` has always existed and nothing ever called it on a
    * schedule: the queue drained only on a DO alarm or when somebody POSTed by hand, so a delivery
@@ -3189,6 +3190,13 @@ const worker = {
             // silently meant a board failing every five-minute tick, forever, left no trace
             // anywhere. Logged, not rethrown: the loop still continues to the next board.
             console.error(`sweepBoard failed for board ${board.id}`, err);
+          }
+          // The superwitness outbox's backstop (superwitness app spec §3.5): the board alarm is the
+          // drain; this catches a board whose alarm was lost. Due rows only — backoff still holds.
+          try {
+            await boardStub(env, board.tenantId, board.id).drainRunReports();
+          } catch {
+            logReporter('error', { msg: 'superwitness.sweep_failed', 'board.id': board.id });
           }
         }
         // Third arm, same shape as the two above: every project's rollup (Task 19), refreshed so
