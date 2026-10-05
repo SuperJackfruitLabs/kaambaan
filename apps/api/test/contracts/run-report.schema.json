@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.superwitness.dev/schemas/run-report.schema.json",
+  "title": "superwitness run report",
+  "description": "The body of POST /v1/runs: one report, or {\"runs\": [...]} with 1 to 100 reports. Unknown fields are rejected.",
+  "oneOf": [
+    { "$ref": "#/$defs/report" },
+    { "$ref": "#/$defs/batch" }
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 64
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/$defs/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "external_ref", "status", "source_status", "reported_at"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,31}$"
+        },
+        "external_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 200 }
+          }
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "executor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^prn_[0-9a-f]{20}$" },
+            "name": { "type": "string", "minLength": 1, "maxLength": 200 }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "running", "waiting", "succeeded", "failed", "cancelled"]
+        },
+        "source_status": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "started_at": { "$ref": "#/$defs/nullableTimestamp" },
+        "ended_at": { "$ref": "#/$defs/nullableTimestamp" },
+        "reported_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runs"],
+      "properties": {
+        "runs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/report" }
+        }
+      }
+    }
+  }
+}
