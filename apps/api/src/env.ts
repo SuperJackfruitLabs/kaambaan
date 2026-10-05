@@ -43,6 +43,18 @@ export interface Env {
    * input-required, which is correct and is also an outage.
    */
   ENFORCE_CONTROL_PAIR?: string;
+  /**
+   * superwitness's public origin, e.g. https://app.superwitness.dev (superwitness app spec §3.5).
+   *
+   * Unset means run reporting is OFF: no outbox row is ever written and nothing is sent. Set in
+   * wrangler.jsonc `vars`, not the dashboard — a deploy replaces dashboard vars.
+   */
+  SUPERWITNESS_URL?: string;
+  /**
+   * The run reporter's hub service credential, `<svc_id>:<secret>` (secret). Exchanged at
+   * `{HUB_ISSUER}/api/auth/service-token` for a five-minute token carrying `runs:write`.
+   */
+  SUPERWITNESS_REPORTER_CREDENTIAL?: string;
   /** When "true", accept dev-mode X-Tenant-Id / X-Agent-Id headers (local + tests). Never in prod. */
   DEV_AUTH?: string;
   /** Static web assets (the SPA), served for non-API routes when deployed same-origin. */

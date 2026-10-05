@@ -16,6 +16,8 @@ import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
 import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
 import { wouldCycle, type LinkKind, type LinkRow } from './links';
+import { mapRunStatus, type RunReportDraft } from '../superwitness/report';
+import { reportingEnabled } from '../superwitness/config';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -982,6 +984,18 @@ export type BoardErrorCode =
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
+/** One superwitness outbox row (superwitness app spec §3.5), as `getRunReportOutbox` returns it. */
+export interface RunReportOutboxRow {
+  runId: string;
+  gen: number;
+  status: 'pending' | 'dead';
+  attempts: number;
+  nextAttemptAt: number;
+  lastError: string | null;
+  reportedAt: string;
+  draft: RunReportDraft;
+}
+
 /** The Board DO's RPC surface as the Worker calls it — hand-typed to avoid deep RPC type instantiation. */
 export interface BoardStub {
   init(board: BoardInit): Promise<BoardSnapshot>;
@@ -1097,6 +1111,7 @@ export interface BoardStub {
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   pendingElicitationDeliveries(): Promise<ElicitationPendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
+  getRunReportOutbox(): Promise<RunReportOutboxRow[]>;
   sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
   createSchedule(input: {
     title: string;
@@ -1400,6 +1415,37 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * When this run's REPORTED state last changed — superwitness's `reported_at` (superwitness app
+     * spec §3.5: "the run row's own update timestamp"). Strictly increasing per run (`reportRun`).
+     * Nullable: rows from before this column read NULL, and the backfill reports them at
+     * COALESCE(updated_at, ended_at, started_at). Heartbeats do not touch it.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE runs ADD COLUMN updated_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * The superwitness run-report outbox (superwitness app spec §3.5), the same pattern as
+     * `push_deliveries`. One row per run holding its LATEST snapshot; `gen` counts upserts so a
+     * drain that sent an older snapshot never deletes a newer one. `status` is `pending` or `dead`
+     * (parked); `next_attempt_at` is epoch ms.
+     */
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS run_reports (
+        run_id TEXT PRIMARY KEY,
+        gen INTEGER NOT NULL DEFAULT 1,
+        report_json TEXT NOT NULL,
+        reported_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_run_reports_due ON run_reports(status, next_attempt_at)`);
     /**
      * What the queuer was PERMITTED to dispatch, as granted at the moment they
      * queued it.
@@ -2468,6 +2514,7 @@ export class BoardDO extends DurableObject<Env> {
       'notifications',
       'push_deliveries',
       'push_configs',
+      'run_reports',
       'profiles',
       'webhook_deliveries',
       'events',
@@ -3105,6 +3152,23 @@ export class BoardDO extends DurableObject<Env> {
         body: r.body as string,
         status: r.status as string,
         attempts: Number(r.attempts),
+      }));
+  }
+
+  /** The superwitness outbox, soonest due first (tests, and the backfill route's counts). */
+  async getRunReportOutbox(): Promise<RunReportOutboxRow[]> {
+    return this.sql
+      .exec(`SELECT * FROM run_reports ORDER BY next_attempt_at ASC, run_id ASC`)
+      .toArray()
+      .map((r) => ({
+        runId: r.run_id as string,
+        gen: Number(r.gen),
+        status: r.status as 'pending' | 'dead',
+        attempts: Number(r.attempts),
+        nextAttemptAt: Number(r.next_attempt_at),
+        lastError: (r.last_error as string | null) ?? null,
+        reportedAt: r.reported_at as string,
+        draft: JSON.parse(r.report_json as string) as RunReportDraft,
       }));
   }
 
@@ -4188,6 +4252,7 @@ export class BoardDO extends DurableObject<Env> {
       now,
       card.id,
     );
+    this.reportRun(runId);
     this.emit('card.claimed', { cardId: card.id, agentId: input.agentId, runId });
     await this.scheduleReclaim();
 
@@ -5278,6 +5343,116 @@ export class BoardDO extends DurableObject<Env> {
     if (agentId === null || agentId === undefined) return null;
     if ((run.agent_id as string) === agentId) return null;
     return { ok: false, code: 'NOT_RUN_OWNER', message: 'this run belongs to another agent' };
+  }
+
+  // ----- superwitness run reports (superwitness app spec §3.5) -----
+
+  /**
+   * A run's reported state just changed: bump `runs.updated_at` and, when reporting is on, upsert
+   * the run's outbox row with its current state.
+   *
+   * SYNCHRONOUS ON PURPOSE (ruling R5). Every caller invokes it in the same synchronous span as the
+   * write that changed the run, with no `await` between them, so the Durable Object commits the
+   * run change and its report together. Adding an `await` before a call to this breaks that.
+   *
+   * `updated_at` is strictly increasing per run — `max(now, previous + 1 ms)` — because Workers
+   * freezes the clock inside a request and superwitness drops a report whose `reported_at` is not
+   * strictly newer than the one it holds (R4).
+   */
+  private reportRun(runId: string): void {
+    const run = this.getRunRow(runId);
+    if (!run) return;
+    const previous = (run.updated_at as string | null) ?? null;
+    const nextMs = previous ? Math.max(this.nowMs(), Date.parse(previous) + 1) : this.nowMs();
+    const updatedAt = new Date(nextMs).toISOString();
+    this.sql.exec(`UPDATE runs SET updated_at = ? WHERE id = ?`, updatedAt, runId);
+    if (!reportingEnabled(this.env)) return;
+    this.enqueueRunReport(run, updatedAt);
+  }
+
+  /** Upsert `run`'s outbox row with its current state as of `reportedAt` (R6: latest wins, gen bumps). */
+  private enqueueRunReport(run: Row, reportedAt: string): void {
+    this.sql.exec(
+      `INSERT INTO run_reports (run_id, gen, report_json, reported_at, status, attempts, next_attempt_at, last_error, created_at)
+       VALUES (?, 1, ?, ?, 'pending', 0, ?, NULL, ?)
+       ON CONFLICT(run_id) DO UPDATE SET
+         gen = run_reports.gen + 1,
+         report_json = excluded.report_json,
+         reported_at = excluded.reported_at,
+         status = 'pending',
+         attempts = 0,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = NULL`,
+      run.id as string,
+      JSON.stringify(this.runReportDraft(run, reportedAt)),
+      reportedAt,
+      this.nowMs(),
+      this.now(),
+    );
+  }
+
+  private runReportDraft(run: Row, reportedAt: string): RunReportDraft {
+    const runId = run.id as string;
+    const pendingElicitation =
+      Number(this.sql.exec(`SELECT COUNT(*) AS n FROM elicitations WHERE run_id = ? AND status = 'pending'`, runId).one().n) > 0;
+    const mapped = mapRunStatus({
+      status: run.status as string,
+      outcome: (run.outcome as string | null) ?? null,
+      pendingElicitation,
+      gate: this.gateJudgingRun(run),
+    });
+    const card = this.sql.exec(`SELECT title FROM cards WHERE id = ?`, run.card_id as string).toArray()[0];
+    return {
+      boardId: this.getMeta('boardId') ?? '',
+      boardName: this.getMeta('name'),
+      runId,
+      agentId: run.agent_id as string,
+      title: (card?.title as string | undefined) ?? null,
+      status: mapped.status,
+      sourceStatus: mapped.sourceStatus,
+      startedAt: (run.started_at as string | null) ?? null,
+      endedAt: (run.ended_at as string | null) ?? null,
+      reportedAt,
+    };
+  }
+
+  /**
+   * The newest gate judging this run's work (ruling R3). Gates carry `run_id` since 2026-09-29;
+   * an older gate has none and is matched as the first gate on the same card and stage opened at
+   * or after a `submitted` run ended — the one outcome that always opened one (R21).
+   */
+  private gateJudgingRun(run: Row): { status: string; decision: string | null } | null {
+    const linked = this.sql
+      .exec(`SELECT status, decision FROM gates WHERE run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, run.id as string)
+      .toArray()[0];
+    if (linked) return { status: linked.status as string, decision: (linked.decision as string | null) ?? null };
+    if ((run.outcome as string | null) !== 'submitted' || !run.ended_at) return null;
+    const legacy = this.sql
+      .exec(
+        `SELECT status, decision FROM gates
+          WHERE run_id IS NULL AND card_id = ? AND stage_key = ? AND created_at >= ?
+          ORDER BY created_at ASC, rowid ASC LIMIT 1`,
+        run.card_id as string,
+        run.stage_key as string,
+        run.ended_at as string,
+      )
+      .toArray()[0];
+    return legacy ? { status: legacy.status as string, decision: (legacy.decision as string | null) ?? null } : null;
+  }
+
+  /** The run a gate judges: its `run_id`, or for a legacy gate, the submitted run it was opened for (R21). */
+  private runJudgedByGate(gate: Row): string | null {
+    if (gate.run_id) return gate.run_id as string;
+    const row = this.sql
+      .exec(
+        `SELECT id FROM runs WHERE card_id = ? AND stage_key = ? AND outcome = 'submitted' AND ended_at <= ?
+          ORDER BY ended_at DESC LIMIT 1`,
+        gate.card_id as string,
+        gate.stage_key as string,
+        gate.created_at as string,
+      )
+      .toArray()[0];
+    return row ? (row.id as string) : null;
   }
 
   /**
