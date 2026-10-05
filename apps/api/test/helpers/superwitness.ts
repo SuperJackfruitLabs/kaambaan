@@ -1,4 +1,5 @@
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
+import type { BoardDO } from '../../src/board/board-do';
 import type { ReporterFetch } from '../../src/superwitness/client';
 
 export const SW_URL = 'https://sw.test';
@@ -76,4 +77,21 @@ export function fakeSuperwitness(
     throw new Error(`unexpected fetch: ${url}`);
   };
   return { fetcher, batches, hubCalls: () => hubCalls, hubInits };
+}
+
+// A report is due at once, so arming the board alarm for it makes workerd fire that alarm on its own,
+// and a drain that outlives its test then dies with an uncaught "internal error" once the test's
+// storage frame is gone. A test registers its boards here and `quietBoards` (afterEach) lets
+// that drain finish, then deletes the alarm.
+const tracked = new Set<DurableObjectStub<BoardDO>>();
+export function trackBoard(stub: DurableObjectStub<BoardDO>): DurableObjectStub<BoardDO> {
+  tracked.add(stub);
+  return stub;
+}
+export async function quietBoards(): Promise<void> {
+  const stubs = [...tracked];
+  tracked.clear();
+  // Let a drain workerd already started finish inside this test's storage frame, then stop the next.
+  await new Promise((r) => setTimeout(r, 100));
+  for (const stub of stubs) await runInDurableObject(stub, async (_b: BoardDO, state) => state.storage.deleteAlarm());
 }

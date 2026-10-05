@@ -1,14 +1,16 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { BoardDO, type BoardInit } from '../src/board/board-do';
 import { reportingEnabled, reporterConfig } from '../src/superwitness/config';
-import { runRow, withReporting } from './helpers/superwitness';
+import { runRow, withReporting, trackBoard, quietBoards } from './helpers/superwitness';
 
 const BUILD: BoardInit['stages'] = [{ key: 'build', name: 'Build', order: 0, ownerKind: 'capability', owner: 'build' }];
 
 function stubFor(name: string): DurableObjectStub<BoardDO> {
-  return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
+  return trackBoard(env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>);
 }
+
+afterEach(quietBoards);
 
 async function claimOne(board: BoardDO, boardId: string): Promise<string> {
   await board.init({ id: boardId, tenantId: 'tnt_sw', name: 'Release board', stages: BUILD });

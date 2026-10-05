@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { BoardDO, type BoardInit } from '../src/board/board-do';
-import { runRow, withReporting } from './helpers/superwitness';
+import { runRow, withReporting, trackBoard, quietBoards } from './helpers/superwitness';
 
 const BUILD: BoardInit['stages'] = [{ key: 'build', name: 'Build', order: 0, ownerKind: 'capability', owner: 'build' }];
 const CHECKED: BoardInit['stages'] = [
@@ -18,8 +18,10 @@ const SUBMIT: BoardInit['stages'] = [
 ];
 
 function stubFor(name: string): DurableObjectStub<BoardDO> {
-  return env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>;
+  return trackBoard(env.BOARD_DO.get(env.BOARD_DO.idFromName(name)) as unknown as DurableObjectStub<BoardDO>);
 }
+
+afterEach(quietBoards);
 
 async function start(board: BoardDO, id: string, stages: BoardInit['stages'], cap: string) {
   await board.init({ id, tenantId: 'tnt_sw', name: 'B', stages });

@@ -16,8 +16,18 @@ import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
 import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
 import { wouldCycle, type LinkKind, type LinkRow } from './links';
-import { mapRunStatus, type RunReportDraft } from '../superwitness/report';
-import { reportingEnabled } from '../superwitness/config';
+import { buildRunReport, mapRunStatus, type RunReport, type RunReportDraft } from '../superwitness/report';
+import { reportingEnabled, reporterConfig } from '../superwitness/config';
+import {
+  defaultReporterFetch,
+  postRunReports,
+  runReportBackoffMs,
+  RUN_REPORT_MAX_ATTEMPTS,
+  ServiceTokenCache,
+  type ReporterFetch,
+} from '../superwitness/client';
+import { logReporter } from '../superwitness/log';
+import { agentNamesFor, principalIdsFor } from '../db/catalog';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -107,6 +117,11 @@ const MAX_PUSH_ATTEMPTS = 5;
  * asked for.
  */
 const PUSH_DRAIN_BASE_MS = 5_000;
+
+/** superwitness run reports (superwitness app spec §3.5; rulings R12, R13). */
+const RUN_REPORT_BATCH_MAX = 100;
+const RUN_REPORT_BATCH_MAX_BYTES = 200 * 1024;
+const RUN_REPORT_MAX_BATCHES_PER_DRAIN = 10;
 
 /**
  * How much of the previous stage's handoff a gate carries into a room.
@@ -996,8 +1011,15 @@ export interface RunReportOutboxRow {
   draft: RunReportDraft;
 }
 
+export interface RunReportDrainResult {
+  sent: number;
+  retried: number;
+  parked: number;
+}
+
 /** The Board DO's RPC surface as the Worker calls it — hand-typed to avoid deep RPC type instantiation. */
 export interface BoardStub {
+  drainRunReports(): Promise<RunReportDrainResult>;
   init(board: BoardInit): Promise<BoardSnapshot>;
   createCard(input: {
     /** What the queuer was permitted to dispatch, as granted at this moment. */
@@ -1220,6 +1242,10 @@ const defaultPushSender: PushSender = (url, init) => fetch(url, init).then((r) =
 
 export class BoardDO extends DurableObject<Env> {
   private sql: SqlStorage;
+  /** The run reporter's hub token, in memory only (ruling R14). */
+  private readonly reporterToken = new ServiceTokenCache();
+  /** One drain at a time: the alarm and the cron backstop can both ask. */
+  private reportDrain: Promise<RunReportDrainResult> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -3186,6 +3212,23 @@ export class BoardDO extends DurableObject<Env> {
   }
 
   /**
+   * Send due superwitness run reports (superwitness app spec §3.5). Called by the alarm, and by the
+   * Worker cron as a backstop. `fetcher`/`nowMs` are injectable for tests, like
+   * `dispatchPushDeliveries`'s sender. Never throws for a delivery failure — those are recorded on
+   * the rows.
+   */
+  async drainRunReports(opts: { fetcher?: ReporterFetch; nowMs?: number } = {}): Promise<RunReportDrainResult> {
+    if (this.reportDrain) return this.reportDrain;
+    const run = this.drainRunReportsOnce(opts.fetcher ?? defaultReporterFetch, opts.nowMs ?? this.nowMs());
+    this.reportDrain = run;
+    try {
+      return await run;
+    } finally {
+      this.reportDrain = null;
+    }
+  }
+
+  /**
    * Drain pending push deliveries: sign each with its config token and send (docs/05 §4). The sender
    * is injectable (tests pass a stub); production durability — Queue + Workflow with exponential
    * backoff — wraps this. A single drain marks each delivery sent/failed.
@@ -4766,6 +4809,12 @@ export class BoardDO extends DurableObject<Env> {
     // fixes; `scheduleReclaim` below is what brings the alarm back while
     // anything is still pending.
     await this.dispatchPushDeliveries();
+    // Its own try/catch: a reporter failure must not stop the alarm re-arming below.
+    try {
+      await this.drainRunReports();
+    } catch (err) {
+      logReporter('error', { msg: 'superwitness.drain_failed', 'board.id': this.getMeta('boardId') ?? '', code: err instanceof Error ? err.name : 'unknown' });
+    }
     await this.scheduleReclaim();
   }
 
@@ -5485,6 +5534,151 @@ export class BoardDO extends DurableObject<Env> {
     return row ? (row.id as string) : null;
   }
 
+  private async drainRunReportsOnce(fetcher: ReporterFetch, nowMs: number): Promise<RunReportDrainResult> {
+    const result: RunReportDrainResult = { sent: 0, retried: 0, parked: 0 };
+    if (!reportingEnabled(this.env)) return result;
+    const boardId = this.getMeta('boardId') ?? '';
+    for (let i = 0; i < RUN_REPORT_MAX_BATCHES_PER_DRAIN; i++) {
+      const due = this.sql
+        .exec(
+          `SELECT run_id, gen, report_json, attempts FROM run_reports
+            WHERE status = 'pending' AND next_attempt_at <= ?
+            ORDER BY next_attempt_at ASC, run_id ASC LIMIT ?`,
+          nowMs,
+          RUN_REPORT_BATCH_MAX,
+        )
+        .toArray()
+        .map((r) => ({
+          runId: r.run_id as string,
+          gen: Number(r.gen),
+          attempts: Number(r.attempts),
+          draft: JSON.parse(r.report_json as string) as RunReportDraft,
+        }));
+      if (due.length === 0) break;
+
+      const cfg = reporterConfig(this.env);
+      if ('error' in cfg) {
+        logReporter('warn', { msg: 'superwitness.reporter_misconfigured', 'board.id': boardId, code: cfg.error });
+        this.tallyRetry(result, this.retryRunReports(due, nowMs, cfg.error, null), due.length);
+        break;
+      }
+
+      let executors: Map<string, { principalId: string | null; name: string | null }>;
+      try {
+        executors = await this.runReportExecutors(due.map((d) => d.draft.agentId));
+      } catch {
+        logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, code: 'catalog_unavailable', count: due.length });
+        this.tallyRetry(result, this.retryRunReports(due, nowMs, 'catalog_unavailable', null), due.length);
+        break;
+      }
+
+      // Cap by bytes as well as by count: 100 reports of multibyte text can pass 256 KiB (R12).
+      const batch: typeof due = [];
+      const reports: RunReport[] = [];
+      let bytes = '{"runs":[]}'.length;
+      for (const d of due) {
+        const report = buildRunReport(d.draft, executors.get(d.draft.agentId) ?? { principalId: null, name: null });
+        const size = new TextEncoder().encode(JSON.stringify(report)).length + 1;
+        if (batch.length > 0 && bytes + size > RUN_REPORT_BATCH_MAX_BYTES) break;
+        batch.push(d);
+        reports.push(report);
+        bytes += size;
+      }
+
+      const outcome = await postRunReports(cfg, this.reporterToken, fetcher, nowMs, reports);
+      if (outcome.kind === 'ok') {
+        // `gen` guard (R6): a row re-written while this batch was in flight holds a newer snapshot.
+        for (const d of batch) this.sql.exec(`DELETE FROM run_reports WHERE run_id = ? AND gen = ?`, d.runId, d.gen);
+        result.sent += batch.length;
+        continue;
+      }
+      if (outcome.kind === 'retry') {
+        logReporter('warn', { msg: 'superwitness.report_retry', 'board.id': boardId, 'http.status': outcome.status, code: outcome.code, count: batch.length });
+        this.tallyRetry(result, this.retryRunReports(batch, nowMs, outcome.code, outcome.retryAfterMs), batch.length);
+        break;
+      }
+      // Refused: the one named item, or the whole batch (R11). The rest stay due and go next loop.
+      const refused = outcome.index !== null ? [batch[outcome.index]!] : batch;
+      for (const d of refused) this.parkRunReport(d, boardId, `${outcome.status} ${outcome.code}`, outcome.status, outcome.code);
+      result.parked += refused.length;
+    }
+    const dead = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM run_reports WHERE status = 'dead'`).one().n);
+    if (dead > 0) {
+      logReporter('warn', { msg: 'superwitness.run_reports_dead', metric: 'run_reports_dead', value: dead, 'board.id': boardId });
+    }
+    return result;
+  }
+
+  private tallyRetry(result: RunReportDrainResult, parked: number, total: number): void {
+    result.parked += parked;
+    result.retried += total - parked;
+  }
+
+  /** A retryable failure (R9, R10): back off, or park on the 12th attempt. Returns how many were parked. */
+  private retryRunReports(
+    rows: Array<{ runId: string; gen: number; attempts: number }>,
+    nowMs: number,
+    code: string,
+    retryAfterMs: number | null,
+  ): number {
+    let parked = 0;
+    const boardId = this.getMeta('boardId') ?? '';
+    for (const d of rows) {
+      const attempts = d.attempts + 1;
+      if (attempts >= RUN_REPORT_MAX_ATTEMPTS) {
+        this.parkRunReport(d, boardId, `gave up: ${code}`, 0, code);
+        parked += 1;
+        continue;
+      }
+      const delay = Math.max(runReportBackoffMs(attempts), retryAfterMs ?? 0);
+      this.sql.exec(
+        `UPDATE run_reports SET attempts = ?, next_attempt_at = ?, last_error = ? WHERE run_id = ? AND gen = ?`,
+        attempts,
+        nowMs + delay,
+        code,
+        d.runId,
+        d.gen,
+      );
+    }
+    return parked;
+  }
+
+  /** Park a row: kept, never retried, counted as `run_reports_dead` (R16). Ids and codes only in the log. */
+  private parkRunReport(
+    d: { runId: string; gen: number },
+    boardId: string,
+    lastError: string,
+    status: number,
+    code: string,
+  ): void {
+    this.sql.exec(
+      `UPDATE run_reports SET status = 'dead', attempts = attempts + 1, last_error = ? WHERE run_id = ? AND gen = ?`,
+      lastError,
+      d.runId,
+      d.gen,
+    );
+    logReporter('warn', {
+      msg: 'superwitness.report_parked',
+      metric: 'run_reports_dead',
+      'board.id': boardId,
+      'run.id': d.runId,
+      'http.status': status,
+      code,
+    });
+  }
+
+  /** Executor identity from the catalog (ruling R7). */
+  private async runReportExecutors(agentIds: string[]): Promise<Map<string, { principalId: string | null; name: string | null }>> {
+    const tenantId = this.getMeta('tenantId') ?? '';
+    const [principals, names] = await Promise.all([
+      principalIdsFor(this.env.DB, tenantId, agentIds),
+      agentNamesFor(this.env.DB, tenantId, agentIds),
+    ]);
+    const out = new Map<string, { principalId: string | null; name: string | null }>();
+    for (const id of new Set(agentIds)) out.set(id, { principalId: principals.get(id) ?? null, name: names.get(id) ?? null });
+    return out;
+  }
+
   /**
    * Set the single alarm to whichever comes first: a run's reclaim deadline, or
    * the next push-delivery attempt.
@@ -5511,7 +5705,14 @@ export class BoardDO extends DurableObject<Env> {
     const drainAt =
       Number(queued.n) > 0 ? this.nowMs() + PUSH_DRAIN_BASE_MS * 2 ** Number(queued.a ?? 0) : null;
 
-    const next = [reclaimAt, drainAt].filter((t): t is number => t !== null).sort((a, b) => a - b)[0];
+    // Third job on the one alarm: the superwitness outbox. Only while reporting is on, so rows left
+    // behind when it was switched off cannot wake the board on a loop.
+    const reportDue = reportingEnabled(this.env)
+      ? this.sql.exec(`SELECT MIN(next_attempt_at) AS t FROM run_reports WHERE status = 'pending'`).one().t
+      : null;
+    const reportAt = reportDue === null || reportDue === undefined ? null : Math.max(Number(reportDue), this.nowMs());
+
+    const next = [reclaimAt, drainAt, reportAt].filter((t): t is number => t !== null).sort((a, b) => a - b)[0];
     if (next === undefined) {
       await this.ctx.storage.deleteAlarm();
       return;
