@@ -2144,8 +2144,19 @@ export class BoardDO extends DurableObject<Env> {
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
+    // Runs whose wait this move ends — judged by a pending gate, or asking a pending question —
+    // change reported state. Collected before the cancels below change what they read as.
+    const waitingRuns = new Set<string>();
+    for (const g of this.sql.exec(`SELECT * FROM gates WHERE card_id = ? AND status = 'pending'`, cardId).toArray()) {
+      const judged = this.runJudgedByGate(g);
+      if (judged) waitingRuns.add(judged);
+    }
+    for (const e of this.sql.exec(`SELECT DISTINCT run_id FROM elicitations WHERE card_id = ? AND status = 'pending'`, cardId).toArray()) {
+      waitingRuns.add(e.run_id as string);
+    }
     this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
     this.cancelElicitationsForCard(cardId);
+    for (const r of waitingRuns) this.reportRun(r);
     // The person moving it IS the human attention the card was waiting for; carrying
     // the request across the move would ask for something already given.
     this.setNeedsHuman(cardId, null);
@@ -2165,6 +2176,7 @@ export class BoardDO extends DurableObject<Env> {
       this.resolveCard(cardId, this.getCardHandoffJson(cardId), target.key);
       const resolved = this.mustGetCard(cardId);
       this.emit('card.moved', { cardId, from: card.currentStageKey, to: target.key });
+      await this.scheduleReclaim();
       return { ok: true, value: resolved };
     }
     this.sql.exec(
@@ -2206,6 +2218,7 @@ export class BoardDO extends DurableObject<Env> {
         `moved to "${target.name}" past ${unresolvedBlockers} unresolved blocker${unresolvedBlockers === 1 ? '' : 's'}${actorUserId ? ` by ${actorUserId}` : ''}`,
       );
     }
+    await this.scheduleReclaim();
     return { ok: true, value: updated };
   }
 
@@ -4341,6 +4354,7 @@ export class BoardDO extends DurableObject<Env> {
       cardState = input.signal === 'auth' ? 'auth-required' : 'input-required';
       this.sql.exec(`UPDATE cards SET state = ?, updated_at = ? WHERE id = ?`, cardState, now, cardId);
       this.openElicitation(input, run, cardId, now);
+      this.reportRun(input.runId);
     }
     this.emit('activity', { runId: input.runId, cardId, activityType: input.type });
     await this.scheduleReclaim();
@@ -4516,6 +4530,10 @@ export class BoardDO extends DurableObject<Env> {
       this.emit('card.rejected', { cardId, gateId: input.gateId });
     }
     this.emit('gate.resolved', { gateId: input.gateId, cardId, decision: input.decision, decidedBy: input.decidedBy });
+    // After advanceCard: an approval into another human gate stage chains a gate on the same run.
+    const judged = this.runJudgedByGate(gate);
+    if (judged) this.reportRun(judged);
+    await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
   }
 
@@ -4616,6 +4634,8 @@ export class BoardDO extends DurableObject<Env> {
       option: option === '' ? null : option,
       answeredBy: input.answeredBy,
     });
+    this.reportRun(elicitation.runId);
+    await this.scheduleReclaim();
     return {
       ok: true,
       value: { card: this.mustGetCard(card.id), elicitation: this.mustGetElicitation(elicitation.id) },
