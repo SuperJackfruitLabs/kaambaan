@@ -232,6 +232,35 @@ describe('drainRunReports', () => {
 });
 
 describe('the alarm drains the outbox', () => {
+  // The alarm's only guard against a tight loop is what scheduleReclaim arms after a drain. A
+  // working run keeps a 15-minute reclaim deadline in play, so the report term is what is measured.
+  it('does not re-arm the alarm for a parked report', () =>
+    withReporting(() =>
+      runInDurableObject(stubFor('swd-alarm-parked'), async (board: BoardDO, state) => {
+        await runs(board, 'brd_swd_alarm_parked', 1);
+        await state.storage.deleteAlarm(); // no self-fired drain between here and the read
+        state.storage.sql.exec(`UPDATE run_reports SET attempts = 0, next_attempt_at = 0`);
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const sw = fakeSuperwitness({ runs: () => Response.json({ error: 'bad_request' }, { status: 400 }) });
+        expect(await board.drainRunReports({ fetcher: sw.fetcher })).toMatchObject({ parked: 1 });
+        await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
+        expect((await state.storage.getAlarm())!).toBeGreaterThan(Date.now() + 14 * 60 * 1000);
+      }),
+    ));
+
+  it('re-arms no sooner than the backoff after a failed drain', () =>
+    withReporting(() =>
+      runInDurableObject(stubFor('swd-alarm-backoff'), async (board: BoardDO, state) => {
+        await runs(board, 'brd_swd_alarm_backoff', 1);
+        await state.storage.deleteAlarm();
+        state.storage.sql.exec(`UPDATE run_reports SET attempts = 0, next_attempt_at = 0`);
+        const sw = fakeSuperwitness({ runs: () => new Response('down', { status: 503 }) });
+        expect(await board.drainRunReports({ fetcher: sw.fetcher, nowMs: Date.now() })).toMatchObject({ retried: 1 });
+        await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
+        expect((await state.storage.getAlarm())!).toBeGreaterThanOrEqual(Date.now() + 29_000);
+      }),
+    ));
+
   it('arms the alarm for a fresh report and sends it when the alarm runs', async () => {
     const stub = stubFor('swd-alarm');
     const realFetch = globalThis.fetch;
