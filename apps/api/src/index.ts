@@ -101,6 +101,7 @@ import {
   type ProjectState,
   type ProjectHealth,
 } from './db/projects';
+import { withRunTelemetry } from './telemetry/run-telemetry';
 
 export { BoardDO };
 
@@ -437,7 +438,7 @@ async function runEvidence(request: Request, env: Env, boardId: string, runId: s
   }
 }
 
-export default {
+const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -3206,4 +3207,10 @@ export default {
       })(),
     );
   },
+} satisfies ExportedHandler<Env>;
+
+export default {
+  fetch: (request: Request, env: Env): Promise<Response> => withRunTelemetry(request, () => worker.fetch(request, env)),
+  scheduled: (event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> =>
+    worker.scheduled(event, env, ctx),
 } satisfies ExportedHandler<Env>;

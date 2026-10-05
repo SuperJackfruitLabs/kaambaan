@@ -4,8 +4,27 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-11-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Workers Observability → superwitness (ws4). Traces go only to the gateway (`persist: false`
+  // stores nothing in Cloudflare). Logs stay persisted as before AND go to the gateway. The
+  // sampling rate comes from the measurement in ws4 Task 15 Step 1. Change it only with a new
+  // measurement.
+  // The destinations `superwitness-traces` and `superwitness-logs` must exist in the account
+  // before this config is deployed.
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 1,
+      "destinations": ["superwitness-logs"],
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.1,
+      "destinations": ["superwitness-traces"],
+      "persist": false
+    }
   },
   // NOTE: DEV_AUTH is deliberately NOT set here. Dev-mode auth (accepting X-Tenant-Id / X-Agent-Id
   // headers as a credential) is opt-IN: `pnpm dev` passes `--var DEV_AUTH:true` and the test runner
