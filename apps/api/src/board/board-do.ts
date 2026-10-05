@@ -1020,6 +1020,7 @@ export interface RunReportDrainResult {
 /** The Board DO's RPC surface as the Worker calls it — hand-typed to avoid deep RPC type instantiation. */
 export interface BoardStub {
   drainRunReports(): Promise<RunReportDrainResult>;
+  enqueueAllRunReports(): Promise<Result<{ enqueued: number; pending: number; dead: number }>>;
   init(board: BoardInit): Promise<BoardSnapshot>;
   createCard(input: {
     /** What the queuer was permitted to dispatch, as granted at this moment. */
@@ -3226,6 +3227,32 @@ export class BoardDO extends DurableObject<Env> {
     } finally {
       this.reportDrain = null;
     }
+  }
+
+  /**
+   * Enqueue one report per run on this board (superwitness app spec §3.5 backfill; ruling R18).
+   *
+   * Safe to re-run: each run is reported at its OWN stored update time and nothing here bumps it,
+   * so a report superwitness already holds arrives with an equal `reported_at` and is a no-op
+   * there. Parked rows go back to pending, which makes this the repair tool as well.
+   */
+  async enqueueAllRunReports(): Promise<Result<{ enqueued: number; pending: number; dead: number }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    let enqueued = 0;
+    if (reportingEnabled(this.env)) {
+      for (const run of this.sql.exec(`SELECT * FROM runs ORDER BY started_at ASC`).toArray()) {
+        const reportedAt = (run.updated_at as string | null) ?? (run.ended_at as string | null) ?? (run.started_at as string);
+        this.enqueueRunReport(run, reportedAt);
+        enqueued += 1;
+      }
+      await this.scheduleReclaim();
+    }
+    const counts = this.sql
+      .exec(
+        `SELECT COALESCE(SUM(status = 'pending'), 0) AS pending, COALESCE(SUM(status = 'dead'), 0) AS dead FROM run_reports`,
+      )
+      .one();
+    return { ok: true, value: { enqueued, pending: Number(counts.pending), dead: Number(counts.dead) } };
   }
 
   /**

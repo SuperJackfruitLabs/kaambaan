@@ -37,6 +37,7 @@ import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
 import { logReporter } from './superwitness/log';
+import { reportingEnabled } from './superwitness/config';
 import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
@@ -974,6 +975,37 @@ const worker = {
       } catch (err) {
         return unexpected(err);
       }
+    }
+
+    /**
+     * POST /v1/admin/superwitness/backfill — enqueue a superwitness report for every run on one
+     * board (superwitness app spec §3.5; ruling R18). Idempotent, and the repair tool for parked or
+     * missed reports.
+     *
+     * A person with `manage` (admin or owner) in the board's workspace. Not an agent: re-reporting a
+     * board's history is administration, not shaping work. 409 while reporting is off, because an
+     * off reporter writes no outbox rows and a 200 would claim work that did not happen.
+     */
+    if (path === '/v1/admin/superwitness/backfill') {
+      if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
+      const caller = await resolveWorkspaceCaller(request, env, { human: 'manage', agentScope: null });
+      if (caller instanceof Response) return caller;
+      let body: { board_id?: unknown } | null = null;
+      try {
+        body = (await request.json()) as { board_id?: unknown };
+      } catch {
+        body = null;
+      }
+      const boardId = typeof body?.board_id === 'string' ? body.board_id.trim() : '';
+      if (boardId === '') return Response.json({ error: 'board_id is required' }, { status: 400 });
+      if (!reportingEnabled(env)) {
+        return Response.json({ error: 'run reporting is off: SUPERWITNESS_URL is not set' }, { status: 409 });
+      }
+      const boards = await listBoards(env.DB, caller.tenantId);
+      if (!boards.some((b) => b.id === boardId)) return Response.json({ error: 'board not found' }, { status: 404 });
+      const result = await boardStub(env, caller.tenantId, boardId).enqueueAllRunReports();
+      if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+      return Response.json({ board_id: boardId, ...result.value });
     }
 
     // /v1/projects[/:id[/milestones|/rollup]] — a workspace's projects (migration 0013), which
