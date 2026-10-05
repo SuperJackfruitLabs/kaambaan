@@ -37,6 +37,7 @@ describe('drainRunReports', () => {
         const agent = await createAgent(env.DB, TENANT, { name: 'Writer', capabilities: ['build'] });
         await setAgentExternalMapping(env.DB, TENANT, agent.id, { externalId: 'prn_0123456789abcdef0123', externalSource: 'org-plane' });
         const [a, b, c, d, e] = await runs(board, 'brd_swd_contract', 5, agent.id);
+        await state.storage.deleteAlarm();
         await board.postActivity({ runId: a!.runId, leaseEpoch: a!.leaseEpoch, type: 'elicitation', body: 'Which?' }); // waiting
         await board.submitForReview({ runId: b!.runId, leaseEpoch: b!.leaseEpoch });
         const gateId = state.storage.sql.exec(`SELECT id FROM gates WHERE run_id = ?`, b!.runId).one().id as string;
@@ -70,8 +71,9 @@ describe('drainRunReports', () => {
 
   it('keeps a newer snapshot written during the send (gen guard)', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-gen'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-gen'), async (board: BoardDO, state) => {
         const [r] = await runs(board, 'brd_swd_gen', 1);
+        await state.storage.deleteAlarm();
         const sw = fakeSuperwitness({
           runs: async (body) => {
             // The run changes while its report is in flight.
@@ -87,10 +89,37 @@ describe('drainRunReports', () => {
       }),
     ));
 
+  // The retry and park UPDATEs carry the same guard: a failed send must not back off or park a
+  // snapshot it never sent.
+  it.each([
+    ['park (400)', () => Response.json({ error: { code: 'bad_request', message: 'no' } }, { status: 400 })],
+    ['retry (503)', () => new Response('down', { status: 503 })],
+  ] as const)('keeps a newer snapshot written during a failed send — %s', (name, answer) =>
+    withReporting(() =>
+      runInDurableObject(stubFor(`swd-gen-${name.slice(0, 5)}`), async (board: BoardDO, state) => {
+        const [r] = await runs(board, `brd_swd_gen_${name.slice(0, 5)}`, 1);
+        await state.storage.deleteAlarm();
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const sw = fakeSuperwitness({
+          runs: async () => {
+            await board.postActivity({ runId: r!.runId, leaseEpoch: r!.leaseEpoch, type: 'elicitation', body: 'Which?' });
+            return answer();
+          },
+        });
+        await board.drainRunReports({ fetcher: sw.fetcher });
+        expect(sw.batches).toHaveLength(1);
+        const rows = await board.getRunReportOutbox();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ gen: 2, status: 'pending', attempts: 0, lastError: null });
+        expect(rows[0]!.draft.status).toBe('waiting');
+      }),
+    ));
+
   it('backs off 30 s, then 60 s, and does not send before the row is due', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-backoff'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-backoff'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_backoff', 1);
+        await state.storage.deleteAlarm(); // no self-fired drain ahead of this test's own
         const sw = fakeSuperwitness({ runs: () => new Response('down', { status: 503 }) });
         const t0 = Date.now() + 1;
         expect(await board.drainRunReports({ fetcher: sw.fetcher, nowMs: t0 })).toEqual({ sent: 0, retried: 1, parked: 0 });
@@ -106,8 +135,9 @@ describe('drainRunReports', () => {
 
   it('honours Retry-After as a floor on 429', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-429'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-429'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_429', 1);
+        await state.storage.deleteAlarm();
         const sw = fakeSuperwitness({ runs: () => new Response('', { status: 429, headers: { 'Retry-After': '600' } }) });
         const t0 = Date.now() + 1;
         await board.drainRunReports({ fetcher: sw.fetcher, nowMs: t0 });
@@ -119,6 +149,7 @@ describe('drainRunReports', () => {
     withReporting(() =>
       runInDurableObject(stubFor('swd-giveup'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_giveup', 1);
+        await state.storage.deleteAlarm();
         state.storage.sql.exec(`UPDATE run_reports SET attempts = 11`);
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const sw = fakeSuperwitness({ runs: () => new Response('down', { status: 500 }) });
@@ -130,8 +161,9 @@ describe('drainRunReports', () => {
 
   it('parks a 4xx without retrying it, and the next change revives the row', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-park'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-park'), async (board: BoardDO, state) => {
         const [r] = await runs(board, 'brd_swd_park', 1);
+        await state.storage.deleteAlarm();
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const sw = fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "' + SECRET_TITLE + '" is not allowed' } }, { status: 400 }) });
         await board.drainRunReports({ fetcher: sw.fetcher });
@@ -145,8 +177,9 @@ describe('drainRunReports', () => {
 
   it('a 422 naming one item parks only that item and sends the rest', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-422'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-422'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_422', 3);
+        await state.storage.deleteAlarm();
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const sw = fakeSuperwitness({
           runs: (body, n) =>
@@ -167,6 +200,7 @@ describe('drainRunReports', () => {
     withReporting(() =>
       runInDurableObject(stubFor('swd-bytes'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_bytes', 100);
+        await state.storage.deleteAlarm();
         const wide = '𝔁'.repeat(200); // 4 bytes each in UTF-8
         for (const row of await board.getRunReportOutbox()) {
           const draft = { ...row.draft, title: wide, boardName: wide, agentId: wide };
@@ -182,8 +216,9 @@ describe('drainRunReports', () => {
   it('a misconfigured reporter retries with a code and posts nothing', () =>
     withReporting(
       () =>
-        runInDurableObject(stubFor('swd-misconf'), async (board: BoardDO) => {
+        runInDurableObject(stubFor('swd-misconf'), async (board: BoardDO, state) => {
           await runs(board, 'brd_swd_misconf', 1);
+          await state.storage.deleteAlarm();
           vi.spyOn(console, 'warn').mockImplementation(() => {});
           const sw = fakeSuperwitness();
           expect(await board.drainRunReports({ fetcher: sw.fetcher })).toEqual({ sent: 0, retried: 1, parked: 0 });
@@ -195,8 +230,9 @@ describe('drainRunReports', () => {
 
   it('runs one drain at a time', () =>
     withReporting(() =>
-      runInDurableObject(stubFor('swd-single'), async (board: BoardDO) => {
+      runInDurableObject(stubFor('swd-single'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_single', 1);
+        await state.storage.deleteAlarm();
         let release!: () => void;
         const gate = new Promise<void>((r) => (release = r));
         const sw = fakeSuperwitness({
@@ -217,6 +253,7 @@ describe('drainRunReports', () => {
     withReporting(() =>
       runInDurableObject(stubFor('swd-nocontent'), async (board: BoardDO, state) => {
         await runs(board, 'brd_swd_nocontent', 3);
+        await state.storage.deleteAlarm();
         const lines: unknown[] = [];
         for (const m of ['log', 'warn', 'error', 'info'] as const) vi.spyOn(console, m).mockImplementation((...a) => void lines.push(a));
         await board.drainRunReports({ fetcher: fakeSuperwitness({ runs: () => Response.json({ error: { code: 'bad_request', message: 'Title "' + SECRET_TITLE + '" is not allowed' } }, { status: 400 }) }).fetcher });
