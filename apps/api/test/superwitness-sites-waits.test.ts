@@ -122,3 +122,49 @@ describe('superwitness reports — waits', () => {
       }),
     ));
 });
+
+// A parent whose run completes with an open child defers its advance, so the run is reported
+// `succeeded`. When the child stops being open, the replay opens a human gate judging that run, and
+// the run must be reported `waiting` again — by whichever of the three ways the child goes.
+const DEFER: BoardInit['stages'] = [
+  { key: 'work', name: 'Work', order: 0, ownerKind: 'capability', owner: 'work' },
+  { key: 'review', name: 'Review', order: 1, ownerKind: 'human', gate: 'approval' },
+];
+
+describe('superwitness reports — deferred parent advance', () => {
+  it.each(['resolve', 'delete', 'unlink'] as const)('the replayed advance into a human gate reports the parent run waiting (%s the child)', (how) =>
+    withReporting(() =>
+      runInDurableObject(stubFor(`sww-defer-${how}`), async (board: BoardDO, state) => {
+        await board.init({ id: `brd_sww_defer_${how}`, tenantId: 'tnt_sw', name: 'B', stages: DEFER });
+        const p = await board.createCard({ title: 'Parent', ownerUserId: 'usr_a' });
+        if (!p.ok) throw new Error(p.message);
+        const cp = await board.claim({ agentId: 'agt_p', capabilities: ['work'] });
+        if (!cp.claimed) throw new Error('expected the parent claim');
+        const child = await board.createChildCard(p.value.id, { title: 'Child', ownerUserId: 'usr_a' });
+        if (!child.ok) throw new Error(child.message);
+        await board.complete({ runId: cp.runId, leaseEpoch: cp.leaseEpoch, handoff: { summary: 'split' } });
+        const deferred = await reported(board, state, cp.runId);
+        expect(deferred.status).toBe('succeeded');
+        const before = runRow(state, cp.runId).updated_at as string;
+
+        if (how === 'resolve') {
+          const cc = await board.claim({ agentId: 'agt_c', capabilities: ['work'] });
+          if (!cc.claimed || cc.card.id !== child.value.id) throw new Error('expected the child claim');
+          await board.complete({ runId: cc.runId, leaseEpoch: cc.leaseEpoch, handoff: { summary: 'c' } });
+          const childGate = (await board.getState()).gates.find((g) => g.cardId === child.value.id)!;
+          expect((await board.resolveGate({ gateId: childGate.id, decision: 'approve', decidedBy: 'usr_h' })).ok).toBe(true);
+        } else {
+          await state.storage.deleteAlarm(); // the resuming verb must arm the drain itself
+          const r = how === 'delete' ? await board.deleteCard(child.value.id) : await board.removeLink(p.value.id, child.value.id, 'parent');
+          expect(r.ok).toBe(true);
+          expect(await state.storage.getAlarm()).not.toBeNull();
+          expect((await state.storage.getAlarm())!).toBeLessThanOrEqual(Date.now() + 1000);
+        }
+
+        const after = await reported(board, state, cp.runId);
+        expect(after.status).toBe('waiting');
+        expect(after.gen).toBeGreaterThan(deferred.gen);
+        expect(Date.parse(runRow(state, cp.runId).updated_at as string)).toBeGreaterThan(Date.parse(before));
+      }),
+    ));
+});

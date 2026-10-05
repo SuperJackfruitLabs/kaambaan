@@ -2367,6 +2367,7 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM cards WHERE id = ?`, cardId);
     this.emit('card.deleted', { cardId });
     if (parentId) this.resumeParentAdvanceIfFree(parentId);
+    await this.scheduleReclaim();
     return { ok: true, value: { ok: true } };
   }
 
@@ -2731,6 +2732,7 @@ export class BoardDO extends DurableObject<Env> {
     // Un-parenting a card is the other way (besides completion) it can stop counting as an open
     // child — see `resumeParentAdvanceIfFree`'s note. `fromCardId` IS the parent for a `parent` edge.
     if (kind === 'parent') this.resumeParentAdvanceIfFree(fromCardId);
+    await this.scheduleReclaim();
     return { ok: true, value: { ok: true } };
   }
 
@@ -5036,6 +5038,9 @@ export class BoardDO extends DurableObject<Env> {
     const pending = JSON.parse(pendingJson) as { fromStageKey: string; producedBy: string; handoffJson: string | null; runId?: string | null };
     this.sql.exec(`UPDATE cards SET pending_advance_json = NULL WHERE id = ?`, parentId);
     this.advanceCard(parentId, pending.fromStageKey, pending.producedBy, pending.handoffJson, pending.runId ?? null);
+    // The replay may open a gate judging the parent's run, which was reported `succeeded` when the
+    // advance was deferred — report it again (R5: same synchronous span). Callers arm the drain.
+    if (pending.runId) this.reportRun(pending.runId);
   }
 
   private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string, runId: string | null): string {
@@ -5322,7 +5327,11 @@ export class BoardDO extends DurableObject<Env> {
       this.resolveCard(cardId, this.getCardHandoffJson(cardId));
       completed++;
     }
-    if (completed > 0) this.emit('cards.terminal_backfilled', { completed });
+    if (completed > 0) {
+      this.emit('cards.terminal_backfilled', { completed });
+      // A resolved card may free a parent whose replayed advance reports its run.
+      await this.scheduleReclaim();
+    }
     return { completed };
   }
 
