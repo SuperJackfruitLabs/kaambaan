@@ -182,14 +182,14 @@ describe('plane sign-in — the SPA keeps authority past five minutes', () => {
     expect(cookies(res).has('superpipeline_plane_refresh')).toBe(false);
   });
 
+  // The fetch double is deliberately NOT async: a rejection threaded through several async frames
+  // is reported by workerd as unhandled before the caller's catch adopts it (see hub-jwt.ts), so
+  // "unreachable" is a synchronous throw, which `tokenGrant`'s try/catch handles the same way.
   it.each([
-    ['a 5xx from the plane', async () => new Response('upstream', { status: 502 })],
-    ['the plane unreachable', async () => { throw new TypeError('network'); }],
+    ['a 5xx from the plane', (): Response => new Response('upstream', { status: 502 })],
+    ['the plane unreachable', (): Response => { throw new TypeError('network'); }],
   ])('on %s, keeps the refresh cookie and answers a retryable 503', async (_name, answer) => {
-    const impl = (async (input: RequestInfo | URL) => {
-      if (String(input) === PLANE_JWKS) return new Response((await planeKeys()).jwksBody, { headers: { 'content-type': 'application/json' } });
-      return answer();
-    }) as unknown as typeof fetch;
+    const impl = ((_input: RequestInfo | URL) => Promise.resolve(answer())) as unknown as typeof fetch;
     const req = new Request('https://api.test/hub/token', { headers: { Cookie: 'superpipeline_plane_refresh=still-good' } });
     const res = (await handlePlaneSignInRoute(req, envOn(), '/hub/token', impl))!;
     expect(res.status).toBe(503);
