@@ -17,6 +17,8 @@ import {
 } from '../db/catalog';
 import { roleFor, type Role } from '../db/members';
 import { verifyHubToken, planeAudience } from './hub-jwt';
+import { orgPlaneMode } from './org-plane';
+import { resolvePlaneUser, resolvePlaneAgent, resolvePlaneService } from './org-plane-resolve';
 
 export interface UserPrincipal {
   userId: string;
@@ -220,6 +222,12 @@ export async function resolveAgent(request: Request, env: Env): Promise<AgentPri
  *     other kind just because it verifies.
  */
 export async function resolveHubUser(request: Request, env: Env): Promise<UserPrincipal | null> {
+  // The Organization plane replaces the hub; it does not join it (contract §1, no dual-accept).
+  // `invalid` — the switch set, the rest missing — refuses everything rather than fall back.
+  const plane = orgPlaneMode(env);
+  if (plane.kind === 'on') return resolvePlaneUser(request, env, plane.cfg);
+  if (plane.kind === 'invalid') return null;
+
   const issuer = env.HUB_ISSUER;
   if (!issuer) return null;
 
@@ -291,6 +299,12 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
  *     that invisibility a refusal instead of a silent cross-tenant hop.
  */
 export async function resolveHubAgent(request: Request, env: Env): Promise<AgentPrincipal | null> {
+  // The Organization plane replaces the hub; it does not join it (contract §1, no dual-accept).
+  // `invalid` — the switch set, the rest missing — refuses everything rather than fall back.
+  const plane = orgPlaneMode(env);
+  if (plane.kind === 'on') return resolvePlaneAgent(request, env, plane.cfg);
+  if (plane.kind === 'invalid') return null;
+
   const issuer = env.HUB_ISSUER;
   if (!issuer) return null;
 
@@ -356,6 +370,12 @@ export interface ServicePrincipal {
  * by itself; a route checks `scopes` for the one permission it needs.
  */
 export async function resolveHubService(request: Request, env: Env): Promise<ServicePrincipal | null> {
+  // The Organization plane replaces the hub; it does not join it (contract §1, no dual-accept).
+  // `invalid` — the switch set, the rest missing — refuses everything rather than fall back.
+  const plane = orgPlaneMode(env);
+  if (plane.kind === 'on') return resolvePlaneService(request, env, plane.cfg);
+  if (plane.kind === 'invalid') return null;
+
   const issuer = env.HUB_ISSUER;
   if (!issuer) return null;
   const token = bearer(request);

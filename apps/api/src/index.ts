@@ -45,6 +45,8 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
+import { entitlementRefusal } from './auth/org-plane-resolve';
+import { orgPlaneMode } from './auth/org-plane';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor } from './db/catalog';
 import { authorizeAgentQueue } from './auth/agent-queue';
 import { stagePatchRefusal } from './auth/scopes';
@@ -449,6 +451,11 @@ const worker = {
       return Response.json({ ok: true, service: 'superpipeline-api', phase: 'P8' });
     }
 
+    // Contract §2: a plane token whose `ent` lacks superpipeline is told so, by name, before any
+    // route can turn it into a generic 401/403. Inert unless ORG_PLANE_ISSUER is set.
+    const notEnabled = await entitlementRefusal(request, env);
+    if (notEnabled) return notEnabled;
+
     // Human auth (GitHub OAuth → session): /auth/login · /auth/callback · /auth/me · /auth/logout.
     if (path.startsWith('/auth/')) {
       const res = await handleAuthRoute(request, env, path);
@@ -558,6 +565,11 @@ const worker = {
           return Response.json({ tenant });
         }
         if (request.method !== 'PATCH') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        // In plane mode this workspace IS an org-plane mapping; writing a fleet over it would
+        // orphan it, and the next token would create a fresh tenant by first sight.
+        if (orgPlaneMode(env).kind !== 'off') {
+          return Response.json({ error: 'this workspace is managed by the organization plane' }, { status: 409 });
+        }
         // Linking a plane is at least as consequential as revoking a credential, so it is the one
         // act reserved to an owner. The comment this replaces recorded the absence of exactly this
         // check as "a decision about the whole product rather than about this endpoint" — the

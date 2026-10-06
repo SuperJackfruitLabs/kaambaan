@@ -476,12 +476,15 @@ function distinctIds(localIds: Array<string | null>): string[] {
   return [...new Set(localIds.filter((v): v is string => typeof v === 'string' && v !== ''))];
 }
 
-/** Local user id → the id the hub knows that user by (`users.external_id`, source `agentpod`). Linked users only. */
+/**
+ * Local user id → the id the suite knows that user by (`users.external_id`, source `agentpod` or
+ * `org-plane` — an org-plane id is always a `prn_`). Linked users only.
+ */
 async function userExternalIds(db: D1Database, ids: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   if (ids.length === 0) return out;
   const { results } = await db
-    .prepare(`SELECT id, external_id FROM users WHERE external_source = 'agentpod' AND id IN (${ids.map(() => '?').join(',')})`)
+    .prepare(`SELECT id, external_id FROM users WHERE external_source IN ('agentpod', 'org-plane') AND id IN (${ids.map(() => '?').join(',')})`)
     .bind(...ids)
     .all<{ id: string; external_id: string }>();
   for (const r of results) out.set(r.id, r.external_id);

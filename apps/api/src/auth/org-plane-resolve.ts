@@ -1,0 +1,87 @@
+/**
+ * Plane-mode resolution: the three siblings of `resolveHubUser` / `resolveHubAgent` /
+ * `resolveHubService`, with the same refusals, keyed by `org` instead of `tenant`.
+ */
+import type { Env } from '../env';
+import type { UserPrincipal, AgentPrincipal, ServicePrincipal } from './resolve';
+import { findAgentByExternal, findTenantByExternal } from '../db/catalog';
+import { entitles, orgPlaneMode, verifyOrgPlaneToken, ORG_PLANE_SOURCE, type OrgPlaneClaims, type OrgPlaneConfig } from './org-plane';
+import { ensureOrgTenant, provisionOrgHuman } from './org-tenancy';
+
+export function bearerOf(request: Request): string | null {
+  const m = (request.headers.get('Authorization') ?? '').match(/^Bearer\s+(.+)$/i);
+  return m ? m[1]!.trim() : null;
+}
+
+/** One verify per (request, audience): the entitlement gate and the resolver share it. */
+const memo = new WeakMap<Request, Map<string, Promise<OrgPlaneClaims | null>>>();
+
+export function planeClaimsFor(request: Request, cfg: OrgPlaneConfig, audience: string): Promise<OrgPlaneClaims | null> {
+  const token = bearerOf(request);
+  // `spa_` is superpipeline's own credential and never a JWT; a value without two dots is not one either.
+  if (!token || token.startsWith('spa_') || token.split('.').length !== 3) return Promise.resolve(null);
+  let byAud = memo.get(request);
+  if (!byAud) memo.set(request, (byAud = new Map()));
+  let p = byAud.get(audience);
+  if (!p) byAud.set(audience, (p = verifyOrgPlaneToken(token, cfg, audience)));
+  return p;
+}
+
+export function productNotEnabled(org: string): Response {
+  return Response.json({ error: 'product_not_enabled', org }, { status: 403 });
+}
+
+/** The contract §2 refusal, before any route runs. Null when it does not apply. */
+export async function entitlementRefusal(request: Request, env: Env): Promise<Response | null> {
+  const mode = orgPlaneMode(env);
+  if (mode.kind !== 'on') return null;
+  const path = new URL(request.url).pathname;
+  const audience = path === '/mcp' ? mode.cfg.mcpAudience : mode.cfg.audience;
+  const claims = await planeClaimsFor(request, mode.cfg, audience);
+  return claims && !entitles(claims) ? productNotEnabled(claims.org) : null;
+}
+
+export async function resolvePlaneUser(request: Request, env: Env, cfg: OrgPlaneConfig): Promise<UserPrincipal | null> {
+  const claims = await planeClaimsFor(request, cfg, cfg.audience);
+  if (!claims || !entitles(claims) || claims.principalKind !== 'human') return null;
+  const tenantId = await ensureOrgTenant(env.DB, claims.org);
+  const human = await provisionOrgHuman(env.DB, tenantId, claims);
+  if (!human) {
+    // Logged without claims: the useful fact is that a verified person could not be placed.
+    console.warn('org-plane: a verified human could not be provisioned (unverified address, or an address held by a still-hub-mapped account)');
+    return null;
+  }
+  return { userId: human.userId, tenantId, role: human.role, mayDispatch: claims.mayDispatch };
+}
+
+export async function resolvePlaneAgent(request: Request, env: Env, cfg: OrgPlaneConfig): Promise<AgentPrincipal | null> {
+  const claims = await planeClaimsFor(request, cfg, cfg.audience);
+  if (!claims || !entitles(claims) || claims.principalKind !== 'agent') return null;
+  const found = await findAgentByExternal(env.DB, ORG_PLANE_SOURCE, claims.sub);
+  if (!found) return null;
+  const tenantId = await findTenantByExternal(env.DB, ORG_PLANE_SOURCE, claims.org);
+  if (!tenantId || tenantId !== found.tenantId) return null;
+  return {
+    tenantId: found.tenantId,
+    agentId: found.agentId,
+    capabilities: found.capabilities,
+    concurrency: found.concurrency,
+    externalId: claims.sub,
+    mayDispatch: claims.mayDispatch,
+    queueing: {
+      ownerUserId: found.ownerUserId,
+      mayQueueTo: found.mayQueueTo,
+      queueCeilingPerHour: found.queueCeilingPerHour,
+      boardCeilingPerDay: found.boardCeilingPerDay,
+    },
+  };
+}
+
+export async function resolvePlaneService(request: Request, env: Env, cfg: OrgPlaneConfig): Promise<ServicePrincipal | null> {
+  const claims = await planeClaimsFor(request, cfg, cfg.audience);
+  if (!claims || !entitles(claims) || claims.principalKind !== 'service') return null;
+  const tenantId = await findTenantByExternal(env.DB, ORG_PLANE_SOURCE, claims.org);
+  if (!tenantId) return null;
+  const scopes = typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
+  return { principalId: claims.sub, tenantId, scopes };
+}
