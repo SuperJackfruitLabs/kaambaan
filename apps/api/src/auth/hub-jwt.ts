@@ -139,6 +139,21 @@ export interface VerifyOptions {
 }
 
 /**
+ * What `verifyJws` needs: the issuer's exact `iss`, where its keys live, and the audience demanded.
+ * Shared by every issuer this plane trusts — the hub today, the Organization plane after cutover
+ * (`org-plane.ts`) — so both take the same hardened path.
+ */
+export interface JwsOptions {
+  issuer: string;
+  /** Where the key set lives. The cache is keyed by this, not by the issuer. */
+  jwksUrl: string;
+  audience: string;
+  /** Claims jose must find. The hub path asks for exp+iat; the plane path adds jti and sub. */
+  requiredClaims: string[];
+  fetch?: typeof fetch;
+}
+
+/**
  * The origin this deployment answers on, as both the audience it demands and the `redirect_uri`
  * it registers.
  *
@@ -189,7 +204,7 @@ const cache = new Map<string, CachedSet>();
 const JWKS_TTL_MS = 10 * 60 * 1000;
 
 /**
- * One fetch in flight per issuer, shared by every caller that needs it at the
+ * One fetch in flight per key-set URL, shared by every caller that needs it at the
  * same moment — whether they're here because the TTL lapsed or because a
  * `kid` is missing from an otherwise-fresh set.
  *
@@ -211,40 +226,40 @@ function hasKid(set: CachedSet | undefined, kid: string): boolean {
   return !!set && set.keys.keys.some((key) => key.kid === kid);
 }
 
-/** Fetch a fresh set for `opts.issuer`, coalescing concurrent callers onto one request. */
-function fetchFresh(opts: VerifyOptions): Promise<CachedSet | null> {
-  const existing = inflight.get(opts.issuer);
+/** Fetch a fresh set from `opts.jwksUrl`, coalescing concurrent callers onto one request. */
+function fetchFresh(opts: JwsOptions): Promise<CachedSet | null> {
+  const existing = inflight.get(opts.jwksUrl);
   if (existing) return existing;
 
   const promise = (async (): Promise<CachedSet | null> => {
     const doFetch = opts.fetch ?? fetch;
     try {
-      const res = await doFetch(`${opts.issuer}/api/auth/jwks`);
+      const res = await doFetch(opts.jwksUrl);
       if (!res.ok) return null;
       const keys = (await res.json()) as JSONWebKeySet;
       if (!Array.isArray(keys?.keys) || keys.keys.length === 0) return null;
 
       const fresh: CachedSet = { keys, verify: createLocalJWKSet(keys), fetchedAt: Date.now() };
-      cache.set(opts.issuer, fresh);
+      cache.set(opts.jwksUrl, fresh);
       return fresh;
     } catch {
       return null;
     }
   })();
 
-  inflight.set(opts.issuer, promise);
+  inflight.set(opts.jwksUrl, promise);
   promise.finally(() => {
     // Only the fetch that's still current clears the slot — otherwise a fetch
     // that finishes after a newer one has already started could delete the
     // newer one's in-flight entry out from under it.
-    if (inflight.get(opts.issuer) === promise) inflight.delete(opts.issuer);
+    if (inflight.get(opts.jwksUrl) === promise) inflight.delete(opts.jwksUrl);
   });
   return promise;
 }
 
-async function keySet(opts: VerifyOptions, kid: string): Promise<CachedSet | null> {
+async function keySet(opts: JwsOptions, kid: string): Promise<CachedSet | null> {
   const now = Date.now();
-  const cached = cache.get(opts.issuer);
+  const cached = cache.get(opts.jwksUrl);
   const isFresh = !!cached && now - cached.fetchedAt < JWKS_TTL_MS;
 
   if (isFresh && hasKid(cached, kid)) return cached;
@@ -268,16 +283,17 @@ async function keySet(opts: VerifyOptions, kid: string): Promise<CachedSet | nul
 }
 
 /**
- * Verify a hub token and return its claims, or null.
+ * Header check, key lookup and signature/iss/aud/exp verification shared by every issuer this
+ * plane trusts, returning the verified payload or null.
  *
  * Null for every failure, deliberately: a caller that cannot tell "expired"
  * from "forged" cannot accidentally treat one as the other, and neither is a
  * reason to let the request through. What the caller does with null is refuse.
+ *
+ * jose's `audience` option accepts a token whose `aud` is a string equal to it OR an array
+ * containing it (issuer contract §2).
  */
-export async function verifyHubToken(
-  token: string,
-  opts: VerifyOptions
-): Promise<HubClaims | null> {
+export async function verifyJws(token: string, opts: JwsOptions): Promise<JWTPayload | null> {
   if (!token) return null;
 
   // Reject an unsupported algorithm, or a header naming no `kid` at all,
@@ -342,28 +358,44 @@ export async function verifyHubToken(
       // This plane, not the issuer. See `VerifyOptions.audience` for why the two were the same
       // value until 2026-09-20 and why that made the check vacuous. Do not "simplify" it back.
       audience: opts.audience,
-      requiredClaims: ['exp', 'iat'],
+      requiredClaims: opts.requiredClaims,
       // Pinned, never taken from the token's own header — otherwise `alg: none`
       // is a valid token and so is one signed with a key of the caller's
       // choosing.
       algorithms: ['EdDSA'],
     });
-
-    // A token that verifies but names no tenant is not a weaker caller, it is
-    // an unresolvable one. Falling back to a default boundary here would hand
-    // one tenant's data to a token that never named it.
-    const tenant = payload.tenant;
-    if (typeof tenant !== 'string' || tenant === '') return null;
-
-    const kind = payload.principalKind;
-    if (kind !== 'human' && kind !== 'agent' && kind !== 'service') return null;
-
-    if (typeof payload.sub !== 'string' || payload.sub === '') return null;
-
-    return payload as HubClaims;
+    return payload;
   } catch {
     // Expired, wrong issuer, unknown key, bad signature, malformed — all the
     // same answer to a caller: not authorized.
     return null;
   }
+}
+
+/** Verify a hub token and return its claims, or null. */
+export async function verifyHubToken(
+  token: string,
+  opts: VerifyOptions
+): Promise<HubClaims | null> {
+  const payload = await verifyJws(token, {
+    issuer: opts.issuer,
+    jwksUrl: `${opts.issuer}/api/auth/jwks`,
+    audience: opts.audience,
+    requiredClaims: ['exp', 'iat'],
+    fetch: opts.fetch,
+  });
+  if (!payload) return null;
+
+  // A token that verifies but names no tenant is not a weaker caller, it is
+  // an unresolvable one. Falling back to a default boundary here would hand
+  // one tenant's data to a token that never named it.
+  const tenant = payload.tenant;
+  if (typeof tenant !== 'string' || tenant === '') return null;
+
+  const kind = payload.principalKind;
+  if (kind !== 'human' && kind !== 'agent' && kind !== 'service') return null;
+
+  if (typeof payload.sub !== 'string' || payload.sub === '') return null;
+
+  return payload as HubClaims;
 }
