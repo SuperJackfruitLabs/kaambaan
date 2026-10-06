@@ -36,6 +36,8 @@ import type { LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
+import { logReporter } from './superwitness/log';
+import { reportingEnabled } from './superwitness/config';
 import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
@@ -973,6 +975,37 @@ const worker = {
       } catch (err) {
         return unexpected(err);
       }
+    }
+
+    /**
+     * POST /v1/admin/superwitness/backfill — enqueue a superwitness report for every run on one
+     * board (superwitness app spec §3.5; ruling R18). Idempotent, and the repair tool for parked or
+     * missed reports.
+     *
+     * A person with `manage` (admin or owner) in the board's workspace. Not an agent: re-reporting a
+     * board's history is administration, not shaping work. 409 while reporting is off, because an
+     * off reporter writes no outbox rows and a 200 would claim work that did not happen.
+     */
+    if (path === '/v1/admin/superwitness/backfill') {
+      if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
+      const caller = await resolveWorkspaceCaller(request, env, { human: 'manage', agentScope: null });
+      if (caller instanceof Response) return caller;
+      let body: { board_id?: unknown } | null = null;
+      try {
+        body = (await request.json()) as { board_id?: unknown };
+      } catch {
+        body = null;
+      }
+      const boardId = typeof body?.board_id === 'string' ? body.board_id.trim() : '';
+      if (boardId === '') return Response.json({ error: 'board_id is required' }, { status: 400 });
+      if (!reportingEnabled(env)) {
+        return Response.json({ error: 'run reporting is off: SUPERWITNESS_URL is not set' }, { status: 409 });
+      }
+      const boards = await listBoards(env.DB, caller.tenantId);
+      if (!boards.some((b) => b.id === boardId)) return Response.json({ error: 'board not found' }, { status: 404 });
+      const result = await boardStub(env, caller.tenantId, boardId).enqueueAllRunReports();
+      if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+      return Response.json({ board_id: boardId, ...result.value });
     }
 
     // /v1/projects[/:id[/milestones|/rollup]] — a workspace's projects (migration 0013), which
@@ -3163,7 +3196,7 @@ const worker = {
   },
 
   /**
-   * Drain every board's push delivery queue.
+   * Drain every board's push delivery queue and superwitness run-report outbox.
    *
    * `POST /v1/boards/:id/push/dispatch` has always existed and nothing ever called it on a
    * schedule: the queue drained only on a DO alarm or when somebody POSTed by hand, so a delivery
@@ -3189,6 +3222,13 @@ const worker = {
             // silently meant a board failing every five-minute tick, forever, left no trace
             // anywhere. Logged, not rethrown: the loop still continues to the next board.
             console.error(`sweepBoard failed for board ${board.id}`, err);
+          }
+          // The superwitness outbox's backstop (superwitness app spec §3.5): the board alarm is the
+          // drain; this catches a board whose alarm was lost. Due rows only — backoff still holds.
+          try {
+            await boardStub(env, board.tenantId, board.id).drainRunReports();
+          } catch {
+            logReporter('error', { msg: 'superwitness.sweep_failed', 'board.id': board.id });
           }
         }
         // Third arm, same shape as the two above: every project's rollup (Task 19), refreshed so

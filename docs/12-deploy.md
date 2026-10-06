@@ -50,6 +50,7 @@ app.superpipeline.dev automatically — `superpipeline.dev` is a separate static
    wrangler secret put GITHUB_CLIENT_ID
    wrangler secret put GITHUB_CLIENT_SECRET
    wrangler secret put APP_URL               # the deployed origin, e.g. https://superpipeline-api.<sub>.workers.dev
+   wrangler secret put SUPERWITNESS_REPORTER_CREDENTIAL   # optional: <svc_id>:<secret> for run reporting
    ```
 6. **Build the web + deploy** (this builds `apps/web/build` and deploys with dev-auth OFF):
    ```
@@ -66,6 +67,26 @@ explicitly. It is deliberately **not** in `wrangler.jsonc`, so *any* deploy — 
 
 Opting in is per-command: `pnpm --filter @superpipeline/api dev` runs `wrangler dev --var DEV_AUTH:true`,
 and the API test runner sets the binding in `apps/api/vitest.config.ts`.
+
+### Reporting runs to superwitness
+
+Every run's status is reported to superwitness's run registry (`POST /v1/runs`). It is off until
+`SUPERWITNESS_URL` is set in `apps/api/wrangler.jsonc` `vars`; while it is off, nothing is
+queued and nothing is sent.
+
+- **Credential.** `SUPERWITNESS_REPORTER_CREDENTIAL` is a hub service credential,
+  `<svc_id>:<secret>`, for a service principal granted `runs:write`. The Worker exchanges it at
+  `{HUB_ISSUER}/api/auth/service-token` for a five-minute token. Set it with
+  `wrangler secret put`; it is never printed or logged.
+- **URL.** `SUPERWITNESS_URL` must be a public `https://` origin. A Worker cannot reach a tailnet
+  address.
+- **Delivery.** Each board queues reports in its own `run_reports` table, in the same write as
+  the run change, and sends them from its alarm in batches of up to 100. The five-minute cron
+  sweep is a backstop. Failures back off from 30 s to 1 h, up to 12 attempts; a refused report is
+  parked and logged with `metric: "run_reports_dead"`.
+- **Backfill and repair.** `POST /v1/admin/superwitness/backfill` with `{"board_id": "brd_…"}`
+  (workspace admin or owner) queues one report per existing run on that board. It is safe to
+  re-run, and it revives parked reports.
 
 ## After deploy
 

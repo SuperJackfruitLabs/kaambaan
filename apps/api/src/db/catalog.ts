@@ -526,6 +526,22 @@ export async function principalIdsFor(
 }
 
 /**
+ * Display names for this tenant's agents, for the superwitness run reporter's `executor.name`.
+ * Ids with no row are absent; the caller falls back to the local id.
+ */
+export async function agentNamesFor(db: D1Database, tenantId: string, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const agentIds = distinctIds(ids).filter((v) => v.startsWith('agt_'));
+  if (agentIds.length === 0) return out;
+  const { results } = await db
+    .prepare(`SELECT id, name FROM agents WHERE tenant_id = ? AND id IN (${agentIds.map(() => '?').join(',')})`)
+    .bind(tenantId, ...agentIds)
+    .all<{ id: string; name: string }>();
+  for (const r of results) out.set(r.id, r.name);
+  return out;
+}
+
+/**
  * Local ids → the hub token `sub` the person is known by, when that `sub` is NOT a principal id
  * (C4 `gates[].decided_by_hub_sub`). superwitness hands it to the hub's principals route, which
  * resolves it through `principal_identities`.
