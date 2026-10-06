@@ -325,3 +325,16 @@ describe('plane mode', () => {
     expect(fetchSpy.mock.calls.map((c) => String(c[0]))).toEqual(['/hub/token']);
   });
 });
+
+describe('plane mode — a transient refresh failure', () => {
+  it('stays in plane mode on a retryable 503, and never falls back to the hub', async () => {
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).startsWith('/hub/token')
+        ? new Response(JSON.stringify({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true }), { status: 503 })
+        : new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await hubToken()).toBeNull();
+    expect((await hubStatus()).signIn).toBe('org-plane');
+    expect(fetchSpy.mock.calls.every((c) => String(c[0]).startsWith('/hub/token'))).toBe(true);
+  });
+});

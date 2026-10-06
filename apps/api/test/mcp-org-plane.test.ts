@@ -72,9 +72,32 @@ describe('MCP calls in plane mode', () => {
       const tenantId = await ensureOrgTenant(env.DB, ORG);
       const agent = await createAgent(env.DB, tenantId, { name: 'Builder', capabilities: ['build'] });
       await setAgentExternalMapping(env.DB, tenantId, agent.id, { externalSource: 'org-plane', externalId: AGENT });
-      const res = await rpc(await planeToken({ sub: AGENT, principalKind: 'agent' }, { aud: [MCP_AUD, `${PLANE}/api/auth/oauth2/userinfo`] }));
+      const res = await rpc(await planeToken({ sub: AGENT, principalKind: 'agent', scope: 'claim run' }, { aud: [MCP_AUD, `${PLANE}/api/auth/oauth2/userinfo`] }));
       expect(res.status).toBe(200);
       expect(await toolNames(res)).toContain('superpipeline_claim_card');
+    });
+  });
+
+  /**
+   * Contract §2: an agent's grant scopes are its token's `scope`. Absent is NOTHING, never
+   * "unscoped" — `null` would register every gated verb for a token whose grant said nothing.
+   * Reads stay unscoped by design (TOOL_SCOPE), so they are offered either way.
+   */
+  it.each([
+    ['a read-only grant', 'cards:read', 'prn_000000000000000000b7'],
+    ['no scope claim at all', undefined, 'prn_000000000000000000b8'],
+  ])('an agent token with %s is offered no gated verb', async (_name, scope, sub) => {
+    await withOrgPlane(async () => {
+      const tenantId = await ensureOrgTenant(env.DB, ORG);
+      const agent = await createAgent(env.DB, tenantId, { name: 'Scoped', capabilities: ['build'] });
+      await setAgentExternalMapping(env.DB, tenantId, agent.id, { externalSource: 'org-plane', externalId: sub });
+      const res = await rpc(await planeToken({ sub, principalKind: 'agent', scope }, { aud: MCP_AUD }));
+      expect(res.status).toBe(200);
+      const names = await toolNames(res);
+      expect(names).toContain('superpipeline_list_work');
+      for (const gated of ['superpipeline_claim_card', 'superpipeline_complete', 'superpipeline_split_card']) {
+        expect(names).not.toContain(gated);
+      }
     });
   });
 

@@ -114,8 +114,15 @@ export function signInMode(): 'github' | 'org-plane' | null {
 export async function hubStatus(): Promise<HubStatus> {
   try {
     const res = await fetch('/hub/token', { credentials: 'same-origin' });
-    if (!res.ok) return { configured: false, token: null, signIn: 'github' };
-    const body = (await res.json()) as { token?: string | null; hubToken?: string | null; hubConfigured?: boolean; signIn?: string };
+    // A non-2xx can still say which mode this is: plane mode answers a transient refresh failure
+    // with a retryable 503 that names `signIn`, and reading it as hub mode would send this page
+    // to the hub for a token the hub must not be asked for.
+    const body = ((await res.json().catch(() => null)) ?? {}) as { token?: string | null; hubToken?: string | null; hubConfigured?: boolean; signIn?: string };
+    if (!res.ok) {
+      if (body.signIn !== 'org-plane') return { configured: false, token: null, signIn: 'github' };
+      lastSignIn = 'org-plane';
+      return { configured: body.hubConfigured === true, token: null, signIn: 'org-plane' };
+    }
     const signIn = body.signIn === 'org-plane' ? 'org-plane' : 'github';
     lastSignIn = signIn;
     if (signIn === 'org-plane') {

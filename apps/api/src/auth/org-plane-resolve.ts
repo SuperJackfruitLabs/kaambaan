@@ -29,6 +29,15 @@ export function planeClaimsFor(request: Request, cfg: OrgPlaneConfig, audience: 
   return p;
 }
 
+/**
+ * An agent's or service's grant scopes, from its token's `scope` (contract §2: read grant scopes
+ * only from agent/service tokens). Absent means NO scopes — `[]`, never `null`, which
+ * `scopePermits` would read as an unscoped credential and permit everything.
+ */
+export function grantScopes(claims: Pick<OrgPlaneClaims, 'scope'>): string[] {
+  return typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
+}
+
 export function productNotEnabled(org: string): Response {
   return Response.json({ error: 'product_not_enabled', org }, { status: 403 });
 }
@@ -69,6 +78,7 @@ export async function resolvePlaneAgent(request: Request, env: Env, cfg: OrgPlan
     capabilities: found.capabilities,
     concurrency: found.concurrency,
     externalId: claims.sub,
+    scopes: grantScopes(claims),
     mayDispatch: claims.mayDispatch,
     queueing: {
       ownerUserId: found.ownerUserId,
@@ -84,8 +94,7 @@ export async function resolvePlaneService(request: Request, env: Env, cfg: OrgPl
   if (!claims || !entitles(claims) || claims.principalKind !== 'service') return null;
   const tenantId = await findTenantByExternal(env.DB, ORG_PLANE_SOURCE, claims.org);
   if (!tenantId) return null;
-  const scopes = typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
-  return { principalId: claims.sub, tenantId, scopes };
+  return { principalId: claims.sub, tenantId, scopes: grantScopes(claims) };
 }
 
 export async function resolvePlaneMcp(request: Request, env: Env, cfg: OrgPlaneConfig): Promise<McpAuth | null> {
@@ -100,7 +109,7 @@ export async function resolvePlaneMcp(request: Request, env: Env, cfg: OrgPlaneC
       tenantId,
       agentId: found.agentId,
       capabilities: await effectiveCapabilities(env.DB, tenantId, found.capabilities),
-      scopes: null,
+      scopes: grantScopes(claims),
       externalId: claims.sub,
     };
   }

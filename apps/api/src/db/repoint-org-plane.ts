@@ -41,9 +41,23 @@ function update(table: 'tenants' | 'users', id: string, from: [string, string], 
 export function planRepoint(snapshot: CatalogSnapshot, mapping: RepointMapping, direction: 'forward' | 'reverse'): RepointPlan {
   check(mapping);
   const [fromSrc, toSrc] = direction === 'forward' ? ['agentpod', 'org-plane'] : ['org-plane', 'agentpod'];
-  const tenantMap = direction === 'forward' ? mapping.tenants : Object.fromEntries(Object.entries(mapping.tenants).map(([f, o]) => [o, f]));
-  const userMap = direction === 'forward' ? mapping.users : Object.fromEntries(Object.entries(mapping.users).map(([h, p]) => [p, h]));
   const plan: RepointPlan = { statements: [], tenants: [], users: [], unmapped: { tenants: [], users: [] }, conflicts: [] };
+
+  // A mapping must be one-to-one. Two fleets onto one org would plan two UPDATEs that migration
+  // 0017 lets only one of win, and the reverse of a many-to-one mapping cannot know which fleet to
+  // restore. Both directions refuse every entry involved, by name.
+  const oneToOne = (entries: Array<[string, string]>, what: string): Array<[string, string]> => {
+    const byTarget = new Map<string, string[]>();
+    for (const [k, v] of entries) byTarget.set(v, [...(byTarget.get(v) ?? []), k]);
+    for (const [target, keys] of byTarget) {
+      if (keys.length > 1) plan.conflicts.push(`${target} is the target of more than one ${what} (${keys.sort().join(', ')})`);
+    }
+    return entries.filter(([, v]) => byTarget.get(v)!.length === 1);
+  };
+  const tenantPairs = oneToOne(Object.entries(mapping.tenants), 'fleet');
+  const userPairs = oneToOne(Object.entries(mapping.users), 'hub user');
+  const tenantMap: Record<string, string> = Object.fromEntries(direction === 'forward' ? tenantPairs : tenantPairs.map(([f, o]) => [o, f]));
+  const userMap: Record<string, string> = Object.fromEntries(direction === 'forward' ? userPairs : userPairs.map(([h, p]) => [p, h]));
 
   // Tenants: group the candidates by the external id they will move from.
   const held = new Map(snapshot.tenants.filter((t) => t.external_source === toSrc).map((t) => [t.external_id!, t.id]));

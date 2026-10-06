@@ -33,6 +33,30 @@ export async function ensureOrgTenant(db: D1Database, org: string): Promise<stri
   return after;
 }
 
+/** The local user `sub` maps to: found, adopted by verified address, or created. Null if none may be. */
+async function findOrAdoptOrgHuman(
+  db: D1Database,
+  claims: Pick<OrgPlaneClaims, 'sub' | 'email' | 'email_verified'>,
+): Promise<UserRecord | null> {
+  const mapped = await findUserByExternal(db, ORG_PLANE_SOURCE, claims.sub);
+  if (mapped) return mapped;
+  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+  if (email === '' || claims.email_verified !== true) return null;
+  const candidate = await findUserByEmail(db, email);
+  if (candidate) {
+    // Mapped already: to THIS person by a concurrent first request (read the mapping, so the source
+    // is checked too), or to someone else, which is never captured.
+    if (candidate.externalId) {
+      return candidate.externalId === claims.sub ? findUserByExternal(db, ORG_PLANE_SOURCE, claims.sub) : null;
+    }
+    await setUserExternalMapping(db, candidate.id, { externalSource: ORG_PLANE_SOURCE, externalId: claims.sub });
+    return candidate;
+  }
+  const created = await upsertUserByEmail(db, { email, name: null });
+  await setUserExternalMapping(db, created.id, { externalSource: ORG_PLANE_SOURCE, externalId: claims.sub });
+  return created;
+}
+
 export interface OrgHuman {
   userId: string;
   role: Role;
@@ -43,19 +67,15 @@ export async function provisionOrgHuman(
   tenantId: string,
   claims: Pick<OrgPlaneClaims, 'sub' | 'email' | 'email_verified'>,
 ): Promise<OrgHuman | null> {
-  let user: UserRecord | null = await findUserByExternal(db, ORG_PLANE_SOURCE, claims.sub);
-  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
-
-  if (!user && email !== '' && claims.email_verified === true) {
-    const candidate = await findUserByEmail(db, email);
-    if (candidate && !candidate.externalId) {
-      await setUserExternalMapping(db, candidate.id, { externalSource: ORG_PLANE_SOURCE, externalId: claims.sub });
-      user = candidate;
-    } else if (!candidate) {
-      const created = await upsertUserByEmail(db, { email, name: null });
-      await setUserExternalMapping(db, created.id, { externalSource: ORG_PLANE_SOURCE, externalId: claims.sub });
-      user = created;
-    }
+  let user: UserRecord | null;
+  try {
+    user = await findOrAdoptOrgHuman(db, claims);
+  } catch (e) {
+    // Two first requests for the SAME person (a board view fires several at once) can both see
+    // "nobody yet" and race to insert; the loser hits `users.email` or `users_external_identity`.
+    // Nothing is wrong — the winner's row is the answer — so read again rather than 500.
+    if (!(e instanceof Error) || !/UNIQUE constraint failed/.test(e.message)) throw e;
+    user = await findOrAdoptOrgHuman(db, claims);
   }
   if (!user) return null;
 

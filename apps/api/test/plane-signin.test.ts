@@ -167,12 +167,35 @@ describe('plane sign-in — the SPA keeps authority past five minutes', () => {
     expect(cookies(res).get('superpipeline_plane_refresh')).toBe('r2');
   });
 
-  it('answers token: null and drops the refresh cookie when the plane refuses the refresh', async () => {
-    const fake = plane(() => null);
-    const req = new Request('https://api.test/hub/token', { headers: { Cookie: 'superpipeline_plane_refresh=revoked' } });
+  /**
+   * A refused refresh (invalid_grant) is NOT a sign-out. With two tabs open, the other tab may
+   * already have rotated this refresh token and set a newer cookie; clearing ours here would
+   * overwrite that newer cookie with nothing. So the cookie is left alone and the answer says to
+   * re-run authorize, which the plane's own session makes silent.
+   */
+  it('on invalid_grant, leaves the refresh cookie alone and asks for a silent re-authorize', async () => {
+    const fake = plane(() => null); // 400 { error: 'invalid_grant' }
+    const req = new Request('https://api.test/hub/token', { headers: { Cookie: 'superpipeline_plane_refresh=spent-by-the-other-tab' } });
     const res = (await handlePlaneSignInRoute(req, envOn(), '/hub/token', fake.impl))!;
-    expect(await res.json()).toEqual({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane' });
-    expect(cookies(res).get('superpipeline_plane_refresh')).toBe('');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
+    expect(cookies(res).has('superpipeline_plane_refresh')).toBe(false);
+  });
+
+  it.each([
+    ['a 5xx from the plane', async () => new Response('upstream', { status: 502 })],
+    ['the plane unreachable', async () => { throw new TypeError('network'); }],
+  ])('on %s, keeps the refresh cookie and answers a retryable 503', async (_name, answer) => {
+    const impl = (async (input: RequestInfo | URL) => {
+      if (String(input) === PLANE_JWKS) return new Response((await planeKeys()).jwksBody, { headers: { 'content-type': 'application/json' } });
+      return answer();
+    }) as unknown as typeof fetch;
+    const req = new Request('https://api.test/hub/token', { headers: { Cookie: 'superpipeline_plane_refresh=still-good' } });
+    const res = (await handlePlaneSignInRoute(req, envOn(), '/hub/token', impl))!;
+    expect(res.status).toBe(503);
+    expect(res.headers.get('Retry-After')).toBeTruthy();
+    expect(await res.json()).toMatchObject({ token: null, signIn: 'org-plane', error: 'plane_unavailable', retryable: true });
+    expect(cookies(res).has('superpipeline_plane_refresh')).toBe(false);
   });
 
   it('serves a live token cookie without calling the plane', async () => {

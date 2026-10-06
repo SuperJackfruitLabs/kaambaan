@@ -90,4 +90,14 @@ describe('provisionOrgHuman', () => {
     const first = await provisionOrgHuman(env.DB, t, { sub: prn(0x20a), email: 'sub-only@example.com', email_verified: true });
     expect((await provisionOrgHuman(env.DB, t, { sub: prn(0x20a) }))?.userId).toBe(first?.userId);
   });
+
+  it('survives two concurrent first sign-ins of the SAME person: one user, one mapping, no 500', async () => {
+    const t = await ensureOrgTenant(env.DB, org(0x20b));
+    const claims = { sub: prn(0x20b), email: 'twice@example.com', email_verified: true };
+    const [a, b] = await Promise.all([provisionOrgHuman(env.DB, t, claims), provisionOrgHuman(env.DB, t, claims)]);
+    expect(a?.userId).toBeTruthy();
+    expect(b?.userId).toBe(a?.userId);
+    const { results } = await env.DB.prepare(`SELECT id FROM users WHERE external_source = 'org-plane' AND external_id = ?`).bind(prn(0x20b)).all();
+    expect(results).toHaveLength(1);
+  });
 });

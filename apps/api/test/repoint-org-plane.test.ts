@@ -95,4 +95,17 @@ describe('planRepoint', () => {
       `UPDATE tenants SET external_source = 'org-plane', external_id = '${ORG_A}', updated_at = datetime('now') WHERE id = 'tnt_a' AND external_source = 'agentpod' AND external_id = '${FLEET_A}';`,
     );
   });
+
+  it.each(['forward', 'reverse'] as const)('refuses (%s) two fleets mapped to one org, and two hub ids mapped to one prn_', async (direction) => {
+    const doubled: RepointMapping = {
+      tenants: { [FLEET_A]: ORG_A, [FLEET_B]: ORG_A },
+      chosenTenants: { [ORG_B]: 'tnt_b2' },
+      users: { BetterAuthOne: PRN_1, BetterAuthTwo: PRN_1 },
+    };
+    const plan = planRepoint(await snapshot(), doubled, direction);
+    expect(plan.conflicts).toContain(`${ORG_A} is the target of more than one fleet (${FLEET_A}, ${FLEET_B})`);
+    expect(plan.conflicts).toContain(`${PRN_1} is the target of more than one hub user (BetterAuthOne, BetterAuthTwo)`);
+    expect(plan.statements.join('\n')).not.toContain(ORG_A);
+    expect(plan.statements.join('\n')).not.toContain(PRN_1);
+  });
 });

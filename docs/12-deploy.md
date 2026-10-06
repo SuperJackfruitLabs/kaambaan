@@ -115,6 +115,9 @@ keep calling the hub's `/api/fleet/dispatchable`.
    - A service principal for the run reporter exists in the operator's org. It needs a `svc_`
      credential, and the plane must allow it to mint for superwitness's audience.
    - `ent` for the org includes `superpipeline`.
+   - Every agent that claims or runs work has `claim` and `run` in its grant's scopes. A plane agent
+     token's `scope` IS its grant here (REST and MCP alike): a token with no `scope` may read and
+     nothing else.
 2. **Mapping file** from the hub export: fleet → org, and hub user id → `prn_`
    (`{ "tenants": {…}, "chosenTenants": {…}, "users": {…} }`). It is a deployment's data and is
    never committed. Dry-run it and resolve every conflict, or accept every `unmapped` row in
@@ -151,9 +154,14 @@ keep calling the hub's `/api/fleet/dispatchable`.
    2. `bun scripts/repoint-org-plane.ts --mapping map.json --remote --reverse --write`.
    3. Restore the previous reporter credential.
 
-   Tenants created by first sight during the window keep their `org-plane` mapping and are
-   invisible in hub mode. List them with
-   `SELECT id FROM tenants WHERE external_source = 'org-plane'` before reverting.
+   What `--reverse` does **not** do:
+   - It does not unmap tenants or users that first sight created under the plane. It reverses only
+     the mapping file's entries, so those rows keep their `org-plane` mapping and are invisible in
+     hub mode. List them with `SELECT id FROM tenants WHERE external_source = 'org-plane'` (and the
+     same on `users`) before reverting.
+   - It does not restore `updated_at`: both directions set it to the time of the write.
+   - It never guesses a many-to-one mapping. Two fleets mapped to one org, or two hub user ids to one
+     `prn_`, are reported as conflicts in both directions, and `--write` refuses while any remain.
 
 ## After deploy
 

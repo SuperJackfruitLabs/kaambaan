@@ -113,6 +113,10 @@ describe('plane mode — agent and service bearers', () => {
       const req = new Request('https://api.test/x', { headers: { Authorization: `Bearer ${await planeToken({ sub: AGENT, principalKind: 'agent', mayDispatch: [] })}` } });
       const resolved = await resolveHubAgent(req, planeEnv());
       expect(resolved).toMatchObject({ tenantId, agentId: agent.id, capabilities: ['research'], externalId: AGENT, mayDispatch: [] });
+      // No `scope` claim → no grant scopes ([]), never unscoped (null/undefined).
+      expect(resolved?.scopes).toEqual([]);
+      const scoped = new Request('https://api.test/x', { headers: { Authorization: `Bearer ${await planeToken({ sub: AGENT, principalKind: 'agent', scope: 'claim run' })}` } });
+      expect((await resolveHubAgent(scoped, planeEnv()))?.scopes).toEqual(['claim', 'run']);
     });
   });
 

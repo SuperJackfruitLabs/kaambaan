@@ -40,25 +40,47 @@ function text(status: number, body: string, headers: HeadersInit = {}): Response
   return new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...headers } });
 }
 
+/**
+ * A token grant's outcome. `refused` is the plane saying no on purpose (OAuth `invalid_grant`, or
+ * a 400/401): the grant is dead, re-authorize. `transient` is everything else — the plane down, a
+ * 5xx, a timeout, an unreadable body — and spends nothing, so the caller keeps what it holds.
+ */
+type Grant = { ok: true; tokens: TokenResponse } | { ok: false; refused: boolean };
+
+async function tokenGrant(
+  cfg: OrgPlaneConfig,
+  form: Record<string, string>,
+  fetchImpl: typeof fetch,
+  resource: string = cfg.audience,
+): Promise<Grant> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${cfg.url}/api/auth/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({ ...form, client_id: PLANE_CLIENT_ID, resource }).toString(),
+      redirect: 'manual',
+    });
+  } catch {
+    return { ok: false, refused: false };
+  }
+  if (!res.ok) return { ok: false, refused: res.status === 400 || res.status === 401 };
+  try {
+    const body = (await res.json()) as TokenResponse;
+    return typeof body.access_token === 'string' && body.access_token !== '' ? { ok: true, tokens: body } : { ok: false, refused: false };
+  } catch {
+    return { ok: false, refused: false };
+  }
+}
+
 async function tokenRequest(
   cfg: OrgPlaneConfig,
   form: Record<string, string>,
   fetchImpl: typeof fetch,
   resource: string = cfg.audience,
 ): Promise<TokenResponse | null> {
-  try {
-    const res = await fetchImpl(`${cfg.url}/api/auth/oauth2/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: new URLSearchParams({ ...form, client_id: PLANE_CLIENT_ID, resource }).toString(),
-      redirect: 'manual',
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as TokenResponse;
-    return typeof body.access_token === 'string' && body.access_token !== '' ? body : null;
-  } catch {
-    return null;
-  }
+  const g = await tokenGrant(cfg, form, fetchImpl, resource);
+  return g.ok ? g.tokens : null;
 }
 
 /** The hub's resource, if this deployment has a hub: `HUB_ISSUER`, which is also the hub's audience. */
@@ -182,11 +204,21 @@ export async function handlePlaneSignInRoute(
     // Two concurrent grants on one rotating refresh token would look like a replay to the plane.
     const headers = new Headers();
     if (!app) {
-      const tokens = await tokenRequest(cfg, { grant_type: 'refresh_token', refresh_token: refresh }, fetchImpl);
-      if (!tokens) {
-        headers.append('Set-Cookie', refreshCookie('', 0));
-        return answer(null, null, headers);
+      const grant = await tokenGrant(cfg, { grant_type: 'refresh_token', refresh_token: refresh }, fetchImpl);
+      if (!grant.ok && grant.refused) {
+        // NOT a sign-out, and the refresh cookie is NOT cleared: another tab may have rotated this
+        // token a moment ago and already set a newer cookie, which a clear here would overwrite.
+        // The answer is to re-run authorize, which the plane's own session makes silent.
+        return Response.json({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
       }
+      if (!grant.ok) {
+        // The plane is down or erroring. Nothing was spent; keep the cookie and say "try again".
+        return Response.json(
+          { token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true },
+          { status: 503, headers: { 'Retry-After': '5' } },
+        );
+      }
+      const tokens = grant.tokens;
       app = tokens.access_token!;
       headers.append('Set-Cookie', tokenCookie(app, ttlOf(tokens)));
       // Rotation: the old refresh token is spent; keep only the new one.
