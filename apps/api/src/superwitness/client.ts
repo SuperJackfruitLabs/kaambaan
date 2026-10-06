@@ -37,25 +37,34 @@ export class ServiceTokenCache {
   async get(cfg: ReporterConfig, fetcher: ReporterFetch, nowMs: number): Promise<TokenResult> {
     if (this.token !== null && nowMs < this.refreshAtMs) return { ok: true, token: this.token };
     this.drop();
+    // Plane mode (contract §3.3): JSON body naming superwitness's audience, `{ access_token,
+    // expires_in }` back. Hub mode: no body, `{ token, expiresIn }` back. Codes keep their prefix.
+    const plane = cfg.tokenAudience !== null;
+    const prefix = plane ? 'plane' : 'hub';
     let res: Response;
     try {
       res = await fetcher(cfg.tokenUrl, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${cfg.credential}` },
+        headers: plane
+          ? { Authorization: `Bearer ${cfg.credential}`, 'Content-Type': 'application/json' }
+          : { Authorization: `Bearer ${cfg.credential}` },
+        ...(plane ? { body: JSON.stringify({ audience: cfg.tokenAudience }) } : {}),
         redirect: 'manual',
         signal: AbortSignal.timeout(REPORTER_FETCH_TIMEOUT_MS),
       });
     } catch {
-      return { ok: false, status: 0, code: 'hub_unreachable' };
+      return { ok: false, status: 0, code: `${prefix}_unreachable` };
     }
-    if (res.status !== 200) return { ok: false, status: res.status, code: `hub_${res.status}` };
-    const body = (await readJson(res)) as { token?: unknown; expiresIn?: unknown } | null;
-    if (!body || typeof body.token !== 'string' || body.token === '' || typeof body.expiresIn !== 'number' || !(body.expiresIn > 0)) {
-      return { ok: false, status: 200, code: 'hub_bad_response' };
+    if (res.status !== 200) return { ok: false, status: res.status, code: `${prefix}_${res.status}` };
+    const body = (await readJson(res)) as Record<string, unknown> | null;
+    const token = plane ? body?.access_token : body?.token;
+    const ttl = plane ? body?.expires_in : body?.expiresIn;
+    if (typeof token !== 'string' || token === '' || typeof ttl !== 'number' || !(ttl > 0)) {
+      return { ok: false, status: 200, code: `${prefix}_bad_response` };
     }
-    this.token = body.token;
-    this.refreshAtMs = nowMs + body.expiresIn * 1000 - TOKEN_REFRESH_MARGIN_MS;
-    return { ok: true, token: body.token };
+    this.token = token;
+    this.refreshAtMs = nowMs + ttl * 1000 - TOKEN_REFRESH_MARGIN_MS;
+    return { ok: true, token };
   }
 
   drop(): void {

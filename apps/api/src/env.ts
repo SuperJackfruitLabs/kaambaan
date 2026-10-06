@@ -63,8 +63,10 @@ export interface Env {
    */
   SUPERWITNESS_URL?: string;
   /**
-   * The run reporter's hub service credential, `<svc_id>:<secret>` (secret). Exchanged at
-   * `{HUB_ISSUER}/api/auth/service-token` for a five-minute token carrying `runs:write`.
+   * The run reporter's service credential, `<svc_id>:<secret>` (secret). Before the Organization
+   * plane cutover it is the HUB's `svc_`, exchanged at `{HUB_ISSUER}/api/auth/service-token` for a
+   * five-minute token carrying `runs:write`. After it (ORG_PLANE_ISSUER set) it is the PLANE's
+   * `svc_`, exchanged at `{ORG_PLANE_URL}/api/token/service` for superwitness's audience.
    */
   SUPERWITNESS_REPORTER_CREDENTIAL?: string;
   /** When "true", accept dev-mode X-Tenant-Id / X-Agent-Id headers (local + tests). Never in prod. */
