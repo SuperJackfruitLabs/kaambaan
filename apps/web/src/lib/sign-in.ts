@@ -76,3 +76,20 @@ export function urlWithoutSignInParam(href: string): string {
     return href;
   }
 }
+
+/** What the landing page offers, given how this deployment signs people in. */
+export interface SignInChoices {
+  primary: { href: string; label: string };
+  /** Whether to also offer the separate "Continue with AgentPod" door (hub mode only). */
+  offerHubConnect: boolean;
+}
+
+/**
+ * One door after the Organization-plane cutover — `/auth/login` goes to the plane, which is also
+ * where an AgentPod identity lives — and the two doors of before while it has not happened.
+ */
+export function signInChoices(status: { configured: boolean; signIn: 'github' | 'org-plane' }): SignInChoices {
+  return status.signIn === 'org-plane'
+    ? { primary: { href: '/auth/login', label: 'Sign in' }, offerHubConnect: false }
+    : { primary: { href: '/auth/login', label: 'Sign in with GitHub' }, offerHubConnect: status.configured };
+}

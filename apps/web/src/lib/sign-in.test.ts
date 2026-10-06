@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { signInNotice, urlWithoutSignInParam, SIGNIN_PARAM, SIGNIN_NO_ACCOUNT } from './sign-in';
+import { signInNotice, signInChoices, urlWithoutSignInParam, SIGNIN_PARAM, SIGNIN_NO_ACCOUNT } from './sign-in';
 
 /**
  * The sentence a failed sign-in leaves behind.
@@ -68,5 +68,21 @@ describe('urlWithoutSignInParam', () => {
 
   it('hands back what it was given rather than throwing on nonsense', () => {
     expect(urlWithoutSignInParam('not a url')).toBe('not a url');
+  });
+});
+
+describe('signInChoices', () => {
+  it('offers GitHub, plus the hub connect, before cutover', () => {
+    expect(signInChoices({ configured: true, signIn: 'github' })).toEqual({
+      primary: { href: '/auth/login', label: 'Sign in with GitHub' },
+      offerHubConnect: true,
+    });
+  });
+
+  it('offers one sign-in and no separate hub button in plane mode', () => {
+    expect(signInChoices({ configured: true, signIn: 'org-plane' })).toEqual({
+      primary: { href: '/auth/login', label: 'Sign in' },
+      offerHubConnect: false,
+    });
   });
 });
