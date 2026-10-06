@@ -99,10 +99,13 @@ describe('POST /v1/admin/superwitness/backfill', () => {
   });
 
   it('409 when reporting is off', async () => {
-    const { boardId, stub } = await boardWithRuns('tnt_bf_off', 1);
-    const res = await backfill('tnt_bf_off', { board_id: boardId });
-    expect(res.status).toBe(409);
-    await runInDurableObject(stub, async (board: BoardDO) => expect(await board.getRunReportOutbox()).toEqual([]));
+    // Off explicitly: wrangler.jsonc sets SUPERWITNESS_URL in production, and the test env inherits it.
+    await withReporting(async () => {
+      const { boardId, stub } = await boardWithRuns('tnt_bf_off', 1);
+      const res = await backfill('tnt_bf_off', { board_id: boardId });
+      expect(res.status).toBe(409);
+      await runInDurableObject(stub, async (board: BoardDO) => expect(await board.getRunReportOutbox()).toEqual([]));
+    }, {});
   });
 
   it('404 for a board in another workspace', async () => {

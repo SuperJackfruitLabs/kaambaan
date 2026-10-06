@@ -62,7 +62,11 @@
     // says why. That is why the web app now carries a hub token (see
     // apps/web/src/lib/hub-token.ts): before it did, enabling this would have
     // made the board unusable through its own UI (superpipeline#43).
-    "ENFORCE_CONTROL_PAIR": "true"
+    "ENFORCE_CONTROL_PAIR": "true",
+    // Run reporting to superwitness (superwitness app spec §3.5). Not a credential: it names where
+    // reports go; the credential is the SUPERWITNESS_REPORTER_CREDENTIAL secret. Removing this line
+    // turns reporting off (no outbox writes).
+    "SUPERWITNESS_URL": "https://app.superwitness.dev"
   },
   // The push delivery queue drains here, on a schedule.
   //
