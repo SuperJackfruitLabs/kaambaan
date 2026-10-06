@@ -40,12 +40,21 @@ export interface SignInNotice {
  * Takes the search string rather than reading `location` so it is a pure function — which is
  * the only way anything on this side of the app gets tested, the web suite running in node.
  */
-export function signInNotice(search: string): SignInNotice | null {
+export function signInNotice(search: string, mode: 'github' | 'org-plane' = 'github'): SignInNotice | null {
   let value: string | null = null;
   try {
     value = new URLSearchParams(search).get(SIGNIN_PARAM);
   } catch {
     return null;
+  }
+
+  if (value === SIGNIN_NO_ACCOUNT && mode === 'org-plane') {
+    // After the Organization-plane cutover there is one door, and GitHub is not it.
+    return {
+      title: 'Signed in, but not known here',
+      detail:
+        'That identity is not linked to a superpipeline account in this workspace. Use Sign in again with the address your workspace knows you by, or ask someone who owns the workspace to invite you.',
+    };
   }
 
   if (value === SIGNIN_NO_ACCOUNT) {
@@ -75,4 +84,21 @@ export function urlWithoutSignInParam(href: string): string {
   } catch {
     return href;
   }
+}
+
+/** What the landing page offers, given how this deployment signs people in. */
+export interface SignInChoices {
+  primary: { href: string; label: string };
+  /** Whether to also offer the separate "Continue with AgentPod" door (hub mode only). */
+  offerHubConnect: boolean;
+}
+
+/**
+ * One door after the Organization-plane cutover — `/auth/login` goes to the plane, which is also
+ * where an AgentPod identity lives — and the two doors of before while it has not happened.
+ */
+export function signInChoices(status: { configured: boolean; signIn: 'github' | 'org-plane' }): SignInChoices {
+  return status.signIn === 'org-plane'
+    ? { primary: { href: '/auth/login', label: 'Sign in' }, offerHubConnect: false }
+    : { primary: { href: '/auth/login', label: 'Sign in with GitHub' }, offerHubConnect: status.configured };
 }

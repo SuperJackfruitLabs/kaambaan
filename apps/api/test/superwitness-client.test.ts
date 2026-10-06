@@ -4,7 +4,7 @@ import type { ReporterConfig } from '../src/superwitness/config';
 import { buildRunReport } from '../src/superwitness/report';
 import { CREDENTIAL, HUB_URL, SW_URL, fakeSuperwitness } from './helpers/superwitness';
 
-const CFG: ReporterConfig = { runsUrl: `${SW_URL}/v1/runs`, tokenUrl: `${HUB_URL}/api/auth/service-token`, credential: CREDENTIAL };
+const CFG: ReporterConfig = { runsUrl: `${SW_URL}/v1/runs`, tokenUrl: `${HUB_URL}/api/auth/service-token`, credential: CREDENTIAL, tokenAudience: null };
 const T0 = 1_800_000_000_000;
 const REPORT = buildRunReport(
   {

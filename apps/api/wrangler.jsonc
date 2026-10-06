@@ -36,6 +36,9 @@
   // its own: it names WHO we will believe, and a token still has to verify against that issuer's
   // published JWKS and then map its `fleet_` tenant onto one of ours. An unset value means the path
   // is off; a wrong value means every hub token is refused. Neither fails open.
+  // ORG_PLANE_ISSUER / ORG_PLANE_JWKS_URL / ORG_PLANE_AUDIENCE / ORG_PLANE_URL switch this deployment
+  // to the Organization plane (src/auth/org-plane.ts). They are deliberately ABSENT until the P4
+  // cutover: setting ORG_PLANE_ISSUER refuses every hub token. See docs/12-deploy.md.
   "vars": {
     "HUB_ISSUER": "https://hub.agentpod.dev",
     // This deployment's own origin — the `redirect_uri` we register with the hub AND the `aud`
@@ -111,6 +114,6 @@
     // with index.html — the code would be dropped on the floor and the operator would land on a
     // board that looks fine and still has no authority, which is precisely the silent failure
     // this whole flow exists to end.
-    "run_worker_first": ["/v1/*", "/auth/*", "/hub/*", "/mcp", "/health"]
+    "run_worker_first": ["/v1/*", "/auth/*", "/hub/*", "/mcp", "/health", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/*"]
   }
 }

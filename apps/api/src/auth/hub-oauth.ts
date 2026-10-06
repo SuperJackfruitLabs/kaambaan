@@ -66,7 +66,7 @@ const PKCE_COOKIE = 'superpipeline_hub_pkce';
  * navigation that started somewhere else, so a top-level navigation from another site must not be
  * able to make `GET /hub/token` answer.
  */
-const TOKEN_COOKIE = 'superpipeline_hub_token';
+export const TOKEN_COOKIE = 'superpipeline_hub_token';
 
 /** A code lives 60s at the hub; ten minutes is generous for a person reading a sign-in page. */
 const PKCE_TTL_S = 600;
@@ -85,19 +85,19 @@ export const HUB_CALLBACK_PATH = '/hub/callback';
 
 const enc = new TextEncoder();
 
-function b64url(bytes: Uint8Array): string {
+export function b64url(bytes: Uint8Array): string {
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /** 32 bytes of CSPRNG, base64url — 43 characters, which is also the shape the hub demands of the challenge. */
-function random256(): string {
+export function random256(): string {
   return b64url(crypto.getRandomValues(new Uint8Array(32)));
 }
 
 /** `code_challenge` = base64url(SHA-256(verifier)); the hub accepts S256 and refuses `plain`. */
-async function challengeFor(verifier: string): Promise<string> {
+export async function challengeFor(verifier: string): Promise<string> {
   return b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(verifier))));
 }
 
@@ -107,14 +107,14 @@ async function challengeFor(verifier: string): Promise<string> {
  * Cheap belt and braces. The stored state is single-use — the cookie is cleared on every callback,
  * whatever the outcome — so there is no second attempt for a timing signal to inform.
  */
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
 
-function readCookie(request: Request, name: string): string | null {
+export function readCookie(request: Request, name: string): string | null {
   const cookie = request.headers.get('Cookie');
   if (!cookie) return null;
   for (const part of cookie.split(';')) {
@@ -607,6 +607,8 @@ export async function handleHubRoute(
     return Response.json({
       token: readCookie(request, TOKEN_COOKIE),
       hubConfigured: hubConfig(request, env) !== null,
+      // How this deployment signs people in; `plane-signin.ts` answers 'org-plane' after cutover.
+      signIn: 'github' as const,
     });
   }
 

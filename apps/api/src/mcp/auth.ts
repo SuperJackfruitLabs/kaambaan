@@ -15,15 +15,22 @@
  * self-asserted "<tenantId>:<agentId>:<caps>" bearer with no secret in it.
  *
  * Note the metadata advertises `authorization_servers: [origin]` and this origin serves no AS
- * endpoints, so a client that follows the discovery chain dead-ends. A real Authorization Server
- * (PKCE / dynamic client registration via @cloudflare/workers-oauth-provider) is a fast-follow; when
- * it lands, `resolveBearer` and that metadata field are what change.
+ * endpoints, so a client that follows the discovery chain dead-ends. That is the HUB-MODE posture
+ * (`ORG_PLANE_ISSUER` unset), and everything above describes it.
+ *
+ * **Plane mode** (`ORG_PLANE_ISSUER` set, `auth/org-plane.ts`): `/mcp` also accepts Organization
+ * plane JWTs, and here audience IS validated — `aud` must be `${ORG_PLANE_AUDIENCE}/mcp`. The
+ * challenge names `/.well-known/oauth-protected-resource/mcp` (RFC 9728 §3.1), whose metadata lists
+ * `authorization_servers: [ORG_PLANE_ISSUER]`, so discovery ends at the plane. The dev bearer is
+ * not accepted in plane mode, and a half-configured switch (`invalid`) refuses everything but `spa_`.
  */
 import type { McpAuth } from './tools';
 import type { Env } from '../env';
 import { hashToken } from '../auth/agent-token';
 import { findAgentByTokenHash } from '../db/catalog';
 import { effectiveCapabilities } from '../db/implications';
+import { orgPlaneMode } from '../auth/org-plane';
+import { resolvePlaneMcp } from '../auth/org-plane-resolve';
 
 const PROTECTED_RESOURCE_PATH = '/.well-known/oauth-protected-resource';
 
@@ -51,6 +58,11 @@ export async function resolveMcpAuth(request: Request, env: Env): Promise<McpAut
       externalId: found.externalId,
     };
   }
+  // Plane mode: the plane's tokens for `<app>/mcp`, and nothing self-asserted. `invalid` — the
+  // switch set, the rest missing — refuses everything rather than fall back.
+  const plane = orgPlaneMode(env);
+  if (plane.kind === 'on') return token ? resolvePlaneMcp(request, env, plane.cfg) : null;
+  if (plane.kind === 'invalid') return null;
   if (env.DEV_AUTH === 'true') {
     const dev = resolveBearer(request);
     if (!dev) return null;
@@ -77,28 +89,57 @@ export function resolveBearer(request: Request): McpAuth | null {
   return { tenantId, agentId, capabilities };
 }
 
-/** 401 challenge that points the client at the protected-resource metadata (docs/05 §2). */
-export function unauthorized(request: Request): Response {
-  const metadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
+/** RFC 9728 §3.1: insert the well-known segment between the origin and the resource's path. */
+export function metadataUrlFor(resource: string): string {
+  const u = new URL(resource);
+  const path = u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, '');
+  return `${u.origin}${PROTECTED_RESOURCE_PATH}${path}`;
+}
+
+export function unauthorized(request: Request, env: Env): Response {
+  const plane = orgPlaneMode(env);
+  const metadata = plane.kind === 'on'
+    ? metadataUrlFor(plane.cfg.mcpAudience)
+    : `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
   return new Response(JSON.stringify({ error: 'unauthorized', error_description: 'A bearer token is required.' }), {
     status: 401,
-    headers: {
-      'Content-Type': 'application/json',
-      'WWW-Authenticate': `Bearer resource_metadata="${metadata}"`,
-    },
+    headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': `Bearer resource_metadata="${metadata}"` },
   });
 }
 
-/** OAuth 2.0 Protected Resource Metadata (RFC 9728). */
-export function protectedResourceMetadata(request: Request): Response {
-  const origin = new URL(request.url).origin;
-  return Response.json({
-    resource: `${origin}/mcp`,
-    // The Authorization Server is co-located for now; replaced by a dedicated AS when OAuth lands.
-    authorization_servers: [origin],
-    bearer_methods_supported: ['header'],
-    resource_name: 'superpipeline board worker',
-  });
+/** RFC 9728 metadata for `path`, or null if this deployment does not serve that path. */
+export function protectedResourceMetadata(request: Request, env: Env, path: string): Response | null {
+  const plane = orgPlaneMode(env);
+  if (plane.kind !== 'on') {
+    if (path !== PROTECTED_RESOURCE_PATH) return null;
+    const origin = new URL(request.url).origin;
+    // Unchanged pre-cutover shell — see test/oauth-surface.test.ts, which pins its dead end.
+    return Response.json({
+      resource: `${origin}/mcp`,
+      authorization_servers: [origin],
+      bearer_methods_supported: ['header'],
+      resource_name: 'superpipeline board worker',
+    });
+  }
+  const { cfg } = plane;
+  if (path === new URL(metadataUrlFor(cfg.mcpAudience)).pathname) {
+    return Response.json({
+      resource: cfg.mcpAudience,
+      authorization_servers: [cfg.issuer],
+      bearer_methods_supported: ['header'],
+      scopes_supported: ['openid', 'profile', 'email', 'offline_access'],
+      resource_name: 'superpipeline MCP',
+    });
+  }
+  if (path === PROTECTED_RESOURCE_PATH) {
+    return Response.json({
+      resource: cfg.audience,
+      authorization_servers: [cfg.issuer],
+      bearer_methods_supported: ['header'],
+      resource_name: 'superpipeline',
+    });
+  }
+  return null;
 }
 
 export const MCP_PROTECTED_RESOURCE_PATH = PROTECTED_RESOURCE_PATH;

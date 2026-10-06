@@ -23,6 +23,18 @@ export interface Env {
    */
   HUB_ISSUER?: string;
   /**
+   * The Organization plane (accounts `2026-10-06-issuer-contract.md` §1). **`ORG_PLANE_ISSUER` is the
+   * switch**: unset means this deployment verifies the hub's tokens exactly as before. Set means it
+   * verifies the plane's tokens and refuses the hub's — there is no dual-accept. Set with any of
+   * the other three missing or malformed fails closed (`orgPlaneMode` → `invalid`).
+   */
+  ORG_PLANE_ISSUER?: string;
+  ORG_PLANE_JWKS_URL?: string;
+  /** This deployment's resource, e.g. https://app.superpipeline.dev. MCP's is this plus `/mcp`. */
+  ORG_PLANE_AUDIENCE?: string;
+  /** Base for the plane's OAuth and token endpoints. */
+  ORG_PLANE_URL?: string;
+  /**
    * This plane's key in the hub's OAuth client registry (`HUB_OAUTH_CLIENTS` on the hub), used by
    * the cross-domain token handoff in `auth/hub-oauth.ts`.
    *
@@ -51,8 +63,10 @@ export interface Env {
    */
   SUPERWITNESS_URL?: string;
   /**
-   * The run reporter's hub service credential, `<svc_id>:<secret>` (secret). Exchanged at
-   * `{HUB_ISSUER}/api/auth/service-token` for a five-minute token carrying `runs:write`.
+   * The run reporter's service credential, `<svc_id>:<secret>` (secret). Before the Organization
+   * plane cutover it is the HUB's `svc_`, exchanged at `{HUB_ISSUER}/api/auth/service-token` for a
+   * five-minute token carrying `runs:write`. After it (ORG_PLANE_ISSUER set) it is the PLANE's
+   * `svc_`, exchanged at `{ORG_PLANE_URL}/api/token/service` for superwitness's audience.
    */
   SUPERWITNESS_REPORTER_CREDENTIAL?: string;
   /** When "true", accept dev-mode X-Tenant-Id / X-Agent-Id headers (local + tests). Never in prod. */

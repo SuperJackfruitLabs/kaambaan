@@ -7,10 +7,15 @@
  *
  * Resolution order:
  *
- *   1. `$SUPERPIPELINE_TOKEN` — this CLI's own, for a caller that wants them separate
- *   2. `$AGENTPOD_TOKEN` — the hub token, because it IS the credential superpipeline accepts
- *   3. the token cache `fleet login` writes
- *   4. its device credential, exchanged with its recorded issuer when the cache expires
+ *   1. `$SUPERPIPELINE_AGENT_TOKEN_FILE` — an agent's credential, re-read each run
+ *   2. `$SUPERPIPELINE_AGENT_TOKEN` — an agent's credential
+ *   3. `$SUPERPIPELINE_TOKEN` — this CLI's own, for a caller that wants them separate
+ *   4. `$AGENTPOD_TOKEN` — the hub token, accepted while superpipeline is in hub mode
+ *   5. `supi login`'s token cache, when fresh
+ *   6. `supi login`'s device credential, exchanged at its recorded Organization plane for its
+ *      recorded audience (issuer contract §3.2; device credentials are per client)
+ *   7. the token cache `fleet login` writes
+ *   8. its device credential, renewed at its recorded hub (useful only in hub mode)
  *
  * **An agent may also drive this CLI, from `$SUPERPIPELINE_AGENT_TOKEN` alone.**
  *
@@ -29,7 +34,8 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, mkdtempSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, renameSync, rmSync, chmodSync, mkdirSync } from "node:fs";
+import { exchangeDevice, DEVICE_CREDENTIAL } from "./plane-login.ts";
 
 export const ENV_TOKEN = "SUPERPIPELINE_TOKEN";
 export const ENV_HUB_TOKEN = "AGENTPOD_TOKEN";
@@ -116,6 +122,62 @@ export function fleetConfigDir(platform: NodeJS.Platform = process.platform): st
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "agentpod");
 }
 
+/** supi's own directory — the same platform rules as fleetConfigDir, under "superpipeline". */
+export function supiConfigDir(platform: NodeJS.Platform = process.platform): string {
+  return join(fleetConfigDir(platform), '..', 'superpipeline');
+}
+
+function writePrivate(path: string, value: unknown): void {
+  mkdirSync(supiConfigDir(), { recursive: true, mode: 0o700 });
+  const staging = mkdtempSync(join(supiConfigDir(), '.supi-'));
+  try {
+    const tmp = join(staging, 'f.json');
+    writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    renameSync(tmp, path);
+    chmodSync(path, 0o600);
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+}
+
+export function saveSupiDevice(d: { credential: string; plane: string; audience: string }): void {
+  writePrivate(join(supiConfigDir(), 'device.json'), d);
+  rmSync(join(supiConfigDir(), 'token.json'), { force: true });
+}
+
+export function clearSupiCredentials(): void {
+  rmSync(join(supiConfigDir(), 'device.json'), { force: true });
+  rmSync(join(supiConfigDir(), 'token.json'), { force: true });
+}
+
+/** Steps 5–6 of the order: supi's cached plane token, else its device credential exchanged. Null when supi has none. */
+async function supiPlaneCredential(): Promise<Credential | null> {
+  const devicePath = join(supiConfigDir(), 'device.json');
+  let device: { credential?: unknown; plane?: unknown; audience?: unknown };
+  try {
+    device = JSON.parse(readFileSync(devicePath, 'utf8'));
+  } catch {
+    return null;
+  }
+  try {
+    const cached = JSON.parse(readFileSync(join(supiConfigDir(), 'token.json'), 'utf8')) as { token?: string };
+    const c = typeof cached.token === 'string' ? inspect(cached.token) : null;
+    if (c?.expiry && !expired(c)) return { token: cached.token!, source: join(supiConfigDir(), 'token.json'), kind: 'human' };
+  } catch { /* no cache */ }
+  const plane = typeof device.plane === 'string' ? device.plane : '';
+  let ok = false;
+  try {
+    const u = new URL(plane);
+    ok = u.protocol === 'https:' || (u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname));
+  } catch { ok = false; }
+  if (!ok || typeof device.credential !== 'string' || !DEVICE_CREDENTIAL.test(device.credential) || typeof device.audience !== 'string') {
+    throw new Error('The stored sign-in is not usable. Run supi login again.');
+  }
+  const { token } = await exchangeDevice({ plane: plane.replace(/\/+$/, ''), audience: device.audience }, device.credential);
+  try { writePrivate(join(supiConfigDir(), 'token.json'), { token }); } catch { /* best effort */ }
+  return { token, source: devicePath, kind: 'human' };
+}
+
 function fleetTokenPath(): string {
   return join(fleetConfigDir(), "token.json");
 }
@@ -195,6 +257,10 @@ export async function resolveCredential(): Promise<Credential | null> {
   // the renewal path below would mint a HUMAN token, silently changing who is acting.
   if (cached?.kind === "agent") return cached;
   if (cached?.source.startsWith("env:")) return cached;
+  // `supi login`'s own credential outranks `fleet login`'s files: it is the explicit act for this
+  // CLI, and after the Organization-plane cutover it is the only one superpipeline accepts.
+  const own = await supiPlaneCredential();
+  if (own) return own;
   const claims = cached ? inspect(cached.token) : null;
   if (claims?.expiry && !expired(claims)) return cached;
 

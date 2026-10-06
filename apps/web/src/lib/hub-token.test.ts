@@ -148,7 +148,7 @@ describe('hubStatus', () => {
       vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: true }), { status: 200 })),
     );
 
-    expect(await hubStatus()).toEqual({ configured: true, token: null });
+    expect(await hubStatus()).toEqual({ configured: true, token: null, signIn: 'github' });
   });
 
   it('reports no hub on a standalone superpipeline, so nothing offers to connect', async () => {
@@ -160,7 +160,7 @@ describe('hubStatus', () => {
       vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: false }), { status: 200 })),
     );
 
-    expect(await hubStatus()).toEqual({ configured: false, token: null });
+    expect(await hubStatus()).toEqual({ configured: false, token: null, signIn: 'github' });
   });
 
   it('reports no hub when the field is absent altogether', async () => {
@@ -177,7 +177,7 @@ describe('hubStatus', () => {
   it('reports no hub rather than throwing when our own back end cannot be reached', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network'); }));
 
-    expect(await hubStatus()).toEqual({ configured: false, token: null });
+    expect(await hubStatus()).toEqual({ configured: false, token: null, signIn: 'github' });
   });
 });
 
@@ -304,5 +304,37 @@ describe('a failed handoff', () => {
     await expect(withAuthority({ 'Content-Type': 'application/json' })).resolves.toEqual({
       'Content-Type': 'application/json',
     });
+  });
+});
+
+describe('plane mode', () => {
+  it('reports signIn from our back end, defaulting to github for an older Worker', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: true }), { status: 200 })));
+    expect((await hubStatus()).signIn).toBe('github');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ token: null, hubConfigured: true, signIn: 'org-plane' }), { status: 200 })));
+    expect((await hubStatus()).signIn).toBe('org-plane');
+  });
+
+  it('never falls back to the hub directly in plane mode — a plane token is not the hub\'s', async () => {
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).startsWith('/hub/token')
+        ? new Response(JSON.stringify({ token: null, hubConfigured: true, signIn: 'org-plane' }), { status: 200 })
+        : new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await hubToken()).toBeNull();
+    expect(fetchSpy.mock.calls.map((c) => String(c[0]))).toEqual(['/hub/token']);
+  });
+});
+
+describe('plane mode — a transient refresh failure', () => {
+  it('stays in plane mode on a retryable 503, and never falls back to the hub', async () => {
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).startsWith('/hub/token')
+        ? new Response(JSON.stringify({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true }), { status: 503 })
+        : new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await hubToken()).toBeNull();
+    expect((await hubStatus()).signIn).toBe('org-plane');
+    expect(fetchSpy.mock.calls.every((c) => String(c[0]).startsWith('/hub/token'))).toBe(true);
   });
 });

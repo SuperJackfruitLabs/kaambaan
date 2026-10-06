@@ -32,6 +32,7 @@ describe('superwitness outbox — configuration', () => {
     expect(reporterConfig(ok)).toEqual({
       runsUrl: 'https://sw.test/v1/runs',
       tokenUrl: 'https://hub.test/api/auth/service-token',
+      tokenAudience: null,
       credential: 'svc_a:b',
     });
     expect(reporterConfig({ ...ok, SUPERWITNESS_URL: 'http://sw.test' })).toEqual({ error: 'superwitness_url_invalid' });

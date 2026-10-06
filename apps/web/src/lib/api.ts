@@ -4,7 +4,7 @@ import type { AgentScope } from '@superpipeline/contract';
  * (sent automatically, same-origin); the `X-Tenant-Id` header is a no-op there and only enables the
  * local dev workspace (when the server runs with DEV_AUTH on).
  */
-import { hubToken, withAuthority } from './hub-token';
+import { hubAudienceToken, withAuthority } from './hub-token';
 
 const TENANT = 'tnt_dev';
 
@@ -861,7 +861,11 @@ export interface HubPrincipal {
 export async function getHubPrincipals(): Promise<HubPrincipal[] | null> {
   // Asked first so a board with no authority makes no cross-origin request at
   // all: with no token there is nothing to send, and the answer is the same.
-  const token = await hubToken();
+  //
+  // `hubAudienceToken`, not `hubToken`: after the Organization-plane cutover the app's own token
+  // names this deployment as its audience and the hub refuses it, so the picker uses the second,
+  // hub-audience token the issuer contract (§3.1) lets this client hold.
+  const token = await hubAudienceToken();
   if (!token) return null;
 
   const base = import.meta.env.PUBLIC_HUB_URL ?? 'https://hub.agentpod.dev';

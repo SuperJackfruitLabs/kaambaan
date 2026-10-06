@@ -268,6 +268,40 @@ describe('getHubPrincipals', () => {
     expect(await getHubPrincipals()).toBeNull();
   });
 
+  /**
+   * After the Organization-plane cutover the app's token names THIS deployment as its audience, and
+   * the hub refuses it. The issuer contract (§3.1, amended) lets `superpipeline-web` hold a second,
+   * hub-audience token for exactly this call; our Worker hands it over as `hubToken`.
+   */
+  it('in plane mode, carries the hub-audience token — never the app token — to the hub', async () => {
+    const appToken = jwtExpiringIn(300);
+    const hubAud = jwtExpiringIn(299);
+    const spy = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (String(url).startsWith('/hub/token')) {
+        return new Response(JSON.stringify({ token: appToken, hubToken: hubAud, hubConfigured: true, signIn: 'org-plane' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ agents: [] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', spy);
+
+    expect(await getHubPrincipals()).toEqual([]);
+    const call = spy.mock.calls.find((c) => String(c[0]).includes('/api/fleet/dispatchable'));
+    expect((call?.[1]?.headers as Record<string, string>).Authorization).toBe(`Bearer ${hubAud}`);
+  });
+
+  it('in plane mode with no hub-audience token, answers null and sends nothing to the hub', async () => {
+    const spy = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (String(url).startsWith('/hub/token')) {
+        return new Response(JSON.stringify({ token: jwtExpiringIn(300), hubToken: null, hubConfigured: true, signIn: 'org-plane' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ agents: [] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', spy);
+
+    expect(await getHubPrincipals()).toBeNull();
+    expect(spy.mock.calls.some((c) => String(c[0]).includes('/api/fleet/dispatchable'))).toBe(false);
+  });
+
   it('reads an empty grant as an empty list, not as no hub', async () => {
     // `[]` and `null` mean different things to the caller: nothing to offer
     // versus nowhere to ask. An operator with no grant sees "every agent in the

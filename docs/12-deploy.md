@@ -88,6 +88,81 @@ queued and nothing is sent.
   (workspace admin or owner) queues one report per existing run on that board. It is safe to
   re-run, and it revives parked reports.
 
+## Switching to the Organization plane (P4)
+
+Until this runs, the four `ORG_PLANE_*` vars are absent and the Worker behaves exactly as before:
+it verifies the hub's tokens and signs people in with GitHub. Setting `ORG_PLANE_ISSUER` switches
+it to the Organization plane (`apps/api/src/auth/org-plane.ts`) and refuses every hub token —
+there is no dual-accept. Setting it with any of the other three missing fails closed (no sign-in,
+no bearer of either kind), never back to the hub.
+
+| Var | Production value |
+|---|---|
+| `ORG_PLANE_ISSUER` | `https://accounts.superjackfruit.com` (exact `iss`) |
+| `ORG_PLANE_JWKS_URL` | `https://accounts.superjackfruit.com/api/auth/jwks` |
+| `ORG_PLANE_AUDIENCE` | `https://app.superpipeline.dev` (MCP's is this plus `/mcp`) |
+| `ORG_PLANE_URL` | `https://accounts.superjackfruit.com` |
+
+`HUB_ISSUER` **stays set**. In plane mode it no longer names an issuer this Worker trusts; it names
+the hub's resource, which the web client requests as a second token so the assignee picker can
+keep calling the hub's `/api/fleet/dispatchable`.
+
+1. **Preconditions.**
+   - The plane serves resources `https://app.superpipeline.dev` and `https://app.superpipeline.dev/mcp`.
+   - Client `superpipeline-web` is registered with redirect `https://app.superpipeline.dev/auth/callback`,
+     and may request both the app resource and the hub's (`https://hub.agentpod.dev`).
+   - Client `supi` exists for the device flow.
+   - A service principal for the run reporter exists in the operator's org. It needs a `svc_`
+     credential, and the plane must allow it to mint for superwitness's audience.
+   - `ent` for the org includes `superpipeline`.
+   - Every agent that claims or runs work has `claim` and `run` in its grant's scopes. A plane agent
+     token's `scope` IS its grant here (REST and MCP alike): a token with no `scope` may read and
+     nothing else.
+2. **Mapping file** from the hub export: fleet → org, and hub user id → `prn_`
+   (`{ "tenants": {…}, "chosenTenants": {…}, "users": {…} }`). It is a deployment's data and is
+   never committed. Dry-run it and resolve every conflict, or accept every `unmapped` row in
+   writing on the P4 card:
+   `bun scripts/repoint-org-plane.ts --mapping map.json --remote`.
+   The script never defaults its target: `--remote` or `--local` is required every time.
+3. **Freeze** (design §8 step 1). Then, back to back:
+   1. `bun scripts/repoint-org-plane.ts --mapping map.json --remote --write` — applies, then
+      re-snapshots and refuses to report success unless a fresh plan is empty.
+   2. `wrangler secret put SUPERWITNESS_REPORTER_CREDENTIAL` (the plane `svc_` credential).
+   3. `wrangler secret put SESSION_SECRET` with a **new** value. This ends every GitHub-era and
+      hub-era session, so nobody stays in a personal tenant through a 30-day cookie.
+   4. Merge the PR that adds the four `ORG_PLANE_*` values to `apps/api/wrangler.jsonc` `vars`.
+      CI deploys it.
+
+   Between steps 1 and 4, hub tokens for re-pointed tenants are refused. That is why this runs in
+   the freeze.
+4. **Live checks** (record each output on the P4 card):
+   - `curl -s https://app.superpipeline.dev/.well-known/oauth-protected-resource/mcp` names the plane
+     in `authorization_servers`.
+   - A browser sign-in lands on the team's existing boards, not an empty workspace, and the
+     assignee picker lists the agents the person may dispatch.
+   - `supi login && supi boards` works.
+   - A station agent's token claims and completes a card.
+   - The reporter drains: the outbox empties, and superwitness shows the run.
+   - `claude mcp add --transport http superpipeline https://app.superpipeline.dev/mcp` completes
+     consent and lists tools. Its discovery fetch must hit the plane's ROOT
+     `/.well-known/oauth-authorization-server`.
+   - Switching workspace at the plane, then signing in again, lands on the other workspace's
+     boards. A token's `org` is fixed at consent, so a refresh alone never switches.
+   - A token for an org without `superpipeline` gets `403 {"error":"product_not_enabled","org":…}`.
+5. **Rollback.**
+   1. Revert the vars PR.
+   2. `bun scripts/repoint-org-plane.ts --mapping map.json --remote --reverse --write`.
+   3. Restore the previous reporter credential.
+
+   What `--reverse` does **not** do:
+   - It does not unmap tenants or users that first sight created under the plane. It reverses only
+     the mapping file's entries, so those rows keep their `org-plane` mapping and are invisible in
+     hub mode. List them with `SELECT id FROM tenants WHERE external_source = 'org-plane'` (and the
+     same on `users`) before reverting.
+   - It does not restore `updated_at`: both directions set it to the time of the write.
+   - It never guesses a many-to-one mapping. Two fleets mapped to one org, or two hub user ids to one
+     `prn_`, are reported as conflicts in both directions, and `--write` refuses while any remain.
+
 ## After deploy
 
 - Confirm the callback URL in the GitHub OAuth app matches `<origin>/auth/callback`.

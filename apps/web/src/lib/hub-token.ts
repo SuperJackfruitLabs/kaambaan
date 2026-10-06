@@ -42,6 +42,13 @@ const HUB_URL = import.meta.env.PUBLIC_HUB_URL ?? 'https://hub.agentpod.dev';
 const REFRESH_MARGIN_MS = 60_000;
 
 let cached: { token: string; expiresAtMs: number } | null = null;
+/**
+ * The hub-audience token, in plane mode only (issuer contract §3.1, amended). The app token's `aud`
+ * is this deployment, which the hub refuses, so the assignee picker gets a second token that our
+ * Worker requested for the hub's resource. Minted alongside the app token and refreshed with it.
+ */
+let cachedHubAud: { token: string; expiresAtMs: number } | null = null;
+let lastSignIn: 'github' | 'org-plane' | null = null;
 let inFlight: Promise<string | null> | null = null;
 
 /** `exp` from the payload, without verifying — the hub verifies; this only schedules. */
@@ -83,6 +90,13 @@ export interface HubStatus {
   configured: boolean;
   /** A hub token for this operator, or null. Null is an ordinary answer. */
   token: string | null;
+  /** How this deployment signs people in. Absent (an older Worker) reads as GitHub. */
+  signIn: 'github' | 'org-plane';
+}
+
+/** The sign-in mode the last `hubStatus()` saw, or null before the first call. */
+export function signInMode(): 'github' | 'org-plane' | null {
+  return lastSignIn;
 }
 
 /**
@@ -100,12 +114,25 @@ export interface HubStatus {
 export async function hubStatus(): Promise<HubStatus> {
   try {
     const res = await fetch('/hub/token', { credentials: 'same-origin' });
-    if (!res.ok) return { configured: false, token: null };
-    const body = (await res.json()) as { token?: string | null; hubConfigured?: boolean };
-    return { configured: body.hubConfigured === true, token: remember(body.token) };
+    // A non-2xx can still say which mode this is: plane mode answers a transient refresh failure
+    // with a retryable 503 that names `signIn`, and reading it as hub mode would send this page
+    // to the hub for a token the hub must not be asked for.
+    const body = ((await res.json().catch(() => null)) ?? {}) as { token?: string | null; hubToken?: string | null; hubConfigured?: boolean; signIn?: string };
+    if (!res.ok) {
+      if (body.signIn !== 'org-plane') return { configured: false, token: null, signIn: 'github' };
+      lastSignIn = 'org-plane';
+      return { configured: body.hubConfigured === true, token: null, signIn: 'org-plane' };
+    }
+    const signIn = body.signIn === 'org-plane' ? 'org-plane' : 'github';
+    lastSignIn = signIn;
+    if (signIn === 'org-plane') {
+      const exp = body.hubToken ? expiryOf(body.hubToken) : 0;
+      cachedHubAud = body.hubToken && exp > 0 ? { token: body.hubToken, expiresAtMs: exp } : null;
+    }
+    return { configured: body.hubConfigured === true, token: remember(body.token), signIn };
   } catch {
     // Offline, or a back end that is not there. Neither is an error to show.
-    return { configured: false, token: null };
+    return { configured: false, token: null, signIn: 'github' };
   }
 }
 
@@ -159,7 +186,11 @@ export async function hubToken(): Promise<string | null> {
 
   inFlight = (async () => {
     try {
-      return (await hubStatus()).token ?? (await tokenFromHubDirectly());
+      const status = await hubStatus();
+      // In plane mode the token is the app's (aud = this deployment); the hub would refuse it, and
+      // there is no hub cookie to fall back on. Null is the ordinary answer.
+      if (status.signIn === 'org-plane') return status.token;
+      return status.token ?? (await tokenFromHubDirectly());
     } finally {
       inFlight = null;
     }
@@ -200,9 +231,25 @@ export async function beginHubAuthorization(
   }
 }
 
+/**
+ * A token the HUB will accept, for calls made to the hub itself (the assignee picker), or null.
+ *
+ * Before cutover that is the same token `hubToken()` returns — the hub minted it. In plane mode it
+ * is the separate hub-audience token, never the app token: sending the app's token to the hub
+ * would be refused at best and, at worst, hand one product's credential to another.
+ */
+export async function hubAudienceToken(): Promise<string | null> {
+  const token = await hubToken();
+  if (lastSignIn !== 'org-plane') return token;
+  if (cachedHubAud && cachedHubAud.expiresAtMs - REFRESH_MARGIN_MS > Date.now()) return cachedHubAud.token;
+  return null;
+}
+
 /** Drop the cached token — after signing out, or when the hub rejects it. */
 export function forgetHubToken(): void {
   cached = null;
+  cachedHubAud = null;
+  lastSignIn = null;
 }
 
 /**

@@ -24,13 +24,16 @@
  */
 import { readFileSync } from "node:fs";
 import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
-import { baseUrl, describeCredential, expired, inspect, refusalHint, resolveCredential, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
+import { baseUrl, clearSupiCredentials, describeCredential, expired, inspect, refusalHint, resolveCredential, saveSupiDevice, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
+import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 
 const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the same command)
 
+  supi login                   sign in to this server's organization plane (device flow)
+  supi logout                  forget that sign-in on this machine
   supi whoami                  who the stored token says you are
   supi boards                  the workspace's boards
   supi board <boardId>         one board: its stages and their cards
@@ -112,9 +115,11 @@ const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the 
   --json                       machine-stable output, on any command (the default is
                                readable; a shape with no renderer prints JSON either way)
 
-Credential: $${ENV_TOKEN}, else $AGENTPOD_TOKEN, else the token \`fleet login\` writes.
+Credential, first found wins: $${ENV_AGENT_TOKEN_FILE}, $${ENV_AGENT_TOKEN}, $${ENV_TOKEN},
+$AGENTPOD_TOKEN, the token \`supi login\` cached, \`supi login\`'s device credential
+(exchanged at the organization plane), the token \`fleet login\` writes, then fleet's device.
 An agent acts with $${ENV_AGENT_TOKEN_FILE} (a file, re-read every run) or
-$${ENV_AGENT_TOKEN}, either outranking all three. An spa_ token reads and plans; only a
+$${ENV_AGENT_TOKEN}, either outranking every person's credential. An spa_ token reads and plans; only a
 hub-issued STATION token carries the dispatch grant that queues work and moves cards, and
 it lives minutes — so point the FILE at something the node-agent keeps fresh.
 Expired file tokens renew through the device credential from fleet login.
@@ -151,7 +156,8 @@ async function credentialOrExit() {
   if (!c) {
     fail(
       "Not signed in.",
-      `  fleet login          sign in once, for both planes\n` +
+      `  supi login           sign in to this workspace\n` +
+        `  fleet login          the sign-in for a server not yet on the organization plane\n` +
         `  ${ENV_TOKEN}=…   supply a token directly\n` +
         `  ${ENV_AGENT_TOKEN}=spa_…   act as an agent, not as a person\n` +
         `  ${ENV_AGENT_TOKEN_FILE}=…   a file something keeps fresh (a station token lives minutes)`,
@@ -181,7 +187,7 @@ async function credentialOrExit() {
   if (claims && expired(claims)) {
     const hint = c.source.startsWith("env:")
       ? `Replace or unset ${c.source.slice(4)}; explicit tokens are not renewed.`
-      : "fleet login";
+      : "supi login   (fleet login, for a server not yet on the organization plane)";
     fail(`Your session expired at ${claims.expiry!.toLocaleString()}.`, `  ${hint}`);
   }
   return c;
@@ -200,7 +206,7 @@ async function api(path: string, init: RequestInit = {}): Promise<unknown> {
   const body = await res.text();
 
   if (res.status === 401) {
-    fail("superpipeline did not accept that token (401).", "  fleet login");
+    fail("superpipeline did not accept that token (401).", "  supi login   (fleet login, for a server not yet on the organization plane)");
   }
   if (res.status === 403) {
     // Distinguished from 401 deliberately: 401 means sign in, 403 means you may not — and telling
@@ -336,6 +342,23 @@ async function main(argv: string[]): Promise<void> {
       }
       return;
     }
+
+    case "login": {
+      const target = await discoverPlane(baseUrl()).catch(() => null);
+      if (!target) fail(`${baseUrl()} does not sign in through an organization plane yet.`, "  fleet login          the sign-in it uses today");
+      const credential = await deviceLogin(target, {
+        print: (l) => process.stdout.write(l + "\n"),
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      }).catch((e) => fail(e instanceof Error ? e.message : String(e)));
+      saveSupiDevice({ credential, plane: target.plane, audience: target.audience });
+      await exchangeDevice(target, credential).catch((e) => fail(e instanceof Error ? e.message : String(e)));
+      process.stdout.write("Signed in.\n");
+      return;
+    }
+    case "logout":
+      clearSupiCredentials();
+      process.stdout.write("Signed out on this machine.\n");
+      return;
 
     case "whoami": {
       const c = await credentialOrExit();
