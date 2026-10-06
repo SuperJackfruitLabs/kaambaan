@@ -86,3 +86,19 @@ describe('signInChoices', () => {
     });
   });
 });
+
+describe('signInNotice, by sign-in mode', () => {
+  const search = `?${SIGNIN_PARAM}=${SIGNIN_NO_ACCOUNT}`;
+
+  it('keeps the GitHub wording in hub mode (the default)', () => {
+    expect(signInNotice(search)?.detail).toContain('Sign in with GitHub');
+    expect(signInNotice(search, 'github')?.detail).toContain('Sign in with GitHub');
+  });
+
+  it('never mentions GitHub in plane mode, and points at the one Sign in', () => {
+    const n = signInNotice(search, 'org-plane');
+    expect(n).not.toBeNull();
+    expect(`${n!.title} ${n!.detail}`).not.toMatch(/github/i);
+    expect(n!.detail).toContain('Sign in');
+  });
+});

@@ -51,7 +51,10 @@
   onMount(() => {
     // Read the outcome before anything can navigate, then take it out of the URL: the notice is
     // about one sign-in attempt, and a reload half an hour later should not re-assert it.
-    notice = signInNotice(location.search);
+    // Read in hub wording first; re-read once `hubStatus()` says how this deployment signs people in,
+    // so a plane-mode page never tells anyone to use GitHub.
+    const outcome = location.search;
+    notice = signInNotice(outcome);
     if (notice) history.replaceState(history.state, '', urlWithoutSignInParam(location.href));
 
     // `hubStatus()` answers rather than throws on every failure it can have — no hub, an
@@ -59,6 +62,7 @@
     // false`, which is exactly the render this page wants.
     void hubStatus().then((status) => {
       choices = signInChoices(status);
+      if (notice) notice = signInNotice(outcome, status.signIn);
     });
   });
 
