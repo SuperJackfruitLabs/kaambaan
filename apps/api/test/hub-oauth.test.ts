@@ -295,7 +295,7 @@ describe('GET /hub/token', () => {
       '/hub/token',
     );
     expect(res?.status).toBe(200);
-    expect(await res!.json()).toEqual({ token: 'hub.jwt.value', hubConfigured: true });
+    expect(await res!.json()).toEqual({ token: 'hub.jwt.value', hubConfigured: true, signIn: 'github' });
   });
 
   it('answers null rather than an error when there is none', async () => {
@@ -303,7 +303,7 @@ describe('GET /hub/token', () => {
     // connected and an expired token are one answer, and neither is a failure.
     const res = await handleHubRoute(new Request(`${APP}/hub/token`), envWith(), '/hub/token');
     expect(res?.status).toBe(200);
-    expect(await res!.json()).toEqual({ token: null, hubConfigured: true });
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: true, signIn: 'github' });
   });
 
   it('says a standalone deployment has no hub, so nothing offers to connect to one', async () => {
@@ -318,7 +318,7 @@ describe('GET /hub/token', () => {
       '/hub/token',
     );
     expect(res?.status).toBe(200);
-    expect(await res!.json()).toEqual({ token: null, hubConfigured: false });
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: false, signIn: 'github' });
   });
 
   it('says the same for an issuer that is set but is not a URL', async () => {
@@ -329,7 +329,7 @@ describe('GET /hub/token', () => {
       envWith({ HUB_ISSUER: 'not a url' }),
       '/hub/token',
     );
-    expect(await res!.json()).toEqual({ token: null, hubConfigured: false });
+    expect(await res!.json()).toEqual({ token: null, hubConfigured: false, signIn: 'github' });
   });
 });
 
@@ -340,7 +340,7 @@ describe('wired into the Worker', () => {
     // the hub's redirect with index.html and drop the code on the floor.
     const res = await SELF.fetch('https://api.test/hub/token');
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ token: null, hubConfigured: true });
+    expect(await res.json()).toEqual({ token: null, hubConfigured: true, signIn: 'github' });
   });
 
   it('serves a real connect through the Worker, with the deployment issuer', async () => {

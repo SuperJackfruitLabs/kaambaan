@@ -45,6 +45,7 @@ import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_
 import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
+import { handlePlaneSignInRoute } from './auth/plane-signin';
 import { entitlementRefusal } from './auth/org-plane-resolve';
 import { orgPlaneMode } from './auth/org-plane';
 import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor } from './db/catalog';
@@ -455,6 +456,14 @@ const worker = {
     // route can turn it into a generic 401/403. Inert unless ORG_PLANE_ISSUER is set.
     const notEnabled = await entitlementRefusal(request, env);
     if (notEnabled) return notEnabled;
+
+    // Organization-plane sign-in owns /auth/login, /auth/callback, /auth/logout and /hub/{token,
+    // connect,callback} once ORG_PLANE_ISSUER is set; it answers null otherwise, and the GitHub and
+    // hub-handoff routes below run exactly as before.
+    if (path.startsWith('/auth/') || path.startsWith('/hub/')) {
+      const res = await handlePlaneSignInRoute(request, env, path);
+      if (res) return res;
+    }
 
     // Human auth (GitHub OAuth → session): /auth/login · /auth/callback · /auth/me · /auth/logout.
     if (path.startsWith('/auth/')) {
