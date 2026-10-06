@@ -34,39 +34,60 @@ board's own refusals.
 
 ## Signing in and staying signed in
 
-Install AgentPod's standalone `fleet` client, then run:
+**After a server moves to the Organization plane** (`accounts.superjackfruit.com`), a person
+signs in with `supi` itself:
 
 ```sh
-fleet login
+supi login
 supi whoami
 supi boards
 ```
 
-`supi` uses hub-issued tokens and the device credential created by `fleet login`.
-It checks `SUPERPIPELINE_TOKEN`, then `AGENTPOD_TOKEN`, then fleet's token cache.
-If the cache is absent, malformed or expired, it exchanges the stored device
-credential for a fresh five-minute token and caches that token for later commands.
-No browser interaction is needed while the device credential remains usable.
+`supi login` reads the server's `/.well-known/oauth-protected-resource` to find its plane and
+audience, then runs the plane's device flow as client `supi`: open the printed link, confirm the
+code, and `supi` stores a long-lived device credential of its own (device credentials are per
+client — `fleet` holds a separate one). Every command after that exchanges it at the plane's
+`/api/token/device` for a five-minute token, cached beside it. `supi logout` deletes both files.
+A server that has not moved yet answers `supi login` with "does not sign in through an
+organization plane yet"; use `fleet login` there, as below.
+
+**Before that move**, install AgentPod's standalone `fleet` client, then run `fleet login`.
+`supi` uses the hub-issued token and the device credential `fleet login` created, renewing the
+token through it when it expires. No browser interaction is needed while either device
+credential remains usable.
+
+The credential is resolved in this order; the first one found wins:
+
+1. `$SUPERPIPELINE_AGENT_TOKEN_FILE` (an agent; see below)
+2. `$SUPERPIPELINE_AGENT_TOKEN` (an agent)
+3. `$SUPERPIPELINE_TOKEN`
+4. `$AGENTPOD_TOKEN`
+5. `supi login`'s token cache, when fresh
+6. `supi login`'s device credential, exchanged at its recorded plane for its recorded audience
+7. `fleet login`'s token cache
+8. `fleet login`'s device credential, renewed at its recorded hub
+
+After the cutover `$AGENTPOD_TOKEN` holds a token for the **hub's** audience, which
+superpipeline refuses. Do not export it into a shell that runs `supi`: it outranks
+`supi login` and every command would answer 401.
 
 Explicit environment tokens take precedence even when expired. Replace or unset
 an expired variable; `supi` will not silently switch to a different disk identity.
-Without a usable device credential, run `fleet login` again. A refused exchange
-also asks for a new login; a network/server failure asks you to retry. No API write
-is automatically replayed.
+Without a usable device credential, run `supi login` (or, before the cutover, `fleet login`)
+again. A refused exchange also asks for a new login; a network/server failure asks you to
+retry. No API write is automatically replayed.
 
-The files are `agentpod/token.json` and `agentpod/device.json` under the same
-platform config directory as fleet: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux,
-`~/Library/Application Support` on macOS, and `%AppData%` on Windows. The device
-secret goes only to the issuer recorded in `device.json`, with redirects disabled.
-HTTPS is required except for loopback development hubs. Token-cache replacement
-is atomic and private (0600); the device file is never modified. If caching fails,
-the fresh token still works for that command.
+`supi login`'s files are `superpipeline/device.json` and `superpipeline/token.json`;
+`fleet login`'s are `agentpod/token.json` and `agentpod/device.json`. Both live under the same
+platform config directory: `$XDG_CONFIG_HOME` (or `~/.config`) on Linux,
+`~/Library/Application Support` on macOS, and `%AppData%` on Windows. A device secret goes only
+to the plane or hub recorded in its `device.json`, with redirects disabled. HTTPS is required
+except for loopback development servers. Files are written atomically and privately (0600). If
+caching fails, the fresh token still works for that command.
 
 `SUPERPIPELINE_URL` changes the work API destination (default
-`https://app.superpipeline.dev`), not the issuer used for device exchange.
+`https://app.superpipeline.dev`), not where a device credential is exchanged.
 Superpipeline verifies the resulting token and its audience/authority at the API.
-This reuses the existing fleet credential protocol; it does not add a separate
-Superpipeline login or change the suite's identity agreements.
 
 ## When an AGENT is the one running it
 
