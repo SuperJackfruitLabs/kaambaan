@@ -381,7 +381,10 @@ describe('the alarm drains the outbox', () => {
   it('does not arm for reports while reporting is off', () =>
     runInDurableObject(stubFor('swd-alarm-off'), async (board: BoardDO, state) => {
       await withReporting(() => runs(board, 'brd_swd_alarm_off', 1));
-      await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
-      expect((await state.storage.getAlarm())!).toBeGreaterThan(Date.now() + 14 * 60 * 1000); // only the reclaim deadline
+      // Off explicitly: wrangler.jsonc sets SUPERWITNESS_URL in production, and the test env inherits it.
+      await withReporting(async () => {
+        await (board as unknown as { scheduleReclaim(): Promise<void> }).scheduleReclaim();
+        expect((await state.storage.getAlarm())!).toBeGreaterThan(Date.now() + 14 * 60 * 1000); // only the reclaim deadline
+      }, {});
     }));
 });
