@@ -1,0 +1,32 @@
+{
+  "source": "accounts docs/superpowers/specs/2026-10-06-issuer-contract.md §2 (P2's fixtures/ecosystem-identity/ supersedes this once it exists)",
+  "version": 1,
+  "always": ["iss", "sub", "aud", "exp", "iat", "jti", "principalKind", "org", "ent", "mayDispatch", "mayGrantReach"],
+  "conditional": {
+    "scope": "exchange tokens: grant scopes; OAuth tokens: the OAuth scope string. Read only when principalKind is agent or service.",
+    "act": "when delegated: { sub: prn_ }",
+    "amr": "exchange tokens only: [device] | [exchange] | [service]",
+    "email": "humans",
+    "email_verified": "humans"
+  },
+  "ignored": ["client_id", "azp", "sid"],
+  "removed": ["tenant"],
+  "examples": {
+    "human_oauth": {
+      "sub": "prn_000000000000000000a1", "principalKind": "human", "org": "org_00000000000000000a01",
+      "ent": ["agentpod", "superpipeline"], "mayDispatch": ["prn_000000000000000000a2"], "mayGrantReach": true,
+      "scope": "openid profile email offline_access", "email": "person@example.com", "email_verified": true,
+      "client_id": "superpipeline-web", "azp": "superpipeline-web", "sid": "s1"
+    },
+    "agent_exchange": {
+      "sub": "prn_000000000000000000a2", "principalKind": "agent", "org": "org_00000000000000000a01",
+      "ent": ["superpipeline"], "mayDispatch": [], "mayGrantReach": false,
+      "scope": "evidence:read", "act": { "sub": "prn_000000000000000000a4" }, "amr": ["exchange"]
+    },
+    "service_exchange": {
+      "sub": "prn_000000000000000000a3", "principalKind": "service", "org": "org_00000000000000000a01",
+      "ent": ["superpipeline", "superwitness"], "mayDispatch": [], "mayGrantReach": false,
+      "scope": "evidence:read", "amr": ["service"]
+    }
+  }
+}
