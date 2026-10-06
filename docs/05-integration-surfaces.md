@@ -77,6 +77,19 @@ that flow in the present tense. None of it was ever built.
 > hop**. Configure your client with a `spa_` token directly instead. A real Authorization Server is
 > a fast-follow (**⚠️ OPEN**); until it lands, only the `401`-and-metadata shape is real.
 
+**After the Organization-plane cutover.** Everything above is the pre-cutover state, and stays
+true while `ORG_PLANE_ISSUER` is unset. With it set (`apps/api/src/auth/org-plane.ts`):
+
+- `/mcp` accepts the plane's tokens whose `aud` is `<ORG_PLANE_AUDIENCE>/mcp` (string or array),
+  verified offline against `ORG_PLANE_JWKS_URL`. A token for the app's own audience is refused at
+  `/mcp`, and the reverse. `spa_` tokens keep working; the dev bearer does not.
+- The `401` names `<app>/.well-known/oauth-protected-resource/mcp`, and that document lists
+  `authorization_servers: [<ORG_PLANE_ISSUER>]`, so a spec-following MCP client completes
+  discovery and consent at the plane rather than dead-ending here.
+- A human token gets the read tools only (no claim or run verbs); an agent token is that agent,
+  with its own row's capabilities; a service token is refused. An org whose `ent` lacks
+  `superpipeline` gets `403 {"error":"product_not_enabled","org":"<org_>"}`.
+
 - **Session**: none — the transport is **stateless** (`sessionIdGenerator: undefined`), so there is
   no `Mcp-Session-Id` acting as a credential. **⚠️ OPEN**: `Origin`/DNS-rebinding validation is not
   wired (auth is a bearer, so there is no ambient browser session to hijack).

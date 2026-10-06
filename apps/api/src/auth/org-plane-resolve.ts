@@ -7,6 +7,8 @@ import type { UserPrincipal, AgentPrincipal, ServicePrincipal } from './resolve'
 import { findAgentByExternal, findTenantByExternal } from '../db/catalog';
 import { entitles, orgPlaneMode, verifyOrgPlaneToken, ORG_PLANE_SOURCE, type OrgPlaneClaims, type OrgPlaneConfig } from './org-plane';
 import { ensureOrgTenant, provisionOrgHuman } from './org-tenancy';
+import type { McpAuth } from '../mcp/tools';
+import { effectiveCapabilities } from '../db/implications';
 
 export function bearerOf(request: Request): string | null {
   const m = (request.headers.get('Authorization') ?? '').match(/^Bearer\s+(.+)$/i);
@@ -84,4 +86,30 @@ export async function resolvePlaneService(request: Request, env: Env, cfg: OrgPl
   if (!tenantId) return null;
   const scopes = typeof claims.scope === 'string' ? claims.scope.split(' ').filter((s) => s !== '') : [];
   return { principalId: claims.sub, tenantId, scopes };
+}
+
+export async function resolvePlaneMcp(request: Request, env: Env, cfg: OrgPlaneConfig): Promise<McpAuth | null> {
+  const claims = await planeClaimsFor(request, cfg, cfg.mcpAudience);
+  if (!claims || !entitles(claims)) return null;
+  if (claims.principalKind === 'agent') {
+    const found = await findAgentByExternal(env.DB, ORG_PLANE_SOURCE, claims.sub);
+    if (!found) return null;
+    const tenantId = await findTenantByExternal(env.DB, ORG_PLANE_SOURCE, claims.org);
+    if (!tenantId || tenantId !== found.tenantId) return null;
+    return {
+      tenantId,
+      agentId: found.agentId,
+      capabilities: await effectiveCapabilities(env.DB, tenantId, found.capabilities),
+      scopes: null,
+      externalId: claims.sub,
+    };
+  }
+  if (claims.principalKind === 'human') {
+    const tenantId = await ensureOrgTenant(env.DB, claims.org);
+    const human = await provisionOrgHuman(env.DB, tenantId, claims);
+    if (!human) return null;
+    // `scopes: []` registers only the unscoped (read) tools — TOOL_SCOPE gates the rest.
+    return { tenantId, agentId: human.userId, capabilities: [], scopes: [], externalId: claims.sub };
+  }
+  return null;
 }

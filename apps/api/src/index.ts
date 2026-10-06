@@ -475,12 +475,13 @@ const worker = {
     }
 
     // MCP surface (docs/05 §2): an OAuth Resource Server in front of the Streamable HTTP endpoint.
-    if (request.method === 'GET' && path === MCP_PROTECTED_RESOURCE_PATH) {
-      return protectedResourceMetadata(request);
+    if (request.method === 'GET' && path.startsWith(MCP_PROTECTED_RESOURCE_PATH)) {
+      const meta = protectedResourceMetadata(request, env, path);
+      if (meta) return meta;
     }
     if (path === '/mcp') {
       const auth = await resolveMcpAuth(request, env);
-      if (!auth) return unauthorized(request);
+      if (!auth) return unauthorized(request, env);
       return handleMcpRequest(request, env, auth);
     }
 
