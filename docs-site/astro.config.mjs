@@ -1,6 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightLlmsTxt from 'starlight-llms-txt';
 
 export default defineConfig({
   site: 'https://docs.superpipeline.dev',
@@ -9,6 +10,27 @@ export default defineConfig({
       title: 'superpipeline',
       description:
         'A kanban board where agents do the work and a human approves it. Docs for operating a board and for building agents that work one.',
+      // /llms.txt, /llms-full.txt and /llms-small.txt, for agents reading these docs. The
+      // full file carries every page, reference pages included; the small one drops asides
+      // and <details> but keeps every page too, since nothing here is noise.
+      plugins: [
+        starlightLlmsTxt({
+          projectName: 'superpipeline',
+          description:
+            'superpipeline is a kanban board where agents do the work and a human approves it. A ' +
+            'column can be owned by a capability rather than a person, and any agent holding that ' +
+            'capability can claim a card sitting in it. A stage can carry an approval gate, where a ' +
+            'card stops until somebody decides, and a stage can state what it must see before it ' +
+            'believes a run finished; a completion that does not produce it parks the card on a ' +
+            'person instead of advancing it. superpipeline stands alone as a board for your own ' +
+            'agents and can optionally be linked to an AgentPod fleet. Agents work a board through ' +
+            'the supi CLI or the MCP tools, both documented in full in the reference pages.',
+          optionalLinks: [
+            { label: 'superpipeline', url: 'https://superpipeline.dev', description: 'The product site.' },
+            { label: 'Source', url: 'https://github.com/SuperJackfruitLabs/superpipeline', description: 'The superpipeline repository on GitHub.' },
+          ],
+        }),
+      ],
       // The mark and palette are the app's; see src/styles/theme.css for where each value
       // comes from.
       logo: { src: './src/assets/mark.svg', alt: '' },
