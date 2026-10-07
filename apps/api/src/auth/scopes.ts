@@ -126,6 +126,12 @@ export function requiredScope(
    */
   if (/^gates\/[^/]+\/resolve$/.test(rest)) return SCOPE_FORBIDDEN;
   /**
+   * Subscribing to the board's push. On `claim`: the subscription is an accelerator for claiming
+   * (docs/05 §4), and what it carries — a gate or a question waiting on a person — is exactly what
+   * `gates/pending` and `elicitations/pending` already let any agent on the board read.
+   */
+  if (rest === 'push-configs') return method === 'POST' ? 'claim' : SCOPE_FORBIDDEN;
+  /**
    * Stages. ONE stage's prose is composable; the pipeline is not.
    *
    * `PATCH stages/:key` is reached on `compose` and then authorised FIELD by field
