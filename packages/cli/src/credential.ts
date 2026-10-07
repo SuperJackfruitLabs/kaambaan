@@ -14,8 +14,10 @@
  *   5. `supi login`'s token cache, when fresh
  *   6. `supi login`'s device credential, exchanged at its recorded Organization plane for its
  *      recorded audience (issuer contract §3.2; device credentials are per client)
- *   7. the token cache `fleet login` writes
- *   8. its device credential, renewed at its recorded hub (useful only in hub mode)
+ *   7. the token cache `fleet login` writes — skipped when its `aud` does not name this API, which
+ *      is every token `fleet login` stores under the Organization plane (minted for the hub)
+ *   8. its device credential: under the plane (`plane_url` recorded) exchanged at that plane for
+ *      this API's audience, cached in supi's own directory; in hub mode renewed at its recorded hub
  *
  * **An agent may also drive this CLI, from `$SUPERPIPELINE_AGENT_TOKEN` alone.**
  *
@@ -178,6 +180,41 @@ async function supiPlaneCredential(): Promise<Credential | null> {
   return { token, source: devicePath, kind: 'human' };
 }
 
+/**
+ * Step 8 under the plane: fleet's device credential, exchanged for this API.
+ *
+ * The result is cached in supi's OWN directory, never in fleet's `token.json` — that one is the
+ * hub token fleet itself runs on, and replacing it would break `fleet` to fix `supi`.
+ */
+async function fleetPlaneCredential(planeUrl: unknown, credential: string, devicePath: string): Promise<Credential> {
+  const cachePath = join(supiConfigDir(), "fleet-token.json");
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, "utf8")) as { token?: unknown };
+    const c = typeof cached.token === "string" ? inspect(cached.token) : null;
+    if (c?.expiry && !expired(c) && aimedHere(c)) return { token: cached.token as string, source: devicePath, kind: "human" };
+  } catch { /* no cache */ }
+
+  // The long-lived secret goes only to the plane fleet recorded, over https (loopback http for
+  // local development) — never to SUPERPIPELINE_URL, a claim, or a redirect.
+  let plane: string;
+  try {
+    const u = new URL(typeof planeUrl === "string" ? planeUrl : "");
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+    if ((u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) || u.username || u.password || u.search || u.hash) {
+      throw new Error();
+    }
+    plane = u.href.replace(/\/+$/, "");
+  } catch {
+    throw new Error("The fleet device has no safe sign-in service recorded. Run fleet login (or supi login) again.");
+  }
+  if (!DEVICE_CREDENTIAL.test(credential)) {
+    throw new Error("The fleet device credential is not usable. Run fleet login (or supi login) again.");
+  }
+  const { token } = await exchangeDevice({ plane, audience: apiAudience() }, credential);
+  try { writePrivate(cachePath, { token }); } catch { /* best effort */ }
+  return { token, source: devicePath, kind: "human" };
+}
+
 function fleetTokenPath(): string {
   return join(fleetConfigDir(), "token.json");
 }
@@ -262,17 +299,25 @@ export async function resolveCredential(): Promise<Credential | null> {
   const own = await supiPlaneCredential();
   if (own) return own;
   const claims = cached ? inspect(cached.token) : null;
-  if (claims?.expiry && !expired(claims)) return cached;
+  const usable = claims?.expiry && !expired(claims) && aimedHere(claims);
+  if (usable) return cached;
+  // A token minted for somewhere else is never a fallback: it is a guaranteed 401.
+  const fallback = claims && !aimedHere(claims) ? null : cached;
 
-  let device: { id?: unknown; secret?: unknown; hub?: unknown } | null;
+  let device: { id?: unknown; secret?: unknown; hub?: unknown; plane_url?: unknown } | null;
   const devicePath = join(fleetConfigDir(), "device.json");
   try {
     device = JSON.parse(readFileSync(devicePath, "utf8"));
   } catch {
-    return cached;
+    return fallback;
   }
   if (typeof device?.id !== "string" || !device.id.trim() ||
-      typeof device.secret !== "string" || !device.secret.trim()) return cached;
+      typeof device.secret !== "string" || !device.secret.trim()) return fallback;
+
+  // Under the Organization plane, fleet's device credential is a plane credential (contract §3.2)
+  // and the hub no longer renews anything. Exchange it at the plane `fleet login` recorded, for
+  // THIS API's audience.
+  if (device.plane_url !== undefined) return fleetPlaneCredential(device.plane_url, `${device.id}:${device.secret}`, devicePath);
 
   // The long-lived secret goes only to the issuer recorded by fleet login, never to
   // SUPERPIPELINE_URL, a JWT claim, or a redirected host. Local development can use HTTP.
@@ -355,6 +400,25 @@ export interface Claims {
   subject: string;
   principalKind: string;
   expiry: Date | null;
+  /** The token's `aud`, or null when it carries none. */
+  audience?: string[] | null;
+}
+
+/**
+ * The audience superpipeline checks a token against: its own origin (`planeAudience` server-side
+ * is `APP_URL`, else the request's origin — the same thing for the URL this CLI talks to).
+ */
+export function apiAudience(): string {
+  return new URL(baseUrl()).origin;
+}
+
+/**
+ * Could this token be spent here? A token with no `aud` is not second-guessed — the server
+ * decides. One that names its audiences and not this API's is certain to be refused (401), which
+ * is what a `fleet login` token minted for the hub is under the Organization plane.
+ */
+function aimedHere(c: Claims): boolean {
+  return !c.audience || c.audience.includes(apiAudience());
 }
 
 /**
@@ -372,10 +436,13 @@ export function inspect(token: string): Claims | null {
       sub?: string;
       principalKind?: string;
       exp?: number;
+      aud?: unknown;
     };
+    const aud = payload.aud;
     return {
       subject: payload.sub ?? "",
       principalKind: payload.principalKind ?? "",
+      audience: typeof aud === "string" ? [aud] : Array.isArray(aud) ? aud.filter((a): a is string => typeof a === "string") : null,
       expiry: typeof payload.exp === "number" && Number.isFinite(payload.exp) && Number.isFinite(new Date(payload.exp * 1000).getTime())
         ? new Date(payload.exp * 1000) : null,
     };
