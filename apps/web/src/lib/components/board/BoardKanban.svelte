@@ -33,9 +33,10 @@
   {@const stages = [...board.stages].sort((a, b) => a.order - b.order)}
 
   <!-- the directed flight path: stages are waypoints, work flows →
-       No own overflow: the full-height screen container (in +page.svelte) is the scroller, so
-       horizontal scroll works across the whole viewport height, not just the lanes' height.
-       min-h-full makes the board fill the available height (drop targets + scroll region). -->
+       The lanes div below is the horizontal scroller (measured at 390px: it is the only ancestor
+       of the lanes whose scrollWidth exceeds its width); the screen container above it scrolls
+       vertically only. min-h-full makes the board fill the available height (drop targets +
+       scroll region). -->
   <StageStepper stages={stages} container={scroller} />
 
   <!-- Three shapes, by width:

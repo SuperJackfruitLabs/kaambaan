@@ -23,7 +23,16 @@
     return Object.fromEntries(stages.map((s) => [s.key, cards.filter((c) => c.currentStageKey === s.key).length]));
   });
 
+  /**
+   * Which lanes exist. The observer has to be rebuilt whenever this changes, not only when the
+   * scroller does: switching boards keeps the scroller and replaces every lane in it, and an
+   * observer attached once went on watching the old, detached lanes — so after the first board the
+   * selected tab never moved again (reported from a phone, 2026-10-07).
+   */
+  const laneKeys = $derived(stages.map((s) => s.key).join('\n'));
+
   $effect(() => {
+    void laneKeys;
     if (!container) return;
     const lanes = [...container.querySelectorAll<HTMLElement>('[data-lane]')];
     if (lanes.length === 0) return;
