@@ -16,9 +16,16 @@
   import Activity from './Activity.svelte';
 </script>
 
-<div class="mx-auto grid max-w-3xl gap-3 p-3">
-  <NeedsYou />
-  <Running />
-  <Spend />
-  <Activity />
+<!-- One column up to 1200px; above it two — what needs a person on the left, what it cost and
+     what happened on the right. A single 742px column used 40% of a 1920px screen and stacked
+     four panels a reader had to scroll past to reach Activity (responsive audit, 2026-10-07). -->
+<div class="touch-form mx-auto grid max-w-3xl items-start gap-3 p-3 min-[1200px]:max-w-[1400px] min-[1200px]:grid-cols-2 min-[1200px]:p-4">
+  <div class="grid min-w-0 gap-3">
+    <NeedsYou />
+    <Running />
+  </div>
+  <div class="grid min-w-0 gap-3">
+    <Spend />
+    <Activity />
+  </div>
 </div>

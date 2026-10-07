@@ -27,14 +27,17 @@
     if (!container) return;
     const lanes = [...container.querySelectorAll<HTMLElement>('[data-lane]')];
     if (lanes.length === 0) return;
+    // On a tablet two or three lanes are on screen at once; the leftmost of them is "here".
+    const visible = new Set<number>();
     const io = new IntersectionObserver(
       (entries) => {
         for (const e of entries) {
-          if (e.isIntersecting) {
-            const i = lanes.indexOf(e.target as HTMLElement);
-            if (i >= 0) current = i;
-          }
+          const i = lanes.indexOf(e.target as HTMLElement);
+          if (i < 0) continue;
+          if (e.isIntersecting) visible.add(i);
+          else visible.delete(i);
         }
+        if (visible.size > 0) current = Math.min(...visible);
       },
       { root: container, threshold: 0.6 },
     );

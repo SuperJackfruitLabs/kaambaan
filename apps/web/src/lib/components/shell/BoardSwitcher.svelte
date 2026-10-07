@@ -76,12 +76,12 @@
   }}
 />
 
-<div class="relative" bind:this={menuEl}>
+<div class="relative max-w-[14rem] min-w-0" bind:this={menuEl}>
   <button
     onclick={() => (open = !open)}
     aria-expanded={open}
     aria-haspopup="menu"
-    class="hover:bg-inset flex max-w-[14rem] items-center gap-1.5 rounded-[7px] px-2 py-1.5 text-sm font-medium"
+    class="hover:bg-inset flex max-w-full items-center gap-1.5 rounded-[7px] px-2 py-1.5 text-sm font-medium"
     style="min-height:var(--tap)"
   >
     <span class="truncate">{current}</span>

@@ -450,12 +450,16 @@
   }
   .foot nav {
     display: flex;
-    gap: 18px;
+    gap: 6px 18px;
     flex-wrap: wrap;
   }
+  /* A 20px-tall text link is a miss on a finger; the target grows, the type does not. */
   .foot a {
     color: var(--muted);
     text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--tap);
   }
   .foot a:hover {
     color: var(--text);

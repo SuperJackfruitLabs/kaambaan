@@ -38,11 +38,17 @@
        min-h-full makes the board fill the available height (drop targets + scroll region). -->
   <StageStepper stages={stages} container={scroller} />
 
-  <!-- Below 900px each lane is the width of the viewport and snaps, so the pipeline is paged
-       rather than squeezed. Above it, lanes sit side by side as before. -->
+  <!-- Three shapes, by width:
+       - below 600px each lane is the width of the viewport and snaps, so the pipeline is paged
+         rather than squeezed;
+       - 600–899px (a tablet) lanes are a fixed 300px and snap to their start edge, so two sit
+         side by side with the third peeking in — one 744px lane on an iPad hid four stages
+         behind swipes (responsive audit, 2026-10-07);
+       - 900px and up lanes sit side by side at 264px, and from 1536px they grow to share the
+         width (up to 380px) instead of leaving a quarter of a wide screen empty. -->
   <div
     bind:this={scroller}
-    class="flex min-h-full items-start overflow-x-auto px-3 pt-3 pb-6 [scroll-snap-type:x_mandatory] min-[900px]:px-4 min-[900px]:pt-4 min-[900px]:[scroll-snap-type:none]"
+    class="flex min-h-full items-start gap-2 overflow-x-auto px-3 pt-3 pb-6 [scroll-padding-inline:0.75rem] [scroll-snap-type:x_mandatory] min-[900px]:gap-0 min-[900px]:px-4 min-[900px]:pt-4 min-[900px]:[scroll-snap-type:none]"
   >
     {#each stages as stage, i (stage.key)}
       {@const cards = cardsInStage(stage.key)}
@@ -69,7 +75,7 @@
       <section
         aria-labelledby="lane-{stage.key}"
         data-lane
-        class="lane w-[calc(100vw-1.5rem)] shrink-0 rounded-[12px] p-2 [scroll-snap-align:center] min-[900px]:w-[264px] min-[900px]:[scroll-snap-align:none] transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
+        class="lane w-[calc(100vw-1.5rem)] shrink-0 rounded-[12px] p-2 [scroll-snap-align:center] min-[600px]:w-[300px] min-[600px]:[scroll-snap-align:start] min-[900px]:w-[264px] min-[900px]:[scroll-snap-align:none] 2xl:w-auto 2xl:max-w-[380px] 2xl:min-w-[264px] 2xl:flex-1 transition-[box-shadow,background-color] {overStage === stage.key ? 'ring-marigold bg-card ring-2' : 'bg-card/40'}"
         use:columnDropTarget={{
           stageKey: stage.key,
           onDrop: (cardId) => app.moveCard(cardId, stage.key),

@@ -6,8 +6,9 @@
    * priority, due date and description — a control below the WCAG floor guarding fields that were
    * first-class in the API all along. Here they are simply fields.
    *
-   * One component, two containers: a dialog at 900px and up, a full-screen sheet below, because a
-   * four-field form on a phone should not be a floating box with the board showing round it.
+   * One component, two containers: a dialog from 600px up, a full-screen sheet below, because a
+   * four-field form on a phone should not be a floating box with the board showing round it — and
+   * on a tablet it should not be a full screen of mostly empty form (audit 2026-10-07).
    */
   import { app } from '$lib/stores/app.svelte';
   import { Button } from '$lib/components/ui/button';
@@ -47,12 +48,12 @@
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-40 flex items-end justify-center min-[900px]:items-center">
+  <div class="fixed inset-0 z-40 flex items-end justify-center min-[600px]:items-center min-[600px]:p-6">
     <button class="absolute inset-0 bg-black/55" onclick={onClose} aria-label="Close" tabindex="-1"></button>
 
     <form
       onsubmit={submit}
-      class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border shadow-2xl min-[900px]:h-auto min-[900px]:max-w-lg min-[900px]:rounded-[12px]"
+      class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border shadow-2xl min-[600px]:h-auto min-[600px]:max-h-full min-[600px]:max-w-lg min-[600px]:rounded-[12px]"
     >
       <div class="border-border flex items-center justify-between gap-3 border-b p-4">
         <div>

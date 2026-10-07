@@ -104,7 +104,9 @@
 {#if groups.length === 0}
   <p class="text-muted-foreground mono py-16 text-center text-sm">No cards match these filters.</p>
 {:else}
-  <div class="pb-10">
+  <!-- A reading column, not the full width: at 1920px a card's state, agent, due date and cost sat
+       about 1000px to the right of its title, too far to read across (audit 2026-10-07). -->
+  <div class="mx-auto max-w-5xl pb-10">
     <!-- Column headers double as the sort control. A separate sort menu would be a second place
          to look for something the columns already name. -->
     <div class="border-border text-muted-foreground mono sticky top-0 z-10 flex items-center gap-3 border-b px-4 py-1.5 text-[10px] tracking-wider uppercase" style="background:var(--ink)">
