@@ -64,8 +64,11 @@ The credential is resolved in this order; the first one found wins:
 4. `$AGENTPOD_TOKEN`
 5. `supi login`'s token cache, when fresh
 6. `supi login`'s device credential, exchanged at its recorded plane for its recorded audience
-7. `fleet login`'s token cache
-8. `fleet login`'s device credential, renewed at its recorded hub
+7. `fleet login`'s token cache — passed over when its `aud` does not name this API (under the
+   Organization plane `fleet login` stores a token for the hub, which superpipeline refuses)
+8. `fleet login`'s device credential — under the plane, exchanged at its recorded plane for this
+   API's audience and cached as `superpipeline/fleet-token.json`; in hub mode, renewed at its
+   recorded hub
 
 After the cutover `$AGENTPOD_TOKEN` holds a token for the **hub's** audience, which
 superpipeline refuses. Do not export it into a shell that runs `supi`: it outranks
