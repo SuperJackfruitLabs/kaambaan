@@ -29,105 +29,21 @@ import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
+import { findCommands, renderCommandHelp, renderUsage } from "./commands.ts";
 
-const USAGE = `supi — superpipeline from a terminal (\`superpipeline\` is the same command)
+/**
+ * The summary `supi help` prints, rendered from `commands.ts` — the same table the published
+ * reference is generated from, so the help, the reference and this switch are held to one list
+ * (`reference.test.ts`).
+ */
+const USAGE = renderUsage();
 
-  supi login                   sign in to this server's organization plane (device flow)
-  supi logout                  forget that sign-in on this machine
-  supi whoami                  who the stored token says you are
-  supi boards                  the workspace's boards
-  supi board <boardId>         one board: its stages and their cards
-  supi card <boardId> <cardId> one card in full
-  supi move <boardId> <cardId> <stageKey>
-                               move a card to another stage
-  supi gates <boardId>         approval gates waiting on a human
-  supi approve <boardId> <gateId> [--comment "why"]
-  supi reject <boardId> <gateId> [--comment "why"]
-  supi request-changes <boardId> <gateId> --comment "what to change"
-                               decide a gate without leaving the terminal
-  supi log <boardId> <cardId>  what an agent did on a card, and its handoff
-  supi archive <boardId> <cardId>
-                               archive a card, so the "show archived" filter has something to show
-  supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
-                               [--to-board <boardId>]
-                               declare an edge; --to-board names another board for an
-                               advisory (not enforced) cross-board edge
-  supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
-                               [--to-board <boardId>]
-                               remove one
-  supi link list <boardId> <cardId>
-                               every edge touching a card — same-board (enforced) and
-                               cross-board (advisory), kept apart
-
-  supi create-board <name> [--template <id>] [--stages <file|->]
-                               create a board; --template defaults to \`simple\`
-  supi set-stages <boardId> <file|->
-                               replace a board's pipeline
-  supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name ...]
-                               [--completion <file|->] [--clear-completion]
-                               change ONE stage, leaving the others alone
-  supi create-card <boardId> <title> [--spec <file|->] [--priority <n>]
-                               [--due YYYY-MM-DD] [--label <id>]...
-                               queue a card, with this token as its grant
-  supi templates               the starting pipelines --template accepts
-
-  supi label list               the tenant's label catalogue
-  supi label add <name> <colour>
-                               declare a label
-  supi label rm <id>           remove a label (cards keep the stale id)
-
-  supi project list            the workspace's projects (group cards across boards)
-  supi project add <name> [--description <text>] [--target YYYY-MM-DD] [--lead <userId>]
-                               declare a project
-  supi project show <projectId>
-                               a project with its milestones, in order
-  supi project rm <projectId>  remove a project (cards keep the stale id)
-  supi milestone add <projectId> <name> [--target YYYY-MM-DD] [--sort <n>]
-                               add a milestone to a project
-  supi milestone rm <milestoneId>
-                               remove a milestone (cards keep the stale id)
-
-  supi schedule list <boardId> the board's recurring cards
-  supi schedule add <boardId> --title <t> --rule <r> --tz <tz>
-                               [--stage <key>] [--priority <n>] [--overlap skip|allow]
-                               declare a schedule; rule is "every <n> minutes|hours|days",
-                               "daily at HH:MM", "weekly on <mon-sun> at HH:MM", or
-                               "monthly on <1-28> at HH:MM" — checked every five minutes,
-                               so it may fire up to five minutes after its stated time
-  supi schedule rm <boardId> <scheduleId>
-                               remove a schedule
-  supi schedule pause <boardId> <scheduleId>
-  supi schedule resume <boardId> <scheduleId>
-
-  supi forge [<host>|none]     this workspace's forge host, shown or set
-  supi agents                  the workspace's agents and what they declare
-  supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id,…>|none]
-                               [--ceiling <n>]
-                               what an agent may queue of its OWN: whose work it owns,
-                               which boards may receive it, how many cards an hour.
-                               --boards none is the default and means NO board
-  supi capabilities            the capability registry, with each one's origin
-  supi implications            what one capability implies about another
-
-  supi update [--check]        replace this binary with the newest release
-  supi version                 print this binary's version
-
-  --json                       machine-stable output, on any command (the default is
-                               readable; a shape with no renderer prints JSON either way)
-
-Credential, first found wins: $${ENV_AGENT_TOKEN_FILE}, $${ENV_AGENT_TOKEN}, $${ENV_TOKEN},
-$AGENTPOD_TOKEN, the token \`supi login\` cached, \`supi login\`'s device credential
-(exchanged at the organization plane), the token \`fleet login\` writes, then fleet's device.
-An agent acts with $${ENV_AGENT_TOKEN_FILE} (a file, re-read every run) or
-$${ENV_AGENT_TOKEN}, either outranking every person's credential. An spa_ token reads and plans; only a
-hub-issued STATION token carries the dispatch grant that queues work and moves cards, and
-it lives minutes — so point the FILE at something the node-agent keeps fresh.
-Expired file tokens renew through the device credential from fleet login.
-Explicit environment tokens are used as supplied; superpipeline verifies them offline.
-
-Not here: staffing agents, editing capabilities, changing the fleet link.
-What you may do is your seat in the workspace, which the server decides — not this
-command. A refusal comes back as a 403 and is printed as it arrives.`;
+/** `supi help <verb> [<sub-verb>]` and `supi <verb> --help`: one command, or a verb's sub-commands, in full. */
+function printHelp(words: string[]): void {
+  const found = findCommands(words);
+  if (found.length === 0) fail(`unknown command: ${words.join(" ")}`, "  supi help           every command");
+  process.stdout.write(found.map(renderCommandHelp).join("\n\n") + "\n");
+}
 
 /**
  * `create-card --due`'s own shape check, matching the API's (`DUE_AT_RE`, apps/api/src/index.ts).
@@ -320,12 +236,23 @@ async function main(argv: string[]): Promise<void> {
   // Flags and the values they consume removed — see `positionals`; the old filter kept the value.
   const pos = positionals(rest);
 
+  // `supi <verb> --help` explains the verb instead of running it — a person checking what
+  // `set-stages` does should not have replaced a pipeline to find out.
+  if (cmd !== undefined && cmd !== "help" && rest.includes("--help")) {
+    printHelp([cmd, ...pos]);
+    return;
+  }
+
   switch (cmd) {
     case undefined:
-    case "help":
     case "-h":
     case "--help":
       process.stdout.write(USAGE + "\n");
+      return;
+
+    case "help":
+      if (pos.length > 0) printHelp(pos);
+      else process.stdout.write(USAGE + "\n");
       return;
 
     case "version":
@@ -709,7 +636,8 @@ async function main(argv: string[]): Promise<void> {
      * after the operator revoked them.
      */
     case "agent": {
-      if (pos[0] !== "queueing" || !pos[1]) {
+      const sub = pos[0];
+      if (sub !== "queueing" || !pos[1]) {
         fail("usage: supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id>|none] [--ceiling <n>]");
       }
       const body: Record<string, unknown> = {};

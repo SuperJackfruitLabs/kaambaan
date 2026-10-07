@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { COMMANDS } from "./commands.ts";
 
 const source = readFileSync(join(import.meta.dirname, "index.ts"), "utf8");
 
@@ -25,13 +26,15 @@ const source = readFileSync(join(import.meta.dirname, "index.ts"), "utf8");
  */
 function dispatched(): Set<string> {
   const all = [...source.matchAll(/^\s{4}case "([a-z-]+)":/gm)].map((m) => m[1]);
-  return new Set(all.filter((v) => v !== "help" && v !== "-h" && v !== "--help"));
+  return new Set(all.filter((v) => v !== "-h" && v !== "--help"));
 }
 
-/** Every verb the USAGE block shows as `supi <verb>`. */
+/**
+ * Every verb the help advertises. The USAGE block is rendered from `commands.ts` now, so that table
+ * is what `supi help` shows; `reference.test.ts` holds it to the switch sub-verb by sub-verb.
+ */
 function listed(): Set<string> {
-  const usage = source.slice(source.indexOf("const USAGE"), source.indexOf("function wantsJson"));
-  return new Set([...usage.matchAll(/^ {2}supi ([a-z-]+)/gm)].map((m) => m[1]));
+  return new Set(COMMANDS.map((c) => c.path[0]!));
 }
 
 describe("verb surface", () => {

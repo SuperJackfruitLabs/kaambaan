@@ -7,6 +7,10 @@ description: supi — boards, cards, gates, links, projects, schedules and runbo
 under its full name, for scripts that should read plainly. It is a client: it adds no authority of
 its own and renders the board's answers, including its refusals.
 
+This page is a tour. Every command, flag, default and environment variable — and who may run each
+one — is in the [command reference](/reference/cli/), generated from the CLI itself; `supi help
+<verb>` prints the same entry in a terminal.
+
 ## Installing
 
 ```sh
@@ -33,20 +37,21 @@ there.
 
 ## Signing in
 
-`supi` authenticates with a **hub-issued token** — the same credential `fleet login` produces.
-superpipeline verifies it offline against the hub's published keys, so one sign-in serves both
-planes.
+People sign in to superpipeline with their account at **accounts.superjackfruit.com** — the same
+account the web app uses. From a terminal that is one command:
 
 ```sh
-fleet login     # once, for both planes
-supi whoami     # who that token says you are
+supi login      # prints a link and a code; confirm the code in your browser
+supi whoami     # who you are signed in as, and when the token expires
+supi boards
 ```
 
-After login, `supi` renews an expired or missing cached token using fleet's device credential,
-without opening a browser. A refused exchange asks you to run `fleet login` again; a network
-failure asks you to retry.
+`supi login` keeps a device credential of its own and exchanges it for a short-lived token on every
+command, so you are not asked for a browser again until that device is revoked. `supi logout`
+forgets it on this machine.
 
-Or supply one directly:
+If you already ran AgentPod's `fleet login` on this machine, `supi` can use that sign-in instead
+and needs no second one. Or supply a token directly:
 
 ```sh
 SUPERPIPELINE_TOKEN=… supi boards
@@ -54,20 +59,21 @@ SUPERPIPELINE_TOKEN=… supi boards
 
 | variable | meaning |
 |---|---|
-| `SUPERPIPELINE_TOKEN` | a token, used before anything else |
-| `AGENTPOD_TOKEN` | the fleet token — what superpipeline actually accepts |
+| `SUPERPIPELINE_TOKEN` | a person's token, used exactly as supplied |
 | `SUPERPIPELINE_URL` | the deployment to talk to. Defaults to `https://app.superpipeline.dev`. |
 
 Explicit environment tokens are used as supplied and are never renewed or replaced with a disk
-identity. If one expires, replace or unset the variable.
+identity. If one expires, replace or unset the variable. The full resolution order, every file
+`supi` writes and every variable it reads are in the
+[command reference](/reference/cli/).
 
 ### When an agent is the one running it
 
 An agent acts with `SUPERPIPELINE_AGENT_TOKEN_FILE` — a **file**, re-read every run — or
-`SUPERPIPELINE_AGENT_TOKEN`, either outranking all three variables above.
+`SUPERPIPELINE_AGENT_TOKEN`, either outranking every person's credential.
 
-This distinction is load-bearing. An `spa_` token reads and plans. Only a hub-issued **station**
-token carries the dispatch grant that queues work and moves cards, and it lives for minutes — so
+This distinction is load-bearing. An `spa_` token reads and plans. Only an agent JWT — a **station**
+token — carries the dispatch grant that queues work and moves cards, and it lives for minutes — so
 point the file at something that keeps it fresh, rather than at a value that was true when you set
 it.
 
@@ -137,8 +143,9 @@ nothing rather than a dangling name. See [Planning work](/use/planning/).
 supi templates                        # the starting pipelines --template accepts
 supi create-board <name> [--template <id>] [--stages <file|->]
 supi set-stages <boardId> <file|->    # replace the whole pipeline
-supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name ...]
-                                     [--completion <file|->] [--clear-completion]
+supi set-stage <boardId> <stageKey> [--instructions <file|->] [--clear-instructions]
+                                     [--name <name>] [--gate none|approval] [--wip <n>|none]
+                                     [--owner <capability>] [--completion <file|->] [--clear-completion]
 ```
 
 **Prefer `set-stage`.** It changes one stage and leaves the others alone, including a concurrent
@@ -183,7 +190,7 @@ nothing you needed is dropped in the retelling.
 The installer can place an agent skill alongside the binary:
 
 ```sh
-SKILL_DIR=~/.claude/skills curl -fsSL https://github.com/SuperJackfruitLabs/superpipeline/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/SuperJackfruitLabs/superpipeline/releases/latest/download/install.sh | SKILL_DIR=~/.claude/skills bash
 ```
 
 Omitted by default, because most callers are people and a person needs no skill. The skill
@@ -192,21 +199,23 @@ rather than the operator's.
 
 ## Workspace authority
 
-A linked hub identity uses its superpipeline account's actual workspace role. Unmapped principals
-fall back to `member`; linked owners can create boards. The API checks permissions; the CLI adds
-none and bypasses none.
+You act with your own workspace role, the same one the web app uses. The API checks permissions;
+the CLI adds none and bypasses none. Each command's entry in the [reference](/reference/cli/) says
+which role, or which agent scope, it needs.
 
 **Not here:** staffing agents, editing capabilities, changing the fleet link, and deciding a gate
 as anyone but yourself. What you may do is your seat in the workspace, which the server decides.
 
-## What it will never read
+## What it will never mix up
 
-`supi` does not take a human credential from an agent-token variable or the node agent's enrollment
-config. An `spa_` **agent** token names an agent, and an agent is not a person operating a board. A
-CLI that quietly acted as one would attribute your decisions to it.
+A person's credential and an agent's are never interchangeable. `supi` refuses a person's token in
+an agent variable, and an `spa_` agent token in a person's — rather than quietly acting as whoever
+the token names — and a token file that is named but missing or empty is a refusal, never a
+fall-back to the operator's sign-in. The board records who asked for each card, and a CLI that
+swapped identities would make that record a lie.
 
 ## Reading a refusal
 
-**401** means sign in. **403** means your role or your scopes do not permit this. They are never
+**401** means sign in (`supi login`). **403** means your role or your scopes do not permit this. They are never
 conflated — a `member` meeting an `admin` verb gets the second, and being told to sign in again
 would send you round a loop. A refusal is printed as it arrives, in the server's own words.

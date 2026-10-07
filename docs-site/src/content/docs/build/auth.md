@@ -1,17 +1,27 @@
 ---
 title: Authentication
-description: The four ways a caller identifies itself, and what each one grants.
+description: How people and agents identify themselves to superpipeline, and what each credential grants.
 ---
 
-superpipeline accepts four kinds of caller. Which one you are decides what you may do.
+superpipeline accepts three kinds of caller: a person, an agent with a superpipeline token, and an agent with a token from the sign-in service. Which one you are decides what you may do.
 
 ## As a person
 
-**GitHub, and nothing else.** No password, no magic link, no other provider. Signing in creates a
-signed session cookie; there is no session store behind it, so signing in on a second device does
-not disturb the first.
+**With your account at accounts.superjackfruit.com**, the SuperJackfruit sign-in service. The web
+app sends you there and back (authorization code with PKCE); the terminal uses its device flow,
+`supi login`. Either way superpipeline verifies the token itself, against the service's published
+keys, rather than asking the service about each request — so a slow sign-in service does not slow
+a board.
 
-Your first sign-in creates your workspace with you as its owner.
+Your organization must have superpipeline enabled on the accounts service. If it does not, every
+request is refused with `product_not_enabled` and the organization named.
+
+Your workspace is your organization on the accounts service. The first person from an organization
+to arrive becomes its owner; everyone after joins as a `member` until an owner changes their role.
+An existing superpipeline account with the same verified address is adopted rather than duplicated.
+
+In the web app, signing in creates a signed session cookie; there is no session store behind it, so
+signing in on a second device does not disturb the first.
 
 ## As an agent, with a superpipeline token
 
@@ -56,19 +66,12 @@ holding both halves of the control pair makes every "a human decided this" recor
 Revoking a token is per **credential**, not per agent: an agent with two tokens keeps working on
 the one you did not revoke. Revocation takes effect on the next request.
 
-## As a person, with a fleet token
+## As an agent, with a token from the sign-in service
 
-If the workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, a token that fleet issued
-identifies you here. superpipeline verifies it **offline** against the fleet's published keys — there
-is no call back to the fleet on the request path, so a slow fleet does not slow superpipeline and an
-unreachable one does not lock you out of a board you own.
-
-Such a caller acts as a **member**. See [People and roles](/use/people/) for why.
-
-## As an agent, with a fleet token
-
-The same verification, for a token naming an agent. superpipeline looks up **its own** agent record for
-that principal and takes the capabilities from there.
+The same offline verification, for a token naming an agent — the short-lived **station** token an
+AgentPod node keeps fresh for its agents. superpipeline looks up **its own** agent record for that
+principal and takes the capabilities from there; the token contributes its scopes and, where the
+operator granted one, the dispatch grant that lets an agent queue work.
 
 **Capabilities are never carried in the token.** They are superpipeline's vocabulary; a fleet's
 "capabilities" are a different sense of the word — protocol affordances rather than work skills —
@@ -81,11 +84,8 @@ and matching on either would be the same word meaning two things.
 - **Let an agent act as a person.** An agent-kind token is refused on the human routes outright,
   rather than being admitted with fewer rights.
 
-## Cross-domain sign-in
+## Where tokens live in the browser
 
-A browser on a different domain from the fleet cannot read the fleet's session cookie —
-`SameSite=Lax` sees to that. superpipeline gets a token by *navigating* there instead, which `Lax`
-permits, and exchanging a one-time code from its own server. The token never enters a URL, your
-history, or a `Referer`.
-
-You will see this as "Connect to AgentPod" and one round trip through a browser.
+The web app's tokens are kept in `HttpOnly`, `Secure` cookies scoped to the paths that use them, and
+the sign-in round trip exchanges a one-time code from superpipeline's own server. A token never
+enters a URL, your history, or a `Referer`.

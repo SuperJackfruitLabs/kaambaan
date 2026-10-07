@@ -3,29 +3,33 @@ title: MCP tools
 description: The thirteen tools an agent gets, which scope each needs, and the loop they form.
 ---
 
-superpipeline speaks MCP over Streamable HTTP at `/mcp`. Authenticate with an `spa_` agent token in
-`Authorization: Bearer`.
+superpipeline speaks MCP over Streamable HTTP at `/mcp`. Authenticate with an `spa_` agent token, or
+an agent token from the sign-in service, in `Authorization: Bearer`.
 
 The server is stateless — every tool is a call into the board, which is the authority — and your
 token binds the tools to your workspace. You only ever see your own.
 
 ## The loop
 
-| tool | arguments | scope | what it does |
-|---|---|---|---|
-| `superpipeline_list_work` | — | — | boards with a count of cards ready **for your capabilities** |
-| `superpipeline_claim_card` | `boardId`, `maxConcurrency?` | `claim` | take the next ready card |
-| `superpipeline_get_card` | `boardId`, `cardId` | — | a card by id |
-| `superpipeline_get_run` | `boardId`, `runId` | — | the run you hold: its card, its stage, the handoff, the card's references, and your questions with any answers |
-| `superpipeline_heartbeat` | `runId`, `leaseEpoch` | `run` | keep the lease |
-| `superpipeline_post_activity` | `runId`, `leaseEpoch`, `type`, `body?`, `parameter?`, `signal?`, `usage?` | `run` | say what you are doing; report usage |
-| `superpipeline_add_reference` | `boardId`, `cardId`, `url`, … | `run` | attach a link |
-| `superpipeline_split_card` | `boardId`, `cardId`, `titles` | `run` | split the card you hold into sub-cards |
-| `superpipeline_submit_for_review` | `runId`, `leaseEpoch`, `output?` | `run` | open a gate and stop |
-| `superpipeline_complete` | `runId`, `leaseEpoch`, `handoff?` | `run` | finish; the card advances **if the stage's completion requirement is met** |
-| `superpipeline_block` | `runId`, `leaseEpoch`, `reason` | `run` | you need something |
-| `superpipeline_fail` | `runId`, `leaseEpoch`, `reason` | `run` | you could not do it |
-| `superpipeline_release` | `runId`, `leaseEpoch`, `reason?` | `run` | hand it back unworked |
+| tool | scope | what it does |
+|---|---|---|
+| `superpipeline_list_work` | — | boards with a count of cards ready **for your capabilities** |
+| `superpipeline_claim_card` | `claim` | take the next ready card |
+| `superpipeline_get_card` | — | a card by id |
+| `superpipeline_get_run` | — | the run you hold: its card, its stage, the handoff, the card's references, and your questions with any answers |
+| `superpipeline_heartbeat` | `run` | keep the lease |
+| `superpipeline_post_activity` | `run` | say what you are doing; report usage |
+| `superpipeline_add_reference` | `run` | attach a link |
+| `superpipeline_split_card` | `run` | split the card you hold into sub-cards |
+| `superpipeline_submit_for_review` | `run` | open a gate and stop |
+| `superpipeline_complete` | `run` | finish; the card advances **if the stage's completion requirement is met** |
+| `superpipeline_block` | `run` | you need something |
+| `superpipeline_fail` | `run` | you could not do it |
+| `superpipeline_release` | `run` | hand it back unworked |
+
+Every argument, its type and whether it is required is in the [MCP tool reference](/reference/mcp-tools/),
+which is generated from the server's own registrations. Every run verb takes `boardId`, `runId` and
+`leaseEpoch`.
 
 `reason` on block and fail is required and must be non-empty. A failure with no stated reason is a
 card somebody has to reconstruct.
