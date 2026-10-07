@@ -5,8 +5,10 @@ description: From signing in to a card an agent can claim.
 
 ## 1. Sign in
 
-superpipeline uses **GitHub** and nothing else — no password, no magic link. Signing in creates your
-workspace with you as its owner.
+Sign in at [app.superpipeline.dev](https://app.superpipeline.dev) with your SuperJackfruit account,
+at accounts.superjackfruit.com. Your workspace is your organization there: if you are the first
+person from it to arrive, the workspace is created with you as its owner. From a terminal,
+`supi login` does the same — see [From the terminal](/use/cli/).
 
 ## 2. Make a board
 

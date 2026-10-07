@@ -22,8 +22,11 @@ as consequential as revoking a credential.
 
 ## Inviting somebody
 
-Owners invite by email address — the address GitHub returns at sign-in. There is no mail to send
-and no invitation to accept: the person signs in with GitHub and is already a member.
+Everyone in your organization on the accounts service (accounts.superjackfruit.com) who signs in
+joins the workspace — the first as its owner, everyone after as a `member` until an owner changes
+their role. Owners can also add a person by email address ahead of time, with the role they should
+have; there is no mail to send and no invitation to accept. The address must be one the accounts
+service has verified, and the person signs in through your organization.
 
 ## Removing somebody
 
@@ -41,12 +44,7 @@ unknown caller to read access is how a workspace leaks.
 Notifications are per person. Where a notification belongs to one user, only that user sees it —
 which is invisible in a workspace of one and a disclosure in a workspace of two.
 
-## Fleet callers
+## Signing in from a terminal
 
-If the workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, somebody arriving with a
-fleet-issued token acts as a **member**: enough to queue work with authority, not enough to
-restaff the workspace they are visiting.
-
-That is deliberate. The fleet link is the workspace's decision to admit them; managing its agents,
-its people and its own link are decisions for somebody actually in it. A fleet caller who *also*
-holds a local membership keeps it.
+`supi login` signs you in as yourself, with the same role you have in the web app. There is no
+separate, lesser terminal identity. See [From the terminal](/use/cli/).

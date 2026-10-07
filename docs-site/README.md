@@ -36,6 +36,18 @@ claim on their dependency resolution.
 name a tool, capability or environment variable the codebase does not define. Prose
 about the product is checked against the product. Run it with `pnpm -F @superpipeline/docs-check test`.
 
+## Generated pages
+
+`src/content/docs/reference/` is generated — do not edit it by hand.
+
+- `reference/cli/*` comes from `packages/cli/src/commands.ts`, the table `supi help` is printed from.
+  Regenerate with `pnpm -F @superpipeline/cli reference`.
+- `reference/mcp-tools.md` comes from the MCP server's own tool registrations
+  (`apps/api/src/mcp/tools.ts`). Regenerate with `pnpm -F @superpipeline/docs-check reference`.
+
+Both are checked in `pnpm test`: a stale page, a page for a command that no longer exists, or a
+command with no page fails CI.
+
 ## Publishing
 
 Deployed by the `deploy-docs` job in `.github/workflows/ci.yml`, on every push to `main`

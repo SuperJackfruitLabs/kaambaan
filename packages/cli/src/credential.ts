@@ -518,9 +518,14 @@ export function refusalHint(kind: Credential["kind"]): string {
       "which boards, is also set per agent: `supi agent queueing <agentId>`."
     );
   }
+  // The older text said an AgentPod identity "reads as `member` until it is linked" and pointed at a
+  // README a person who installed a binary does not have. Under the Organization plane a person's
+  // role is their membership row, full stop: the first person from an organization owns the
+  // workspace and later arrivals join as `member` until an owner changes it.
   return (
     "Your seat in this workspace does not permit that.\n" +
-    "An AgentPod identity reads as `member` until it is linked to a superpipeline account —\n" +
-    "sign in once at the web app with the same address to link them. See packages/cli/README.md."
+    "Roles are set by the workspace's owner, under Workspace → People in the web app. If you\n" +
+    "expected more, check `supi whoami` names the account linked to your seat.\n" +
+    "Who may run what: https://docs.superpipeline.dev/reference/cli/"
   );
 }

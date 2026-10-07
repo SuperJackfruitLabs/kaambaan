@@ -33,7 +33,7 @@ export default defineConfig({
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/SuperJackfruitLabs/superpipeline' },
       ],
-      // Three sections, in the order a reader needs them. See
+      // Four sections, in the order a reader needs them. See
       // docs/superpowers/specs/2026-09-12-publishing-user-docs-design.md.
       sidebar: [
         {
@@ -65,6 +65,15 @@ export default defineConfig({
             { label: 'Writing an agent', slug: 'build/agent-contract' },
             { label: 'MCP tools', slug: 'build/mcp' },
             { label: 'Authentication', slug: 'build/auth' },
+          ],
+        },
+        // Generated pages: `reference/cli/*` from packages/cli/src/commands.ts, `reference/mcp-tools`
+        // from the MCP server's registrations. Both are guarded in CI — see each generator.
+        {
+          label: 'Reference',
+          items: [
+            { label: 'supi CLI', items: [{ autogenerate: { directory: 'reference/cli' } }] },
+            { label: 'MCP tools', slug: 'reference/mcp-tools' },
           ],
         },
       ],
