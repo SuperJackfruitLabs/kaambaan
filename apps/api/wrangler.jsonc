@@ -37,9 +37,19 @@
   // published JWKS and then map its `fleet_` tenant onto one of ours. An unset value means the path
   // is off; a wrong value means every hub token is refused. Neither fails open.
   // ORG_PLANE_ISSUER / ORG_PLANE_JWKS_URL / ORG_PLANE_AUDIENCE / ORG_PLANE_URL switch this deployment
-  // to the Organization plane (src/auth/org-plane.ts). They are deliberately ABSENT until the P4
-  // cutover: setting ORG_PLANE_ISSUER refuses every hub token. See docs/12-deploy.md.
+  // to the Organization plane (src/auth/org-plane.ts). Set at the P4 cutover (accounts
+  // docs/superpowers/plans/2026-10-06-p4-cutover.md step 2.4): from this deploy on, every hub token
+  // is refused. There is no dual-accept; rollback is reverting this change. See docs/12-deploy.md.
   "vars": {
+    // The Organization plane (accounts issuer contract §1, production values). Plain vars, not
+    // secrets: they name whom to believe and grant nothing. They change only through a merged PR,
+    // because CI's `wrangler deploy` on every merge would drop a hand-set `--var`.
+    "ORG_PLANE_ISSUER": "https://accounts.superjackfruit.com",
+    "ORG_PLANE_JWKS_URL": "https://accounts.superjackfruit.com/api/auth/jwks",
+    "ORG_PLANE_AUDIENCE": "https://app.superpipeline.dev",
+    "ORG_PLANE_URL": "https://accounts.superjackfruit.com",
+    // Kept under the plane: it no longer names an issuer this Worker trusts, it names the hub's
+    // resource, which the web client requests as a second token for the assignee picker.
     "HUB_ISSUER": "https://hub.agentpod.dev",
     // This deployment's own origin — the `redirect_uri` we register with the hub AND the `aud`
     // we now demand of every hub token (`auth/hub-jwt.ts`, `planeAudience`).

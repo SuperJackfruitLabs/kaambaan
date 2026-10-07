@@ -29,6 +29,13 @@ export default defineConfig({
           // already drive the Worker at, so the pinned value and the request's
           // own origin agree and a token is valid for the reason it reads as.
           APP_URL: 'https://api.test',
+          // Production runs on the Organization plane (wrangler.jsonc). The suite does not: hub mode
+          // is the default it was written against, and the plane tests set these themselves
+          // (test/org-plane-*.test.ts, test/mcp-org-plane.test.ts). Empty is "off" (orgPlaneMode).
+          ORG_PLANE_ISSUER: '',
+          ORG_PLANE_JWKS_URL: '',
+          ORG_PLANE_AUDIENCE: '',
+          ORG_PLANE_URL: '',
         },
       },
     }),
