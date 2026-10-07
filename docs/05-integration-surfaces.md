@@ -312,7 +312,12 @@ an agent to call `claim`. Modeled on A2A **PushNotificationConfig**:
 ### Implementation (P7)
 
 The Board DO owns the subscriptions and the delivery queue. `registerPushConfig({agentId, url, token,
-capabilities, events})` stores a config (http(s)-only — the SSRF guard; `POST …/push-configs`). When a
+capabilities, events})` stores a config (http(s)-only — the SSRF guard; `POST …/push-configs`). An
+**agent registers its own** with its bearer token (scope `claim`; the subscriber is the token's agent,
+never a header) — this is how agentpod's hub subscribes each board it works to `gate.pending` and
+`elicitation.pending`, refreshing it every sweep. A person may still register one for a named agent
+with `X-Agent-Id`. (Until 2026-10-07 the route was human-only, so the hub could not subscribe and
+no production board had a config: every gate reached its room via the hub's 5-minute sweep.) When a
 card becomes **claimable** (created at / advanced into / released or reclaimed back to a
 capability-owned stage), `notifyWorkAvailable` queues a `work.available` delivery into `push_deliveries`
 for every subscribed config whose `capabilities` match the stage's owner — so an agent is only pinged

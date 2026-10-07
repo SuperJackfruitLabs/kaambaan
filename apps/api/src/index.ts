@@ -1738,9 +1738,21 @@ const worker = {
      * token resolves no agent and falls through to the human branch, which knows how to read it.
      */
     const offersBearer = /^Bearer\s+\S/i.test(request.headers.get('Authorization') ?? '');
+    /**
+     * An agent subscribing ITSELF to a board's push (docs/05 §4: a config is "registered per
+     * agent/board").
+     *
+     * This was a human route only, with the subscriber named by a caller-asserted `X-Agent-Id`, and
+     * the one party that needs a subscription — the hub's bridge — holds an agent credential and
+     * nothing else. So nobody ever registered one: every production board's delivery queue was
+     * empty and a gate reached its room only when the hub's five-minute sweep found it. With a
+     * bearer it resolves like a coordinator route — an agent token subscribes its own agent, and a
+     * bearer that names no agent falls through to the human branch unchanged.
+     */
+    const isSubscriptionRoute = !!boardId && request.method === 'POST' && rest === 'push-configs';
     const isAgentRoute =
       (!!boardId && (rest === 'claims' || rest.startsWith('runs/') || isEitherRoute)) ||
-      (isCoordinatorRoute && offersBearer);
+      ((isCoordinatorRoute || isSubscriptionRoute) && offersBearer);
     // Both webhook doors self-authenticate by HMAC inside the DO, so neither carries a session.
     const isWebhook = !!boardId && (rest === 'webhooks/github' || rest === 'webhooks/forge');
     let tenantId: string;
@@ -1799,7 +1811,7 @@ const worker = {
       // A route open to both resolves as a human when no agent credential was offered, and falls
       // through to the human branch's own 401 rather than reporting "a valid agent token is
       // required" to a person who holds no agent token and needs none.
-      if (!agent && (isEitherRoute || isCoordinatorRoute)) {
+      if (!agent && (isEitherRoute || isCoordinatorRoute || isSubscriptionRoute)) {
         // Not a shortcut past the human branch — the SAME branch. A coordinator route reached
         // with a bearer that names no agent is still a person creating a card, and a person
         // creating a card is `work`. The earlier version of this resolved a user and stopped,
@@ -2887,7 +2899,9 @@ const worker = {
 
       // POST /v1/boards/:id/push-configs — register an agent push subscription (docs/05 §4)
       if (rest === 'push-configs' && request.method === 'POST') {
-        const agentId = request.headers.get('X-Agent-Id');
+        // An agent token subscribes the agent it authenticates — never the one a header names. A
+        // person (session cookie or dev headers) still names the subscriber with `X-Agent-Id`.
+        const agentId = agent ? agent.agentId : request.headers.get('X-Agent-Id');
         if (!agentId || agentId.trim() === '') return Response.json({ error: 'X-Agent-Id required' }, { status: 400 });
         const body = (await request.json()) as { url: string; token: string; capabilities?: string[]; events?: string[] };
         // Built from named fields rather than `...body`: `agentId` is the caller's own identity,
