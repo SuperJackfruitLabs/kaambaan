@@ -60,7 +60,7 @@
   <div class="border-border flex items-center gap-2 border-b px-3.5 py-2.5">
     <h2 class="text-sm font-semibold">Spend</h2>
     <span class="mono text-muted-foreground text-[11px]">last 7 days</span>
-    <a href="/b/{app.boardId}/operate/telemetry" class="mono text-muted-foreground hover:text-foreground ml-auto text-[11px] underline underline-offset-2">detail</a>
+    <a href="/b/{app.boardId}/operate/telemetry" class="mono text-muted-foreground hover:text-foreground -my-2 ml-auto inline-flex items-center px-1 text-[11px] underline underline-offset-2" style="min-height:max(var(--tap),32px)">detail</a>
   </div>
 
   <div class="px-3.5 py-3">

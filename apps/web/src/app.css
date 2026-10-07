@@ -115,6 +115,27 @@
     display: inline-grid;
     place-items: center;
   }
+
+  /* Forms dense enough to need it — board settings, the workspace tabs — opt their whole subtree
+     in rather than each control. On a finger every button, field and select is at least 44px, and
+     fields are 16px text so iOS does not zoom the page on focus. A mouse keeps the compact sizes.
+     The responsive audit (2026-10-07) counted 68 targets under 44px on the settings page alone,
+     with reorder arrows at 7×9px and fields about 18px tall. */
+  @media (pointer: coarse) {
+    .touch-form :is(button, select, input:not([type='checkbox']):not([type='radio'])) {
+      min-height: 44px;
+    }
+    .touch-form button {
+      min-width: 44px;
+    }
+    .touch-form :is(input, select, textarea) {
+      font-size: 16px;
+    }
+    .touch-form :is(input[type='checkbox'], input[type='radio']) {
+      width: 20px;
+      height: 20px;
+    }
+  }
 }
 
 @layer base {
@@ -847,9 +868,12 @@
   }
 
   /* ---- telemetry screen ---- */
+  /* Centred, and wider than it was: at 1920px a left-aligned 1180px column left 656px blank. */
   .tele-pad {
     padding: 20px 22px 32px;
-    max-width: 1180px;
+    width: 100%;
+    max-width: 1440px;
+    margin-inline: auto;
   }
 
   /* metric card grid: 4 cols → 2 on narrow */

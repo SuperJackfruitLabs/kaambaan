@@ -117,7 +117,8 @@
       <p class="text-muted-foreground mt-1 text-sm">
         {board?.name ?? 'Board'} · last
         <button
-          class="mono text-xs underline underline-offset-2 hover:text-foreground transition"
+          class="mono inline-flex items-center px-1 align-middle text-xs underline underline-offset-2 hover:text-foreground transition"
+          style="min-height:max(var(--tap),28px)"
           onclick={() => { window_ = window_ === '7d' ? '5h' : '7d'; }}
         >
           {window_ === '7d' ? '7 days' : '5 hours'}

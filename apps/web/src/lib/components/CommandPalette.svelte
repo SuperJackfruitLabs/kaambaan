@@ -2,6 +2,7 @@
   import { app } from '$lib/stores/app.svelte';
   import { goto } from '$app/navigation';
   import { tick } from 'svelte';
+  import { signOut, otherThemeLabel } from '$lib/components/shell/account';
 
   // ---- state ----
   let query = $state('');
@@ -84,6 +85,31 @@
         act: () => {
           void goto(`/b/${app.boardId}/operate/telemetry`);
           close();
+        },
+      },
+    );
+
+    // Account. The rail is the only other place these live, and it is not rendered below 900px —
+    // so on a phone or a tablet this and the bottom nav's "You" menu are the way to them.
+    items.push(
+      {
+        grp: 'Account',
+        icon: app.theme === 'light' ? '☾' : '☀',
+        label: otherThemeLabel(app.theme),
+        sub: 'theme',
+        act: () => {
+          app.toggleTheme();
+          close();
+        },
+      },
+      {
+        grp: 'Account',
+        icon: '⏻',
+        label: 'Sign out',
+        sub: app.user?.login ?? '',
+        act: () => {
+          close();
+          void signOut();
         },
       },
     );

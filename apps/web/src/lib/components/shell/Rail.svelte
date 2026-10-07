@@ -15,7 +15,7 @@
    */
   import { page } from '$app/state';
   import { app } from '$lib/stores/app.svelte';
-  import { logout } from '$lib/api';
+  import { signOut } from './account';
   import BrandMark from '$lib/components/BrandMark.svelte';
 
   const boardId = $derived(app.boardId);
@@ -34,10 +34,6 @@
     { id: 'workspace', label: 'Workspace', href: '/workspace/agents' },
   ]);
 
-  async function onSignOut(): Promise<void> {
-    await logout();
-    location.reload();
-  }
 </script>
 
 <nav class="border-border bg-surface hidden w-[84px] shrink-0 flex-col items-center gap-0.5 border-r px-1.5 py-3 min-[900px]:flex" aria-label="Main">
@@ -88,7 +84,7 @@
             {(app.user.name ?? app.user.login ?? '·').slice(0, 1).toUpperCase()}
           </span>
         {/if}
-        <button onclick={() => void onSignOut()} aria-label="Sign out" title="Sign out" class="text-muted-foreground hover:text-coral tap rounded-[8px] text-xs">⏻</button>
+        <button onclick={() => void signOut()} aria-label="Sign out" title="Sign out" class="text-muted-foreground hover:text-coral tap rounded-[8px] text-xs">⏻</button>
       </div>
     {/if}
   </div>

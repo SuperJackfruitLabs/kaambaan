@@ -49,14 +49,15 @@
     <svg class="size-[17px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></svg>
   </button>
 
+  <!-- At least 44px square everywhere — it is the page's one primary action — and labelled
+       wherever the header has the room; only the narrowest phones fall back to the bare "+". -->
   <button
     onclick={() => (composing = true)}
-    class="bg-primary text-primary-foreground flex items-center gap-1.5 rounded-[8px] px-3 py-1.5 text-sm font-medium transition hover:brightness-110"
-    style="min-height:var(--tap)"
+    class="bg-primary text-primary-foreground flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1.5 rounded-[8px] px-3 text-sm font-medium transition hover:brightness-110 min-[900px]:min-h-[max(var(--tap),36px)]"
   >
     <span aria-hidden="true">+</span>
-    <span class="hidden min-[560px]:inline">New card</span>
-    <span class="sr-only min-[560px]:hidden">New card</span>
+    <span class="hidden min-[360px]:inline">New card</span>
+    <span class="sr-only min-[360px]:hidden">New card</span>
   </button>
 </header>
 

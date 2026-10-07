@@ -183,16 +183,19 @@
   }
 </script>
 
-<div class="mx-auto max-w-2xl">
+<!-- One column on a phone and a tablet; from 1280px the pipeline editor takes the left and the
+     shorter sections sit beside it, instead of a 672px form in an 1836px screen. -->
+<div class="touch-form mx-auto max-w-2xl min-[1280px]:max-w-6xl">
   <div class="eyebrow mb-1">board settings</div>
   <h1 class="wordmark mb-4 text-lg leading-snug">{board.name}</h1>
 
-  <div class="space-y-6">
+  <div class="grid gap-6 min-[1280px]:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] min-[1280px]:gap-10">
+  <div class="min-w-0 space-y-6">
         <!-- rename -->
         <section>
           <div class="eyebrow mb-2">name</div>
           <div class="flex gap-2">
-            <input bind:value={nameInput} class="bg-inset border-border focus:border-marigold flex-1 rounded-[7px] border px-3 py-2 text-sm outline-none" />
+            <input bind:value={nameInput} class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[7px] border px-3 py-2 text-sm outline-none" />
             <Button size="sm" onclick={saveName} disabled={busy === 'name' || nameInput.trim() === '' || nameInput.trim() === board.name}>Rename</Button>
           </div>
         </section>
@@ -210,14 +213,14 @@
             {#each draft as stage, i (stage.key)}
               <div class="bg-inset border-border rounded-[8px] border px-2.5 py-2">
                 <div class="flex items-center gap-1.5">
-                  <div class="flex shrink-0 flex-col">
-                    <button onclick={() => move(i, -1)} disabled={i === 0} aria-label="Move {stage.name} earlier" class="text-muted-foreground hover:text-foreground text-[9px] leading-none disabled:opacity-30">▲</button>
-                    <button onclick={() => move(i, 1)} disabled={i === draft.length - 1} aria-label="Move {stage.name} later" class="text-muted-foreground hover:text-foreground text-[9px] leading-none disabled:opacity-30">▼</button>
+                  <div class="flex shrink-0 flex-col max-[899px]:flex-row">
+                    <button onclick={() => move(i, -1)} disabled={i === 0} aria-label="Move {stage.name} earlier" class="tap text-muted-foreground hover:text-foreground hover:bg-surface rounded-[6px] text-[11px] leading-none disabled:opacity-30" style="min-height:max(var(--tap),18px)">▲</button>
+                    <button onclick={() => move(i, 1)} disabled={i === draft.length - 1} aria-label="Move {stage.name} later" class="tap text-muted-foreground hover:text-foreground hover:bg-surface rounded-[6px] text-[11px] leading-none disabled:opacity-30" style="min-height:max(var(--tap),18px)">▼</button>
                   </div>
                   <input
                     bind:value={stage.name}
                     aria-label="Name of stage {stage.key}"
-                    class="bg-surface border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2 py-1 text-sm outline-none"
+                    class="bg-surface border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2 py-1.5 text-sm outline-none"
                   />
                   <span class="mono text-muted-foreground shrink-0 text-[10px]">{stage.key}</span>
                   <button
@@ -225,7 +228,7 @@
                     disabled={(cardsPerStage[stage.key] ?? 0) > 0 || draft.length === 1}
                     aria-label="Remove stage {stage.name}"
                     title={(cardsPerStage[stage.key] ?? 0) > 0 ? `Holds ${cardsPerStage[stage.key]} card(s) — move them first` : 'Remove this stage'}
-                    class="text-muted-foreground hover:text-coral shrink-0 disabled:opacity-30"
+                    class="tap text-muted-foreground hover:text-coral hover:bg-surface shrink-0 rounded-[6px] disabled:opacity-30"
                   >
                     <svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
                   </button>
@@ -234,7 +237,7 @@
                   <select
                     bind:value={stage.ownerKind}
                     aria-label="Who works stage {stage.name}"
-                    class="bg-surface border-border mono rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                    class="bg-surface border-border mono rounded-[5px] border px-2 py-1.5 text-xs"
                   >
                     <option value="human">human</option>
                     <option value="capability">agent</option>
@@ -246,17 +249,17 @@
                       placeholder="capability"
                       aria-label="Capability required for stage {stage.name}"
                       title="An agent holding this capability claims cards here. Separate several with commas."
-                      class="bg-surface border-border mono w-40 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                      class="bg-surface border-border mono w-40 rounded-[5px] border px-2 py-1.5 text-xs"
                     />
                     <!-- Only meaningful once a lane names more than one capability. -->
                     {#if ownerParts(ownerText(stage)).length > 1}
-                      <div class="border-border flex shrink-0 overflow-hidden rounded-[5px] border text-[10px]">
-                        <button onclick={() => setMatch(stage, 'all')} class="mono px-1.5 py-0.5 {stage.requires?.any ? 'text-muted-foreground' : 'bg-marigold text-primary-foreground'}" title="An agent must hold every one">all</button>
-                        <button onclick={() => setMatch(stage, 'any')} class="mono border-border border-l px-1.5 py-0.5 {stage.requires?.any ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground'}" title="Holding any one is enough">any</button>
+                      <div class="border-border flex shrink-0 overflow-hidden rounded-[5px] border text-xs">
+                        <button onclick={() => setMatch(stage, 'all')} class="mono px-2.5 py-1.5 {stage.requires?.any ? 'text-muted-foreground' : 'bg-marigold text-primary-foreground'}" title="An agent must hold every one">all</button>
+                        <button onclick={() => setMatch(stage, 'any')} class="mono border-border border-l px-2.5 py-1.5 {stage.requires?.any ? 'bg-marigold text-primary-foreground' : 'text-muted-foreground'}" title="Holding any one is enough">any</button>
                       </div>
                     {/if}
                   {/if}
-                  <label class="text-muted-foreground flex items-center gap-1">
+                  <label class="text-muted-foreground flex items-center gap-1.5" style="min-height:var(--tap)">
                     <input type="checkbox" checked={stage.gate === 'approval'} onchange={(e) => (stage.gate = e.currentTarget.checked ? 'approval' : 'none')} class="accent-marigold" />
                     approval gate
                   </label>
@@ -284,12 +287,12 @@
                     value={stage.instructions ?? ''}
                     onblur={(e) => void saveRule(stage, e.currentTarget.value)}
                     placeholder="What every agent that claims a card here should know — pushed to its prompt."
-                    class="bg-surface border-border focus:border-marigold mt-0.5 w-full resize-y rounded-[5px] border px-1.5 py-1 text-[11px] outline-none"
+                    class="bg-surface border-border focus:border-marigold mt-0.5 w-full resize-y rounded-[5px] border px-2 py-1.5 text-xs outline-none"
                   ></textarea>
                   {#if ruleSaved === stage.key}
                     <span class="mono text-[10px]" style="color:var(--live)">saved</span>
                   {/if}
-                  <label class="text-muted-foreground flex items-center gap-1">
+                  <label class="text-muted-foreground mono mt-1.5 flex items-center gap-1.5 text-[11px]">
                     wip
                     <input
                       type="number"
@@ -298,7 +301,7 @@
                       onchange={(e) => (stage.wipLimit = e.currentTarget.value === '' ? undefined : Number(e.currentTarget.value))}
                       placeholder="—"
                       aria-label="WIP limit for stage {stage.name}"
-                      class="bg-surface border-border mono w-14 rounded-[5px] border px-1.5 py-0.5 text-[10px]"
+                      class="bg-surface border-border mono w-16 rounded-[5px] border px-2 py-1.5 text-xs"
                     />
                   </label>
                   {#if (cardsPerStage[stage.key] ?? 0) > 0}
@@ -314,7 +317,7 @@
               bind:value={newStageName}
               placeholder="add a stage"
               onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addStage(); } }}
-              class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2.5 py-1.5 text-xs outline-none"
+              class="bg-inset border-border focus:border-marigold min-w-0 flex-1 rounded-[6px] border px-2.5 py-2 text-sm outline-none"
             />
             <Button size="sm" variant="outline" onclick={addStage} disabled={newStageName.trim() === ''}>Add</Button>
           </div>
@@ -323,6 +326,8 @@
           <div class="mt-3 flex justify-end"><Button size="sm" onclick={saveStages} disabled={busy === 'stages'}>{busy === 'stages' ? 'Saving…' : 'Save pipeline'}</Button></div>
         </section>
 
+  </div>
+  <div class="min-w-0 space-y-6">
         <!-- schedules -->
         <ScheduleList boardId={board.boardId!} stages={board.stages} />
 
@@ -336,7 +341,7 @@
           <div class="text-muted-foreground mono mb-1 text-[10px]">payload url</div>
           <div class="bg-inset border-border mono mb-3 flex items-center justify-between gap-2 overflow-hidden rounded-[7px] border px-2.5 py-1.5 text-[10px]">
             <span class="truncate">{webhookUrl}</span>
-            <button onclick={() => navigator.clipboard?.writeText(webhookUrl)} class="shrink-0" style="color:var(--marigold)">copy</button>
+            <button onclick={() => navigator.clipboard?.writeText(webhookUrl)} class="tap shrink-0 px-1.5" style="color:var(--marigold)">copy</button>
           </div>
 
           <div class="text-muted-foreground mono mb-1 text-[10px]">
@@ -349,9 +354,9 @@
               class="bg-inset border-border focus:border-marigold mono min-w-0 flex-1 rounded-[7px] border px-2.5 py-2 text-xs outline-none"
             />
             <Button size="sm" variant="outline" onclick={genSecret}>Generate</Button>
-            <button onclick={() => navigator.clipboard?.writeText(githubSecret)} disabled={githubSecret === ''} title="Copy secret" class="shrink-0 px-1 text-xs disabled:opacity-40" style="color:var(--marigold)">copy</button>
+            <button onclick={() => navigator.clipboard?.writeText(githubSecret)} disabled={githubSecret === ''} title="Copy secret" class="tap shrink-0 px-1.5 text-xs disabled:opacity-40" style="color:var(--marigold)">copy</button>
           </div>
-          <label class="flex select-none items-center gap-2 text-sm">
+          <label class="flex select-none items-center gap-2 text-sm" style="min-height:var(--tap)">
             <input type="checkbox" bind:checked={issueTrigger} class="accent-marigold" />
             <span>Open a card for each new GitHub issue</span>
           </label>
@@ -396,5 +401,6 @@
             <Button size="sm" variant="outline" onclick={addProfile} disabled={busy === 'profile' || pKey.trim() === ''}>Add</Button>
           </div>
         </section>
+  </div>
   </div>
 </div>
