@@ -1088,12 +1088,15 @@ const worker = {
             return Response.json({ error: { code: 'INVALID_STALE_SETTINGS', message: '`hours` must be a number, 0 or more' } }, { status: 400 });
           }
         }
+        // `attention=1`: the Needs-you feed — everything waiting on a person now, plus ownerless-stage
+        // cards past their board's threshold (see `collectStale`).
+        const attention = url.searchParams.get('attention') === '1';
         const nowIso = new Date().toISOString();
         const cards: StaleCardView[] = [];
         let boardsUnanswered = 0;
         for (const board of await listBoards(env.DB, caller.tenantId)) {
           try {
-            cards.push(...(await boardStub(env, caller.tenantId, board.id).staleCards({ nowIso, ...(afterHours !== undefined ? { afterHours } : {}) })));
+            cards.push(...(await boardStub(env, caller.tenantId, board.id).staleCards({ nowIso, attention, ...(afterHours !== undefined ? { afterHours } : {}) })));
           } catch (err) {
             boardsUnanswered += 1;
             console.error(`GET /v1/stale: board ${board.id} did not answer`, err);

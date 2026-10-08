@@ -196,6 +196,10 @@ describe('GET /v1/stale', () => {
     // The board's own threshold (24h) applies when none is given: nothing is that old yet.
     const dflt = await (await SELF.fetch(`${base}/v1/stale`, { headers: as(t, 'usr_v') })).json<{ cards: unknown[] }>();
     expect(dflt.cards).toEqual([]);
+
+    // The Needs-you feed: intake cards are backlog until they pass the threshold.
+    const attention = await (await SELF.fetch(`${base}/v1/stale?attention=1`, { headers: as(t, 'usr_v') })).json<{ cards: unknown[] }>();
+    expect(attention.cards).toEqual([]);
   });
 
   it('refuses a non-member and a malformed threshold', async () => {
@@ -218,5 +222,35 @@ describe('GET /v1/stale', () => {
     const board = await (await SELF.fetch(`${base}/v1/boards/${boardId}`, { headers: as(t, 'usr_owner') })).json<{ stale: unknown }>();
     expect(board.stale).toEqual({ enabled: false, afterHours: 1 });
     expect((await put('usr_owner', { afterHours: 'a day' })).status).toBe(400);
+  });
+});
+
+describe('the Needs-you feed (attention)', () => {
+  it('lists every card waiting on a person at any age, and ownerless-stage cards only past the threshold', async () => {
+    await runInDurableObject(stubFor('attention'), async (b: BoardDO) => {
+      const ids = await seeded(b, 'brd_at1');
+      const now = await b.staleCards({ nowIso: later(0), attention: true });
+      expect(now.map((s) => s.cardId)).toEqual([ids.blocked]);
+      const tomorrow = await b.staleCards({ nowIso: later(25), attention: true });
+      expect(tomorrow.map((s) => s.cardId).sort()).toEqual([ids.intake, ids.blocked].sort());
+      await b.setStaleSettings({ enabled: false });
+      // Switched off: the ownerless reminder goes, a person's waiting card does not.
+      expect((await b.staleCards({ nowIso: later(25), attention: true })).map((s) => s.cardId)).toEqual([ids.blocked]);
+    });
+  });
+
+  it('carries what a pending review is about on the snapshot gate, and when each card stopped', async () => {
+    await runInDurableObject(stubFor('attention-gate'), async (b: BoardDO) => {
+      await b.init({ id: 'brd_at2', tenantId: 'tnt_stale', name: 'G', stages: STAGES });
+      const c = await b.createCard({ title: 'Ship', ownerUserId: 'usr_owner' });
+      if (!c.ok) throw new Error(c.message);
+      await b.moveCard(c.value.id, 'build');
+      const run = await b.claim(BUILDER);
+      if (!run.claimed) throw new Error('expected claim');
+      await b.complete({ runId: run.runId, leaseEpoch: run.leaseEpoch, handoff: { summary: 'Adds the login form <script>x</script>' } });
+      const state = await b.getState();
+      expect(state.gates[0]?.summary).toBe('Adds the login form <script>x</script>');
+      expect(typeof state.cards[0]?.stateSince).toBe('string');
+    });
   });
 });

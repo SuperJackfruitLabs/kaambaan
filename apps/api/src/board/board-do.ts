@@ -428,6 +428,8 @@ export interface CardView {
   contextId: string;
   createdAt: string;
   updatedAt: string | null;
+  /** When the card last changed state or stage — how long it has sat where it is. */
+  stateSince: string;
   /** Summed agent usage on this card (docs/07 §6); `overBudget` if it exceeds the per-card cap. */
   costUsd: number;
   overBudget: boolean;
@@ -754,6 +756,12 @@ export interface GateView {
   decidedBy: string | null;
   comment: string | null;
   resolvedAt: string | null;
+  /**
+   * What is being approved: the readable part of the card's handoff (`handoffSummary`). On the
+   * board snapshot's pending gates only, so a list can say what a decision is about without
+   * deciding blind. Plain text — a reader must render it as text.
+   */
+  summary?: string | null;
 }
 
 /**
@@ -1244,7 +1252,7 @@ export interface BoardStub {
   getRunReportOutbox(): Promise<RunReportOutboxRow[]>;
   sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number; staleNotified: number }>;
   /** Cards waiting past the threshold — the board's own unless `afterHours` is given. See `StaleCardView`. */
-  staleCards(input: { nowIso: string; afterHours?: number }): Promise<StaleCardView[]>;
+  staleCards(input: { nowIso: string; afterHours?: number; attention?: boolean }): Promise<StaleCardView[]>;
   setStaleSettings(input: { enabled?: boolean; afterHours?: number }): Promise<Result<StaleSettings>>;
   createSchedule(input: {
     title: string;
@@ -4063,15 +4071,21 @@ export class BoardDO extends DurableObject<Env> {
    * lists nothing. An explicit threshold is a person asking directly, and is answered whatever the
    * switch says: the switch silences the board, it does not hide its cards.
    */
-  async staleCards(input: { nowIso: string; afterHours?: number }): Promise<StaleCardView[]> {
+  async staleCards(input: { nowIso: string; afterHours?: number; attention?: boolean }): Promise<StaleCardView[]> {
     return this.collectStale(input);
   }
 
-  private collectStale(input: { nowIso: string; afterHours?: number }): StaleCardView[] {
+  /**
+   * `attention`: the Needs-you feed rather than the stale list. Every card waiting on a person, at
+   * any age — those want an answer now, not tomorrow — plus cards in an ownerless stage once they
+   * pass the board's threshold (before it, a card in an intake column is just backlog), and only
+   * while the board reports stale cards at all.
+   */
+  private collectStale(input: { nowIso: string; afterHours?: number; attention?: boolean }): StaleCardView[] {
     const boardId = this.getMeta('boardId');
     if (!boardId) return [];
     const settings = this.staleSettings();
-    if (input.afterHours === undefined && !settings.enabled) return [];
+    if (input.afterHours === undefined && !input.attention && !settings.enabled) return [];
     const afterHours = input.afterHours ?? settings.afterHours;
     const nowMs = Date.parse(input.nowIso);
     const stages = this.stages();
@@ -4091,7 +4105,11 @@ export class BoardDO extends DurableObject<Env> {
     for (const row of rows) {
       const since = ((row.state_since as string | null) ?? (row.updated_at as string | null) ?? (row.created_at as string));
       const ageMs = nowMs - Date.parse(since);
-      if (!(ageMs >= afterHours * 3600_000)) continue;
+      const waitingOnPerson = (row.state as string) === 'input-required';
+      if (!(input.attention && waitingOnPerson)) {
+        if (input.attention && !settings.enabled) continue;
+        if (!(ageMs >= afterHours * 3600_000)) continue;
+      }
       const card = this.rowToCard(row);
       const stage = stages.find((st) => st.key === card.currentStageKey);
       const why = this.staleWhy(card, row);
@@ -6013,6 +6031,7 @@ export class BoardDO extends DurableObject<Env> {
         decidedBy: (r.decided_by as string | null) ?? null,
         comment: (r.comment as string | null) ?? null,
         resolvedAt: (r.resolved_at as string | null) ?? null,
+        summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
       }));
   }
 
@@ -6795,6 +6814,7 @@ export class BoardDO extends DurableObject<Env> {
       contextId: row.context_id as string,
       createdAt: row.created_at as string,
       updatedAt: (row.updated_at as string | null) ?? null,
+      stateSince: ((row.state_since as string | null) ?? (row.updated_at as string | null) ?? (row.created_at as string)),
       costUsd,
       // `>=` matches the enforcement gate (postActivity rejects once at/over the cap), so the red
       // chip appears exactly when billing stops.
