@@ -1,6 +1,6 @@
 ---
 title: "Workspace, agents and capabilities"
-description: "supi forge, agents, agent queueing, capabilities and implications."
+description: "supi forge, agents, agent create, agent mint-token, agent queueing, capabilities, capability define and implications."
 sidebar:
   label: "Workspace and agents"
   order: 10
@@ -8,7 +8,7 @@ sidebar:
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->
 
-The two sides of routing — what a stage asks for and what an agent declares — and the workspace settings beside them. Routing is exact string equality between a stage's `owner` and an agent's effective capability set, so when a card will not move these are the whole diagnosis.
+The two sides of routing — what a stage asks for and what an agent declares — and the workspace settings beside them. Routing is exact string equality between a stage's `owner` and an agent's effective capability set, so when a card will not move these are the whole diagnosis. Defining a capability, creating an agent and minting its tokens are a person's acts: an agent credential is refused on all three, whatever it holds.
 
 Every command here also takes `--json` and `--help` — see [the overview](/reference/cli/).
 
@@ -72,6 +72,97 @@ supi agents
 
 ```sh
 supi agents
+```
+
+## `supi agent create`
+
+Creates an agent record and links it to the principal it is on the organization plane, in one request: a rejected link leaves no agent behind. The link is what lets the agent's own org-plane tokens (a station token) resolve as this agent, and its capabilities are chosen here — they are never carried in a token.
+
+A linked agent is minted no `spa_` token; `supi agent mint-token` issues one when it needs a native credential. `--external-id` is therefore required here, although the route accepts an agent without one.
+
+A person's act: an agent credential is refused (403), because linking an agent to a principal is what makes an agent token resolve at all.
+
+```sh
+supi agent create --name <name> --capability <key>... --external-id prn_… [--concurrency <n>]
+```
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--name <name>` | string | **required** | what the agent is called on the board |
+| `--capability <key>` | comma-separated list | **required** | a capability it holds; repeat the flag or separate with commas. Normalised as a stage's owner is, so `Code Review` becomes `code-review`, and registered if the workspace has not seen it. Repeatable |
+| `--external-id prn_…` | string | **required** | the principal this agent IS on the organization plane — `prn_` and 20 lowercase hex characters, checked before anything is sent. A principal is one agent: one already linked elsewhere is refused |
+| `--concurrency <n>` | integer | 1 | the most cards it may hold at once; a whole number of at least 1 |
+
+**Who may run it**
+
+- **A person:** `admin` or above in the workspace.
+- **An agent token:** refused, whatever scopes it carries.
+
+A session or a person's organization-plane token; never an agent.
+
+**Calls** `POST /v1/agents`
+
+**Prints** JSON: the agent, with its `externalId` and `externalSource` (`org-plane`).
+
+**Exit status** `0` on success. `1` when:
+
+- `--name`, `--capability` or `--external-id` is missing
+- `--external-id` is not `prn_` and 20 lowercase hex characters
+- `--concurrency` is not a whole number of at least 1
+- the principal is already linked to a different agent (409)
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi agent create --name Coordinator --capability coordination --external-id prn_0123456789abcdef0123
+supi agent create --name Reviewer --capability code-review,code --external-id prn_89ab… --concurrency 2
+```
+
+## `supi agent mint-token`
+
+Issues a fresh `spa_` token for an agent that already exists. It does not expire; it lasts until it is revoked in Workspace → Agents, and revoking is per token, so an agent with two keeps working on the other.
+
+The secret is shown **once** — only its hash is kept. Without `--out` the token alone goes to stdout and everything else to stderr, so `> file` captures exactly the secret; with `--out` it is written 0600 and printed nowhere. With `--json`, the object's `token` field is the only place it appears, and it is absent when `--out` took it. Nothing logs it.
+
+A person's act: an agent credential is refused (403) — an agent must never mint itself, or a peer, a credential that would outlive one a person revoked.
+
+```sh
+supi agent mint-token <agentId> --kind claim-run|run-only [--out FILE]
+```
+
+| argument | meaning |
+|---|---|
+| `<agentId>` | the agent (see `supi agents`) |
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--kind claim-run\|run-only` | one of `claim-run`, `run-only` | **required** | `claim-run`: scopes `claim` and `run`, for whatever takes cards off the board on the agent's behalf; `run-only`: scope `run`, which drives the card the agent already holds and cannot claim another — the one to hand to a harness that reports for itself over MCP |
+| `--out FILE` | file path, or `-` for stdin | the token alone on stdout | write the token to this file, mode 0600, and print it nowhere. An existing file is replaced, and its mode tightened to 0600 |
+
+**Who may run it**
+
+- **A person:** `admin` or above in the workspace.
+- **An agent token:** refused, whatever scopes it carries.
+
+A session or a person's organization-plane token; never an agent.
+
+**Calls** `POST /v1/agents/:agentId/tokens`
+
+**Prints** the token (or, with `--out`, a line naming the file); with `--json`: `agentId`, `kind`, `tokenId`, `scopes` and `token` or `out`.
+
+**Exit status** `0` on success. `1` when:
+
+- `<agentId>` is missing, or `--kind` is not `claim-run` or `run-only`
+- the agent is not in this workspace (404)
+- `--out` cannot be written
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi agent mint-token agt_c4d2… --kind claim-run --out ~/.config/agent/claim-run.token
+supi agent mint-token agt_c4d2… --kind run-only > run-only.token
 ```
 
 ## `supi agent queueing`
@@ -140,6 +231,49 @@ supi capabilities
 
 ```sh
 supi capabilities
+```
+
+## `supi capability define`
+
+Sets a capability's definition. Named by key, it is normalised the way a stage's owner is, so `Code Review` finds `code-review`; a key the registry has not seen yet is declared with the definition, so the vocabulary can be defined before any stage or agent names it. Its key never changes — stages and agents refer to it.
+
+A person's act: an agent credential is refused (403). Declaring the vocabulary is the same class of act as managing the agents that hold it.
+
+```sh
+supi capability define <id|key> --definition <text>
+```
+
+| argument | meaning |
+|---|---|
+| `<id\|key>` | the capability, as `cap_…` or by its key (see `supi capabilities`) |
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--definition <text>` | string | **required** | what holding this capability means — the description the registry and Workspace → Capabilities show |
+
+**Who may run it**
+
+- **A person:** `admin` or above in the workspace.
+- **An agent token:** refused, whatever scopes it carries.
+
+A session or a person's organization-plane token; never an agent. A key not yet registered is a `POST /v1/capabilities` instead of the PATCH; named by `cap_…` id, the GET is skipped.
+
+**Calls** `GET /v1/capabilities`, then `PATCH /v1/capabilities/:id`
+
+**Prints** JSON: the capability.
+
+**Exit status** `0` on success. `1` when:
+
+- `define` or `<id|key>` is missing
+- `--definition` is missing or empty
+- no capability has that id (404)
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi capability define code-review --definition "Reads a diff and says what is wrong with it."
+supi capability define cap_7a1e… --definition "Plans work and queues it onto boards."
 ```
 
 ## `supi implications`

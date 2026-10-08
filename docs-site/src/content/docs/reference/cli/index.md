@@ -103,8 +103,11 @@ The verb comes first. Flags may be written `--name value` or `--name=value`, any
 |---|---|
 | [`supi forge`](/reference/cli/workspace/#supi-forge) | this workspace's forge host, shown or set |
 | [`supi agents`](/reference/cli/workspace/#supi-agents) | the workspace's agents and what they declare |
+| [`supi agent create`](/reference/cli/workspace/#supi-agent-create) | create an agent, linked to its principal as it is made |
+| [`supi agent mint-token`](/reference/cli/workspace/#supi-agent-mint-token) | mint an agent's token: claim-run or run-only, shown once |
 | [`supi agent queueing`](/reference/cli/workspace/#supi-agent-queueing) | what an agent may queue of its OWN: owner, boards, cards an hour |
 | [`supi capabilities`](/reference/cli/workspace/#supi-capabilities) | the capability registry, with each one's origin |
+| [`supi capability define`](/reference/cli/workspace/#supi-capability-define) | say what a capability means, declaring it if it is new |
 | [`supi implications`](/reference/cli/workspace/#supi-implications) | what one capability implies about another |
 
 ## Flags every command takes

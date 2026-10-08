@@ -42,7 +42,7 @@ import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExtern
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
-import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, EVIDENCE_READ } from './auth/resolve';
+import { resolveUser, resolveAgent, type UserPrincipal, type AgentPrincipal, resolveHubUser, resolveHubAgent, resolveHubService, resolveOrgPlaneUser, EVIDENCE_READ } from './auth/resolve';
 import { handleAuthRoute } from './auth/routes';
 import { handleHubRoute } from './auth/hub-oauth';
 import { handlePlaneSignInRoute } from './auth/plane-signin';
@@ -324,13 +324,21 @@ async function resolveWorkspaceCaller(
      * into an unconditional hub fallback let a hub token DEFINE a capability, which its own test
      * caught. Default is `'session-or-hub'`, because `supi` carries a hub JWT and most routes are
      * meant to answer it.
+     *
+     * `'session-or-plane'` adds a HUMAN org-plane bearer and nothing else — not a legacy hub token
+     * (`resolveOrgPlaneUser`). It is how a person at a terminal reaches an operator act that stays
+     * closed to the hub's looser subject mapping.
      */
-    humanVia?: 'session' | 'session-or-hub';
+    humanVia?: 'session' | 'session-or-hub' | 'session-or-plane';
   },
 ): Promise<{ tenantId: string; user: UserPrincipal | null; agent: AgentPrincipal | null } | Response> {
   const user =
     (await resolveUser(request, env)) ??
-    (needed.humanVia === 'session' ? null : await resolveHubUser(request, env));
+    (needed.humanVia === 'session'
+      ? null
+      : needed.humanVia === 'session-or-plane'
+        ? await resolveOrgPlaneUser(request, env)
+        : await resolveHubUser(request, env));
   if (user) {
     const refused = refuseByRole(user, needed.human);
     if (refused) return refused;
@@ -785,8 +793,16 @@ const worker = {
         const caller = await resolveWorkspaceCaller(request, env, {
           human: request.method === 'GET' ? 'read' : 'manage',
           agentScope: request.method === 'GET' ? 'read' : null,
-          // Writes stay session-only, which is the boundary this route already kept.
-          humanVia: request.method === 'GET' ? 'session-or-hub' : 'session',
+          // Defining (POST) and redefining (PATCH) also answer a person's org-plane token, so `supi
+          // capability define` can do from a terminal what Workspace -> Capabilities does — with the
+          // same `manage` role check. A legacy hub token stays refused, and DELETE stays
+          // session-only. An agent is refused on every write by `agentScope: null` above.
+          humanVia:
+            request.method === 'GET'
+              ? 'session-or-hub'
+              : request.method === 'POST' || request.method === 'PATCH'
+                ? 'session-or-plane'
+                : 'session',
         });
         if (caller instanceof Response) return caller;
         const { tenantId: wsTenantId, user: u } = caller;
@@ -1310,6 +1326,21 @@ const worker = {
           u = await resolveHubUser(request, env);
         }
         /**
+         * The two operator acts a terminal needs, opened to a person's ORGANIZATION-PLANE token:
+         *
+         *   - `POST /v1/agents` — create an agent, linked to its principal as it is made;
+         *   - `POST /v1/agents/:id/tokens` — mint a credential for one.
+         *
+         * Only those two, only a human (`resolveOrgPlaneUser` resolves `principalKind: "human"` and
+         * nothing else), and never a legacy hub token: the sentence above about a first integration
+         * not also being the first credential able to mint still holds for the hub. The role check
+         * below is the one the cookie path makes, unchanged — `manage`, so admin or owner.
+         */
+        const operatorAct =
+          request.method === 'POST' &&
+          (!agentsMatch[1] || (agentsMatch[2] === 'tokens' && !agentsMatch[3]));
+        if (!u && operatorAct) u = await resolveOrgPlaneUser(request, env);
+        /**
          * An AGENT may READ this list, on `read`, and nothing more.
          *
          * It is half of any routing diagnosis — a card that will not move is almost always a stage
@@ -1317,8 +1348,9 @@ const worker = {
          * The row carries `tokenIds` and the queueing policy but never a token, so reading which
          * credentials exist is not holding one.
          *
-         * Writes stay exactly as they were: PATCH needs a person (hub token included, since `supi`
-         * carries one), and minting or revoking a credential needs a session — charter Decision 3.
+         * Writes need a person: PATCH answers a hub token too, since `supi` carries one; creating an
+         * agent and minting a credential answer a session or a person's org-plane token (below);
+         * revoking and deleting need a session. Never an agent — charter Decision 3.
          */
         let listingAgent: AgentPrincipal | null = null;
         if (!u && request.method === 'GET' && !agentsMatch[2]) {
@@ -1328,6 +1360,21 @@ const worker = {
           }
           if (listingAgent) {
             return Response.json({ agents: await listAgents(env.DB, listingAgent.tenantId) });
+          }
+        }
+        if (!u && request.method !== 'GET') {
+          /**
+           * An AGENT on a write here is refused by name, not told to sign in.
+           *
+           * Every write below is workspace administration — minting and revoking credentials,
+           * linking an agent to a principal, restaffing, deleting — and the control pair puts all of
+           * it on the human side: an agent must never mint itself (or a peer) a credential, nor point
+           * an agent row at a principal, which is what makes an agent token resolve at all. A 401
+           * would send a thing that cannot sign in round a loop.
+           */
+          const agent = (await resolveAgent(request, env)) ?? (await resolveHubAgent(request, env));
+          if (agent) {
+            return Response.json({ error: 'this is not something an agent may do in this workspace' }, { status: 403 });
           }
         }
         if (!u) return Response.json({ error: 'sign in to continue' }, { status: 401 });
@@ -1342,8 +1389,9 @@ const worker = {
         // that did not exist, and a linked agent — which is created with no `spa_` at all — could
         // never be issued one even when it needed a native credential.
         //
-        // Human-only, exactly like revocation: `u` came from `resolveUser` alone, so an agent can
-        // never mint itself a second credential to outlive one a person revoked
+        // Human-only, exactly like revocation: `u` came from `resolveUser` or, for this route and
+        // create alone, a person's org-plane token (`resolveOrgPlaneUser`, humans only) — so an
+        // agent can never mint itself a second credential to outlive one a person revoked
         // (charter decisions/2026-08-13-ecosystem-identity.md Decision 3).
         // Everything below the agent list is workspace administration: minting and revoking
         // credentials, restaffing an agent, deleting one. `member` works the board; managing what
@@ -1602,8 +1650,17 @@ const worker = {
              * and is linked to nobody.
              */
             externalId?: string;
+            /** The ceiling on cards it may hold at once; absent means the default (1). */
+            concurrency?: unknown;
           };
           if (!body.name || body.name.trim() === '') return Response.json({ error: 'name is required' }, { status: 400 });
+          // Checked before anything is written, like the link below: a refused create leaves no agent.
+          if (
+            body.concurrency !== undefined &&
+            (typeof body.concurrency !== 'number' || !Number.isInteger(body.concurrency) || body.concurrency < 1)
+          ) {
+            return Response.json({ error: 'concurrency must be a whole number of at least 1' }, { status: 400 });
+          }
 
           const linking = typeof body.externalId === 'string' && body.externalId.trim() !== '';
           if (linking) {
@@ -1622,8 +1679,12 @@ const worker = {
           // with a capability spelled in a way no stage would ever match, and the only way to
           // discover that was a card that never moved.
           const wanted = capabilityTags(body.capabilities ?? []);
-          const created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: wanted });
+          let created = await createAgent(env.DB, u.tenantId, { name: body.name.trim(), capabilities: wanted });
           await ensureCapabilities(env.DB, u.tenantId, wanted, u.userId);
+          if (typeof body.concurrency === 'number' && body.concurrency !== created.concurrency) {
+            await updateAgent(env.DB, u.tenantId, created.id, { concurrency: body.concurrency });
+            created = { ...created, concurrency: body.concurrency };
+          }
 
           if (linking) {
             await setAgentExternalMapping(env.DB, u.tenantId, created.id, {

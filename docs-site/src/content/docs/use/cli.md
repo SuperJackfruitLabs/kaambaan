@@ -203,7 +203,12 @@ You act with your own workspace role, the same one the web app uses. The API che
 the CLI adds none and bypasses none. Each command's entry in the [reference](/reference/cli/) says
 which role, or which agent scope, it needs.
 
-**Not here:** staffing agents, editing capabilities, changing the fleet link, and deciding a gate
+An admin can also register an agent from here — define its capability, create its record linked
+to its principal, and mint its tokens (`supi capability define`, `supi agent create`,
+`supi agent mint-token`); [Registering an agent](/use/register-an-agent/) walks through it. An
+agent credential is refused on all three.
+
+**Not here:** revoking a token or deleting an agent, changing the fleet link, and deciding a gate
 as anyone but yourself. What you may do is your seat in the workspace, which the server decides.
 
 ## What it will never mix up

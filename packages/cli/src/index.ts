@@ -22,8 +22,9 @@
  * the server, which is where that decision belongs — a client that pre-empts a server decision
  * is a client that will one day disagree with it, and this file spent a release disagreeing.
  */
-import { readFileSync } from "node:fs";
-import { BOARD_TEMPLATES, boardTemplate, type BoardTemplateStage } from "@superpipeline/contract";
+import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { BOARD_TEMPLATES, boardTemplate, capabilityTag, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, clearSupiCredentials, describeCredential, expired, inspect, refusalHint, resolveCredential, saveSupiDevice, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
 import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
 import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
@@ -227,6 +228,34 @@ async function stagesFromFile(path: string): Promise<BoardTemplateStage[]> {
     fail("Every stage needs a string `key`.");
   }
   return stages as BoardTemplateStage[];
+}
+
+/** What each `mint-token --kind` asks the server for. The scope names are the contract's. */
+const TOKEN_KINDS: Record<string, string[]> = {
+  "claim-run": ["claim", "run"],
+  "run-only": ["run"],
+};
+
+/** The shape the server checks too (`apps/api` POST /v1/agents); caught here so a typo never leaves the terminal. */
+const PRINCIPAL_RE = /^prn_[0-9a-f]{20}$/;
+
+/**
+ * Write a secret to `path`, readable by its owner only.
+ *
+ * Written to a sibling temporary file created 0600 and renamed over the target, so the secret is
+ * never — even for an instant — in a file with wider permissions: `writeFileSync`'s `mode` applies
+ * only when it CREATES a file, and an existing 0644 file would otherwise keep its mode. The chmod
+ * is belt and braces against a umask that strips owner bits.
+ */
+function writeSecret(path: string, secret: string): void {
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, secret + "\n", { mode: 0o600, flag: "wx" });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (error) {
+    fail(`Could not write ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function main(argv: string[]): Promise<void> {
@@ -637,8 +666,86 @@ async function main(argv: string[]): Promise<void> {
      */
     case "agent": {
       const sub = pos[0];
+
+      /**
+       * Create an agent, linked to the principal it IS as it is made.
+       *
+       * `--external-id` is required here, not optional as it is on the route: an agent created
+       * without one is minted an `spa_` in the same response, and this verb exists to register an
+       * agent that authenticates with its own org-plane tokens. A credential nobody asked for is
+       * one more secret to leak; `mint-token` is the way to ask for one.
+       */
+      if (sub === "create") {
+        const name = flag(rest, "--name");
+        if (!name || name.trim() === "") fail("--name is required");
+        const capabilities = flags(rest, "--capability")
+          .flatMap((c) => c.split(","))
+          .map((c) => c.trim())
+          .filter((c) => c !== "");
+        if (capabilities.length === 0) fail("at least one --capability is required");
+        const externalId = flag(rest, "--external-id");
+        if (!externalId) fail("--external-id is required: the agent's principal, as prn_…");
+        if (!PRINCIPAL_RE.test(externalId)) fail("--external-id must look like prn_ followed by 20 lowercase hex characters");
+        const body: Record<string, unknown> = { name: name.trim(), capabilities, externalId };
+        const concurrency = flag(rest, "--concurrency");
+        if (concurrency !== null) {
+          const n = Number(concurrency);
+          if (!Number.isInteger(n) || n < 1) fail("--concurrency must be a whole number of at least 1");
+          body.concurrency = n;
+        }
+        out(await api("/v1/agents", { method: "POST", body: JSON.stringify(body) }));
+        return;
+      }
+
+      /**
+       * Mint a credential for an agent. The secret is shown ONCE — only its hash is kept — so where
+       * it goes is the whole design:
+       *
+       *   - no `--out`: the token alone on stdout, everything else on stderr, so a redirect captures
+       *     the secret and nothing more;
+       *   - `--out FILE`: written 0600, and printed nowhere;
+       *   - `--json`: one object whose `token` field is the only place the secret appears — absent
+       *     entirely when `--out` took it.
+       *
+       * Nothing here logs it. The server decides who may: a person with `admin` or above, never an
+       * agent, whatever it holds.
+       */
+      if (sub === "mint-token") {
+        const agentId = pos[1];
+        if (!agentId) fail("usage: supi agent mint-token <agentId> --kind claim-run|run-only [--out FILE]");
+        const kind = flag(rest, "--kind");
+        if (!kind || !(kind in TOKEN_KINDS)) fail("--kind must be claim-run or run-only");
+        const target = flag(rest, "--out");
+        const minted = (await api(`/v1/agents/${agentId}/tokens`, {
+          method: "POST",
+          body: JSON.stringify({ scopes: TOKEN_KINDS[kind] }),
+        })) as { token?: unknown; tokenId?: unknown; scopes?: unknown };
+        if (typeof minted?.token !== "string") fail("superpipeline answered without a token; nothing was minted that this can show.");
+        const meta = { agentId, kind, tokenId: minted.tokenId, scopes: minted.scopes };
+        if (target) {
+          writeSecret(target, minted.token);
+          if (wantJson) process.stdout.write(JSON.stringify({ ...meta, out: target }, null, 2) + "\n");
+          else process.stdout.write(`Wrote ${kind} token ${String(minted.tokenId)} for ${agentId} to ${target} (mode 0600).\n`);
+          return;
+        }
+        if (wantJson) {
+          process.stdout.write(JSON.stringify({ ...meta, token: minted.token }, null, 2) + "\n");
+          return;
+        }
+        process.stderr.write(
+          `${kind} token ${String(minted.tokenId)} for ${agentId} (scopes: ${(minted.scopes as string[] | undefined)?.join(", ") ?? "?"}).\n` +
+            "Shown once — store it now, readable only by you (0600). Revoke it in Workspace -> Agents.\n",
+        );
+        process.stdout.write(minted.token + "\n");
+        return;
+      }
+
       if (sub !== "queueing" || !pos[1]) {
-        fail("usage: supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id>|none] [--ceiling <n>]");
+        fail(
+          "usage: supi agent create --name <name> --capability <key>... --external-id prn_… [--concurrency <n>]\n" +
+            "       supi agent mint-token <agentId> --kind claim-run|run-only [--out FILE]\n" +
+            "       supi agent queueing <agentId> [--owner <userId>|none] [--boards <id,id>|none] [--ceiling <n>]",
+        );
       }
       const body: Record<string, unknown> = {};
       const owner = flag(rest, "--owner");
@@ -665,6 +772,36 @@ async function main(argv: string[]): Promise<void> {
     case "capabilities":
       out(await api("/v1/capabilities"));
       return;
+
+    /**
+     * Say what a capability MEANS — the registry's description — from a terminal.
+     *
+     * Takes the capability's id (`cap_…`) or its key, in any spelling a stage would normalise to
+     * the same key. A key the registry has not heard of is declared with the definition, so an
+     * operator can define the vocabulary before any agent or stage names it.
+     */
+    case "capability": {
+      const sub = pos[0];
+      const target = pos[1];
+      if (sub !== "define" || !target) fail("usage: supi capability define <id|key> --definition <text>");
+      const definition = flag(rest, "--definition");
+      if (!definition || definition.trim() === "") fail("--definition is required: what holding this capability means");
+      const description = definition.trim();
+      let id: string | null = target.startsWith("cap_") ? target : null;
+      if (!id) {
+        const key = capabilityTag(target);
+        if (key === "") fail(`${target} is not a capability key: it needs a letter or a digit`);
+        const { capabilities } = (await api("/v1/capabilities")) as { capabilities?: Array<{ id: string; key: string }> };
+        const found = (capabilities ?? []).find((c) => c.key === key);
+        if (!found) {
+          out(await api("/v1/capabilities", { method: "POST", body: JSON.stringify({ key, description }) }));
+          return;
+        }
+        id = found.id;
+      }
+      out(await api(`/v1/capabilities/${id}`, { method: "PATCH", body: JSON.stringify({ description }) }));
+      return;
+    }
 
     case "implications":
       out(await api("/v1/capabilities/implications"));

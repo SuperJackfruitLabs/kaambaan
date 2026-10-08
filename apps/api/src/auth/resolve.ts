@@ -269,6 +269,28 @@ export async function resolveHubUser(request: Request, env: Env): Promise<UserPr
 }
 
 /**
+ * A person from an ORGANIZATION-PLANE bearer, and from nothing else.
+ *
+ * The credential the operator acts reach a terminal with: defining a capability, creating an agent
+ * linked to a principal, and minting an agent's tokens. Those were session-cookie only, so `supi` —
+ * which carries exactly this token — was answered 401 on all three.
+ *
+ * Narrower than `resolveHubUser` on purpose. That function is the legacy hub's path too, where an
+ * unmapped subject is admitted as a `member` and the mapping between the two id spaces has a known
+ * open question (see its comment); the boundary these routes kept against hub tokens is kept. In
+ * plane mode the two are the same function, so nothing a hub token could do changes.
+ *
+ * The role still decides — this resolves who the person is, never what they may do — and only a
+ * `principalKind: "human"` token resolves at all (`resolvePlaneUser`), so an agent-kind token is
+ * never a person here.
+ */
+export async function resolveOrgPlaneUser(request: Request, env: Env): Promise<UserPrincipal | null> {
+  const plane = orgPlaneMode(env);
+  if (plane.kind !== 'on') return null;
+  return resolvePlaneUser(request, env, plane.cfg);
+}
+
+/**
  * Resolve an agent from a token issued by the suite's hub, verified offline.
  *
  * The agent-kind sibling of `resolveHubUser` above — same shape, deliberately: a node can now

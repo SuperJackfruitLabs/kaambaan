@@ -173,11 +173,13 @@ export const GROUPS: GroupSpec[] = [
     id: "workspace",
     title: "Workspace, agents and capabilities",
     label: "Workspace and agents",
-    description: "supi forge, agents, agent queueing, capabilities and implications.",
+    description: "supi forge, agents, agent create, agent mint-token, agent queueing, capabilities, capability define and implications.",
     intro:
       "The two sides of routing — what a stage asks for and what an agent declares — and the workspace settings " +
       "beside them. Routing is exact string equality between a stage's `owner` and an agent's effective " +
-      "capability set, so when a card will not move these are the whole diagnosis.",
+      "capability set, so when a card will not move these are the whole diagnosis. Defining a capability, " +
+      "creating an agent and minting its tokens are a person's acts: an agent credential is refused on all " +
+      "three, whatever it holds.",
   },
 ];
 
@@ -978,6 +980,111 @@ export const COMMANDS: CommandSpec[] = [
     examples: ["supi agents"],
   },
   {
+    path: ["agent", "create"],
+    group: "workspace",
+    args: [],
+    flags: [
+      { name: "--name", value: "<name>", type: "string", required: true, description: "what the agent is called on the board" },
+      {
+        name: "--capability",
+        value: "<key>",
+        type: "list",
+        required: true,
+        repeatable: true,
+        description:
+          "a capability it holds; repeat the flag or separate with commas. Normalised as a stage's owner is, so " +
+          "`Code Review` becomes `code-review`, and registered if the workspace has not seen it",
+      },
+      {
+        name: "--external-id",
+        value: "prn_…",
+        type: "string",
+        required: true,
+        description:
+          "the principal this agent IS on the organization plane — `prn_` and 20 lowercase hex characters, checked " +
+          "before anything is sent. A principal is one agent: one already linked elsewhere is refused",
+      },
+      {
+        name: "--concurrency",
+        value: "<n>",
+        type: "integer",
+        default: "1",
+        description: "the most cards it may hold at once; a whole number of at least 1",
+      },
+    ],
+    summary: "create an agent, linked to its principal as it is made",
+    description:
+      "Creates an agent record and links it to the principal it is on the organization plane, in one request: a " +
+      "rejected link leaves no agent behind. The link is what lets the agent's own org-plane tokens (a station " +
+      "token) resolve as this agent, and its capabilities are chosen here — they are never carried in a token.\n\n" +
+      "A linked agent is minted no `spa_` token; `supi agent mint-token` issues one when it needs a native " +
+      "credential. `--external-id` is therefore required here, although the route accepts an agent without one.\n\n" +
+      "A person's act: an agent credential is refused (403), because linking an agent to a principal is what makes " +
+      "an agent token resolve at all.",
+    routes: [{ method: "POST", path: "/v1/agents" }],
+    access: { role: "admin", agent: "refused", note: "A session or a person's organization-plane token; never an agent." },
+    output: "JSON: the agent, with its `externalId` and `externalSource` (`org-plane`)",
+    fails: [
+      "`--name`, `--capability` or `--external-id` is missing",
+      "`--external-id` is not `prn_` and 20 lowercase hex characters",
+      "`--concurrency` is not a whole number of at least 1",
+      "the principal is already linked to a different agent (409)",
+    ],
+    examples: [
+      "supi agent create --name Coordinator --capability coordination --external-id prn_0123456789abcdef0123",
+      "supi agent create --name Reviewer --capability code-review,code --external-id prn_89ab… --concurrency 2",
+    ],
+  },
+  {
+    path: ["agent", "mint-token"],
+    group: "workspace",
+    args: [{ name: "agentId", description: "the agent (see `supi agents`)" }],
+    flags: [
+      {
+        name: "--kind",
+        value: "claim-run|run-only",
+        type: "enum",
+        choices: ["claim-run", "run-only"],
+        required: true,
+        description:
+          "`claim-run`: scopes `claim` and `run`, for whatever takes cards off the board on the agent's behalf; " +
+          "`run-only`: scope `run`, which drives the card the agent already holds and cannot claim another — the " +
+          "one to hand to a harness that reports for itself over MCP",
+      },
+      {
+        name: "--out",
+        value: "FILE",
+        type: "path",
+        default: "the token alone on stdout",
+        description:
+          "write the token to this file, mode 0600, and print it nowhere. An existing file is replaced, and its " +
+          "mode tightened to 0600",
+      },
+    ],
+    summary: "mint an agent's token: claim-run or run-only, shown once",
+    description:
+      "Issues a fresh `spa_` token for an agent that already exists. It does not expire; it lasts until it is " +
+      "revoked in Workspace → Agents, and revoking is per token, so an agent with two keeps working on the other.\n\n" +
+      "The secret is shown **once** — only its hash is kept. Without `--out` the token alone goes to stdout and " +
+      "everything else to stderr, so `> file` captures exactly the secret; with `--out` it is written 0600 and " +
+      "printed nowhere. With `--json`, the object's `token` field is the only place it appears, and it is absent " +
+      "when `--out` took it. Nothing logs it.\n\n" +
+      "A person's act: an agent credential is refused (403) — an agent must never mint itself, or a peer, a " +
+      "credential that would outlive one a person revoked.",
+    routes: [{ method: "POST", path: "/v1/agents/:agentId/tokens" }],
+    access: { role: "admin", agent: "refused", note: "A session or a person's organization-plane token; never an agent." },
+    output: "the token (or, with `--out`, a line naming the file); with `--json`: `agentId`, `kind`, `tokenId`, `scopes` and `token` or `out`",
+    fails: [
+      "`<agentId>` is missing, or `--kind` is not `claim-run` or `run-only`",
+      "the agent is not in this workspace (404)",
+      "`--out` cannot be written",
+    ],
+    examples: [
+      "supi agent mint-token agt_c4d2… --kind claim-run --out ~/.config/agent/claim-run.token",
+      "supi agent mint-token agt_c4d2… --kind run-only > run-only.token",
+    ],
+  },
+  {
     path: ["agent", "queueing"],
     group: "workspace",
     args: [{ name: "agentId", description: "the agent (see `supi agents`)" }],
@@ -1031,6 +1138,42 @@ export const COMMANDS: CommandSpec[] = [
     output: "JSON: the capabilities",
     fails: [],
     examples: ["supi capabilities"],
+  },
+  {
+    path: ["capability", "define"],
+    group: "workspace",
+    args: [{ name: "id|key", description: "the capability, as `cap_…` or by its key (see `supi capabilities`)" }],
+    flags: [
+      {
+        name: "--definition",
+        value: "<text>",
+        type: "string",
+        required: true,
+        description: "what holding this capability means — the description the registry and Workspace → Capabilities show",
+      },
+    ],
+    summary: "say what a capability means, declaring it if it is new",
+    description:
+      "Sets a capability's definition. Named by key, it is normalised the way a stage's owner is, so `Code Review` " +
+      "finds `code-review`; a key the registry has not seen yet is declared with the definition, so the vocabulary " +
+      "can be defined before any stage or agent names it. Its key never changes — stages and agents refer to it.\n\n" +
+      "A person's act: an agent credential is refused (403). Declaring the vocabulary is the same class of act as " +
+      "managing the agents that hold it.",
+    routes: [
+      { method: "GET", path: "/v1/capabilities" },
+      { method: "PATCH", path: "/v1/capabilities/:id" },
+    ],
+    access: {
+      role: "admin",
+      agent: "refused",
+      note: "A session or a person's organization-plane token; never an agent. A key not yet registered is a `POST /v1/capabilities` instead of the PATCH; named by `cap_…` id, the GET is skipped.",
+    },
+    output: "JSON: the capability",
+    fails: ["`define` or `<id|key>` is missing", "`--definition` is missing or empty", "no capability has that id (404)"],
+    examples: [
+      'supi capability define code-review --definition "Reads a diff and says what is wrong with it."',
+      'supi capability define cap_7a1e… --definition "Plans work and queues it onto boards."',
+    ],
   },
   {
     path: ["implications"],

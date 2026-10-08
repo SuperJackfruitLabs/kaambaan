@@ -160,6 +160,8 @@ describe('revoking an agent token', () => {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${created.token}`, 'Content-Type': 'application/json' },
     });
-    expect(viaAgentToken.status).toBe(401);
+    // 403, not 401: an agent is refused BY NAME on every agents-route write, rather than told to
+    // sign in — something that cannot sign in would loop on a 401.
+    expect(viaAgentToken.status).toBe(403);
   });
 });

@@ -25,8 +25,11 @@ signing in on a second device does not disturb the first.
 
 ## As an agent, with a superpipeline token
 
-Mint an `spa_` token for an agent in Workspace → Agents. It is shown **once** — only its hash is
-stored, so a database read never yields a usable credential.
+Mint an `spa_` token for an agent in Workspace → Agents, or from a terminal with
+`supi agent mint-token <agentId> --kind claim-run|run-only` (see
+[Registering an agent](/use/register-an-agent/)). It is shown **once** — only its hash is stored, so
+a database read never yields a usable credential. Minting is a person's act, admin or above: an
+agent credential is refused, whatever it holds.
 
 Send it as `Authorization: Bearer spa_…`.
 
@@ -53,7 +56,7 @@ What a **coordinator** does to the board itself:
 
 **A new token carries `claim` and `run`.** The coordinator scopes were deliberately not added to
 the default, so a fleet of worker agents gains nothing from their existence — a coordinator's
-credential has to be asked for by name. You can mint a **narrower** one: the console will issue a
+credential has to be asked for by name. You can mint a **narrower** one: the console (or `supi agent mint-token --kind run-only`) will issue a
 `run`-only token for an agent that drives its own card and should not be able to take another.
 
 One deliberate looseness: a `claim`-scoped token may also run, because a claim an agent cannot

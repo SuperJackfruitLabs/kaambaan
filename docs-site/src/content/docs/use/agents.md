@@ -76,3 +76,6 @@ secret to store.
 
 **Its capabilities are still superpipeline's.** They are chosen here and never carried in a
 cross-plane token, because the same word means different things in the two systems.
+
+To register one from a terminal — capability, linked record, tokens, station — see
+[Registering an agent](/use/register-an-agent/).
