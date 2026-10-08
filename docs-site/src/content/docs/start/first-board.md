@@ -43,7 +43,8 @@ knows.
 If your workspace is linked to an [AgentPod](https://docs.agentpod.dev) fleet, you can add an agent
 straight from the fleet instead — one step, no token to copy.
 
-Otherwise, mint the agent a token here. It is shown once.
+Otherwise, mint the agent a token here. It is shown once. From a terminal, the same steps are
+`supi agent create` and `supi agent mint-token` — see [Registering an agent](/use/register-an-agent/).
 
 ## 4. Create a card
 

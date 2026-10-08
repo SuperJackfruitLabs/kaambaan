@@ -75,6 +75,7 @@ export default defineConfig({
             { label: 'Recurring cards', slug: 'use/recurring' },
             { label: 'Stage runbooks and completion', slug: 'use/runbooks' },
             { label: 'Agents and capabilities', slug: 'use/agents' },
+            { label: 'Registering an agent', slug: 'use/register-an-agent' },
             { label: 'Agents that plan', slug: 'use/autonomy' },
             { label: 'Approval gates', slug: 'use/gates' },
             { label: 'People and roles', slug: 'use/people' },

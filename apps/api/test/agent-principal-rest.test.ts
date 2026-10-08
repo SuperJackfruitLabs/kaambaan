@@ -157,7 +157,9 @@ describe('PATCH /v1/agents/:id — link a suite principal', () => {
       headers: { Authorization: `Bearer ${agent.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ externalId: prn(5) }),
     });
-    expect(viaAgentToken.status).toBe(401);
+    // 403, not 401: an agent is refused BY NAME on every agents-route write, rather than told to
+    // sign in — something that cannot sign in would loop on a 401.
+    expect(viaAgentToken.status).toBe(403);
 
     // Neither attempt actually wrote a mapping.
     const list = await (await SELF.fetch('https://api.test/v1/agents', { headers: dev('tnt_prt_human') })).json<{
