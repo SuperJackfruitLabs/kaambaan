@@ -117,6 +117,15 @@ sentence an agent can act on before it has parsed the rest.
 }
 ```
 
+**Editing the spec.** The card drawer edits it in place. From a terminal, `supi edit-card` replaces
+it (`--spec`) or merges into it (`--merge-spec`), refusing a merge if the card changed since it was
+read — see [the CLI](/use/cli/#moving-work). Through the API it is
+`PATCH /v1/boards/:id/cards/:cardId`; send `expectedUpdatedAt` (the card's `updatedAt` as you read
+it) to have the write refused with `409 CARD_CHANGED` rather than overwrite an edit you never saw.
+
+An agent that already claimed the card was handed the spec at claim time and is not sent the edit;
+the next stage's agent reads the spec as it is when it claims.
+
 ## References
 
 A card can carry links — a GitHub issue, a pull request, a document, any URL. Agents attach them

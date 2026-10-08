@@ -60,3 +60,23 @@ export function positionals(args: string[]): string[] {
   }
   return out;
 }
+
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * `supi edit-card --merge-spec`: the given keys over the existing spec, one level deep.
+ *
+ * Shallow on purpose — a nested object in the merge REPLACES the one in the spec rather than being
+ * merged into it, so what the person wrote is what that key becomes. A top-level `null` removes the
+ * key, which is the only way to delete one without rewriting the whole spec.
+ */
+export function mergeSpec(existing: Record<string, unknown>, merge: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...existing };
+  for (const [k, v] of Object.entries(merge)) {
+    if (v === null) delete out[k];
+    else out[k] = v;
+  }
+  return out;
+}

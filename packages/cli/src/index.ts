@@ -28,7 +28,7 @@ import { BOARD_TEMPLATES, boardTemplate, capabilityTag, type BoardTemplateStage 
 import { baseUrl, clearSupiCredentials, describeCredential, expired, inspect, refusalHint, resolveCredential, saveSupiDevice, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
 import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
 import { renderBoards, renderBoard, renderComments, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
-import { flag, flags, positionals } from "./args.ts";
+import { flag, flags, isPlainObject, mergeSpec, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 import { findCommands, renderCommandHelp, renderUsage } from "./commands.ts";
 
@@ -110,7 +110,12 @@ async function credentialOrExit() {
   return c;
 }
 
-async function api(path: string, init: RequestInit = {}): Promise<unknown> {
+/**
+ * `conflict`, when given, is the sentence a 409 prints instead of the generic "returned 409" — for
+ * a request that carried a precondition, where 409 means exactly one thing and the person should
+ * be told what it was.
+ */
+async function api(path: string, init: RequestInit = {}, opts: { conflict?: string } = {}): Promise<unknown> {
   const c = await credentialOrExit();
   const res = await fetch(baseUrl() + path, {
     ...init,
@@ -137,6 +142,7 @@ async function api(path: string, init: RequestInit = {}): Promise<unknown> {
     // Which dead end this is depends on what is holding the credential — see `refusalHint`.
     fail(`Refused by superpipeline (403). ${body.trim()}`, refusalHint(c.kind));
   }
+  if (res.status === 409 && opts.conflict) fail(opts.conflict);
   if (!res.ok) fail(`superpipeline returned ${res.status}: ${body.trim()}`);
 
   try {
@@ -197,6 +203,21 @@ function readText(path: string): string {
     return (path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8")).trim();
   } catch {
     fail(`Could not read ${path === "-" ? "stdin" : path}.`);
+  }
+}
+
+/** A JSON value from a file, or stdin for `-`; refused by the flag's name when it is not JSON. */
+function readJson(path: string, flagName: string): unknown {
+  let raw: string;
+  try {
+    raw = path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8");
+  } catch {
+    fail(`Could not read ${path === "-" ? "stdin" : path}.`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    fail(`${flagName} is not JSON: ${path}`);
   }
 }
 
@@ -646,6 +667,64 @@ async function main(argv: string[]): Promise<void> {
         return;
       }
       out(created);
+      return;
+    }
+
+    /**
+     * Edit a card's title, spec, priority or due date — the PATCH the web drawer sends.
+     *
+     * `--spec` replaces the spec whole. `--merge-spec` is a read-modify-write: read the card, merge
+     * the given object one level deep (a top-level `null` removes that key), and write back with
+     * `expectedUpdatedAt` set to what was read — so an edit someone made in between is refused
+     * with a 409 rather than silently overwritten by a spec built from the older copy.
+     */
+    case "edit-card": {
+      if (!pos[0] || !pos[1]) {
+        fail(
+          "usage: supi edit-card <boardId> <cardId> [--title <text>] [--spec <file|->]",
+          "  [--merge-spec <file|->] [--priority <n>] [--due YYYY-MM-DD|none]",
+        );
+      }
+      const titleArg = flag(rest, "--title");
+      const specArg = flag(rest, "--spec");
+      const mergeArg = flag(rest, "--merge-spec");
+      const priorityArg = flag(rest, "--priority");
+      const dueArg = flag(rest, "--due");
+      if (specArg && mergeArg) fail("--spec replaces the spec and --merge-spec merges into it; pass one.");
+      if (!titleArg && !specArg && !mergeArg && !priorityArg && !dueArg) {
+        fail("Nothing to change.", "  supi edit-card <boardId> <cardId> --title … | --spec … | --merge-spec … | --priority … | --due …");
+      }
+      const body: Record<string, unknown> = {};
+      if (titleArg) body.title = titleArg;
+      if (priorityArg) {
+        const n = Number(priorityArg);
+        if (!Number.isFinite(n)) fail(`--priority is not a number: ${priorityArg}`);
+        body.priority = n;
+      }
+      if (dueArg) {
+        if (dueArg !== "none" && !DUE_AT_RE.test(dueArg)) fail(`--due is not a date in YYYY-MM-DD form, or \`none\`: ${dueArg}`);
+        body.dueAt = dueArg === "none" ? null : dueArg;
+      }
+      if (specArg) body.spec = readJson(specArg, "--spec");
+      const cardPath = `/v1/boards/${pos[0]}/cards/${pos[1]}`;
+      if (mergeArg) {
+        const merge = readJson(mergeArg, "--merge-spec");
+        if (!isPlainObject(merge)) fail("--merge-spec must be a JSON object: its top-level keys are merged into the spec.");
+        const { card } = (await api(cardPath)) as { card: { spec: unknown; updatedAt: string | null } };
+        const current = card.spec ?? {};
+        if (!isPlainObject(current)) {
+          fail("This card's spec is not a JSON object, so there is nothing to merge into.", "  supi edit-card <boardId> <cardId> --spec <file|->   replace it instead");
+        }
+        body.spec = mergeSpec(current, merge);
+        body.expectedUpdatedAt = card.updatedAt;
+      }
+      out(
+        await api(cardPath, { method: "PATCH", body: JSON.stringify(body) }, {
+          conflict:
+            "The card changed since it was read, so the merge was refused. Nothing was written.\n\n" +
+            "  Run the same command again: it re-reads the card and merges into what is there now.",
+        }),
+      );
       return;
     }
 

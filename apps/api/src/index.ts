@@ -199,6 +199,10 @@ function statusForCode(code: BoardErrorCode): number {
     case 'NOT_COMMENT_AUTHOR':
     case 'NO_RUN_ON_CARD':
       return 403;
+    // A failed precondition (`expectedUpdatedAt`): the card changed since the caller read it.
+    // Re-read and retry; the same request will keep failing until it does.
+    case 'CARD_CHANGED':
+      return 409;
   }
 }
 
@@ -2288,7 +2292,15 @@ const worker = {
           /** Cross-board project/milestone membership (migration 0013; Task 19). `null` clears it. */
           projectId?: string | null;
           milestoneId?: string | null;
+          /** A precondition: the card's `updatedAt` as last read. A mismatch is a 409 `CARD_CHANGED`. */
+          expectedUpdatedAt?: string | null;
         };
+        if (body.expectedUpdatedAt !== undefined && body.expectedUpdatedAt !== null && typeof body.expectedUpdatedAt !== 'string') {
+          return Response.json(
+            { error: { code: 'INVALID_PRECONDITION', message: 'expectedUpdatedAt must be null or the card\'s updatedAt string' } },
+            { status: 400 },
+          );
+        }
         if (body.ownerUserId !== undefined && (typeof body.ownerUserId !== 'string' || body.ownerUserId.trim() === '')) {
           return Response.json({ error: 'ownerUserId must be a non-empty user id' }, { status: 400 });
         }
@@ -2394,6 +2406,7 @@ const worker = {
           archivedAt: body.archivedAt,
           projectId: body.projectId,
           milestoneId: body.milestoneId,
+          expectedUpdatedAt: body.expectedUpdatedAt,
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });

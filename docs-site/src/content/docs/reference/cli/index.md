@@ -47,6 +47,7 @@ The verb comes first. Flags may be written `--name value` or `--name=value`, any
 |---|---|
 | [`supi card`](/reference/cli/cards/#supi-card) | one card in full |
 | [`supi create-card`](/reference/cli/cards/#supi-create-card) | queue a card, with this token as its grant |
+| [`supi edit-card`](/reference/cli/cards/#supi-edit-card) | change a card's title, spec, priority or due date |
 | [`supi move`](/reference/cli/cards/#supi-move) | move a card to another stage |
 | [`supi archive`](/reference/cli/cards/#supi-archive) | archive a card, so the "show archived" filter has something to show |
 | [`supi log`](/reference/cli/cards/#supi-log) | what an agent did on a card, and its handoff |
