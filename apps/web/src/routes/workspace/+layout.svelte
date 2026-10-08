@@ -14,6 +14,7 @@
   let { children } = $props();
 
   const TABS = [
+    { id: 'needs-you', label: 'Needs you' },
     { id: 'agents', label: 'Agents' },
     { id: 'capabilities', label: 'Capabilities' },
     { id: 'labels', label: 'Labels' },

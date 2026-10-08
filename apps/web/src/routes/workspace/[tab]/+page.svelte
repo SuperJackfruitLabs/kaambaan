@@ -6,19 +6,22 @@
   import LabelManager from '$lib/components/workspace/LabelManager.svelte';
   import PeopleTab from '$lib/components/workspace/PeopleTab.svelte';
   import ConnectionsTab from '$lib/components/workspace/ConnectionsTab.svelte';
+  import NeedsYouTab from '$lib/components/workspace/NeedsYouTab.svelte';
 
   const tab = $derived(page.params.tab);
 
   // An unknown tab redirects rather than rendering nothing — a mistyped URL should land somewhere,
   // not on a blank page that looks like a failure.
   $effect(() => {
-    if (tab && !['agents', 'capabilities', 'labels', 'people', 'connections'].includes(tab)) {
+    if (tab && !['needs-you', 'agents', 'capabilities', 'labels', 'people', 'connections'].includes(tab)) {
       void goto('/workspace/agents', { replaceState: true });
     }
   });
 </script>
 
-{#if tab === 'capabilities'}
+{#if tab === 'needs-you'}
+  <NeedsYouTab />
+{:else if tab === 'capabilities'}
   <CapabilitiesTab />
 {:else if tab === 'labels'}
   <LabelManager />
