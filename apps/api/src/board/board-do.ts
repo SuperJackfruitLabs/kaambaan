@@ -1631,6 +1631,54 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    /**
+     * The one automatic rework this card's current stage visit has already spent, when it has.
+     *
+     * Set by `complete()` on a first completion refusal (`{ stageKey, reason, runId }`) and read by
+     * the next one: a second refusal on the same visit parks the card instead of reworking again.
+     * Cleared by the trigger below whenever the card changes stage, and by `resumeCard` — a person
+     * sending the card back is a fresh start, and so is a reviewer asking for changes (which moves
+     * the card off its review stage and back). Internal; not on `CardView`.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN completion_rework_json TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * When the card last changed state or stage — how long it has been sitting where it is.
+     *
+     * Written by a trigger rather than by each writer because there are more than twenty statements
+     * in this file that move a card, and a timestamp every one of them must remember to set is a
+     * timestamp one of them will forget. It copies the row's own `updated_at`, which every one of
+     * those statements already sets, so the trigger holds no clock of its own. NULL on a card that
+     * has not moved since this column arrived; readers fall back to `updated_at`, then `created_at`.
+     *
+     * `stale_notified_at` is the stale digest's memory, like `overdue_notified_at` is the overdue
+     * sweep's: the last time this card's owner was told it was stuck.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN state_since TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN stale_notified_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    this.sql.exec(
+      `CREATE TRIGGER IF NOT EXISTS cards_state_since AFTER UPDATE OF state, current_stage_key ON cards
+       WHEN NEW.state IS NOT OLD.state OR NEW.current_stage_key IS NOT OLD.current_stage_key
+       BEGIN
+         UPDATE cards SET
+           state_since = COALESCE(NEW.updated_at, NEW.created_at),
+           stale_notified_at = NULL,
+           completion_rework_json = CASE WHEN NEW.current_stage_key IS NOT OLD.current_stage_key
+                                         THEN NULL ELSE completion_rework_json END
+         WHERE id = NEW.id;
+       END`,
+    );
     // Only `project_id` is indexed: `projectSummary` is the one query that filters cards by it,
     // and nothing here looks cards up by `milestone_id` on its own.
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_project ON cards(project_id)`);
@@ -4693,15 +4741,11 @@ export class BoardDO extends DurableObject<Env> {
       this.recordRunCompletion(input.runId, { ...verdict, override: cardOverride !== undefined });
 
       if (!verdict.met) {
-        // Blocked, not failed (D1): the agent asserted something untrue, and a retry loop would
-        // burn budget re-asserting it. A person should see this.
+        // Blocked, not failed (D1): the agent asserted something untrue. The run says so whatever
+        // happens to the card next.
         this.sql.exec(`UPDATE runs SET outcome = 'blocked' WHERE id = ?`, input.runId);
-        // Named, not just recorded on the run: the whole point of D1 is that a person
-        // sees this, and a reader who has to open the run to find out what was missing
-        // is a reader who will not.
-        this.parkForHuman(cardId, { reason: 'blocked', detail: `this stage was not finished: ${verdict.reason}` });
         const reason = `this stage was not finished: ${verdict.reason}`;
-        this.emit('card.blocked', { cardId, reason });
+        this.reworkOrPark(cardId, card.currentStageKey, input.runId, verdict.reason ?? 'the completion requirement was not met', input.handoff);
         // On the card's own replay, as an `error`: a refusal a reader has to reconstruct from
         // run outcomes is a refusal most readers will miss.
         this.sql.exec(
@@ -5095,6 +5139,64 @@ export class BoardDO extends DurableObject<Env> {
       this.now(),
       cardId,
     );
+  }
+
+  /**
+   * A run's handoff failed its stage's completion requirement: rework once, then park.
+   *
+   * The first refusal on a visit to a stage sends the card straight back to `submitted` on the same
+   * stage, with feedback naming exactly what was missing — written into the handoff the next claim
+   * and the run context carry, which is the path a reviewer's "request changes" already uses. The
+   * board's input to the stage is kept, so the rework still has its brief.
+   *
+   * Three things bound it, so it cannot loop:
+   *  - one rework per visit (`completion_rework_json`): a second refusal parks the card `blocked`,
+   *    naming both refusals, because by then the agent has been told once and a third try is
+   *    budget spent re-asserting the same thing — the reason D1 refused to retry at all;
+   *  - the rework is an attempt (`failure_count`), so the circuit breaker still counts it: a refusal
+   *    after a crash, or a crash after a rework, trips the breaker exactly as two crashes would;
+   *  - only a person resets either — `resumeCard`, or a reviewer's request-changes, which moves
+   *    the card through a review stage and so starts a new visit.
+   */
+  private reworkOrPark(cardId: string, stageKey: string, runId: string, reason: string, refusedHandoff: JsonValue | undefined): void {
+    const row = this.getCardRow(cardId);
+    if (!row) return;
+    const spent = row.completion_rework_json
+      ? (JSON.parse(row.completion_rework_json as string) as { stageKey: string; reason: string; runId: string })
+      : null;
+    const failures = Number(row.failure_count) + 1;
+    this.sql.exec(`UPDATE cards SET failure_count = ? WHERE id = ?`, failures, cardId);
+
+    if (spent && spent.stageKey === stageKey) {
+      const detail = `this stage was not finished twice — first: ${spent.reason}; then, after one automatic rework: ${reason}`;
+      this.parkForHuman(cardId, { reason: 'blocked', detail });
+      this.emit('card.blocked', { cardId, reason: detail });
+      this.notify('blocked', cardId, detail);
+      return;
+    }
+    if (failures >= CIRCUIT_BREAKER_LIMIT) {
+      const detail = `this stage was not finished: ${reason}`;
+      this.parkForHuman(cardId, { reason: 'repeated-failure', failureCount: failures, detail });
+      this.emit('card.blocked', { cardId, reason: detail, failures, brokeCircuit: true });
+      this.notify('failed', cardId, detail);
+      return;
+    }
+
+    const prior = this.parseHandoff((row.handoff_json as string | null) ?? null);
+    const feedback = `Your handoff was refused: ${reason}. Finish this stage again and include what is missing.`;
+    const carried = { feedback, refusedHandoff: refusedHandoff ?? null };
+    const merged = prior && typeof prior === 'object' && !Array.isArray(prior) ? { ...prior, ...carried } : carried;
+    this.sql.exec(
+      `UPDATE cards SET state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL, needs_human_json = NULL,
+              handoff_json = ?, completion_rework_json = ?, updated_at = ? WHERE id = ?`,
+      JSON.stringify(merged),
+      JSON.stringify({ stageKey, reason, runId }),
+      this.now(),
+      cardId,
+    );
+    this.emit('card.rework_requested', { cardId, stageKey, runId, reason, failures });
+    this.notify('rework', cardId, `Sent back for one automatic rework: ${reason}`);
+    this.notifyWorkAvailable(cardId);
   }
 
   /** End the current attempt on a card: bump failures and either re-queue or trip the breaker. */

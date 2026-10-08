@@ -69,10 +69,17 @@ describe('a stage that requires something of the handoff', () => {
     const res = await complete(boardId, runId, leaseEpoch, { summary: '## Published — all good!' });
     expect(res.status).toBe(200);
 
-    const card = await cardOf(boardId);
     // The card stays where it was. A board that advanced here would be repeating the exact lie
-    // this exists to stop: `published`, over work that did not happen.
-    expect(card).toMatchObject({ currentStageKey: 'publish', state: 'input-required' });
+    // this exists to stop: `published`, over work that did not happen. The first refusal is sent
+    // back for one automatic rework (completion-rework.test.ts) …
+    expect(await cardOf(boardId)).toMatchObject({ currentStageKey: 'publish', state: 'submitted' });
+
+    // … and a second refusal parks it for a person.
+    const again = await (await SELF.fetch(`https://api.test/v1/boards/${boardId}/claims`, {
+      method: 'POST', headers: { ...T, 'X-Agent-Id': 'agt_coder' }, body: JSON.stringify({ capabilities: ['code'] }),
+    })).json() as { runId: string; leaseEpoch: number };
+    expect((await complete(boardId, again.runId, again.leaseEpoch, { summary: 'really, all good' })).status).toBe(200);
+    expect(await cardOf(boardId)).toMatchObject({ currentStageKey: 'publish', state: 'input-required' });
   });
 
   it('records the run as blocked, not completed, so the trace does not lie either', async () => {
