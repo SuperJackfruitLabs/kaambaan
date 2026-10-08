@@ -20,6 +20,24 @@ Do not simulate branching or lane skipping inside the current single sequential 
 
 The current Marketing board remains unchanged during design and initial implementation. Its two canaries and their gates remain untouched. Operators create the three boards from reviewed definitions, route only new work to them, and decide later whether the legacy board is archived or retained as intake history.
 
+### Selected approach, end to end
+
+| Path | Intake and selection | Production and review | Human authority | Execution and terminal evidence |
+|---|---|---|---|---|
+| LinkedIn | Weekly planning cards plus suitable event nominations; Melissa selects only stories that warrant LinkedIn | Quill writes LinkedIn-native copy, Artistic Lyra supplies optional media, Echo checks claims and sources | Rakesh approves the LinkedIn revision only | Rakesh/operator publishes manually; the card is not complete until a manually supplied public permalink and timestamp are recorded |
+| X | Shipped outcome, useful demo, decision, lesson, or verified failure creates an event card; Melissa selects angle, audience, sequence, or `no_publication` | Quill writes one post or an ordered thread, Lyra supplies optional media, Echo checks claims, deterministic freeze produces the revision/digest | Rakesh approves the rendered X payload for account `99980855` | Gate approval advances to `x-publish`; `work.available` accelerates pickup and the normal AgentPod claim poll is the fallback, so no second manual dispatch is required. The deterministic publisher completes only after public read-back |
+| Community | Scheduled or event-driven collection creates evidence work | Anna records source-linked findings, reply drafts, and product/docs recommendations | Human review is terminal and grants no publishing authority | No outbound capability exists. A future reply must become a new channel-specific card with its own exact target/text approval and supported publisher |
+
+The shared join key is a canonical `storyId`/event ID, not a shared mutable content record. Cards carry the same project ID and related-card links, allowing one story to have independently owned LinkedIn, X, and feedback states without making one channel's approval authorize another.
+
+### Conflicts resolved from earlier stages
+
+- The requirement for automatic post-approval X execution does **not** authorize branching or a direct gate webhook that writes to X. The supported resolution is ordinary gate advancement to the next ordered stage, followed by the existing atomic claim path; push is only an accelerator.
+- The desire for one cross-channel calendar does **not** justify one superset board. The risk review favored three isolated linear boards and one project-linked reporting view because current SuperPipeline routing is next-stage only.
+- Tuesday/Friday are retained only as proposed LinkedIn planning slots. No schedule is installed until Rakesh/operator selects it.
+- `xurl whoami` established read identity only. It is not treated as proof of write scope, credential isolation, or production readiness.
+- The previous risk review is controlling where convenience conflicts with safety: live X remains paused until mandatory controls M1–M9, the no-write suite, operator policy choices, credential review, and a separately approved live canary all pass.
+
 ## 2. Goals and invariants
 
 ### Goals
@@ -134,6 +152,23 @@ Ordered stages:
 4. `review-feedback` — human-owned, ungated terminal lane or approval gate if product/docs owners request one.
 
 Output fields: source URL/post ID, author as publicly observed, captured timestamp, verbatim excerpt, theme, confidence, affected product/docs area, recommendation, owner, and optional reply draft. `publicationIntent` is fixed to `none`. A reply can leave this board only by creating a new, separately approved publication card whose payload names the exact target and text; that future route is not part of this design. DMs are never generated as actions.
+
+### 5.4 Roster and stage prerequisites
+
+The labels below are proposed capability identifiers. Before board creation, the operator must either confirm that the exact identifier already exists on the named existing agent or substitute the estate's canonical identifier in both the board definition and roster grant. A board must not open intake while any capability stage has zero eligible enabled agents.
+
+| Existing identity | Proposed capability | Boards/stages | Required before intake |
+|---|---|---|---|
+| Melissa | `marketing-strategy` | LinkedIn selection; X triage/selection/sequencing | Enabled AgentPod roster entry; claim credential limited to the relevant boards/stages |
+| Quill | `social-copy` | LinkedIn/X copy; deterministic freeze invocation | Enabled roster entry; no social credential or external-write tool |
+| Artistic Lyra | `artistic-media` | Optional LinkedIn/X media preparation | Enabled roster entry; immutable media store access; provenance/checksum/alt-text output; no social credential |
+| Echo | `claims-review` | LinkedIn/X evidence review | Enabled roster entry; read-only source access; no social credential |
+| Anna | `community-research` | All Community agent-owned stages | Enabled roster entry with no outbound messaging/social tools |
+| Existing coordinator | `x-publish` | X `publish-and-verify-x` only | Grant only after no-write acceptance; separate least-privilege SuperPipeline run principal; station-scoped X credential; durable ledger; default-paused account writer |
+| Rakesh | human owner/gate decider | Channel-specific approvals and manual LinkedIn publication | Human principal; gate authority scoped to the intended board; never reused by an agent or publisher |
+| Product/docs owner | human owner | Community terminal review | Human principal only; no implied reply/publication authority |
+
+Board validation must prove stage order, `ownerKind`, capability string, gate placement, WIP/concurrency, and eligible roster count from the reviewed definition. The three definitions and roster diff are review artifacts; applying them is a separate operator-owned card.
 
 ## 6. Canonical approved payload
 
@@ -302,6 +337,24 @@ Controls are separate and explicit:
 
 LinkedIn reminders are derived from open project-linked cards: draft overdue, awaiting approval, approved-awaiting-manual-publish, and published-awaiting-permalink. Reminder delivery does not modify approval or publication state.
 
+## 9A. Risk-review resolution: mandatory controls M1–M9
+
+These controls are release blockers, not recommendations. They incorporate the preceding risk review's ordered concerns (irreversible wrong writes, approval-byte mismatch, duplicates/partial threads, timing races, credential scope, route bypass, false verification, unsafe content, and audit loss).
+
+| Control | Requirement | Release evidence |
+|---|---|---|
+| M1 — Route isolation | Three new linear boards; X gate immediately precedes the publisher; current board/canaries are unchanged; Community has no outbound stage or tool | Reviewed board-definition and roster diffs plus synthetic wrong-board/channel claims |
+| M2 — Exact approval binding | One versioned canonicalizer produces the bytes shown at the gate and checked by the executor; account/channel/revision/digest/text/media/targets/timing are covered; every covered edit invalidates approval | Golden canonicalization fixtures and mutation/cross-channel tests |
+| M3 — Least authority | Separate human, board-admin, claim/run, and station X principals; no human/admin reuse; explicit account `99980855`; secret redaction and revoke/rotate runbook | Principal/grant inventory, startup/per-write `whoami`, redaction test, credential-owner sign-off |
+| M4 — Durable single writer | Transactional intent/step/attempt ledger, unique constraints, account lock, monotonic fence, write-ahead `write_started`, concurrency one | Parallel-claim, lease-loss, crash, constraint, backup/restore, and integrity tests |
+| M5 — Reconcile before retry | Returned ID first, then bounded exact recent-output search; zero or multiple matches block; verified thread prefixes are never replayed | Ambiguous timeout and partial-thread fixtures with an assertion that no second POST precedes reconciliation |
+| M6 — Public verification | Read by public ID and verify author ID, exact full text under versioned equivalence rules, media, targets, order/relationship, and permalink; POST response alone never completes | Read-back contract fixtures and persisted public IDs/permalinks; unknown schema safely blocks |
+| M7 — Pause and timing | Global/account/intent pause plus credential revoke; pause/expiry/not-before/fence rechecked immediately before every item; schedule only if approved | Pause/kill, stale approval, scheduled timing, and narrow in-flight-race runbook tests |
+| M8 — Editorial safety | Echo source map, Lyra rights/provenance/checksum/alt text, legal/privacy escalation, duplicate/flood/budget policy; no quota-filling | Missing-evidence/rights tests, policy fixtures, named human owners, and explicit residual-risk acceptance |
+| M9 — Staged release and audit | No-write suite first; operator values chosen; live writer stays paused; one separately approved canary; append-only evidence and board/public reconciliation | Signed readiness checklist and live canary package containing gate/revision/digest, intent/step/attempt IDs, public read-back, and pause drill |
+
+If any mandatory control is missing or its evidence is inconclusive, the supported fallback is manual X dispatch from the exact approved payload while the automated writer remains paused. This fallback is not production acceptance because it requires a second human dispatch.
+
 ## 10. Data shown on cards
 
 Every channel card records or links:
@@ -388,6 +441,31 @@ A human supplies and approves the exact test copy, media, account, targets, timi
 - pause/kill drill result.
 
 No success claim is allowed if public read-back is unavailable or mismatched.
+
+### Checkable completion criteria
+
+Each statement below must be answered **yes** with attached evidence before the corresponding implementation/cutover card can complete.
+
+1. **AC-01 — Isolation:** Do reviewed definitions create three project-linked ordered boards, leave `brd_e247f164e060443f` and both existing canary gates byte-for-byte/configuration-identical, and give Community no outbound tool or stage?
+2. **AC-02 — LinkedIn cadence:** Does the LinkedIn report compute an `Asia/Calcutta` week, target exactly two selective manual posts, expose due-draft/approval/reminder/permalink states, and treat Tuesday/Friday as unset proposals until a human selects them?
+3. **AC-03 — No LinkedIn writer:** Can a test prove that no LinkedIn API credential, publication client, or automatic publication call is present and that approval alone cannot mark a post published?
+4. **AC-04 — Event-driven X:** Can distinct approved events produce multiple same-day X intents when policy spacing permits, with neither a one-per-day ceiling nor a quota-filling path, while duplicate/flood/rate/budget controls still block unsafe bursts?
+5. **AC-05 — Supported ownership:** Does every agent-owned stage have at least one enabled eligible existing specialist and every human stage/gate name its human owner, with the exact stage-to-roster matrix captured as a reviewed artifact?
+6. **AC-06 — Immutable approval:** For the same canonical bytes, do gate renderer and executor produce the same `social-publish/v1` digest; and does mutating account, channel, item text/order, media ref/checksum/alt text/order, reply/quote target, timing, or expiry force revision `N+1` and a fresh gate?
+7. **AC-07 — Channel separation:** Do LinkedIn approval replay, wrong-board payload, wrong X account, unknown schema, missing gate, expired gate, and non-approving decision each make zero external write calls?
+8. **AC-08 — Automatic claim:** After the correct gate is approved, does the card advance to the X publisher and get claimed through push or normal polling without a second manual dispatch, while the atomic claim remains the authority?
+9. **AC-09 — Pause and time:** Do global/account/intent pause, kill generation, approval expiry, and `notBefore` checks run immediately before every item write; and is scheduled release impossible unless the signed payload says `scheduled`?
+10. **AC-10 — Durable deduplication:** Under duplicate delivery, two parallel claims, process crash, and lease loss, is there one intent per `(channel, account ID, digest)`, one step per item index, and no duplicate POST?
+11. **AC-11 — Ambiguous outcome:** After a possible-send timeout, do all subsequent actions remain read-only until exactly one public match is verified or a human resolves the block, with zero blind write retries?
+12. **AC-12 — Partial thread:** After a failure at item `N`, does recovery verify the contiguous public prefix and issue at most the first verified-unpublished item, deriving its reply target from verified item `N-1` and never replaying the prefix?
+13. **AC-13 — Error classes:** Do 401/403, wrong account, billing/cost refusal, media rejection, 429, 5xx-before-proven-send, and timeout-after-possible-send follow the failure table exactly, with bounded retry counts and no automatic retry of an ambiguous POST?
+14. **AC-14 — Public truth:** Before success, does read-back produce exact post IDs/permalinks and verify author `99980855`, full ordered text under the versioned equivalence rules, media, reply/quote targets, and thread relationships; and does any mismatch/unavailable property prevent completion?
+15. **AC-15 — Feedback boundary:** Does Anna's result contain source, excerpt, analysis, recommendation, and optional exact reply draft while producing no publisher intent, DM, reply, quote, like, repost, or follow call?
+16. **AC-16 — Traceability:** Does every terminal result retain project/card/story links, sources, channel decision, revision/digest, gate/actor, intent/step/attempt IDs, failure class or verification evidence, and public/manual URLs without secrets?
+17. **AC-17 — Recurrence:** Can tests prove recurrence creates only planning/collection cards and cannot create an approval, resolve a gate, schedule an unapproved X release, or mark a platform publication complete?
+18. **AC-18 — Mock-first acceptance:** Does the no-write suite cover every scenario in the table above and pass before any write credential is enabled, and does live mode remain paused until a human separately approves the exact canary payload?
+19. **AC-19 — Live canary:** For the separately approved canary, is there one automatic write after approval and evidence for gate/actor/revision/digest, account, intent/step/attempt, response class, exact public read-back, reference attachment, and pause/kill drill?
+20. **AC-20 — Operator decisions:** Before cutover, are accountable owners plus approval TTL, duplicate window, spacing/burst, retry, budget, retention, manual-account-use coordination, credential revoke/rotate, and LinkedIn slots explicitly recorded rather than inferred from defaults?
 
 ## 14. Scale assumptions and change thresholds
 
