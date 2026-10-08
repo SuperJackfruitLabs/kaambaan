@@ -80,6 +80,36 @@ silently continuing.
 Where there is no cap, the card shows what it has spent and nothing is drawn as a proportion of a
 number you never set.
 
+## The spec
+
+A card's brief is its **spec**: a JSON object of whatever fields its author wants. Three of them
+have a meaning the card drawer knows, and are shown in their own sections:
+
+| field | shape | shown as |
+|---|---|---|
+| `description` | string | the card's description, at the top of the drawer |
+| `plan` | `[{ "t": "step", "done": false }]` | the agent's plan, as a checklist with a progress bar |
+| `acceptanceCriteria` | string array | a bulleted list |
+
+**Every other field is shown under Details**, below them. Keys are spelled out as words
+(`portraitDecision` reads "Portrait decision"), lists become bullets, nested objects become
+labelled groups, and `http`/`https` URLs become links. Details starts open when the card has no
+description, and collapsed when it is long and a description is already above it.
+
+**The agent working the card receives the whole spec**, not only the fields the drawer has a
+section for — so what Details shows is what the agent was told. Start every spec with a
+plain-language `description`: it is the first thing a person reading the card sees, and the one
+sentence an agent can act on before it has parsed the rest.
+
+```json
+{
+  "description": "Write the release notes for 2.4 and link them from the changelog.",
+  "acceptanceCriteria": ["Notes cover every merged PR", "Changelog links the notes"],
+  "audience": "people upgrading from 2.3",
+  "sources": ["https://example.com/milestone/2.4"]
+}
+```
+
 ## References
 
 A card can carry links — a GitHub issue, a pull request, a document, any URL. Agents attach them

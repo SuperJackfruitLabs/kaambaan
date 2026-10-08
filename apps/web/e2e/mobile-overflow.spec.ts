@@ -82,3 +82,45 @@ test('the page itself never scrolls sideways on a phone', async ({ page, request
   }));
   expect(horizontal.scrollWidth).toBeLessThanOrEqual(horizontal.clientWidth + 2);
 });
+
+test('spec fields under Details wrap instead of overflowing, and are all visible', async ({ page, request }) => {
+  const board = await (
+    await request.post(`${API}/v1/boards`, { headers: TENANT, data: { name: 'Overflow demo 3', stages: PIPELINE } })
+  ).json();
+  const card = await (
+    await request.post(`${API}/v1/boards/${board.boardId}/cards`, {
+      headers: TENANT,
+      data: {
+        title: 'Wide spec',
+        ownerUserId: 'usr_a',
+        spec: {
+          role: 'Release reviewer',
+          requirements: ['Reads every diff', UNBREAKABLE],
+          portraitDecision: { reference: `https://images.example.com/${'a'.repeat(120)}.png`, approved: false },
+        },
+      },
+    })
+  ).json();
+
+  await page.setViewportSize(PHONE);
+  await page.goto(`/b/${board.boardId}/c/${card.card.id}`);
+
+  const details = page.getByTestId('spec-details');
+  await expect(details).toBeVisible();
+  // No description, so the Details section is the brief and starts open.
+  await expect(details.getByText('Release reviewer')).toBeVisible();
+  await expect(details.getByText('Portrait decision')).toBeVisible();
+  await expect(details.getByRole('link')).toHaveAttribute('href', /^https:\/\/images\.example\.com\//);
+
+  const over = await page.evaluate(() => {
+    const body = document.querySelector('.dw-body');
+    let worst = 0;
+    for (const el of body?.querySelectorAll('*') ?? []) {
+      if (el.tagName === 'PRE') continue;
+      const d = el.scrollWidth - el.clientWidth;
+      if (el.clientWidth > 0 && d > worst) worst = d;
+    }
+    return worst;
+  });
+  expect(over).toBeLessThanOrEqual(2);
+});

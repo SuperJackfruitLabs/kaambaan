@@ -43,7 +43,7 @@ removed.
 
 ## Card
 
-The durable unit of work. A card has a title, an optional spec, a priority, a due date, labels, an
+The durable unit of work. A card has a title, an optional [spec](/use/cards/#the-spec), a priority, a due date, labels, an
 accountable human owner, and whatever references are attached to it. It may belong to a project and
 one of that project's milestones, and it may be linked to other cards.
 

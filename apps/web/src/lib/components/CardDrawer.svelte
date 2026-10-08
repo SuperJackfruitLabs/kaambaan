@@ -38,6 +38,7 @@
   import { crossBoardNotice, submitAddBlocker, linkRefusalSentence, type LinkKindChoice } from '$lib/components/add-blocker';
   import { resolveProjectName } from '$lib/components/plan/project-lookup';
   import { milestonesForProject, assignmentPatch } from '$lib/components/milestone-picker';
+  import SpecDetails from '$lib/components/card/SpecDetails.svelte';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -1229,6 +1230,12 @@
             </ul>
           </section>
         {/if}
+
+        <!--
+          Every other spec field (role, requirements, nested decisions…). The agent receives the
+          whole spec; the person reviewing the card should be able to read all of it too.
+        -->
+        <SpecDetails spec={card.spec} hasDescription={!!card.spec?.description} />
 
         <!--
           Project / milestone (Step 3) — a card's cross-board membership. `currentProjectName` and
