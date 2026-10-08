@@ -52,6 +52,13 @@ The verb comes first. Flags may be written `--name value` or `--name=value`, any
 | [`supi archive`](/reference/cli/cards/#supi-archive) | archive a card, so the "show archived" filter has something to show |
 | [`supi log`](/reference/cli/cards/#supi-log) | what an agent did on a card, and its handoff |
 
+### Comments on a card
+
+| command | what it does |
+|---|---|
+| [`supi comment`](/reference/cli/comments/#supi-comment) | add a comment to a card |
+| [`supi comments`](/reference/cli/comments/#supi-comments) | read a card's comments |
+
 ### Approval gates
 
 | command | what it does |

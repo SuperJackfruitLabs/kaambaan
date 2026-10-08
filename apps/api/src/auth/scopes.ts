@@ -95,6 +95,17 @@ export function requiredScope(
     // bounds it is not this function but the queuer's own `mayDispatch`, recorded on the card.
     return method === 'POST' ? 'queue' : SCOPE_FORBIDDEN;
   }
+  /**
+   * A card's comments. Reading the thread is a `read`. Posting is `run`, because the only agent that
+   * may post is the one whose live run holds the card (`addComment` checks the run) — a remark from
+   * the worker on the work. Deleting is a person's act alone.
+   */
+  if (/^cards\/[^/]+\/comments$/.test(rest)) {
+    if (method === 'GET') return 'read';
+    if (method === 'POST') return 'run';
+    return SCOPE_FORBIDDEN;
+  }
+  if (/^cards\/[^/]+\/comments\/[^/]+$/.test(rest)) return SCOPE_FORBIDDEN;
   if (/^cards\/[^/]+\/(activities|attempts|estimate)$/.test(rest)) {
     return method === 'GET' ? 'read' : SCOPE_FORBIDDEN;
   }

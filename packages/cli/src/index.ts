@@ -27,7 +27,7 @@ import { basename, dirname, join } from "node:path";
 import { BOARD_TEMPLATES, boardTemplate, capabilityTag, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, clearSupiCredentials, describeCredential, expired, inspect, refusalHint, resolveCredential, saveSupiDevice, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
 import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
-import { renderBoards, renderBoard, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
+import { renderBoards, renderBoard, renderComments, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
 import { flag, flags, isPlainObject, mergeSpec, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 import { findCommands, renderCommandHelp, renderUsage } from "./commands.ts";
@@ -432,6 +432,29 @@ async function main(argv: string[]): Promise<void> {
     case "log": {
       if (!pos[0] || !pos[1]) fail("usage: supi log <boardId> <cardId>");
       out(await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/activities`), renderLog);
+      return;
+    }
+
+    /**
+     * A card's comment thread: `comment` adds to it, `comments` reads it.
+     *
+     * The body is every remaining word, like `create-card`'s title, or stdin for `-` — so a
+     * multi-line note, a list or a pasted log goes in as written. Who may post is the server's
+     * call: a person with board read access, or the agent whose live run holds this card.
+     */
+    case "comment": {
+      if (!pos[0] || !pos[1]) fail("usage: supi comment <boardId> <cardId> <text|->");
+      const text = pos[2] === "-" && pos.length === 3 ? readText("-") : pos.slice(2).join(" ").trim();
+      if (!text) fail("Nothing to say.", "  supi comment <boardId> <cardId> <text>   (or - to read it from stdin)");
+      out(
+        await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/comments`, { method: "POST", body: JSON.stringify({ body: text }) }),
+      );
+      return;
+    }
+
+    case "comments": {
+      if (!pos[0] || !pos[1]) fail("usage: supi comments <boardId> <cardId>");
+      out(await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/comments`), renderComments);
       return;
     }
 

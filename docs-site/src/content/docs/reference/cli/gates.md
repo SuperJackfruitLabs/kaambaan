@@ -3,7 +3,7 @@ title: "Approval gates"
 description: "supi gates, approve, reject and request-changes."
 sidebar:
   label: "Gates"
-  order: 5
+  order: 6
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

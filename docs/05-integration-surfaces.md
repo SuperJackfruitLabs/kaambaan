@@ -111,6 +111,8 @@ true while `ORG_PLANE_ISSUER` is unset. With it set (`apps/api/src/auth/org-plan
 | `superpipeline_block` / `superpipeline_fail` | `runId`, `leaseEpoch`, `reason` *(required, non-empty)* | `POST …/runs/:runId/{block,fail}` *(REST defaults `reason` to `''`)* |
 | `superpipeline_release` | `runId`, `leaseEpoch`, `reason?` | `POST …/runs/:runId/release` *(REST drops `reason`)* |
 | `superpipeline_split_card` | `cardId`, `titles[]` | `POST …/cards/:cardId/split` *(human-auth; the MCP arm additionally requires the calling agent to hold the card's run)* |
+| `superpipeline_list_comments` | `runId` | `GET …/cards/:cardId/comments` *(the MCP arm derives the card from the run)* |
+| `superpipeline_post_comment` | `runId`, `body` | `POST …/cards/:cardId/comments` *(`run`; the agent's live run must hold the card)* |
 
 `{tenant, agentId, capabilities}` always come from the token, never from tool arguments.
 

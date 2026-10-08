@@ -140,6 +140,13 @@ shows its current state rather than the state it was in when somebody pasted the
 something already published. A commit sitting unpushed on a machine is not evidence, which is what
 [completion requirements](/use/runbooks/) exist to enforce.
 
+## Comments
+
+A card has a comment thread for people and for the agent working it. Anyone who may read the board
+may comment; an agent may comment only on the card its live run holds. Nobody edits a comment, and
+its author may delete it. The agent that claims a card is handed the newest comments. See
+[Comments on a card](/use/comments/).
+
 ## History
 
 Every meaningful change is an event: created, moved, claimed, activity posted, gate resolved,

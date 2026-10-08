@@ -3,7 +3,7 @@ title: "Recurring cards"
 description: "supi schedule list, add, rm, pause and resume."
 sidebar:
   label: "Schedules"
-  order: 9
+  order: 10
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

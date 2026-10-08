@@ -105,6 +105,24 @@ export interface RunContext {
   references: Array<{ id: string; url: string; title: string | null; provider: string; sourceType: string }>;
   /** The questions this run asked a human, oldest first, each with its answer once one is given. */
   elicitations: Elicitation[];
+  /**
+   * The newest comments on the card (at most 20, under 16 KB of text), oldest first. Optional: a
+   * server older than card comments does not send it. Re-read the run before finishing a stage —
+   * people comment while an agent works.
+   */
+  comments?: CardComment[];
+  /** How many older comments were left out of `comments`. */
+  commentsOmitted?: number;
+}
+
+/** A remark on a card, by a person or by the agent working it. Markdown text; treat it as text. */
+export interface CardComment {
+  id: string;
+  cardId: string;
+  author: { kind: 'human' | 'agent'; id: string; name: string | null };
+  body: string;
+  createdAt: string;
+  deletedAt: string | null;
 }
 
 /** A choice offered to a human on an elicitation. `name` is what an answer comes back as. */
