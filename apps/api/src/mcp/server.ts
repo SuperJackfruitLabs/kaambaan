@@ -9,7 +9,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { registerSuperpipelineTools, type McpAuth } from './tools';
 import { boardStub } from '../board/stub';
-import { listBoards } from '../db/catalog';
+import { agentNamesFor, listBoards } from '../db/catalog';
 import type { Env } from '../env';
 
 const SERVER_INFO = { name: 'superpipeline', version: '0.1.0' };
@@ -29,6 +29,7 @@ The loop:
    - superpipeline_submit_for_review — at a gated stage; opens a human approval gate and stops.
    - superpipeline_block — you need input to proceed.
    - superpipeline_fail / superpipeline_release — give up / hand the card back; it becomes claimable again.
+   Before finishing, call superpipeline_list_comments: people can comment on the card while you work, and a comment may change what "done" means. Reply with superpipeline_post_comment when one asks you something.
 
 A STALE_LEASE error means you lost the lease (it timed out or was reassigned) — stop working that run and claim fresh work.`;
 
@@ -38,6 +39,7 @@ export async function handleMcpRequest(request: Request, env: Env, auth: McpAuth
     auth,
     boardStub: (boardId) => boardStub(env, auth.tenantId, boardId),
     listBoards: () => listBoards(env.DB, auth.tenantId),
+    agentName: async () => (await agentNamesFor(env.DB, auth.tenantId, [auth.agentId])).get(auth.agentId) ?? null,
   });
 
   const transport = new WebStandardStreamableHTTPServerTransport({

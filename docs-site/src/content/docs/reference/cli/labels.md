@@ -3,7 +3,7 @@ title: "Labels"
 description: "supi label list, label add and label rm."
 sidebar:
   label: "Labels"
-  order: 7
+  order: 8
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

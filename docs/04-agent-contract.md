@@ -210,6 +210,8 @@ The same verb on two surfaces — full detail in [05 — Integration Surfaces](.
 | `complete` | `superpipeline_complete` | `POST /v1/boards/:id/runs/:runId/complete` |
 | `block` / `release` / `fail` | `superpipeline_block` / `_release` / `_fail` | `POST /v1/boards/:id/runs/:runId/{block,release,fail}` |
 | *(split a card into children)* | `superpipeline_split_card` *(not read-only, not idempotent)* | `POST /v1/boards/:id/cards/:cardId/split` *(human-auth)* |
+| *(read the card's comments)* | `superpipeline_list_comments` *(read-only)* | `GET /v1/boards/:id/cards/:cardId/comments` *(`read`)* |
+| *(comment on the card)* | `superpipeline_post_comment` *(not idempotent)* | `POST /v1/boards/:id/cards/:cardId/comments` *(`run`; the agent's live run must hold the card)* |
 
 `superpipeline_split_card` is the one agent verb that **creates** work rather than progressing it: it
 turns a markdown checklist in a card's body into one child card per line. It is gated to the card the

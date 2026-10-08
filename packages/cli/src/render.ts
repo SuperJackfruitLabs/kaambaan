@@ -154,3 +154,30 @@ export function renderLog(value: unknown): string {
   }
   return lines.join("\n");
 }
+
+/**
+ * A card's comment thread, oldest first. Each body keeps its own line breaks, indented under its
+ * author — a comment is prose a person wrote, and flattening it would bury a list or a pasted
+ * command. It is printed as the text it is; nothing in it is interpreted.
+ */
+export function renderComments(value: unknown): string {
+  const comments = list<{
+    author?: { kind?: string; id?: string; name?: string | null };
+    body?: string;
+    createdAt?: string;
+    deletedAt?: string | null;
+  }>(value, "comments");
+  if (comments.length === 0) return "No comments on this card. `supi comment <boardId> <cardId> <text>` adds one.";
+  const blocks: string[] = [];
+  for (const c of comments) {
+    const who = `${c.author?.name || c.author?.id || "?"} (${c.author?.kind === "agent" ? "agent" : "person"})`;
+    const when = typeof c.createdAt === "string" ? c.createdAt.slice(0, 16).replace("T", " ") : "";
+    if (c.deletedAt) {
+      blocks.push(`${when}  ${who}  (deleted)`);
+      continue;
+    }
+    const body = (c.body ?? "").split("\n").map((l) => (l ? `${PAD}${l}` : "")).join("\n");
+    blocks.push(`${when}  ${who}\n${body}`);
+  }
+  return blocks.join("\n\n");
+}

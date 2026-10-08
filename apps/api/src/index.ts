@@ -48,7 +48,7 @@ import { handleHubRoute } from './auth/hub-oauth';
 import { handlePlaneSignInRoute } from './auth/plane-signin';
 import { entitlementRefusal } from './auth/org-plane-resolve';
 import { orgPlaneMode } from './auth/org-plane';
-import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor } from './db/catalog';
+import { recordBoard, listBoards, listAllBoards, renameBoard, updateBoardStages, deleteBoard, listAgents, createAgent, updateAgent, createAgentToken, revokeAgentToken, deleteAgent, setAgentExternalMapping, findAgentByExternal, agentBelongsToTenant, setTenantExternalMapping, setTenantForgeHost, tenantById, recordAgentQueue, countBoardsComposedToday, principalIdsFor, hubSubjectsFor, agentNamesFor } from './db/catalog';
 import { authorizeAgentQueue } from './auth/agent-queue';
 import { stagePatchRefusal } from './auth/scopes';
 import {
@@ -190,7 +190,15 @@ function statusForCode(code: BoardErrorCode): number {
     // never succeed unless the caller changes it, unlike the conflict codes above.
     case 'TOO_MANY_CHILDREN':
     case 'NOTHING_TO_SPLIT':
+    case 'INVALID_COMMENT':
       return 400;
+    case 'COMMENT_NOT_FOUND':
+      return 404;
+    // Both understood and permanently refused for THIS caller: someone else's comment, or a card
+    // the agent's run does not hold.
+    case 'NOT_COMMENT_AUTHOR':
+    case 'NO_RUN_ON_CARD':
+      return 403;
   }
 }
 
@@ -1782,6 +1790,9 @@ const worker = {
             /^cards\/[^/]+$/.test(rest) ||
             /^cards\/[^/]+\/(activities|attempts|estimate)$/.test(rest))) ||
           (request.method === 'POST' && rest === 'cards') ||
+          // A card's comment thread: read on `read`, posted to on `run` — and then only by the agent
+          // whose live run holds that card, which the board checks (`addComment`).
+          ((request.method === 'GET' || request.method === 'POST') && /^cards\/[^/]+\/comments$/.test(rest)) ||
           // `plan`: rearranging work that already exists. `requiredScope` decides which of these
           // needs which scope, and refuses the methods none of them may use.
           (request.method === 'PATCH' && /^cards\/[^/]+$/.test(rest)) ||
@@ -1850,8 +1861,10 @@ const worker = {
       // board, only about what its recipient has already seen. A viewer who was assigned a card
       // receives notifications for it, and being unable to clear them would leave a badge they
       // can never dismiss.
+      // Commenting is the other exception, deliberately: a comment is a remark about the work, not a
+      // change to it, so anyone who may read the board may post one (and delete their own).
       const needed: Capability =
-        request.method === 'GET' || rest.startsWith('notifications/')
+        request.method === 'GET' || rest.startsWith('notifications/') || /^cards\/[^/]+\/comments(\/[^/]+)?$/.test(rest)
           ? 'read'
           : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles' || rest.startsWith('schedules')
             ? 'manage'
@@ -2395,6 +2408,47 @@ const worker = {
         await deleteExternalLinksForCard(env.DB, tenantId, cardMatch[1]!);
         return new Response(null, { status: 204 });
       }
+
+      // GET /v1/boards/:id/cards/:cardId/comments — the thread · POST — add to it.
+      //
+      // A person posts as themselves. An agent posts as itself, and only while its live run holds
+      // this card (`NO_RUN_ON_CARD` otherwise) — the scope gate above already required `run` for
+      // the POST and `read` for the GET. There is no PATCH: nobody edits a comment.
+      const commentsMatch = rest.match(/^cards\/([^/]+)\/comments$/);
+      if (commentsMatch && request.method === 'GET') {
+        const result = await stub.listComments(commentsMatch[1]!);
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ comments: result.value });
+      }
+      if (commentsMatch && request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { body?: unknown } | null;
+        if (!body || typeof body !== 'object' || typeof body.body !== 'string') {
+          return Response.json({ error: { code: 'INVALID_COMMENT', message: 'send { "body": "<text>" }' } }, { status: 400 });
+        }
+        let author: { kind: 'human' | 'agent'; id: string; name: string | null };
+        if (agent) {
+          if (!agent.agentId) {
+            return Response.json({ error: { code: 'NO_RUN_ON_CARD', message: 'a comment needs an identified agent' } }, { status: 403 });
+          }
+          const names = await agentNamesFor(env.DB, tenantId, [agent.agentId]);
+          author = { kind: 'agent', id: agent.agentId, name: names.get(agent.agentId) ?? null };
+        } else {
+          author = { kind: 'human', id: user?.userId ?? 'usr_dev', name: user?.name ?? user?.login ?? null };
+        }
+        const result = await stub.addComment({ cardId: commentsMatch[1]!, author, body: body.body });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ comment: result.value }, { status: 201 });
+      }
+      if (commentsMatch) return Response.json({ error: 'method not allowed' }, { status: 405 });
+      // DELETE /v1/boards/:id/cards/:cardId/comments/:commentId — its author tombstones it.
+      const oneComment = rest.match(/^cards\/([^/]+)\/comments\/([^/]+)$/);
+      if (oneComment && request.method === 'DELETE') {
+        if (!user) return Response.json({ error: 'only a person deletes a comment' }, { status: 403 });
+        const result = await stub.deleteComment({ cardId: oneComment[1]!, commentId: oneComment[2]!, userId: user.userId });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ comment: result.value });
+      }
+      if (oneComment) return Response.json({ error: 'method not allowed — a comment is never edited' }, { status: 405 });
 
       // POST /v1/boards/:id/links — declare an edge · DELETE — remove one (spec §3.4).
       //

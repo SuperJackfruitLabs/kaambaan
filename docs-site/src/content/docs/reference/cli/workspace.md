@@ -3,7 +3,7 @@ title: "Workspace, agents and capabilities"
 description: "supi forge, agents, agent create, agent mint-token, agent queueing, capabilities, capability define and implications."
 sidebar:
   label: "Workspace and agents"
-  order: 10
+  order: 11
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

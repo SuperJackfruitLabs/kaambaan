@@ -3,7 +3,7 @@ title: "Links between cards"
 description: "supi link add, link rm and link list."
 sidebar:
   label: "Links"
-  order: 6
+  order: 7
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

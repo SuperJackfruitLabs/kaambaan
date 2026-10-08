@@ -548,7 +548,40 @@ export interface RunContext {
    * token it already has. No human credential, and no second authorization rule.
    */
   elicitations: ElicitationView[];
+  /**
+   * The card's comments as of this read: the newest `RUN_CONTEXT_COMMENTS` that are not deleted,
+   * oldest first, cut short further if their bodies pass `RUN_CONTEXT_COMMENT_BYTES`. Read here
+   * by the agent at claim time, and again whenever it re-reads its run — which is how a remark
+   * a person adds mid-run reaches it.
+   */
+  comments: CommentView[];
+  /** How many live comments are older than the ones carried — readable in full via the comments route or MCP tool. */
+  commentsOmitted: number;
 }
+
+/** A remark on a card by a person or by the agent working it. Append-only; never edited. */
+export interface CommentView {
+  id: string;
+  cardId: string;
+  author: {
+    kind: 'human' | 'agent';
+    /** A user id for a person, an `agt_…` for an agent. */
+    id: string;
+    /** The display name at the time of posting, when one was known. */
+    name: string | null;
+  };
+  /** Markdown source as written, stored and returned as text — a reader must never interpret it as HTML. Empty once deleted. */
+  body: string;
+  createdAt: string;
+  /** Set when the author deleted it; the row stays so the thread still shows a comment was there. */
+  deletedAt: string | null;
+}
+
+/** The largest comment body, in UTF-8 bytes. */
+export const COMMENT_MAX_BYTES = 8192;
+/** How many comments, and how many bytes of them, a run context carries at most. */
+export const RUN_CONTEXT_COMMENTS = 20;
+export const RUN_CONTEXT_COMMENT_BYTES = 16384;
 
 /** One run of a card, surfaced for the attempts comparison view (docs/07 §5). */
 export interface AttemptView {
@@ -995,7 +1028,11 @@ export type BoardErrorCode =
   | 'ALREADY_HAS_PARENT'
   | 'CARD_BLOCKED'
   | 'TOO_MANY_CHILDREN'
-  | 'NOTHING_TO_SPLIT';
+  | 'NOTHING_TO_SPLIT'
+  | 'INVALID_COMMENT'
+  | 'COMMENT_NOT_FOUND'
+  | 'NOT_COMMENT_AUTHOR'
+  | 'NO_RUN_ON_CARD';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1118,6 +1155,19 @@ export interface BoardStub {
   projectSummary(projectId: string): Promise<Result<{ total: number; done: number; overdue: number; costUsd: number }>>;
   getAttempts(cardId: string): Promise<AttemptView[]>;
   getRunContext(input: { runId: string; agentId?: string | null }): Promise<Result<RunContext>>;
+  /** A card's comments, oldest first, deleted ones as tombstones. */
+  listComments(cardId: string): Promise<Result<CommentView[]>>;
+  /**
+   * Post a comment. An `agent` author must hold a live (`working`) run on the card, or the call
+   * refuses `NO_RUN_ON_CARD`: an agent talks on the card it is working, and nowhere else.
+   */
+  addComment(input: { cardId: string; author: CommentView['author']; body: string }): Promise<Result<CommentView>>;
+  /** Tombstone a comment. Only its human author may; an agent's comment is never deleted. */
+  deleteComment(input: { cardId: string; commentId: string; userId: string }): Promise<Result<CommentView>>;
+  /** The comments on the card a run holds, for that run's agent (the MCP list tool). */
+  listRunComments(input: { runId: string; agentId: string | null }): Promise<Result<CommentView[]>>;
+  /** Post as the agent holding `runId`, on that run's card (the MCP post tool). */
+  addRunComment(input: { runId: string; agentId: string; agentName: string | null; body: string }): Promise<Result<CommentView>>;
 
   /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
   getRunEvidence(runId: string): Promise<Result<RunEvidence>>;
@@ -1707,6 +1757,21 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `CREATE TABLE IF NOT EXISTS webhook_deliveries (delivery_id TEXT PRIMARY KEY, received_at TEXT NOT NULL)`,
     );
+    // Card comments. Append-only: a row is never updated except to tombstone it (`deleted_at`,
+    // body cleared), so the thread keeps saying a comment was there and who wrote it.
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS card_comments (
+        id          TEXT PRIMARY KEY,
+        card_id     TEXT NOT NULL,
+        author_kind TEXT NOT NULL,
+        author_id   TEXT NOT NULL,
+        author_name TEXT,
+        body        TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        deleted_at  TEXT
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_card_comments_card ON card_comments(card_id, created_at)`);
     // Recurring cards (spec §3.7). In the board rather than D1 because a schedule is a property of
     // one board's pipeline, and firing it is a write to this DO.
     this.sql.exec(
@@ -2357,7 +2422,7 @@ export class BoardDO extends DurableObject<Env> {
     // parent parked on a deferred advance (Task 14 step 3), which `resumeParentAdvanceIfFree` needs
     // to know to check.
     const parentId = this.parentIdOf(cardId);
-    for (const t of ['usage_records', 'activities', 'runs', 'gates', 'elicitations', 'card_references', 'notifications']) {
+    for (const t of ['usage_records', 'activities', 'runs', 'gates', 'elicitations', 'card_references', 'notifications', 'card_comments']) {
       this.sql.exec(`DELETE FROM ${t} WHERE card_id = ?`, cardId);
     }
     // Both directions. A deleted card's edges must go with it: a lingering `blocks` row points at a
@@ -4095,8 +4160,130 @@ export class BoardDO extends DurableObject<Env> {
           .toArray()
           .map((r) => this.rowToReference(r)),
         elicitations: this.elicitationsForRun(input.runId),
+        ...this.commentsForRunContext(cardId),
       },
     };
+  }
+
+  // ----- card comments -----
+
+  async listComments(cardId: string): Promise<Result<CommentView[]>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!this.getCardRow(cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    return { ok: true, value: this.commentRows(cardId) };
+  }
+
+  async addComment(input: { cardId: string; author: CommentView['author']; body: string }): Promise<Result<CommentView>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (!this.getCardRow(input.cardId)) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${input.cardId}` };
+    if (typeof input.body !== 'string' || input.body.trim() === '') {
+      return { ok: false, code: 'INVALID_COMMENT', message: 'a comment needs a non-empty body' };
+    }
+    const bytes = new TextEncoder().encode(input.body).length;
+    if (bytes > COMMENT_MAX_BYTES) {
+      return { ok: false, code: 'INVALID_COMMENT', message: `a comment is at most ${COMMENT_MAX_BYTES} bytes; this one is ${bytes}` };
+    }
+    if (input.author.kind === 'agent') {
+      const holds = this.sql
+        .exec(`SELECT 1 FROM runs WHERE card_id = ? AND agent_id = ? AND status = 'working' LIMIT 1`, input.cardId, input.author.id)
+        .toArray();
+      if (holds.length === 0) {
+        return { ok: false, code: 'NO_RUN_ON_CARD', message: 'an agent may comment only on a card its live run holds' };
+      }
+    }
+    const id = newId('cmt');
+    // Strictly after the newest comment on this card: Workers freezes the clock inside a request,
+    // and a thread ordered by a timestamp two comments share is a thread whose order is a guess.
+    const last = this.sql
+      .exec(`SELECT created_at FROM card_comments WHERE card_id = ? ORDER BY created_at DESC LIMIT 1`, input.cardId)
+      .toArray()[0];
+    const nowMs = Date.parse(this.now());
+    const lastMs = last ? Date.parse(last.created_at as string) : Number.NaN;
+    const createdAt = new Date(Number.isNaN(lastMs) ? nowMs : Math.max(nowMs, lastMs + 1)).toISOString();
+    this.sql.exec(
+      `INSERT INTO card_comments (id, card_id, author_kind, author_id, author_name, body, created_at, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+      id,
+      input.cardId,
+      input.author.kind,
+      input.author.id,
+      input.author.name,
+      input.body,
+      createdAt,
+    );
+    // The event names the comment, never its text: the event log is kept for good, and a body
+    // copied into it would outlive the author deleting it.
+    this.emit('card.comment.added', { cardId: input.cardId, commentId: id, authorKind: input.author.kind });
+    return { ok: true, value: this.commentRows(input.cardId).find((c) => c.id === id)! };
+  }
+
+  async deleteComment(input: { cardId: string; commentId: string; userId: string }): Promise<Result<CommentView>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const row = this.sql
+      .exec(`SELECT * FROM card_comments WHERE id = ? AND card_id = ?`, input.commentId, input.cardId)
+      .toArray()[0];
+    if (!row) return { ok: false, code: 'COMMENT_NOT_FOUND', message: `comment not found: ${input.commentId}` };
+    if ((row.author_kind as string) !== 'human' || (row.author_id as string) !== input.userId) {
+      return { ok: false, code: 'NOT_COMMENT_AUTHOR', message: 'only the person who wrote a comment may delete it' };
+    }
+    if (!row.deleted_at) {
+      this.sql.exec(`UPDATE card_comments SET body = '', deleted_at = ? WHERE id = ?`, this.now(), input.commentId);
+      this.emit('card.comment.deleted', { cardId: input.cardId, commentId: input.commentId });
+    }
+    return { ok: true, value: this.commentRows(input.cardId).find((c) => c.id === input.commentId)! };
+  }
+
+  async listRunComments(input: { runId: string; agentId: string | null }): Promise<Result<CommentView[]>> {
+    const row = this.getRunRow(input.runId);
+    if (!row) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${input.runId}` };
+    const denied = this.denyForeignRun(row, input.agentId);
+    if (denied) return denied;
+    return this.listComments(row.card_id as string);
+  }
+
+  async addRunComment(input: { runId: string; agentId: string; agentName: string | null; body: string }): Promise<Result<CommentView>> {
+    const row = this.getRunRow(input.runId);
+    if (!row) return { ok: false, code: 'RUN_NOT_FOUND', message: `run not found: ${input.runId}` };
+    const denied = this.denyForeignRun(row, input.agentId);
+    if (denied) return denied;
+    return this.addComment({
+      cardId: row.card_id as string,
+      author: { kind: 'agent', id: input.agentId, name: input.agentName },
+      body: input.body,
+    });
+  }
+
+  private commentRows(cardId: string): CommentView[] {
+    return this.sql
+      .exec(`SELECT * FROM card_comments WHERE card_id = ? ORDER BY created_at ASC, id ASC`, cardId)
+      .toArray()
+      .map((r) => ({
+        id: r.id as string,
+        cardId: r.card_id as string,
+        author: {
+          kind: r.author_kind as 'human' | 'agent',
+          id: r.author_id as string,
+          name: (r.author_name as string | null) ?? null,
+        },
+        body: r.body as string,
+        createdAt: r.created_at as string,
+        deletedAt: (r.deleted_at as string | null) ?? null,
+      }));
+  }
+
+  /** The bounded slice of a card's thread a run context carries (see `RunContext.comments`). */
+  private commentsForRunContext(cardId: string): { comments: CommentView[]; commentsOmitted: number } {
+    const live = this.commentRows(cardId).filter((c) => c.deletedAt === null);
+    const kept: CommentView[] = [];
+    let bytes = 0;
+    const enc = new TextEncoder();
+    for (let i = live.length - 1; i >= 0 && kept.length < RUN_CONTEXT_COMMENTS; i--) {
+      const size = enc.encode(live[i]!.body).length;
+      if (bytes + size > RUN_CONTEXT_COMMENT_BYTES) break;
+      bytes += size;
+      kept.unshift(live[i]!);
+    }
+    return { comments: kept, commentsOmitted: live.length - kept.length };
   }
 
   /**

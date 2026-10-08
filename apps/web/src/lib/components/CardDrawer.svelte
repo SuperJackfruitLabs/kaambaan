@@ -40,6 +40,7 @@
   import { milestonesForProject, assignmentPatch } from '$lib/components/milestone-picker';
   import SpecDetails from '$lib/components/card/SpecDetails.svelte';
   import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
+  import CardComments from '$lib/components/card/CardComments.svelte';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -1735,6 +1736,15 @@
             </div>
           </section>
         {/if}
+
+        <!--
+          Comments: a thread on the card for people and for the agent working it. Its own component
+          so the text-only rendering rule (no `{@html}`) is held by its own test.
+        -->
+        <section class="sec" aria-label="Comments">
+          <div class="sec-h eyebrow">comments</div>
+          {#if boardId}<CardComments {boardId} cardId={card.id} currentUserId={app.user?.userId ?? null} onFeed={(fn) => app.onFeed(fn)} />{/if}
+        </section>
 
         <!-- handoff from prior stage -->
         {#if cardDetail?.handoff && Object.keys(cardDetail.handoff).length > 0}

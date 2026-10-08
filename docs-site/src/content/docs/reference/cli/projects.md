@@ -3,7 +3,7 @@ title: "Projects and milestones"
 description: "supi project list, add, show and rm; supi milestone add and rm."
 sidebar:
   label: "Projects and milestones"
-  order: 8
+  order: 9
 ---
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->

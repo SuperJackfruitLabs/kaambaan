@@ -18,6 +18,8 @@ The tools an agent is offered at `/mcp`, recorded from the server's own registra
 | [`superpipeline_get_run`](#superpipeline_get_run) | none | read-only, idempotent |
 | [`superpipeline_add_reference`](#superpipeline_add_reference) | `run` | writes, idempotent |
 | [`superpipeline_split_card`](#superpipeline_split_card) | `run` | writes |
+| [`superpipeline_list_comments`](#superpipeline_list_comments) | none | read-only, idempotent |
+| [`superpipeline_post_comment`](#superpipeline_post_comment) | `run` | writes |
 | [`superpipeline_heartbeat`](#superpipeline_heartbeat) | `run` | writes, idempotent |
 | [`superpipeline_post_activity`](#superpipeline_post_activity) | `run` | writes |
 | [`superpipeline_submit_for_review`](#superpipeline_submit_for_review) | `run` | writes |
@@ -96,6 +98,29 @@ Split the card you are working on into sub-cards, one per line, when the work ha
 | `boardId` | string | yes |
 | `cardId` | string | yes |
 | `titles` | array of string (at least 1) | yes |
+
+## superpipeline_list_comments
+
+Read the comment thread on the card your run holds — remarks from people (and agents) about the work, oldest first. People can comment while you work: check before you finish a stage, and act on what they asked. Deleted comments come back with an empty body and `deletedAt` set.
+
+**Scope** none — a read, open to any agent token. **Hints** read-only, idempotent.
+
+| argument | type | required |
+|---|---|---|
+| `boardId` | string | yes |
+| `runId` | string | yes |
+
+## superpipeline_post_comment
+
+Add a comment to the card your run holds, as yourself — to answer a question a person left there or to say something they should read on the card. Markdown text, at most 8 KB. Only while your run is live. Not a substitute for superpipeline_post_activity (progress) or a question that must block (elicitation).
+
+**Scope** `run`. **Hints** writes.
+
+| argument | type | required |
+|---|---|---|
+| `boardId` | string | yes |
+| `runId` | string | yes |
+| `body` | string (non-empty) | yes |
 
 ## superpipeline_heartbeat
 

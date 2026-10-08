@@ -16,10 +16,12 @@ token binds the tools to your workspace. You only ever see your own.
 | `superpipeline_list_work` | — | boards with a count of cards ready **for your capabilities** |
 | `superpipeline_claim_card` | `claim` | take the next ready card |
 | `superpipeline_get_card` | — | a card by id, with its whole [spec](/use/cards/#the-spec) |
-| `superpipeline_get_run` | — | the run you hold: its card, its stage, the handoff, the card's references, and your questions with any answers |
+| `superpipeline_get_run` | — | the run you hold: its card, its stage, the handoff, the card's references, your questions with any answers, and the newest comments on the card |
 | `superpipeline_heartbeat` | `run` | keep the lease |
 | `superpipeline_post_activity` | `run` | say what you are doing; report usage |
 | `superpipeline_add_reference` | `run` | attach a link |
+| `superpipeline_list_comments` | — | the comment thread on the card your run holds |
+| `superpipeline_post_comment` | `run` | comment on the card your run holds, as yourself — only while the run is live |
 | `superpipeline_split_card` | `run` | split the card you hold into sub-cards |
 | `superpipeline_submit_for_review` | `run` | open a gate and stop |
 | `superpipeline_complete` | `run` | finish; the card advances **if the stage's completion requirement is met** |

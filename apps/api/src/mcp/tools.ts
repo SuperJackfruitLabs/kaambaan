@@ -59,6 +59,10 @@ export const TOOL_SCOPE: Record<string, AgentScope | undefined> = {
   // the one card it is working (Task 15); `claim` would hand the power to manufacture more work to
   // the thing whose only job is taking it.
   superpipeline_split_card: 'run',
+  // A remark from the worker on the work: posting is a `run` verb, and the board refuses it unless
+  // the run is live and holds the card. Reading the thread (`superpipeline_list_comments`) is a
+  // read, unscoped like `get_run`, and still refused for a run that is not the caller's.
+  superpipeline_post_comment: 'run',
 };
 
 /**
@@ -81,6 +85,8 @@ export interface ToolDeps {
   boardStub: (boardId: string) => BoardStub;
   /** List the boards in the caller's workspace (for the work-discovery tool). */
   listBoards: () => Promise<Array<{ id: string; name: string }>>;
+  /** The calling agent's display name, for attributing a comment it posts. Absent → no name recorded. */
+  agentName?: () => Promise<string | null>;
 }
 
 const ok = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
@@ -261,6 +267,41 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
     // card you are working on" above.
     async ({ boardId, cardId, titles }) =>
       fromResult(await deps.boardStub(boardId).splitCard(cardId, titles, auth.agentId, auth.agentId)),
+  );
+
+  register(
+    'superpipeline_list_comments',
+    {
+      description:
+        'Read the comment thread on the card your run holds — remarks from people (and agents) about the work, ' +
+        'oldest first. People can comment while you work: check before you finish a stage, and act on what they ' +
+        'asked. Deleted comments come back with an empty body and `deletedAt` set.',
+      inputSchema: { boardId: z.string(), runId: z.string() },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ boardId, runId }) =>
+      fromResult(await deps.boardStub(boardId).listRunComments({ runId, agentId: auth.agentId })),
+  );
+
+  register(
+    'superpipeline_post_comment',
+    {
+      description:
+        'Add a comment to the card your run holds, as yourself — to answer a question a person left there or to ' +
+        'say something they should read on the card. Markdown text, at most 8 KB. Only while your run is live. ' +
+        'Not a substitute for superpipeline_post_activity (progress) or a question that must block (elicitation).',
+      inputSchema: { boardId: z.string(), runId: z.string(), body: z.string().min(1) },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ boardId, runId, body }) =>
+      fromResult(
+        await deps.boardStub(boardId).addRunComment({
+          runId,
+          agentId: auth.agentId,
+          agentName: deps.agentName ? await deps.agentName() : null,
+          body,
+        }),
+      ),
   );
 
   register(
