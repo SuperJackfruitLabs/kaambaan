@@ -91,6 +91,13 @@ have a meaning the card drawer knows, and are shown in their own sections:
 | `plan` | `[{ "t": "step", "done": false }]` | the agent's plan, as a checklist with a progress bar |
 | `acceptanceCriteria` | string array | a bulleted list |
 
+**`plan` accepts more than one shape.** Write `[{ "t": "step", "done": false }]`, or a plain
+string array (`["Draft", "Review"]`, every step not done). Step objects may also name their text
+`text`, `step`, `title`, `label`, `name` or `description`, and mark a step finished with
+`done`, `completed` or `checked` set to `true`, or `status` set to `"done"`, `"complete"` or
+`"completed"`. A step with no text is skipped rather than drawn as an empty box. If the checklist
+cannot draw every step of a plan, the plan is also shown as written under Details.
+
 **Every other field is shown under Details**, below them. Keys are spelled out as words
 (`portraitDecision` reads "Portrait decision"), lists become bullets, nested objects become
 labelled groups, and `http`/`https` URLs become links. Details starts open when the card has no

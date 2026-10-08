@@ -7,12 +7,14 @@
  * actions — was on the wire and invisible to the person reviewing the card.
  */
 
+import { planRendersWhole } from './plan';
+
 /**
  * Keys the drawer renders in their own sections, or owns elsewhere. `labels` and `due` are
  * legacy spec fields superseded by real columns (`card.labels`, `card.dueAt`); repeating a stale
  * copy under Details would be two sources of truth for one value.
  */
-export const DRAWER_OWNED_KEYS: ReadonlySet<string> = new Set(['description', 'plan', 'acceptanceCriteria', 'labels', 'due']);
+export const DRAWER_OWNED_KEYS: ReadonlySet<string> = new Set(['description', 'acceptanceCriteria', 'labels', 'due']);
 
 /** How many levels of nesting are drawn as groups before the rest is shown as compact JSON. */
 export const MAX_DEPTH = 4;
@@ -101,10 +103,14 @@ export function visibleEntries(obj: Record<string, unknown>): SpecEntry[] {
     .map(([key, value]) => ({ key, value }));
 }
 
-/** The spec fields that belong under Details: everything the drawer does not own, minus empties. */
+/**
+ * The spec fields that belong under Details: everything the drawer does not own, minus empties.
+ * `plan` is owned only when the checklist drew every item of it; a plan it could not read (or read
+ * only in part) stays here as written, so no data is hidden.
+ */
 export function specDetailEntries(spec: Record<string, unknown> | null | undefined): SpecEntry[] {
   if (!isPlainObject(spec)) return [];
-  return visibleEntries(spec).filter((e) => !DRAWER_OWNED_KEYS.has(e.key));
+  return visibleEntries(spec).filter((e) => !DRAWER_OWNED_KEYS.has(e.key) && !(e.key === 'plan' && planRendersWhole(e.value)));
 }
 
 /** Count leaves and characters, so a sprawling spec can start collapsed. */
