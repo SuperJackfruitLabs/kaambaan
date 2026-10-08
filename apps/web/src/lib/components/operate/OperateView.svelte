@@ -6,9 +6,9 @@
    * own place in the chrome: Triage (a rail destination), Telemetry (another), the notification
    * bell, and the spend pill. The row was not rearranged; it was given fewer reasons to exist.
    *
-   * Scoped to one board, deliberately (spec §3): the Durable Object is per board, so a
-   * workspace-wide deck would need a fan-out read across every board's DO. Work needing attention
-   * on another board is found when you switch to it.
+   * Scoped to one board (spec §3): the Durable Object is per board. What needs a person on every
+   * board is one list at /workspace/needs-you, read through the one fan-out built for it
+   * (`GET /v1/stale?attention=1`); the panel here links there.
    */
   import NeedsYou from './NeedsYou.svelte';
   import Running from './Running.svelte';

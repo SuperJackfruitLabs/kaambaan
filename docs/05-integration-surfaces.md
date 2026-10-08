@@ -306,7 +306,10 @@ an agent to call `claim`. Modeled on A2A **PushNotificationConfig**:
 - Config: `{ url, token, authentication: { schemes: ["Bearer"], credentials } }`, registered per
   agent/board.
 - Events: `work.available` (a card the agent can claim entered a stage), `gate.pending` (a card
-  is waiting on a human's approval), `gate.resolved`, `run.reclaimed`, `card.canceled`.
+  is waiting on a human's approval), `gate.resolved`, `run.reclaimed`, `card.canceled`,
+  `cards.stale` (the daily stale-card digest: `{ event, boardId, boardName, cards: StaleCardView[], ts }`,
+  one delivery per sweep that has a card not reported in the last 24 hours — see
+  docs-site `use/stuck-cards`).
 - **Delivery is durable**: enqueued to a **Queue**, delivered by a **Workflow** with retries +
   exponential backoff; each delivery is **HMAC/JWT-signed**; the receiver verifies and may then
   `claim`. SSRF defense: webhook URLs are allowlisted/ownership-verified.

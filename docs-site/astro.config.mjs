@@ -72,6 +72,7 @@ export default defineConfig({
             { label: 'Boards and pipelines', slug: 'use/boards' },
             { label: 'Cards and their states', slug: 'use/cards' },
             { label: 'Comments on a card', slug: 'use/comments' },
+            { label: 'When a card gets stuck', slug: 'use/stuck-cards' },
             { label: 'Planning work', slug: 'use/planning' },
             { label: 'Recurring cards', slug: 'use/recurring' },
             { label: 'Stage runbooks and completion', slug: 'use/runbooks' },

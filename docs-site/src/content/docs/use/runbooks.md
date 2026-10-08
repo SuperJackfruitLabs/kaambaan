@@ -53,11 +53,18 @@ agent says is accepted.
 
 ## What a failed check does
 
-**It blocks; it does not fail.** The card parks on a person in its current stage, the run's outcome
-is recorded `blocked`, and an `error` activity naming every missing piece is written onto the card.
+**It blocks; it does not fail.** The run's outcome is recorded `blocked`, and an `error` activity
+naming every missing piece is written onto the card.
 
-Blocking rather than failing is deliberate. A failure re-queues the card, and a retry loop would
-spend budget re-asserting the same untrue claim. Someone has to look.
+**The first refusal is reworked once, automatically.** The card goes back to `submitted` on the same
+stage with feedback naming exactly what was missing — `handoff.feedback`, plus the refused handoff as
+`handoff.refusedHandoff` — which the next agent to claim it reads. **A second refusal on the same
+visit to the stage parks the card on a person**, as `blocked`, with both refusals in its reason.
+
+Blocking rather than failing is deliberate. A failure re-queues the card over and over until the
+breaker trips, and a retry loop would spend budget re-asserting the same untrue claim. One rework is
+enough to catch an agent that forgot a field; after that, someone has to look. The rework counts as
+an attempt, so the [circuit breaker](/use/stuck-cards/#what-heals-itself) still bounds it.
 
 Every failing arm is named at once, so a person fixes both rather than discovering the second on
 the next attempt.
