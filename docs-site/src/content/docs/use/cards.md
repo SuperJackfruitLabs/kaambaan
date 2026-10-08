@@ -102,9 +102,21 @@ string array (`["Draft", "Review"]`, every step not done). Step objects may also
 cannot draw every step of a plan, the plan is also shown as written under Details.
 
 **Every other field is shown under Details**, below them. Keys are spelled out as words
-(`portraitDecision` reads "Portrait decision"), lists become bullets, nested objects become
-labelled groups, and `http`/`https` URLs become links. Details starts open when the card has no
-description, and collapsed when it is long and a description is already above it.
+(`portraitDecision` reads "Portrait decision"; a key that is a path or a repository name, such as
+`SuperJackfruitLabs/agentpod`, is kept as written), lists of text become bullets, lists of objects
+become numbered groups, nested objects become labelled groups under a thin left rule, `null` shows
+as "—", `` `backticked` `` text shows as code, and `http`/`https` URLs become links (no other kind
+of link is ever made). A value that is a JSON object or array stored as a string is read as that
+object or array. Six levels of nesting are drawn in full; anything deeper folds behind **Show
+more**, and a list of more than ten items shows its first eight and **Show all N**. Long words,
+paths and URLs wrap, so nothing scrolls sideways on a phone. **View raw JSON** under the section
+shows the fields exactly as stored, with a **Copy** button. Details starts open when the card has
+no description, and collapsed when it is long and a description is already above it.
+
+**Handoffs are drawn the same way.** What each stage handed on (under its run in the activity) and
+the handoff the card carries into its next stage — including the `feedback` and `refusedHandoff`
+left by a refused completion — use the same renderer, with their own **View raw JSON**. A tool
+call's parameters and result in the activity stay raw JSON: they are a record of what was sent.
 
 **The agent working the card receives the whole spec**, not only the fields the drawer has a
 section for — so what Details shows is what the agent was told. Start every spec with a

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { humaniseKey, safeHref, specDetailEntries, splitLinks, isLongSpec } from './spec-details';
+import {
+  humaniseKey, safeHref, specDetailEntries, splitLinks, isLongSpec,
+  MAX_DEPTH, LIST_PREVIEW, inlineParts, listWindow, nestedEntries, normaliseValue, parseJsonString, rawJson, shouldCollapse,
+} from './spec-details';
 
 describe('humaniseKey', () => {
   it('turns camelCase into a sentence-case label', () => {
@@ -75,5 +78,118 @@ describe('isLongSpec', () => {
     const many = Array.from({ length: 12 }, (_, i) => ({ key: `k${i}`, value: 'v' }));
     expect(isLongSpec(many)).toBe(true);
     expect(isLongSpec([{ key: 'essay', value: 'x'.repeat(2000) }])).toBe(true);
+  });
+});
+
+/* ── The shared readable renderer: Details, and every handoff the drawer shows ───────────── */
+
+
+describe('humaniseKey on handoff keys', () => {
+  it('spells out the keys agents write in handoffs', () => {
+    expect(humaniseKey('codeGrounding')).toBe('Code grounding');
+    expect(humaniseKey('inspectedRepository')).toBe('Inspected repository');
+    expect(humaniseKey('existingCapabilities')).toBe('Existing capabilities');
+  });
+  it('leaves a key that is a path, a repository or a sentence exactly as written', () => {
+    expect(humaniseKey('SuperJackfruitLabs/super-jackfruit-website')).toBe('SuperJackfruitLabs/super-jackfruit-website');
+    expect(humaniseKey('apps/web/src/lib')).toBe('apps/web/src/lib');
+    expect(humaniseKey('runs.handoff_json')).toBe('runs.handoff_json');
+    expect(humaniseKey('Already a label')).toBe('Already a label');
+  });
+});
+
+describe('parseJsonString', () => {
+  it('reads a string that is wholly a JSON object or array', () => {
+    expect(parseJsonString('{"decision":"ship","n":2}')).toEqual({ decision: 'ship', n: 2 });
+    expect(parseJsonString('  ["a", "b"]\n')).toEqual(['a', 'b']);
+  });
+  it('leaves every other string alone', () => {
+    expect(parseJsonString('"quoted"')).toBeNull();
+    expect(parseJsonString('42')).toBeNull();
+    expect(parseJsonString('true')).toBeNull();
+    expect(parseJsonString('null')).toBeNull();
+    expect(parseJsonString('see {"a":1} here')).toBeNull();
+    expect(parseJsonString('{"a":1} trailing')).toBeNull();
+    expect(parseJsonString('{not json}')).toBeNull();
+    expect(parseJsonString('[unclosed')).toBeNull();
+    expect(parseJsonString('')).toBeNull();
+  });
+  it('never evaluates anything', () => {
+    (globalThis as { __ran?: boolean }).__ran = undefined;
+    expect(parseJsonString('[(globalThis.__ran = true)]')).toBeNull();
+    expect((globalThis as { __ran?: boolean }).__ran).toBeUndefined();
+  });
+});
+
+describe('normaliseValue', () => {
+  it('turns a JSON-document string into its value and leaves the rest', () => {
+    expect(normaliseValue('{"in":["x"]}')).toEqual({ in: ['x'] });
+    expect(normaliseValue('plain words')).toBe('plain words');
+    expect(normaliseValue(3)).toBe(3);
+    const o = { a: 1 };
+    expect(normaliseValue(o)).toBe(o);
+  });
+});
+
+describe('nestedEntries', () => {
+  it('keeps nulls and empties inside a value (shown as a dash) and drops only undefined', () => {
+    expect(nestedEntries({ a: null, b: '', c: undefined, d: 0 }).map((e) => e.key)).toEqual(['a', 'b', 'd']);
+  });
+});
+
+describe('shouldCollapse', () => {
+  it('draws six levels and collapses nested values below that', () => {
+    expect(MAX_DEPTH).toBe(6);
+    expect(shouldCollapse({ a: 1 }, MAX_DEPTH - 1)).toBe(false);
+    expect(shouldCollapse({ a: 1 }, MAX_DEPTH)).toBe(true);
+    expect(shouldCollapse([1], MAX_DEPTH)).toBe(true);
+  });
+  it('never collapses a leaf, however deep', () => {
+    expect(shouldCollapse('text', MAX_DEPTH + 3)).toBe(false);
+    expect(shouldCollapse(null, MAX_DEPTH + 3)).toBe(false);
+  });
+});
+
+describe('listWindow', () => {
+  const items = Array.from({ length: 20 }, (_, i) => `item ${i}`);
+  it('shows the first eight of a long list and counts the rest', () => {
+    expect(LIST_PREVIEW).toBe(8);
+    const w = listWindow(items, false);
+    expect(w.shown).toEqual(items.slice(0, 8));
+    expect(w.hidden).toBe(12);
+  });
+  it('shows everything once asked', () => {
+    expect(listWindow(items, true)).toEqual({ shown: items, hidden: 0 });
+  });
+  it('does not hide one or two items behind a button', () => {
+    expect(listWindow(items.slice(0, 10), false).hidden).toBe(0);
+    expect(listWindow(items.slice(0, 11), false).hidden).toBe(3);
+  });
+});
+
+describe('inlineParts', () => {
+  it('turns backticked spans into code and links URLs outside them', () => {
+    expect(inlineParts('run `pnpm test` then see https://example.com/x.')).toEqual([
+      { text: 'run ' },
+      { text: 'pnpm test', code: true },
+      { text: ' then see ' },
+      { text: 'https://example.com/x', href: 'https://example.com/x' },
+      { text: '.' },
+    ]);
+  });
+  it('does not link a URL inside a code span', () => {
+    expect(inlineParts('`https://example.com`')).toEqual([{ text: 'https://example.com', code: true }]);
+  });
+  it('leaves an unmatched backtick as text', () => {
+    expect(inlineParts('it`s fine')).toEqual([{ text: 'it`s fine' }]);
+  });
+});
+
+describe('rawJson', () => {
+  it('pretty-prints and never throws', () => {
+    expect(rawJson({ a: 1 })).toBe('{\n  "a": 1\n}');
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(typeof rawJson(cyclic)).toBe('string');
   });
 });
