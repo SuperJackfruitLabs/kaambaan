@@ -39,6 +39,7 @@
   import { resolveProjectName } from '$lib/components/plan/project-lookup';
   import { milestonesForProject, assignmentPatch } from '$lib/components/milestone-picker';
   import SpecDetails from '$lib/components/card/SpecDetails.svelte';
+  import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -756,13 +757,6 @@
     return ref.title ?? ref.sourceType;
   }
 
-  // plan helpers
-  const planItems = $derived(
-    Array.isArray(card?.spec?.plan) ? (card!.spec!.plan as Array<{ t: string; done: boolean }>) : null,
-  );
-  const planDone = $derived(planItems ? planItems.filter((s) => s.done).length : 0);
-  const planPct = $derived(planItems && planItems.length > 0 ? Math.round((planDone / planItems.length) * 100) : 0);
-
   const acceptanceCriteria = $derived(
     Array.isArray(card?.spec?.acceptanceCriteria) ? (card!.spec!.acceptanceCriteria as string[]) : null,
   );
@@ -1194,30 +1188,8 @@
           </section>
         {/if}
 
-        <!-- plan checklist (from card.spec.plan) -->
-        {#if planItems && planItems.length > 0}
-          <section class="sec">
-            <div class="sec-h eyebrow flex items-center gap-2">
-              agent plan
-              <span class="ml-auto" style="color:var(--live)">{planPct}%</span>
-            </div>
-            <div class="plan flex flex-col gap-0.5">
-              {#each planItems as step, i (i)}
-                <div class="step flex items-center gap-2.5 rounded-[7px] px-2 py-1.5 text-sm {step.done ? 'step-done' : ''}">
-                  <span class="step-box flex size-4 shrink-0 items-center justify-center rounded-[5px] border text-[10px] {step.done ? 'step-box-done' : 'border-border'}">
-                    {#if step.done}✓{/if}
-                  </span>
-                  <span class="step-t {step.done ? 'text-muted-foreground line-through' : ''}">{step.t}</span>
-                </div>
-              {/each}
-            </div>
-            <!-- rollup bar -->
-            <div class="rollup mt-2 h-[5px] overflow-hidden rounded-full bg-inset">
-              <div class="h-full rounded-full transition-all duration-1000" style="width:{planPct}%;background:var(--live)"></div>
-            </div>
-            <div class="eyebrow mt-1.5">{planDone} / {planItems.length} steps · {planPct}%</div>
-          </section>
-        {/if}
+        <!-- plan checklist (from card.spec.plan, any shape agents write) -->
+        <PlanChecklist plan={card.spec?.plan} />
 
         <!-- acceptance criteria (from card.spec.acceptanceCriteria) -->
         {#if acceptanceCriteria && acceptanceCriteria.length > 0}
