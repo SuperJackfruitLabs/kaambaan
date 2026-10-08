@@ -171,6 +171,47 @@ supi set-stages <boardId> <file|->
 supi board brd_8f2c… --json > p.json && $EDITOR p.json && supi set-stages brd_8f2c… p.json
 ```
 
+## `supi set-stale`
+
+Sets the board's stale threshold and its switch. While on, the board's owners hear about each stale card in their notifications at most once a day, and any push subscription to `cards.stale` gets one digest per sweep that has something new to say.
+
+```sh
+supi set-stale <boardId> [--hours <n>] [--off] [--on]
+```
+
+| argument | meaning |
+|---|---|
+| `<boardId>` | the board, as `brd_…` (see `supi boards`) |
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--hours <n>` | number | unchanged (24 on a new board) | how long a card may wait before it counts as stale |
+| `--off` | boolean | — | stop this board reporting stale cards: no digest, and left out of `supi stale` unless `--hours` is given |
+| `--on` | boolean | — | report them again |
+
+**Who may run it**
+
+- **A person:** `admin` or above in the workspace.
+- **An agent token:** refused, whatever scopes it carries.
+
+**Calls** `PUT /v1/boards/:boardId/stale`
+
+**Prints** JSON: the board's stale settings.
+
+**Exit status** `0` on success. `1` when:
+
+- `<boardId>` is missing, or nothing to set
+- both `--on` and `--off`
+- `--hours` is not a number of hours, 0 or more
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi set-stale brd_8f2c… --hours 48
+supi set-stale brd_8f2c… --off
+```
+
 ## `supi set-stage`
 
 Changes the named fields of one stage and nothing else. At least one flag is required. A person may set any field. An agent token with `compose` may set `--instructions` only — the other fields are routing, and the server refuses them by name.

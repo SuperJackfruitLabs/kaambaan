@@ -59,6 +59,11 @@ the board:
 
 Say which of the three it is. "The card is stuck" is not an answer.
 
+`supi stale` lists every card in the workspace that has been waiting past its board's threshold —
+in `input-required`, or sitting in a stage nothing claims — with why and what to do next. Report
+what it says. Resuming a card (`supi resume`) is a person's act: an agent token is refused, so tell
+the person which card needs them and why rather than trying to unblock it yourself.
+
 ## Planning the work
 
 Shaping what exists is a different permission from creating new work, and you may well hold one

@@ -181,3 +181,41 @@ export function renderComments(value: unknown): string {
   }
   return blocks.join("\n\n");
 }
+
+/** `supi stale`: each stuck card, why, for how long, and what to do — grouped under its board. */
+export function renderStale(value: unknown): string {
+  const cards = list<{
+    boardId?: string;
+    boardName?: string;
+    cardId?: string;
+    title?: string;
+    stageKey?: string;
+    stageName?: string;
+    why?: { kind?: string; reason?: string; detail?: string; failureCount?: number };
+    ageHours?: number;
+    next?: string;
+  }>(value, "cards");
+  const unanswered = typeof (value as { boardsUnanswered?: unknown })?.boardsUnanswered === "number"
+    ? (value as { boardsUnanswered: number }).boardsUnanswered
+    : 0;
+  const tail = unanswered > 0 ? `\n\n${unanswered} board${unanswered === 1 ? "" : "s"} did not answer; the list may be incomplete.` : "";
+  if (cards.length === 0) return `Nothing is stuck.${tail}`;
+  const blocks: string[] = [];
+  let board = "";
+  for (const c of cards) {
+    if (c.boardId !== board) {
+      board = c.boardId ?? "";
+      blocks.push(`${c.boardName || board} (${board})`);
+    }
+    const why =
+      c.why?.kind === "no-owner"
+        ? `nothing claims stage "${c.stageKey}"`
+        : [c.why?.reason, c.why?.detail].filter(Boolean).join(": ") +
+          (typeof c.why?.failureCount === "number" ? ` (${c.why.failureCount} failed attempts)` : "");
+    const age = typeof c.ageHours === "number" ? `${Math.floor(c.ageHours)}h` : "?";
+    blocks.push(
+      `${PAD}${c.cardId}  ${c.title ?? ""}\n${PAD}${PAD}${c.stageName ?? c.stageKey} · ${age} · ${why}\n${PAD}${PAD}next: ${c.next ?? ""}`,
+    );
+  }
+  return blocks.join("\n") + tail;
+}
