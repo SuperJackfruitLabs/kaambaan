@@ -927,7 +927,7 @@
       aria-labelledby="drawer-title"
       tabindex="-1"
       onkeydown={trapTab}
-      class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border-l shadow-2xl sm:max-w-[520px]">
+      class="bg-surface border-border drawer-in safe-top safe-bottom safe-x relative flex h-full w-full flex-col border-l shadow-2xl sm:max-w-[520px]">
 
       <!-- dw-head -->
       <div class="dw-head border-border border-b p-4 pb-3.5 flex-none">

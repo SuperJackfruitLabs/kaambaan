@@ -107,6 +107,60 @@
 }
 
 @layer utilities {
+  /* The phone's viewport is three heights, not one.
+
+     `100vh` (Tailwind's `h-screen`) is the LARGEST viewport — the one with the browser's toolbars
+     scrolled away. With them showing, a `100vh` frame is taller than what is visible: on an iPhone
+     in Arc the toolbar sat over the last ~180px of the Operate page, the bottom of Activity could
+     not be reached because the frame is `overflow: hidden`, and the bottom nav — the only way to
+     sign out on a phone — was under the toolbar (2026-10-08). `100dvh` follows the toolbar.
+
+     `100vh` first, for a browser that predates the viewport units; `@supports` swaps it out
+     everywhere else. A desktop browser has no toolbar to hide, so there the two are equal and
+     nothing moves. Nothing in apps/web may size itself in `vh` outside a marked fallback
+     (src/lib/viewport-units.test.ts holds that). */
+  .h-viewport {
+    height: 100vh; /* vh-fallback */
+  }
+  .min-h-viewport {
+    min-height: 100vh; /* vh-fallback */
+  }
+  @supports (height: 100dvh) {
+    .h-viewport {
+      height: 100dvh;
+    }
+    .min-h-viewport {
+      min-height: 100dvh;
+    }
+  }
+
+  /* `viewport-fit=cover` (app.html) hands the whole screen to the page, notch and home indicator
+     included — which an installed app with a translucent status bar needs, and which means the page
+     must keep its own content out from under them. env() is 0 wherever there is nothing to avoid,
+     so on a desktop these are no-ops. */
+  .safe-x {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+  .safe-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  /* The app frame. Below 900px the bottom nav pads the home indicator itself; above it there is
+     no bottom nav, so the frame does. */
+  .app-shell {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+  @media (min-width: 900px) {
+    .app-shell {
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+  }
+
   /* A control that must LOOK small still has to be hittable. Pad the target, never enlarge
      the glyph — which is why this sets only the minimums and centres the content. */
   .tap {
@@ -605,7 +659,9 @@
   }
 
   .cmdk-list {
-    max-height: 46vh;
+    /* The small viewport: the list must fit with the toolbars AND the keyboard showing. */
+    max-height: 46vh; /* vh-fallback */
+    max-height: 46svh;
     overflow-y: auto;
     padding: 8px;
   }

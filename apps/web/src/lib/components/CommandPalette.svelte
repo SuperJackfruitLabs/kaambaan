@@ -208,7 +208,7 @@
 {#if app.cmdkOpen}
   <!-- Backdrop -->
   <div
-    class="fixed inset-0 z-50 flex items-start justify-center pt-[12vh]"
+    class="fixed inset-0 z-50 flex items-start justify-center pt-[12svh]"
     style="background:rgba(8,9,13,.55)"
     role="dialog"
     aria-modal="true"

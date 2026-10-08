@@ -53,7 +53,7 @@
 
     <form
       onsubmit={submit}
-      class="bg-surface border-border drawer-in relative flex h-full w-full flex-col border shadow-2xl min-[600px]:h-auto min-[600px]:max-h-full min-[600px]:max-w-lg min-[600px]:rounded-[12px]"
+      class="bg-surface border-border drawer-in safe-top safe-bottom safe-x relative flex h-full w-full flex-col border shadow-2xl min-[600px]:h-auto min-[600px]:max-h-full min-[600px]:max-w-lg min-[600px]:rounded-[12px]"
     >
       <div class="border-border flex items-center justify-between gap-3 border-b p-4">
         <div>
