@@ -3,7 +3,7 @@
   import { cardProvenance } from '$lib/components/board/card-provenance';
   import { onDestroy } from 'svelte';
   import { groupActivities, isNarrative, isControlRow, defaultOpen, visibleActivities } from '$lib/activity-groups';
-  import { stageAccount, formatHandoff } from '$lib/stage-account';
+  import { stageAccount } from '$lib/stage-account';
   import { app } from '$lib/stores/app.svelte';
   import {
     getCardActivities,
@@ -39,6 +39,8 @@
   import { resolveProjectName } from '$lib/components/plan/project-lookup';
   import { milestonesForProject, assignmentPatch } from '$lib/components/milestone-picker';
   import SpecDetails from '$lib/components/card/SpecDetails.svelte';
+  import HandoffView from '$lib/components/card/HandoffView.svelte';
+  import { isEmptyValue } from '$lib/components/card/spec-details';
   import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
   import CardComments from '$lib/components/card/CardComments.svelte';
   import CardResume from '$lib/components/card/CardResume.svelte';
@@ -1685,15 +1687,10 @@
                           <div class="stage-foot-h">failed</div>
                           <div class="text-xs leading-relaxed">{e.failureReason}</div>
                         </div>
-                      {:else if formatHandoff(e.handoff).length > 0}
+                      {:else if !isEmptyValue(e.handoff)}
                         <div class="stage-foot">
                           <div class="stage-foot-h">handed on</div>
-                          {#each formatHandoff(e.handoff) as f (f.label ?? f.value)}
-                            <div class="text-xs leading-relaxed">
-                              {#if f.label}<span class="mono text-muted-foreground">{f.label}:</span>{/if}
-                              {f.value}
-                            </div>
-                          {/each}
+                          <HandoffView handoff={e.handoff} testid={`handed-on-${g.runId}`} />
                         </div>
                       {/if}
                       {#if e.references.length > 0}
@@ -1768,18 +1765,13 @@
           <section class="sec">
             <div class="sec-h eyebrow">handoff from prior stage</div>
             <!--
-              `overflow-wrap:anywhere`, not `break-word`, and not nothing.
-
-              A handoff value is whatever the agent put there, and an agent that reports
-              `{"artifact_commit_readback":"passed","github_commit_public":"verified"}` has written a
-              single token with no space in it. `break-word` will not break inside one; the line ran
-              324px past the right edge of a phone. `anywhere` breaks it, and also lets the row
-              shrink below its longest word, which is what stops the drawer scrolling sideways.
+              The same renderer as Details and each stage's "handed on": a handoff is whatever the
+              agent wrote — nested groups, lists, a JSON document stored as a string, one long
+              unbroken token — and it reads as a document, wraps on a phone, and keeps its raw JSON
+              one tap away. After a refused completion this holds `feedback` and `refusedHandoff`.
             -->
-            <div class="bg-inset border-border mono min-w-0 space-y-1 rounded-[8px] border p-3 text-[11px]" style="overflow-wrap:anywhere">
-              {#each Object.entries(cardDetail.handoff) as [k, v] (k)}
-                <div class="min-w-0"><span class="text-muted-foreground">{k}:</span> {typeof v === 'string' ? v : JSON.stringify(v)}</div>
-              {/each}
+            <div class="bg-inset border-border min-w-0 rounded-[8px] border p-3" style="overflow-wrap:anywhere">
+              <HandoffView handoff={cardDetail.handoff} testid="carried-handoff" />
             </div>
           </section>
         {/if}

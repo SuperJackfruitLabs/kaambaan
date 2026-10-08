@@ -114,13 +114,26 @@ describe('SpecDetails', () => {
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
   });
 
-  it('caps the depth of nested objects instead of recursing forever', () => {
+  it('folds nesting past six levels behind "Show more" instead of printing JSON', () => {
     let deep: Record<string, unknown> = { leaf: 'bottom' };
     for (let i = 0; i < 12; i++) deep = { [`level${i}`]: deep };
     const { container } = render(SpecDetails, { spec: { tree: deep }, hasDescription: true });
-    // The tail beyond the cap is shown as compact JSON, still readable.
-    expect(container.textContent).toContain('"leaf":"bottom"');
-    expect(container.querySelectorAll('dl').length).toBeLessThanOrEqual(6);
+    const structured = container.querySelector('dl')!;
+    expect(structured.textContent).not.toContain('"leaf"');
+    expect(screen.getByRole('button', { name: /Show more/ })).toBeTruthy();
+  });
+
+  it('reads a spec value that is a JSON document stored as a string', () => {
+    render(SpecDetails, { spec: { scope: JSON.stringify({ in: ['Audit stations'], out: ['Minting keys'] }) }, hasDescription: true });
+    const scope = screen.getByTestId('spec-value-scope');
+    expect(within(scope).getByText('In')).toBeTruthy();
+    expect(within(scope).getByText('Minting keys')).toBeTruthy();
+    expect(scope.textContent).not.toContain('{"');
+  });
+
+  it('offers the raw JSON of the fields it shows', () => {
+    render(SpecDetails, { spec: { role: 'Release reviewer' }, hasDescription: true });
+    expect(screen.getByRole('button', { name: 'View raw JSON' })).toBeTruthy();
   });
 
   it('is open by default when the card has no description', () => {

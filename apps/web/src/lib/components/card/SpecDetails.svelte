@@ -8,8 +8,9 @@
   brief), or when the spec is short enough not to bury the rest of the drawer.
 -->
 <script lang="ts">
-  import SpecValue from './SpecValue.svelte';
-  import { humaniseKey, isLongSpec, isPlainObject, specDetailEntries } from './spec-details';
+  import RawJson from './RawJson.svelte';
+  import StructuredValue from './StructuredValue.svelte';
+  import { humaniseKey, isLongSpec, isPlainObject, normaliseValue, specDetailEntries } from './spec-details';
 
   let { spec, hasDescription }: { spec: Record<string, unknown> | null | undefined; hasDescription: boolean } = $props();
 
@@ -26,19 +27,24 @@
       </summary>
       <dl class="bg-inset border-border mt-2 flex flex-col gap-3 rounded-[7px] border px-3.5 py-3">
         {#each entries as e (e.key)}
+          {@const inner = normaliseValue(e.value)}
           <div class="min-w-0">
             <dt class="spec-k text-muted-foreground mb-0.5 text-[11px] font-medium">{humaniseKey(e.key)}</dt>
-            <dd class="min-w-0 {isPlainObject(e.value) ? 'spec-nest mt-1 border-l pl-2.5' : Array.isArray(e.value) ? 'mt-1' : ''}">
-              <SpecValue value={e.value} depth={0} testid={`spec-value-${e.key}`} />
+            <dd class="min-w-0 {isPlainObject(inner) ? 'spec-nest mt-1 border-l pl-2.5' : Array.isArray(inner) ? 'mt-1' : ''}">
+              <StructuredValue value={inner} depth={0} testid={`spec-value-${e.key}`} />
             </dd>
           </div>
         {/each}
       </dl>
+      <RawJson value={Object.fromEntries(entries.map((e) => [e.key, e.value]))} />
     </details>
   </section>
 {/if}
 
 <style>
+  .spec-k {
+    overflow-wrap: anywhere;
+  }
   .spec-nest {
     border-color: var(--line);
   }

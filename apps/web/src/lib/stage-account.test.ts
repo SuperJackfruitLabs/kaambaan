@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { stageAccount, formatHandoff } from './stage-account';
+import { stageAccount } from './stage-account';
 
 /**
  * A card's account, stage by stage.
@@ -100,32 +100,5 @@ describe('stageAccount', () => {
     expect(got[0]!.handoff).toBeNull();
     expect(got[0]!.failureReason).toBeNull();
     expect(got[0]!.ended).toBe('completed');
-  });
-});
-
-describe('formatHandoff', () => {
-  it('reads a summary as prose, not as JSON (S6)', () => {
-    // A handoff is `JsonValue` and in practice an object. Dumping it would put braces and quotes in
-    // front of a person for no reason.
-    expect(formatHandoff({ summary: 'audited the homepage', next: 'measure p95' })).toEqual([
-      { label: 'summary', value: 'audited the homepage' },
-      { label: 'next', value: 'measure p95' },
-    ]);
-  });
-
-  it('takes a bare string as the whole handoff', () => {
-    expect(formatHandoff('just a sentence')).toEqual([{ label: null, value: 'just a sentence' }]);
-  });
-
-  it('flattens a nested value rather than dropping it', () => {
-    // Anything an agent actually wrote must be visible. Silently omitting a nested object would lose
-    // the part a reader most wants when the summary is thin.
-    const got = formatHandoff({ summary: 'ok', evidence: { url: 'https://x.y', status: 200 } });
-    expect(got.find((f) => f.label === 'evidence')?.value).toContain('https://x.y');
-  });
-
-  it('answers nothing for nothing', () => {
-    expect(formatHandoff(null)).toEqual([]);
-    expect(formatHandoff(undefined as never)).toEqual([]);
   });
 });

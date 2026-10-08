@@ -16,16 +16,32 @@ import { planRendersWhole } from './plan';
  */
 export const DRAWER_OWNED_KEYS: ReadonlySet<string> = new Set(['description', 'acceptanceCriteria', 'labels', 'due']);
 
-/** How many levels of nesting are drawn as groups before the rest is shown as compact JSON. */
-export const MAX_DEPTH = 4;
+/**
+ * How many levels of nesting are drawn as groups before the rest folds behind a "Show more"
+ * disclosure. Real handoffs reach five (`scope.auditBaseline.forgeReadProbes.<repo>`), so six
+ * draws them whole; the fold is for the pathological, and it never falls back to JSON.
+ */
+export const MAX_DEPTH = 6;
+
+/** A list longer than {@link LIST_FOLD_AFTER} shows this many items and a "Show all N" button. */
+export const LIST_PREVIEW = 8;
+/** Hiding one or two items behind a button costs more than showing them. */
+const LIST_FOLD_AFTER = LIST_PREVIEW + 2;
 
 export interface SpecEntry {
   key: string;
   value: unknown;
 }
 
-/** `portraitDecision` → "Portrait decision", `due_by_date` → "Due by date", `prURL` → "Pr URL". */
+/**
+ * `portraitDecision` → "Portrait decision", `due_by_date` → "Due by date", `prURL` → "Pr URL".
+ *
+ * Only an identifier-shaped key is respelled. A handoff keys things by what they are — a
+ * repository (`SuperJackfruitLabs/agentpod`), a path, a column (`runs.handoff_json`), or a phrase
+ * the agent already wrote as words — and lowercasing or splitting those would misname them.
+ */
 export function humaniseKey(key: string): string {
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(key)) return key;
   const words = key
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -96,6 +112,16 @@ export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Entries inside a value, in the author's order. Unlike the top level, a null or empty field here
+ * is shown (as a dash): `refusedHandoff: null` says something, and dropping it would not.
+ */
+export function nestedEntries(obj: Record<string, unknown>): SpecEntry[] {
+  return Object.entries(obj)
+    .filter(([, v]) => v !== undefined)
+    .map(([key, value]) => ({ key, value }));
+}
+
 /** Entries of `obj` worth showing, in the author's order. */
 export function visibleEntries(obj: Record<string, unknown>): SpecEntry[] {
   return Object.entries(obj)
@@ -130,11 +156,72 @@ export function isLongSpec(entries: SpecEntry[]): boolean {
   return acc.leaves > LONG_LEAVES || acc.chars > LONG_CHARS;
 }
 
-/** The tail of a too-deep value, as one line of JSON. Never throws (cycles, BigInt). */
-export function compactJson(v: unknown): string {
+/** The value as indented JSON, for the "View raw JSON" toggle. Never throws (cycles, BigInt). */
+export function rawJson(v: unknown): string {
   try {
-    return JSON.stringify(v) ?? String(v);
+    return JSON.stringify(v, null, 2) ?? String(v);
   } catch {
     return String(v);
   }
+}
+
+/** Past this, a string is prose however it starts; parsing it would only cost time. */
+const MAX_JSON_STRING = 200_000;
+
+/**
+ * An agent sometimes stores a JSON document as a string — `approach: "{\"decision\":…}"` — and it
+ * then reads as one wall of escaped quotes. A string that is WHOLLY a JSON object or array is read
+ * as that value; anything else (a JSON scalar, JSON inside a sentence, a near-miss) stays a string.
+ * `JSON.parse` only: nothing is ever evaluated.
+ */
+export function parseJsonString(s: string): Record<string, unknown> | unknown[] | null {
+  const t = s.trim();
+  if (t.length < 2 || t.length > MAX_JSON_STRING) return null;
+  const open = t[0];
+  const close = t[t.length - 1];
+  if (!((open === '{' && close === '}') || (open === '[' && close === ']'))) return null;
+  try {
+    const v: unknown = JSON.parse(t);
+    return Array.isArray(v) || isPlainObject(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The value to draw: a JSON-document string becomes its value; everything else is as given. */
+export function normaliseValue(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  return parseJsonString(v) ?? v;
+}
+
+/** True when `v` is a group (object or array) at a depth that folds behind "Show more". */
+export function shouldCollapse(v: unknown, depth: number): boolean {
+  return depth >= MAX_DEPTH && (Array.isArray(v) || isPlainObject(v));
+}
+
+/** The items of a list to draw, and how many are behind "Show all". */
+export function listWindow<T>(items: T[], showAll: boolean): { shown: T[]; hidden: number } {
+  if (showAll || items.length <= LIST_FOLD_AFTER) return { shown: items, hidden: 0 };
+  return { shown: items.slice(0, LIST_PREVIEW), hidden: items.length - LIST_PREVIEW };
+}
+
+export interface InlinePart extends TextPart {
+  code?: boolean;
+}
+
+/**
+ * Prose split into text, `code` (a backticked span, as agents write file names and commands) and
+ * http(s) links. A URL inside a code span is code, not a link; a lone backtick is just a backtick.
+ */
+export function inlineParts(s: string): InlinePart[] {
+  const parts: InlinePart[] = [];
+  let last = 0;
+  for (const m of s.matchAll(/`([^`\n]+)`/g)) {
+    const start = m.index ?? 0;
+    if (start > last) parts.push(...splitLinks(s.slice(last, start)));
+    parts.push({ text: m[1]!, code: true });
+    last = start + m[0].length;
+  }
+  if (last < s.length) parts.push(...splitLinks(s.slice(last)));
+  return parts.length > 0 ? parts : [{ text: s }];
 }
