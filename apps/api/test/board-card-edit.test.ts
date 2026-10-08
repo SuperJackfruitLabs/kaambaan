@@ -71,3 +71,54 @@ describe('BoardDO — a card can be reassigned', () => {
     });
   });
 });
+
+/**
+ * A read-modify-write needs a way to say "only if nobody changed it since I read it".
+ *
+ * `supi edit-card --merge-spec` reads the card, merges into its spec, and writes the whole spec
+ * back. Without a precondition, an edit made in between — in the drawer, by another terminal — is
+ * silently overwritten by a spec built from the older copy. `expectedUpdatedAt` is that
+ * precondition: the card's `updatedAt` as the caller read it.
+ */
+describe('BoardDO — updateCard refuses a stale precondition', () => {
+  it('applies the patch when expectedUpdatedAt is what the card still says', async () => {
+    await runInDurableObject(stubFor('ce-pre-ok'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_pre_ok', tenantId: 'tnt_a', name: 'P', stages: PIPE });
+      const c = await board.createCard({ title: 'x', ownerUserId: 'usr_a', spec: { a: 1 } });
+      if (!c.ok) throw new Error('card');
+      const r = await board.updateCard(c.value.id, { spec: { a: 2 }, expectedUpdatedAt: c.value.updatedAt });
+      expect(r).toMatchObject({ ok: true, value: { spec: { a: 2 } } });
+    });
+  });
+
+  it('refuses with CARD_CHANGED, and writes nothing, when the card moved on in between', async () => {
+    await runInDurableObject(stubFor('ce-pre-stale'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_pre_st', tenantId: 'tnt_a', name: 'P', stages: PIPE });
+      const c = await board.createCard({ title: 'x', ownerUserId: 'usr_a', spec: { a: 1 } });
+      if (!c.ok) throw new Error('card');
+      const read = c.value.updatedAt;
+      // Somebody else's edit lands between the read and the write — in the same frozen-clock
+      // window, which is the case a millisecond timestamp alone would miss.
+      const other = await board.updateCard(c.value.id, { title: 'theirs' });
+      if (!other.ok) throw new Error('other');
+      expect(other.value.updatedAt).not.toBe(read);
+
+      const mine = await board.updateCard(c.value.id, { spec: { a: 2 }, expectedUpdatedAt: read });
+      expect(mine).toMatchObject({ ok: false, code: 'CARD_CHANGED' });
+      const now = await board.getCardView(c.value.id);
+      expect(now).toMatchObject({ ok: true, value: { title: 'theirs', spec: { a: 1 } } });
+    });
+  });
+
+  it('gives every edit a distinct updatedAt, even two in one frozen-clock window', async () => {
+    await runInDurableObject(stubFor('ce-pre-mono'), async (board: BoardDO) => {
+      await board.init({ id: 'brd_pre_m', tenantId: 'tnt_a', name: 'P', stages: PIPE });
+      const c = await board.createCard({ title: 'x', ownerUserId: 'usr_a' });
+      if (!c.ok) throw new Error('card');
+      const a = await board.updateCard(c.value.id, { title: 'a' });
+      const b = await board.updateCard(c.value.id, { title: 'b' });
+      if (!a.ok || !b.ok) throw new Error('edit');
+      expect(Date.parse(b.value.updatedAt!)).toBeGreaterThan(Date.parse(a.value.updatedAt!));
+    });
+  });
+});

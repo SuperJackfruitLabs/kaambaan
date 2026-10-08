@@ -67,6 +67,7 @@ without the other. These rearrange:
 ```bash
 supi project add <name> [--description <text>] [--target YYYY-MM-DD]
 supi milestone add <projectId> <name> [--target YYYY-MM-DD]
+supi edit-card <boardId> <cardId> [--title <text>] [--merge-spec <file|->] [--priority <n>] [--due YYYY-MM-DD|none]
 supi move <boardId> <cardId> <stageKey>
 supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
 supi link rm  <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
@@ -75,6 +76,11 @@ supi link rm  <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent
 **Put work in a project.** A card outside one falls out of every rollup: the project's card count
 and its cost both stop including it, silently. If you queue or shape a card that belongs to a body
 of work, say which.
+
+**Prefer `--merge-spec` to `--spec` when editing.** `--spec` replaces the whole brief and drops
+every key you did not repeat; `--merge-spec` changes only the top-level keys you name (`null`
+removes one) and is refused with a 409 if the card changed since it was read — re-run it, do not
+fall back to `--spec`. An agent already working the card is not sent your edit.
 
 **`move` is not an edit.** Moving a card into a stage an agent can claim IS dispatching it, so it
 carries your dispatch grant and is refused the same way queueing is when you have none. Moving a
