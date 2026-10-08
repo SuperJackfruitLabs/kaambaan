@@ -112,6 +112,11 @@ supi archive <boardId> <cardId>
 
 A card created here carries **this token** as its grant — the record of who asked for the work.
 
+`--spec` takes the card's brief as a JSON object. Begin it with a plain-language `description`;
+`plan` and `acceptanceCriteria` get their own sections in the card drawer and every other field is
+shown under **Details**. The agent receives the whole spec either way — see
+[The spec](/use/cards/#the-spec).
+
 ## Order and grouping
 
 ```sh

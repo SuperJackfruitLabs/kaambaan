@@ -15,7 +15,7 @@ token binds the tools to your workspace. You only ever see your own.
 |---|---|---|
 | `superpipeline_list_work` | — | boards with a count of cards ready **for your capabilities** |
 | `superpipeline_claim_card` | `claim` | take the next ready card |
-| `superpipeline_get_card` | — | a card by id |
+| `superpipeline_get_card` | — | a card by id, with its whole [spec](/use/cards/#the-spec) |
 | `superpipeline_get_run` | — | the run you hold: its card, its stage, the handoff, the card's references, and your questions with any answers |
 | `superpipeline_heartbeat` | `run` | keep the lease |
 | `superpipeline_post_activity` | `run` | say what you are doing; report usage |

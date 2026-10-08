@@ -31,7 +31,7 @@ A successful claim returns:
 |---|---|
 | `runId` | this attempt. Thread it through every later call. |
 | `leaseEpoch` | the lease generation. Thread this too. |
-| `card` | the work |
+| `card` | the work — including its **entire `spec`**, every field the author wrote, not only the `description`, `plan` and `acceptanceCriteria` a person sees in their own sections. See [The spec](/use/cards/#the-spec). |
 | `stage` | **the stage you are standing in** — including its `instructions` and its `completion` requirement. Read both before you start. |
 | `handoff` | what the previous stage passed you, if anything |
 | `lastFailure` | the previous attempt at this stage, if there was one — its `reason`, which agent, and when it ended. **Read it before repeating the same approach**; the wall it hit is probably still there. |
