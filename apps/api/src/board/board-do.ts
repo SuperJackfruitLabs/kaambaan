@@ -952,6 +952,48 @@ export interface BoardSnapshot {
      */
     triggerGrantCount: number | null;
   };
+  /** The board's stale-card settings: how long a card may sit before it counts, and whether the digest is on. */
+  stale: StaleSettings;
+}
+
+/** Per-board stale-card settings. Defaults: on, 24 hours. */
+export interface StaleSettings {
+  enabled: boolean;
+  afterHours: number;
+}
+
+/** The default threshold, in hours, past which a waiting card counts as stale. */
+export const STALE_DEFAULT_HOURS = 24;
+/** The digest tells an owner about the same card at most once in this long. */
+const STALE_DIGEST_REPEAT_MS = 24 * 3600_000;
+
+/**
+ * A card that is waiting and will go on waiting unless somebody acts.
+ *
+ * `why` is one of: waiting on a person (`needs-human`, with the card's own reason, or one derived
+ * for the two parks that predate `needsHuman` — a review gate opened on entry, and a parent held
+ * back by open sub-tasks), or sitting in a stage nothing will ever take it from (`no-owner`: not
+ * agent-claimable, no approval gate, and not the last stage — which resolves a card on arrival).
+ */
+export interface StaleCardView {
+  boardId: string;
+  boardName: string;
+  cardId: string;
+  title: string;
+  ownerUserId: string;
+  stageKey: string;
+  stageName: string;
+  state: TaskState;
+  why:
+    | { kind: 'needs-human'; reason: CardNeedsHuman['reason'] | 'sub-tasks'; detail?: string; failureCount?: number; elicitationId?: string; gateId?: string }
+    | { kind: 'no-owner' };
+  /** The readable part of the card's handoff (`handoffSummary`) — what a reviewer is asked to approve. Plain text, never HTML. */
+  summary: string | null;
+  /** When the card stopped where it is (ISO). */
+  since: string;
+  ageHours: number;
+  /** What a person should do next, in words, with the command when there is one. */
+  next: string;
 }
 
 /** Board-level cost rollup + budget state (docs/07 §6). */
@@ -1033,7 +1075,11 @@ export type BoardErrorCode =
   | 'COMMENT_NOT_FOUND'
   | 'NOT_COMMENT_AUTHOR'
   | 'NO_RUN_ON_CARD'
-  | 'CARD_CHANGED';
+  | 'CARD_CHANGED'
+  | 'INVALID_RESUME'
+  | 'QUESTION_PENDING'
+  | 'GATE_PENDING'
+  | 'INVALID_STALE_SETTINGS';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1165,6 +1211,14 @@ export interface BoardStub {
    * refuses `NO_RUN_ON_CARD`: an agent talks on the card it is working, and nowhere else.
    */
   addComment(input: { cardId: string; author: CommentView['author']; body: string }): Promise<Result<CommentView>>;
+  /** Return a card waiting on a person to its stage (or an earlier one) with a comment — see the method. */
+  resumeCard(input: {
+    cardId: string;
+    comment: string;
+    toStageKey?: string;
+    actor: { id: string; name: string | null };
+    queuedGrant?: string[] | null;
+  }): Promise<Result<{ card: CardView; comment: CommentView }>>;
   /** Tombstone a comment. Only its human author may; an agent's comment is never deleted. */
   deleteComment(input: { cardId: string; commentId: string; userId: string }): Promise<Result<CommentView>>;
   /** The comments on the card a run holds, for that run's agent (the MCP list tool). */
@@ -1188,7 +1242,10 @@ export interface BoardStub {
   pendingElicitationDeliveries(): Promise<ElicitationPendingBody[]>;
   dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
   getRunReportOutbox(): Promise<RunReportOutboxRow[]>;
-  sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }>;
+  sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number; staleNotified: number }>;
+  /** Cards waiting past the threshold — the board's own unless `afterHours` is given. See `StaleCardView`. */
+  staleCards(input: { nowIso: string; afterHours?: number }): Promise<StaleCardView[]>;
+  setStaleSettings(input: { enabled?: boolean; afterHours?: number }): Promise<Result<StaleSettings>>;
   createSchedule(input: {
     title: string;
     rule: string;
@@ -1655,7 +1712,9 @@ export class BoardDO extends DurableObject<Env> {
      * has not moved since this column arrived; readers fall back to `updated_at`, then `created_at`.
      *
      * `stale_notified_at` is the stale digest's memory, like `overdue_notified_at` is the overdue
-     * sweep's: the last time this card's owner was told it was stuck.
+     * sweep's: the last time this card's owner was told it was stuck. Deliberately NOT reset when the
+     * card moves: the promise is "never the same card twice in a day", and a card flapping between
+     * two stuck states would otherwise be reported on every flap.
      */
     try {
       this.sql.exec(`ALTER TABLE cards ADD COLUMN state_since TEXT`);
@@ -1673,7 +1732,6 @@ export class BoardDO extends DurableObject<Env> {
        BEGIN
          UPDATE cards SET
            state_since = COALESCE(NEW.updated_at, NEW.created_at),
-           stale_notified_at = NULL,
            completion_rework_json = CASE WHEN NEW.current_stage_key IS NOT OLD.current_stage_key
                                          THEN NULL ELSE completion_rework_json END
          WHERE id = NEW.id;
@@ -2363,6 +2421,102 @@ export class BoardDO extends DurableObject<Env> {
     }
     await this.scheduleReclaim();
     return { ok: true, value: updated };
+  }
+
+  /**
+   * Resume a card that is waiting on a person: the human half of a block.
+   *
+   * Returns the card to its current stage — or a named EARLIER one — as `submitted`, with the
+   * person's comment kept twice: on the card's thread, where people read it, and as
+   * `handoff.feedback`, which the next claim and the run context carry to the agent (the path a
+   * reviewer's request-changes uses). `needsHuman` is cleared, and the stage starts over: the
+   * breaker count goes to zero and the automatic completion rework is owed again.
+   *
+   * Refused where a more specific answer exists, rather than letting resume paper over it:
+   *  - an open question (`QUESTION_PENDING`) is answered through its own form, so the agent gets
+   *    the answer it asked for instead of a card that silently restarted under it;
+   *  - a pending review (`GATE_PENDING`) is decided — request-changes IS the resume for a review,
+   *    and resuming around it would leave a gate deciding nothing;
+   *  - a later stage (`INVALID_RESUME`) is a move, not a resume.
+   *
+   * Resuming re-queues the card, so the person resuming becomes its queuer, exactly as a move does.
+   */
+  async resumeCard(input: {
+    cardId: string;
+    comment: string;
+    toStageKey?: string;
+    actor: { id: string; name: string | null };
+    queuedGrant?: string[] | null;
+  }): Promise<Result<{ card: CardView; comment: CommentView }>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    const card = this.getCard(input.cardId);
+    if (!card) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${input.cardId}` };
+    if (typeof input.comment !== 'string' || input.comment.trim() === '') {
+      return { ok: false, code: 'INVALID_COMMENT', message: 'resuming a card needs a comment saying what changed' };
+    }
+    const bytes = new TextEncoder().encode(input.comment).length;
+    if (bytes > COMMENT_MAX_BYTES) {
+      return { ok: false, code: 'INVALID_COMMENT', message: `a comment is at most ${COMMENT_MAX_BYTES} bytes; this one is ${bytes}` };
+    }
+    if (card.state !== 'input-required') {
+      return { ok: false, code: 'CARD_NOT_WAITING', message: `a card in "${card.state}" is not waiting on anybody` };
+    }
+    const boardId = this.getMeta('boardId');
+    const question = this.sql
+      .exec(`SELECT id FROM elicitations WHERE card_id = ? AND status = 'pending' LIMIT 1`, card.id)
+      .toArray()[0];
+    if (question) {
+      return {
+        ok: false,
+        code: 'QUESTION_PENDING',
+        message: `this card's agent asked a question — answer it instead (POST /v1/boards/${boardId}/elicitations/${question.id as string}/answer, or the card in the web app)`,
+      };
+    }
+    if (this.sql.exec(`SELECT 1 FROM gates WHERE card_id = ? AND status = 'pending' LIMIT 1`, card.id).toArray().length > 0) {
+      return {
+        ok: false,
+        code: 'GATE_PENDING',
+        message: `this card is waiting on a review — decide it instead: supi approve, or supi request-changes ${boardId} <gateId> --comment "…" to send it back`,
+      };
+    }
+    const openChildren = this.openChildCount(card.id);
+    if (openChildren > 0) {
+      return { ok: false, code: 'CARD_BLOCKED', message: `card has ${openChildren} open sub-task${openChildren === 1 ? '' : 's'}` };
+    }
+    const stages = this.stages();
+    const currentIdx = stages.findIndex((s) => s.key === card.currentStageKey);
+    const targetKey = input.toStageKey ?? card.currentStageKey;
+    const targetIdx = stages.findIndex((s) => s.key === targetKey);
+    if (targetIdx === -1) return { ok: false, code: 'UNKNOWN_STAGE', message: `unknown stage: ${targetKey}` };
+    if (currentIdx !== -1 && targetIdx > currentIdx) {
+      return { ok: false, code: 'INVALID_RESUME', message: `"${targetKey}" is after "${card.currentStageKey}" — resume returns a card to its stage or an earlier one; move it to go forward` };
+    }
+
+    const now = this.now();
+    const prior = this.parseHandoff(this.getCardHandoffJson(card.id));
+    const merged =
+      prior && typeof prior === 'object' && !Array.isArray(prior) ? { ...prior, feedback: input.comment } : { feedback: input.comment };
+    const grant = input.queuedGrant === undefined || input.queuedGrant === null ? null : JSON.stringify(input.queuedGrant);
+    this.sql.exec(
+      `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
+              failure_count = 0, needs_human_json = NULL, completion_rework_json = NULL, pending_advance_json = NULL,
+              handoff_json = ?, updated_at = ?, queued_by = ?, queued_by_agent_id = NULL,
+              queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END
+        WHERE id = ?`,
+      targetKey,
+      JSON.stringify(merged),
+      now,
+      input.actor.id,
+      grant,
+      grant,
+      card.id,
+    );
+    const comment = await this.addComment({ cardId: card.id, author: { kind: 'human', ...input.actor }, body: input.comment });
+    if (!comment.ok) return comment;
+    this.emit('card.resumed', { cardId: card.id, from: card.currentStageKey, to: targetKey, by: input.actor.id, commentId: comment.value.id });
+    this.notifyWorkAvailable(card.id);
+    await this.scheduleReclaim();
+    return { ok: true, value: { card: this.mustGetCard(card.id), comment: comment.value } };
   }
 
   /**
@@ -3771,7 +3925,7 @@ export class BoardDO extends DurableObject<Env> {
    * review found here (a failing backfill had been taking the overdue sweep down with it, silently
    * and forever). `schedulesFired` reports 0, honestly, when firing itself failed.
    */
-  async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number }> {
+  async sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number; staleNotified: number }> {
     // The backfill is a migration, not a sweep job. Guarded by a meta flag because its query
     // (`WHERE due_at IS NULL`) matches every card that never had a due date — i.e. most of them,
     // forever — so running it on each five-minute tick would be a full table scan for nothing.
@@ -3859,6 +4013,14 @@ export class BoardDO extends DurableObject<Env> {
       this.emit('schedules.sweep_failed', { reason: String(err) });
     }
 
+    // The stale digest, isolated like the jobs above it: its failure must cost none of them.
+    let staleNotified = 0;
+    try {
+      staleNotified = this.sendStaleDigest(nowIso);
+    } catch (err) {
+      this.emit('stale.sweep_failed', { reason: String(err) });
+    }
+
     // The overdue sweep and schedule firing above ran regardless of the backfill's outcome. Now
     // that they have, surface the deferred failure so a caller (the cron loop) still learns the
     // sweep was not clean.
@@ -3867,8 +4029,172 @@ export class BoardDO extends DurableObject<Env> {
     // must be visible to the caller, and must not have cost the overdue pass or the schedules.
     if (terminalBackfillError) throw terminalBackfillError;
 
-    return { overdueNotified, schedulesFired };
+    return { overdueNotified, schedulesFired, staleNotified };
   }
+
+  // ----- stale cards -----
+
+  async setStaleSettings(input: { enabled?: boolean; afterHours?: number }): Promise<Result<StaleSettings>> {
+    if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+    if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
+      return { ok: false, code: 'INVALID_STALE_SETTINGS', message: '`enabled` must be true or false' };
+    }
+    if (input.afterHours !== undefined && (typeof input.afterHours !== 'number' || !Number.isFinite(input.afterHours) || input.afterHours < 0)) {
+      return { ok: false, code: 'INVALID_STALE_SETTINGS', message: '`afterHours` must be a number of hours, 0 or more' };
+    }
+    if (input.enabled !== undefined) this.setMeta('staleEnabled', input.enabled ? '1' : '0');
+    if (input.afterHours !== undefined) this.setMeta('staleAfterHours', String(input.afterHours));
+    this.emit('board.stale_settings', { ...this.staleSettings() });
+    return { ok: true, value: this.staleSettings() };
+  }
+
+  private staleSettings(): StaleSettings {
+    const hours = Number(this.getMeta('staleAfterHours'));
+    return {
+      enabled: this.getMeta('staleEnabled') !== '0',
+      afterHours: this.getMeta('staleAfterHours') !== null && Number.isFinite(hours) ? hours : STALE_DEFAULT_HOURS,
+    };
+  }
+
+  /**
+   * Cards waiting past a threshold, oldest first.
+   *
+   * With no `afterHours` the board's own setting applies, and a board that switched stale cards off
+   * lists nothing. An explicit threshold is a person asking directly, and is answered whatever the
+   * switch says: the switch silences the board, it does not hide its cards.
+   */
+  async staleCards(input: { nowIso: string; afterHours?: number }): Promise<StaleCardView[]> {
+    return this.collectStale(input);
+  }
+
+  private collectStale(input: { nowIso: string; afterHours?: number }): StaleCardView[] {
+    const boardId = this.getMeta('boardId');
+    if (!boardId) return [];
+    const settings = this.staleSettings();
+    if (input.afterHours === undefined && !settings.enabled) return [];
+    const afterHours = input.afterHours ?? settings.afterHours;
+    const nowMs = Date.parse(input.nowIso);
+    const stages = this.stages();
+    const last = stages[stages.length - 1]?.key;
+    // Stages nothing will ever take a submitted card from. The last stage is excluded because
+    // arriving there resolves the card (`completesOnArrival`).
+    const ownerless = stages.filter((st) => !this.isAgentClaimable(st) && st.gate !== 'approval' && st.key !== last).map((st) => st.key);
+    const placeholders = ownerless.map(() => '?').join(', ');
+    const rows = this.sql
+      .exec(
+        `SELECT * FROM cards WHERE archived_at IS NULL AND (state = 'input-required'
+           ${ownerless.length > 0 ? `OR (state = 'submitted' AND current_stage_key IN (${placeholders}))` : ''})`,
+        ...ownerless,
+      )
+      .toArray();
+    const out: StaleCardView[] = [];
+    for (const row of rows) {
+      const since = ((row.state_since as string | null) ?? (row.updated_at as string | null) ?? (row.created_at as string));
+      const ageMs = nowMs - Date.parse(since);
+      if (!(ageMs >= afterHours * 3600_000)) continue;
+      const card = this.rowToCard(row);
+      const stage = stages.find((st) => st.key === card.currentStageKey);
+      const why = this.staleWhy(card, row);
+      out.push({
+        boardId,
+        boardName: this.getMeta('name') ?? '',
+        cardId: card.id,
+        title: card.title,
+        ownerUserId: card.ownerUserId,
+        stageKey: card.currentStageKey,
+        stageName: stage?.name ?? card.currentStageKey,
+        state: card.state,
+        why,
+        summary: handoffSummary((row.handoff_json as string | null) ?? null),
+        since,
+        ageHours: Math.floor((ageMs / 3600_000) * 10) / 10,
+        next: this.staleNext(boardId, card, why),
+      });
+    }
+    return out.sort((a, b) => a.since.localeCompare(b.since));
+  }
+
+  private staleWhy(card: CardView, row: Row): StaleCardView['why'] {
+    if (card.state !== 'input-required') return { kind: 'no-owner' };
+    const gate = this.sql.exec(`SELECT id FROM gates WHERE card_id = ? AND status = 'pending' LIMIT 1`, card.id).toArray()[0];
+    const needs = card.needsHuman;
+    if (needs) {
+      return {
+        kind: 'needs-human',
+        reason: needs.reason,
+        ...(needs.detail !== undefined ? { detail: needs.detail } : {}),
+        ...(needs.failureCount !== undefined ? { failureCount: needs.failureCount } : {}),
+        ...(needs.elicitationId !== undefined ? { elicitationId: needs.elicitationId } : {}),
+        ...(gate ? { gateId: gate.id as string } : {}),
+      };
+    }
+    // The two parks that predate `needsHuman`: a review gate opened on entry, and a deferred advance.
+    if (gate) return { kind: 'needs-human', reason: 'review', gateId: gate.id as string };
+    if (row.pending_advance_json) return { kind: 'needs-human', reason: 'sub-tasks', detail: 'waiting on its open sub-tasks' };
+    return { kind: 'needs-human', reason: 'blocked' };
+  }
+
+  private staleNext(boardId: string, card: CardView, why: StaleCardView['why']): string {
+    const resume = `supi resume ${boardId} ${card.id} --comment "what changed"`;
+    if (why.kind === 'no-owner') {
+      return `nothing claims stage "${card.currentStageKey}" — move it to a stage someone works (supi move ${boardId} ${card.id} <stage>), or give the stage an owner`;
+    }
+    switch (why.reason) {
+      case 'question':
+        return "answer the agent's question on the card";
+      case 'review':
+        return why.gateId
+          ? `decide the review: supi approve ${boardId} ${why.gateId}, or supi request-changes ${boardId} ${why.gateId} --comment "…"`
+          : 'decide the review on the card';
+      case 'sub-tasks':
+        return 'finish or remove its open sub-tasks';
+      case 'not-authorised':
+        return `resume it as someone allowed to dispatch this work: ${resume}`;
+      default:
+        return `read why it stopped, fix that, then resume it: ${resume}`;
+    }
+  }
+
+  /**
+   * The daily digest: each stale card's owner is told once, and every push config that subscribed
+   * to `cards.stale` gets one delivery listing them. Quiet when there is nothing new to say; a card
+   * already told about in the last 24 hours is left out (`stale_notified_at`).
+   */
+  private sendStaleDigest(nowIso: string): number {
+    const nowMs = Date.parse(nowIso);
+    const due = this.collectStale({ nowIso }).filter((c) => {
+      const row = this.sql.exec(`SELECT stale_notified_at FROM cards WHERE id = ?`, c.cardId).toArray()[0];
+      const last = (row?.stale_notified_at as string | null | undefined) ?? null;
+      return last === null || nowMs - Date.parse(last) >= STALE_DIGEST_REPEAT_MS;
+    });
+    if (due.length === 0) return 0;
+    for (const c of due) {
+      const why = c.why.kind === 'no-owner' ? `nothing claims stage "${c.stageKey}"` : c.why.detail ?? c.why.reason;
+      this.notify('stale', c.cardId, `Stuck ${Math.floor(c.ageHours)}h in ${c.stageName}: ${why}. Next: ${c.next}`);
+      this.sql.exec(`UPDATE cards SET stale_notified_at = ? WHERE id = ?`, nowIso, c.cardId);
+    }
+    const body = JSON.stringify({
+      event: 'cards.stale',
+      boardId: this.getMeta('boardId'),
+      boardName: this.getMeta('name') ?? '',
+      cards: due,
+      ts: nowIso,
+    });
+    for (const cfg of this.sql.exec(`SELECT * FROM push_configs`).toArray()) {
+      const events = JSON.parse(cfg.events_json as string) as string[];
+      if (!events.includes('cards.stale')) continue;
+      this.sql.exec(
+        `INSERT INTO push_deliveries (config_id, url, body, status, attempts, created_at) VALUES (?, ?, ?, 'pending', 0, ?)`,
+        cfg.id,
+        cfg.url,
+        body,
+        this.now(),
+      );
+    }
+    this.emit('cards.stale_digest', { count: due.length, cardIds: due.map((c) => c.cardId) });
+    return due.length;
+  }
+
 
   /**
    * Queue `work.available` deliveries for a claimable card, only to configs that could actually claim
@@ -6679,6 +7005,7 @@ export class BoardDO extends DurableObject<Env> {
         webhookConfigured: this.getMeta('githubWebhookSecret') !== null,
         triggerGrantCount: this.triggerGrant()?.length ?? null,
       },
+      stale: this.staleSettings(),
     };
   }
 

@@ -31,6 +31,7 @@ import {
   type GateDecision,
   type Result,
   type JsonValue,
+  type StaleCardView,
 } from './board/board-do';
 import type { LinkKind } from './board/links';
 import type { Env } from './env';
@@ -202,6 +203,14 @@ function statusForCode(code: BoardErrorCode): number {
     // A failed precondition (`expectedUpdatedAt`): the card changed since the caller read it.
     // Re-read and retry; the same request will keep failing until it does.
     case 'CARD_CHANGED':
+      return 409;
+    // Resume refused for a reason the caller can act on: a later stage is a move (400); an open
+    // question or review is answered or decided through its own form (409, the card's state).
+    case 'INVALID_RESUME':
+    case 'INVALID_STALE_SETTINGS':
+      return 400;
+    case 'QUESTION_PENDING':
+    case 'GATE_PENDING':
       return 409;
   }
 }
@@ -1058,6 +1067,45 @@ const worker = {
       return Response.json({ board_id: boardId, ...result.value });
     }
 
+    /**
+     * GET /v1/stale[?hours=n] — cards waiting past a threshold, across every board in the workspace.
+     *
+     * A fan-out over the tenant's boards (the catalog in D1), one DO call each, the same shape as a
+     * project rollup. A board that fails to answer is counted in `boardsUnanswered` and logged, never
+     * allowed to fail the whole list. Without `hours`, each board's own threshold and off switch
+     * apply; with it, every board is asked with that threshold (`hours=0`: everything waiting now).
+     */
+    if (path === '/v1/stale') {
+      try {
+        if (request.method !== 'GET') return Response.json({ error: 'method not allowed' }, { status: 405 });
+        const caller = await resolveWorkspaceCaller(request, env, { human: 'read', agentScope: 'read' });
+        if (caller instanceof Response) return caller;
+        const raw = url.searchParams.get('hours');
+        let afterHours: number | undefined;
+        if (raw !== null) {
+          afterHours = Number(raw);
+          if (raw.trim() === '' || !Number.isFinite(afterHours) || afterHours < 0) {
+            return Response.json({ error: { code: 'INVALID_STALE_SETTINGS', message: '`hours` must be a number, 0 or more' } }, { status: 400 });
+          }
+        }
+        const nowIso = new Date().toISOString();
+        const cards: StaleCardView[] = [];
+        let boardsUnanswered = 0;
+        for (const board of await listBoards(env.DB, caller.tenantId)) {
+          try {
+            cards.push(...(await boardStub(env, caller.tenantId, board.id).staleCards({ nowIso, ...(afterHours !== undefined ? { afterHours } : {}) })));
+          } catch (err) {
+            boardsUnanswered += 1;
+            console.error(`GET /v1/stale: board ${board.id} did not answer`, err);
+          }
+        }
+        cards.sort((a, b) => a.since.localeCompare(b.since));
+        return Response.json({ cards, boardsUnanswered });
+      } catch (err) {
+        return unexpected(err);
+      }
+    }
+
     // /v1/projects[/:id[/milestones|/rollup]] — a workspace's projects (migration 0013), which
     // group cards ACROSS boards. `GET /v1/projects/:id/rollup` (Task 19) is the one read in this
     // module that fans out to every board's Durable Object, via `computeRollup` (`db/projects.ts`)
@@ -1801,6 +1849,10 @@ const worker = {
           // needs which scope, and refuses the methods none of them may use.
           (request.method === 'PATCH' && /^cards\/[^/]+$/.test(rest)) ||
           (request.method === 'POST' && /^cards\/[^/]+\/move$/.test(rest)) ||
+          // Resume is listed so that an agent's bearer lands in the agent branch and is refused there
+          // by scope (403), rather than reaching the human branch and reading as "sign in" (401).
+          // `requiredScope` forbids it on every scope: resuming is the human half of a block.
+          (request.method === 'POST' && /^cards\/[^/]+\/resume$/.test(rest)) ||
           ((request.method === 'POST' || request.method === 'DELETE') && rest === 'links') ||
           // ONE stage's prose, on `compose`. The body is then authorised field by field, so this
           // door opens for `instructions` and refuses every routing key behind it.
@@ -1870,7 +1922,7 @@ const worker = {
       const needed: Capability =
         request.method === 'GET' || rest.startsWith('notifications/') || /^cards\/[^/]+\/comments(\/[^/]+)?$/.test(rest)
           ? 'read'
-          : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'profiles' || rest.startsWith('schedules')
+          : rest === '' || rest === 'stages' || rest === 'github' || rest === 'budget' || rest === 'stale' || rest === 'profiles' || rest.startsWith('schedules')
             ? 'manage'
             : 'work';
       return refuseByRole(user, needed) ?? user;
@@ -2253,6 +2305,31 @@ const worker = {
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
       }
+
+      // POST /v1/boards/:id/cards/:cardId/resume — return a card waiting on a person to its stage
+      // (or an earlier one), with a comment the next agent reads. A person only: the agent branch
+      // above refuses every agent token, and the human branch requires `work`, the role a move needs.
+      const resumeMatch = rest.match(/^cards\/([^/]+)\/resume$/);
+      if (resumeMatch && request.method === 'POST') {
+        if (!user) return Response.json({ error: 'only a person resumes a card' }, { status: 403 });
+        const body = (await request.json().catch(() => null)) as { comment?: unknown; toStageKey?: unknown } | null;
+        if (!body || typeof body !== 'object' || typeof body.comment !== 'string') {
+          return Response.json({ error: { code: 'INVALID_COMMENT', message: 'send { "comment": "<what changed>", "toStageKey"?: "<stage>" }' } }, { status: 400 });
+        }
+        if (body.toStageKey !== undefined && typeof body.toStageKey !== 'string') {
+          return Response.json({ error: { code: 'UNKNOWN_STAGE', message: '`toStageKey` must be a stage key' } }, { status: 400 });
+        }
+        const result = await stub.resumeCard({
+          cardId: resumeMatch[1]!,
+          comment: body.comment,
+          ...(body.toStageKey !== undefined ? { toStageKey: body.toStageKey } : {}),
+          actor: { id: user.userId, name: user.name ?? user.login ?? null },
+          queuedGrant: user.mayDispatch ?? null,
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
+      }
+      if (resumeMatch) return Response.json({ error: 'method not allowed' }, { status: 405 });
 
       // GET /v1/boards/:id/cards/:cardId — one card · PATCH — edit it · DELETE — remove it
       const cardMatch = rest.match(/^cards\/([^/]+)$/);
@@ -3060,6 +3137,21 @@ const worker = {
       }
 
       // PUT /v1/boards/:id/budget — set/clear USD budget caps (docs/07 §6)
+      // PUT /v1/boards/:id/stale — how long a card may wait before it counts as stale, and whether
+      // the board reports stale cards at all (the digest and the default list). `manage`, like budget.
+      if (rest === 'stale' && request.method === 'PUT') {
+        const body = (await request.json().catch(() => null)) as { enabled?: unknown; afterHours?: unknown } | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { code: 'INVALID_STALE_SETTINGS', message: 'send { "afterHours"?: number, "enabled"?: boolean }' } }, { status: 400 });
+        }
+        const result = await stub.setStaleSettings({
+          ...(body.enabled !== undefined ? { enabled: body.enabled as boolean } : {}),
+          ...(body.afterHours !== undefined ? { afterHours: body.afterHours as number } : {}),
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ stale: result.value });
+      }
+
       if (rest === 'budget' && request.method === 'PUT') {
         const body = (await request.json()) as { boardUsdCap?: number | null; cardUsdCap?: number | null };
         // Built from named fields rather than forwarding `body` whole, same as the other PUT/POST

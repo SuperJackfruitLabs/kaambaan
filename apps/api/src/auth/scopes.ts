@@ -119,6 +119,12 @@ export function requiredScope(
    * the grant says on whose authority. Without the second, an agent could launder a human's grant
    * onto work it chose itself.
    */
+  /**
+   * Resuming a card a person was asked to look at. Refused on every scope: it is the human half of a
+   * block — an agent that could resume its own block would make "a person must look at this" a
+   * formality the agent signs off on itself.
+   */
+  if (/^cards\/[^/]+\/resume$/.test(rest)) return SCOPE_FORBIDDEN;
   if (/^cards\/[^/]+\/move$/.test(rest)) {
     return method === 'POST' ? 'plan' : SCOPE_FORBIDDEN;
   }
