@@ -64,6 +64,7 @@ export default defineConfig({
             { label: 'What superpipeline is', slug: 'start/what-it-is' },
             { label: 'Your first board', slug: 'start/first-board' },
             { label: 'Concepts', slug: 'start/concepts' },
+            { label: 'Install on your phone', slug: 'start/install-on-your-phone' },
           ],
         },
         {

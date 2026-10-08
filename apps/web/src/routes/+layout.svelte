@@ -30,7 +30,7 @@
 />
 
 {#if app.authState === 'loading'}
-  <main class="flex min-h-screen flex-col items-center justify-center gap-3 text-center">
+  <main class="min-h-viewport safe-x flex flex-col items-center justify-center gap-3 text-center">
     <BrandMark class="size-7" />
     <div class="wordmark text-lg">superpipeline</div>
     <div class="mono text-muted-foreground flex items-center gap-2 text-xs"><span class="live-dot"></span>loading your boards…</div>
@@ -38,7 +38,7 @@
 {:else if app.authState === 'signed-out'}
   <Landing />
 {:else}
-  <div class="flex h-screen overflow-hidden">
+  <div class="app-shell h-viewport flex overflow-hidden">
     <Rail />
     <div class="flex min-w-0 flex-1 flex-col">
       {@render children()}

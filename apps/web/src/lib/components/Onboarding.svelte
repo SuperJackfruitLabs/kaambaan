@@ -26,7 +26,10 @@
   }
 </script>
 
-<main class="mx-auto flex min-h-screen max-w-xl flex-col justify-center gap-5 px-5 py-5">
+<!-- It renders inside the app frame, under the frame's own height, so it scrolls rather than
+     claiming a whole screen of its own: a screen-tall minimum here pushed the bottom nav off a phone. -->
+<main class="min-h-0 w-full flex-1 overflow-auto">
+<div class="mx-auto flex min-h-full max-w-xl flex-col justify-center gap-5 px-5 py-5">
   <div class="flex items-center gap-3">
     <BrandMark />
     <div>
@@ -59,4 +62,5 @@
 
   <button onclick={() => void logout().then(() => location.reload())} class="text-muted-foreground hover:text-foreground mono self-start text-xs">sign out</button>
   {#if error}<p class="text-coral mono text-xs">{error}</p>{/if}
+</div>
 </main>

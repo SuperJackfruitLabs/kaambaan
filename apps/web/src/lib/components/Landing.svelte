@@ -91,7 +91,7 @@
   }
 </script>
 
-<main class="landing">
+<main class="landing min-h-viewport">
   <!-- ── hero ─────────────────────────────────────────────────────────────── -->
   <section class="hero">
     <div class="hero-copy">
@@ -210,10 +210,12 @@
 </main>
 
 <style>
+  /* Height comes from `min-h-viewport` (app.css): the dynamic viewport, not the large one. The
+     padding keeps clear of a notch and the home indicator under `viewport-fit=cover`. */
   .landing {
-    min-height: 100vh;
     overflow-y: auto;
-    padding: 0 20px;
+    padding: env(safe-area-inset-top, 0px) max(20px, env(safe-area-inset-right, 0px)) env(safe-area-inset-bottom, 0px)
+      max(20px, env(safe-area-inset-left, 0px));
   }
   .hero,
   .band,
