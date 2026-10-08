@@ -58,6 +58,9 @@ for (const vp of WIDTHS) {
       await page.goto('/workspace/agents');
       await expect(page.getByRole('tab', { name: 'Agents' })).toBeVisible();
       expect(await pageScrollsSideways(page), '/workspace/agents').toBe(false);
+      await page.goto('/workspace/needs-you');
+      await expect(page.getByRole('heading', { name: 'Needs you' })).toBeVisible();
+      expect(await pageScrollsSideways(page), '/workspace/needs-you').toBe(false);
     });
 
     test('sign-out and the theme are reachable', async ({ page }) => {

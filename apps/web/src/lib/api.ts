@@ -174,6 +174,44 @@ export interface Card {
    */
   projectId: string | null;
   milestoneId: string | null;
+  /**
+   * Why this card is waiting on a person, when it is (`CardView.needsHuman`). Absent whenever it is
+   * not. `detail` is the agent's or the board's own words — text to render as text, never HTML.
+   */
+  needsHuman?: NeedsHuman;
+  /** When the card last changed state or stage. Absent from a server older than this field. */
+  stateSince?: string;
+}
+
+export interface NeedsHuman {
+  reason: 'question' | 'repeated-failure' | 'blocked' | 'review' | 'not-authorised';
+  elicitationId?: string;
+  detail?: string;
+  failureCount?: number;
+}
+
+/** A card waiting past a threshold, or waiting on a person (`GET /v1/stale`). */
+export interface StaleCard {
+  boardId: string;
+  boardName: string;
+  cardId: string;
+  title: string;
+  ownerUserId: string;
+  stageKey: string;
+  stageName: string;
+  state: string;
+  why:
+    | { kind: 'needs-human'; reason: NeedsHuman['reason'] | 'sub-tasks'; detail?: string; failureCount?: number; elicitationId?: string; gateId?: string }
+    | { kind: 'no-owner' };
+  summary: string | null;
+  since: string;
+  ageHours: number;
+  next: string;
+}
+
+export interface StaleSettings {
+  enabled: boolean;
+  afterHours: number;
 }
 
 /** One entry in the tenant's label catalogue (migration 0010). */
@@ -304,6 +342,8 @@ export interface Gate {
   decidedBy?: string | null;
   comment?: string | null;
   resolvedAt?: string | null;
+  /** What is being approved — the readable part of the handoff. On pending gates in the snapshot. Text only. */
+  summary?: string | null;
 }
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
@@ -365,6 +405,8 @@ export interface BoardSnapshot {
      */
     triggerGrantCount: number | null;
   };
+  /** Absent from a server older than stale-card settings. */
+  stale?: StaleSettings;
 }
 
 export interface Profile {
@@ -785,6 +827,30 @@ export async function getNotifications(boardId: string): Promise<Notification[]>
 
 export function markNotificationRead(boardId: string, seq: number): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/notifications/${seq}/read`, { method: 'POST', headers });
+}
+
+/**
+ * Send a card that is waiting on a person back to work, with a comment the next agent reads.
+ * The caller reads `res.ok` and, on a refusal, `{ error: { message } }` — the server says what to
+ * do instead (answer the question, decide the review).
+ */
+export async function resumeCard(boardId: string, cardId: string, comment: string, toStageKey?: string): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/cards/${cardId}/resume`, {
+    method: 'POST',
+    headers: await withAuthority(headers),
+    body: JSON.stringify({ comment, ...(toStageKey ? { toStageKey } : {}) }),
+  }).then(noteAuth);
+}
+
+/**
+ * Everything waiting on a person across the workspace (`GET /v1/stale?attention=1`): every card in
+ * `input-required` at any age, plus cards sitting in a stage nothing claims past their board's
+ * threshold.
+ */
+export async function listAttention(): Promise<{ cards: StaleCard[]; boardsUnanswered: number }> {
+  const res = noteAuth(await fetch('/v1/stale?attention=1', { headers }));
+  if (!res.ok) throw new Error(`listAttention failed (${res.status})`);
+  return (await res.json()) as { cards: StaleCard[]; boardsUnanswered: number };
 }
 
 /** Resolve an approval gate. The resolver identity is the signed-in user (set by the server). */

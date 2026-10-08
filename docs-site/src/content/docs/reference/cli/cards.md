@@ -180,6 +180,89 @@ An agent moving a card into an agent-owned stage also needs a dispatch grant and
 supi move brd_8f2c… crd_41aa… review
 ```
 
+## `supi resume`
+
+Resumes a card in `input-required` — blocked by its agent, refused twice at its stage's completion check, stopped by the circuit breaker, or refused dispatch. The card returns to its stage (or `--stage`, an earlier one) as `submitted`, its "needs a person" reason is cleared, and the stage starts over: the failure count is reset and the automatic rework is owed again. Agents that can claim the stage are told it is available.
+
+The comment is stored twice: on the card's thread, and as `feedback` in the handoff the next claim carries — the same place a reviewer's `request-changes` comment goes. Resuming re-queues the card, so you become its queuer, as on a move.
+
+Not for an open question (answer it on the card) or a pending review (use `approve` or `request-changes`): both are refused with a pointer to the right action. To send a card forward, use `move`.
+
+```sh
+supi resume <boardId> <cardId> --comment <text> [--stage <key>]
+```
+
+| argument | meaning |
+|---|---|
+| `<boardId>` | the board, as `brd_…` (see `supi boards`) |
+| `<cardId>` | the card, as `crd_…` (see `supi board <boardId>`) |
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--comment <text>` | string | **required** | what changed, or what to do differently. Kept on the card's comment thread and handed to the next agent as `feedback` |
+| `--stage <key>` | string | the card's current stage | send it back to this earlier stage instead |
+
+**Who may run it**
+
+- **A person:** `member` or above in the workspace.
+- **An agent token:** refused, whatever scopes it carries.
+
+Resuming is the human half of a block: an agent token is refused (403) whatever its scopes.
+
+**Calls** `POST /v1/boards/:boardId/cards/:cardId/resume`
+
+**Prints** JSON: the card and the comment.
+
+**Exit status** `0` on success. `1` when:
+
+- `<boardId>`, `<cardId>` or `--comment` is missing
+- the card is not waiting on a person (the server's 409)
+- the card has an open question or a pending review (409, naming what to do instead)
+- `--stage` is after the card's stage, or unknown (400)
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi resume brd_8f2c… crd_41aa… --comment "Staging is back up; run the migration again."
+supi resume brd_8f2c… crd_41aa… --stage plan --comment "Re-plan this without the staging database."
+```
+
+## `supi stale`
+
+Lists the cards that are waiting and will go on waiting unless somebody acts: cards in `input-required` (with the reason the card gives — blocked, repeated failure, a question, a review, refused dispatch), and cards sitting in a stage nothing claims — no agent owns it, it has no approval gate, and it is not the last stage. For each: the board, the card, its stage, why it is stuck, how long it has been there, and what to do next.
+
+Age is counted from when the card last changed state or stage. Without `--hours` each board's own threshold applies and a board that switched stale cards off is left out.
+
+```sh
+supi stale [--hours <n>]
+```
+
+| flag | type | default | meaning |
+|---|---|---|---|
+| `--hours <n>` | number | each board's own threshold (24 unless set with `set-stale`) | list cards stuck at least this long, on every board, whatever its switch says; `0` lists everything waiting now |
+
+**Who may run it**
+
+- **A person:** `viewer` or above in the workspace.
+- **An agent token:** the `read` scope.
+
+**Calls** `GET /v1/stale`
+
+**Prints** the stuck cards, grouped by board; `--json` for the server's response.
+
+**Exit status** `0` on success. `1` when:
+
+- `--hours` is not a number of hours, 0 or more
+- there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
+
+**Example**
+
+```sh
+supi stale
+supi stale --hours 0 --json
+```
+
 ## `supi archive`
 
 Archives a card now. It leaves the board's lanes and appears under the web app's "show archived" filter.

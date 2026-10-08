@@ -27,7 +27,7 @@ import { basename, dirname, join } from "node:path";
 import { BOARD_TEMPLATES, boardTemplate, capabilityTag, type BoardTemplateStage } from "@superpipeline/contract";
 import { baseUrl, clearSupiCredentials, describeCredential, expired, inspect, refusalHint, resolveCredential, saveSupiDevice, ENV_AGENT_TOKEN, ENV_AGENT_TOKEN_FILE, ENV_TOKEN } from "./credential.ts";
 import { deviceLogin, discoverPlane, exchangeDevice } from "./plane-login.ts";
-import { renderBoards, renderBoard, renderComments, renderGates, renderLog, renderProjects, renderProject } from "./render.ts";
+import { renderBoards, renderBoard, renderComments, renderGates, renderLog, renderProjects, renderProject, renderStale } from "./render.ts";
 import { flag, flags, isPlainObject, mergeSpec, positionals } from "./args.ts";
 import { VERSION, runUpdate } from "./update.ts";
 import { findCommands, renderCommandHelp, renderUsage } from "./commands.ts";
@@ -379,6 +379,55 @@ async function main(argv: string[]): Promise<void> {
         await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/move`, {
           method: "POST",
           body: JSON.stringify({ toStageKey: pos[2] }),
+        }),
+      );
+      return;
+    }
+
+    /**
+     * Resume a card that is waiting on a person: back to its stage, or `--stage` an earlier one.
+     *
+     * The comment is required because it is the whole point — the server keeps it on the card's
+     * thread and hands it to the next agent as feedback. A resume with nothing said re-runs the
+     * same work into the same wall.
+     */
+    case "resume": {
+      const comment = flag(rest, "--comment");
+      const stage = flag(rest, "--stage");
+      if (!pos[0] || !pos[1] || !comment) {
+        fail('usage: supi resume <boardId> <cardId> --comment "what changed" [--stage <key>]');
+      }
+      out(
+        await api(`/v1/boards/${pos[0]}/cards/${pos[1]}/resume`, {
+          method: "POST",
+          body: JSON.stringify({ comment, ...(stage ? { toStageKey: stage } : {}) }),
+        }),
+      );
+      return;
+    }
+
+    /** Cards waiting past a threshold, across every board in the workspace. */
+    case "stale": {
+      const hours = flag(rest, "--hours");
+      if (hours !== null && !(Number.isFinite(Number(hours)) && Number(hours) >= 0)) {
+        fail("--hours takes a number of hours, 0 or more.", "  supi stale --hours 4");
+      }
+      out(await api(`/v1/stale${hours !== null ? `?hours=${encodeURIComponent(hours)}` : ""}`), renderStale);
+      return;
+    }
+
+    case "set-stale": {
+      const hours = flag(rest, "--hours");
+      const on = rest.includes("--on");
+      const off = rest.includes("--off");
+      if (!pos[0]) fail("usage: supi set-stale <boardId> [--hours <n>] [--on|--off]");
+      if (on && off) fail("--on and --off contradict each other.");
+      if (hours === null && !on && !off) fail("Nothing to set.", "  supi set-stale <boardId> --hours 48   (or --off, --on)");
+      if (hours !== null && !(Number.isFinite(Number(hours)) && Number(hours) >= 0)) fail("--hours takes a number of hours, 0 or more.");
+      out(
+        await api(`/v1/boards/${pos[0]}/stale`, {
+          method: "PUT",
+          body: JSON.stringify({ ...(hours !== null ? { afterHours: Number(hours) } : {}), ...(on || off ? { enabled: on } : {}) }),
         }),
       );
       return;

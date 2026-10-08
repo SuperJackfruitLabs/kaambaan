@@ -270,8 +270,8 @@ describe('every way a card comes to rest on a person', () => {
 
   it('a stage whose completion was not met says what was missing', async () => {
     // The D1 refusal: blocked rather than failed, so a retry loop cannot burn budget
-    // re-asserting the same untrue claim. A person has to see it, which means the card
-    // has to say it.
+    // re-asserting the same untrue claim. After its one automatic rework a person has to
+    // see it, which means the card has to say it.
     await runInDurableObject(await board('park-unmet', 'brd_pb3'), async (b: BoardDO) => {
       await b.setStages([
         { key: 'build', name: 'Build', order: 0, ownerKind: 'capability', owner: 'code',
@@ -283,6 +283,10 @@ describe('every way a card comes to rest on a person', () => {
       if (!c.claimed) throw new Error('expected a claim');
 
       await b.complete({ runId: c.runId, leaseEpoch: c.leaseEpoch, handoff: { summary: 'in progress' } });
+      // The first refusal is reworked automatically (completion-rework.test.ts); the second parks.
+      const again = await b.claim(CODER);
+      if (!again.claimed) throw new Error('expected the rework to be claimable');
+      await b.complete({ runId: again.runId, leaseEpoch: again.leaseEpoch, handoff: { summary: 'still in progress' } });
 
       const got = await read(b, card.id);
       expect(got.state).toBe('input-required');

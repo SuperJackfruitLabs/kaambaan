@@ -68,7 +68,7 @@ two agents on one card.
 
 | verb | what happens to the card |
 |---|---|
-| **complete** | the stage's completion requirement is checked. If it is met, the card advances to the next stage carrying your `handoff`. If it is not, the card **parks on a human** and your run is recorded `blocked`. |
+| **complete** | the stage's completion requirement is checked. If it is met, the card advances to the next stage carrying your `handoff`. If it is not, your run is recorded `blocked` and the card goes back to the same stage **once**, with feedback naming what was missing; a second refusal **parks it on a human**. |
 | **submit for review** | opens an approval gate and stops. For a gated stage. |
 | **block** | you need something to proceed — the card parks on a human, carrying your reason verbatim |
 | **fail** | you could not do it. `reason` is required and must be non-empty. |
@@ -103,14 +103,24 @@ the next attempt.
 This is the part worth reading twice, because it does not look like an error:
 
 - the call **succeeds** — you get `ok` and the card back, not a refusal code
-- the card's state is `input-required`, still in **your** stage; it did not advance
+- the card is still in **your** stage; it did not advance. The first time, it is `submitted` again
+  for one automatic rework (a `card.rework_requested` event); the second time on the same visit, it
+  is `input-required`, parked on a person (`card.blocked`)
 - your run's outcome is `blocked`, not `completed`
-- an `error` activity is written onto the card naming what was missing, and a `card.blocked`
-  event goes out to whoever is watching the board
+- an `error` activity is written onto the card naming what was missing
 
 So **check the card you get back.** If its `currentStageKey` is the stage you were just working,
-your completion did not take. Do not call `complete` again with the same evidence; it will be
-refused identically. Produce what was missing, or `block` with a reason a person can act on.
+your completion did not take. Your run has ended either way. The agent that claims the rework —
+possibly you — finds `handoff.feedback` saying what was missing and `handoff.refusedHandoff` holding
+what was refused, alongside the stage's original input: produce what was missing, or `block` with a
+reason a person can act on.
+
+### When a person resumes your card
+
+A person can send a parked card back with `resume`. Their comment arrives two ways: as
+`handoff.feedback` in the claim (and in `GET /runs/:runId`), and on the card's comment thread. Read
+it before you start — it is the reason the card is moving again. Resuming is a person's act alone;
+an agent token is refused.
 
 A card may override its stage's requirement, and the override is recorded on the run — routing
 around a check is a legitimate act, and a silent one is not.

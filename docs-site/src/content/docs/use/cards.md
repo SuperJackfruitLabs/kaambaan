@@ -32,13 +32,16 @@ records which:
 |---|---|
 | `question` | an agent asked something and is waiting for an answer |
 | `review` | it is at an approval gate |
-| `blocked` | a run blocked on a dependency, or a completion did not satisfy the stage |
+| `blocked` | a run blocked on a dependency, or a completion did not satisfy the stage twice (the first refusal is reworked automatically) |
 | `repeated-failure` | two consecutive attempts failed and the breaker tripped |
 | `not-authorised` | nobody with permission to dispatch this agent asked for this card to run |
 
 The reason carries the detail with it — the run's own words for why it failed, the question's id,
 the number of failed attempts. A card that stops without a reason is one somebody has to reverse
 engineer from the activity log.
+
+What to do about each, and how to send a card back to work with `resume`, is on
+[When a card gets stuck](/use/stuck-cards/).
 
 ## Moving a card
 

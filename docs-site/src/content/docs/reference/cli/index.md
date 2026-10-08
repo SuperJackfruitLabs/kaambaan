@@ -39,6 +39,7 @@ The verb comes first. Flags may be written `--name value` or `--name=value`, any
 | [`supi templates`](/reference/cli/boards/#supi-templates) | the starting pipelines --template accepts |
 | [`supi create-board`](/reference/cli/boards/#supi-create-board) | create a board; --template defaults to `simple` |
 | [`supi set-stages`](/reference/cli/boards/#supi-set-stages) | replace a board's pipeline |
+| [`supi set-stale`](/reference/cli/boards/#supi-set-stale) | set when a board's waiting cards count as stale, or switch it off |
 | [`supi set-stage`](/reference/cli/boards/#supi-set-stage) | change ONE stage, leaving the others alone |
 
 ### Cards
@@ -49,6 +50,8 @@ The verb comes first. Flags may be written `--name value` or `--name=value`, any
 | [`supi create-card`](/reference/cli/cards/#supi-create-card) | queue a card, with this token as its grant |
 | [`supi edit-card`](/reference/cli/cards/#supi-edit-card) | change a card's title, spec, priority or due date |
 | [`supi move`](/reference/cli/cards/#supi-move) | move a card to another stage |
+| [`supi resume`](/reference/cli/cards/#supi-resume) | send a card that is waiting on a person back to work, with a comment |
+| [`supi stale`](/reference/cli/cards/#supi-stale) | cards stuck waiting, across every board in the workspace |
 | [`supi archive`](/reference/cli/cards/#supi-archive) | archive a card, so the "show archived" filter has something to show |
 | [`supi log`](/reference/cli/cards/#supi-log) | what an agent did on a card, and its handoff |
 

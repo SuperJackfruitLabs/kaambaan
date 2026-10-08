@@ -41,6 +41,7 @@
   import SpecDetails from '$lib/components/card/SpecDetails.svelte';
   import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
   import CardComments from '$lib/components/card/CardComments.svelte';
+  import CardResume from '$lib/components/card/CardResume.svelte';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -1187,6 +1188,22 @@
               {/if}
             </div>
           </section>
+        {/if}
+
+        <!--
+          Resume — the human half of a block. Only when resume is the answer: a card its agent
+          blocked, the breaker stopped, the completion check refused twice, or dispatch refused.
+          An open question and a pending review have their own panels above.
+        -->
+        {#if boardId}
+          <CardResume
+            {boardId}
+            {card}
+            stages={app.board?.stages ?? []}
+            gatePending={!!gate}
+            questionPending={!!elicitation}
+            onResumed={async () => { await Promise.all([app.refresh(), refreshDrawer(card.id, boardId)]); }}
+          />
         {/if}
 
         <!-- plan checklist (from card.spec.plan, any shape agents write) -->
