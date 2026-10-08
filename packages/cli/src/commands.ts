@@ -125,8 +125,8 @@ export const GROUPS: GroupSpec[] = [
     id: "cards",
     title: "Cards",
     label: "Cards",
-    description: "supi card, create-card, move, archive and log.",
-    intro: "Reading one card, queueing new work, moving it between stages, and reading what an agent did on it.",
+    description: "supi card, create-card, edit-card, move, archive and log.",
+    intro: "Reading one card, queueing new work, editing it, moving it between stages, and reading what an agent did on it.",
   },
   {
     id: "gates",
@@ -576,6 +576,73 @@ export const COMMANDS: CommandSpec[] = [
     examples: [
       "supi create-card brd_8f2c… Write the release notes for 0.0.9",
       "supi create-card brd_8f2c… Audit the token routes --spec spec.json --priority 2 --due 2026-11-01 --label lbl_sec",
+    ],
+  },
+  {
+    path: ["edit-card"],
+    group: "cards",
+    args: [BOARD, CARD],
+    flags: [
+      { name: "--title", value: "<text>", type: "string", default: "unchanged", description: "the card's new title (quote it if it has spaces)" },
+      {
+        name: "--spec",
+        value: "<file|->",
+        type: "path",
+        default: "unchanged",
+        description: "a new spec, as JSON from a file or stdin. It REPLACES the spec whole — every key not in it is gone",
+      },
+      {
+        name: "--merge-spec",
+        value: "<file|->",
+        type: "path",
+        default: "unchanged",
+        description:
+          "a JSON object whose top-level keys are merged into the existing spec: a key given replaces that key (a nested " +
+          "object is replaced, not merged into), a key set to `null` is removed, every other key is kept. Cannot be combined with `--spec`",
+      },
+      { name: "--priority", value: "<n>", type: "number", default: "unchanged", description: "the card's new priority" },
+      {
+        name: "--due",
+        value: "YYYY-MM-DD|none",
+        type: "string",
+        default: "unchanged",
+        description: `the new due date, or \`none\` to clear it; a date ${DATE_FORMAT}`,
+      },
+    ],
+    summary: "change a card's title, spec, priority or due date",
+    description:
+      "Edits a card through the same `PATCH` the web app's card drawer sends, with the same authority. Only the fields " +
+      "named change. Labels, owner and archiving have their own verbs and routes.\n\n" +
+      "`--merge-spec` is a read-modify-write: it reads the card, merges into the spec it read, and writes back with " +
+      "`expectedUpdatedAt` set to the card's `updatedAt` as read. If anything changed the card in between — an edit in " +
+      "the drawer, a claim, a move — the server answers 409 and nothing is written; run the command again to merge into " +
+      "the card as it now is. `--spec` replaces the spec outright and sends no precondition.",
+    // The PATCH is listed first because it is the call every invocation makes; `--merge-spec`
+    // alone reads the card BEFORE it, as the access note says.
+    routes: [
+      { method: "PATCH", path: "/v1/boards/:boardId/cards/:cardId" },
+      { method: "GET", path: "/v1/boards/:boardId/cards/:cardId" },
+    ],
+    access: {
+      role: "member",
+      agent: "plan",
+      note: "With `--merge-spec` the card is read (the GET) before the PATCH, which needs `read` as well on an agent token.",
+    },
+    output: "JSON: the card after the edit",
+    fails: [
+      "`<boardId>` or `<cardId>` is missing",
+      "no field to change was given",
+      "both `--spec` and `--merge-spec` were given",
+      "`--spec` or `--merge-spec` cannot be read or is not JSON; `--merge-spec` is not a JSON object",
+      "`--merge-spec` on a card whose spec is not a JSON object",
+      "`--priority` is not a number; `--due` is neither `YYYY-MM-DD` nor `none`",
+      "the card changed between the read and the write (`--merge-spec`; the server's 409)",
+    ],
+    examples: [
+      'supi edit-card brd_8f2c… crd_41aa… --title "Write the 0.0.9 release notes" --priority 2',
+      "supi edit-card brd_8f2c… crd_41aa… --merge-spec acceptance.json",
+      "echo '{\"notes\": null}' | supi edit-card brd_8f2c… crd_41aa… --merge-spec -",
+      "supi edit-card brd_8f2c… crd_41aa… --due none",
     ],
   },
   {

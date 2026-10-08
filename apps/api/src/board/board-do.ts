@@ -995,7 +995,8 @@ export type BoardErrorCode =
   | 'ALREADY_HAS_PARENT'
   | 'CARD_BLOCKED'
   | 'TOO_MANY_CHILDREN'
-  | 'NOTHING_TO_SPLIT';
+  | 'NOTHING_TO_SPLIT'
+  | 'CARD_CHANGED';
 
 export type Result<T> = { ok: true; value: T } | { ok: false; code: BoardErrorCode; message: string };
 
@@ -1079,6 +1080,8 @@ export interface BoardStub {
       /** Cross-board project/milestone membership (Task 19). `null` clears it. */
       projectId?: string | null;
       milestoneId?: string | null;
+      /** A precondition: the card's `updatedAt` as last read; a mismatch refuses `CARD_CHANGED`. */
+      expectedUpdatedAt?: string | null;
     },
   ): Promise<Result<CardView>>;
   deleteCard(cardId: string): Promise<Result<{ ok: true }>>;
@@ -2286,11 +2289,25 @@ export class BoardDO extends DurableObject<Env> {
       archivedAt?: string | null;
       projectId?: string | null;
       milestoneId?: string | null;
+      /**
+       * A precondition, not a field: the card's `updatedAt` as the caller last read it. When
+       * present and the card has moved on since, nothing is written and `CARD_CHANGED` comes back.
+       * A read-modify-write (`supi edit-card --merge-spec`) sends it so it cannot overwrite an edit
+       * it never saw. Absent, the patch applies as it always has.
+       */
+      expectedUpdatedAt?: string | null;
     },
   ): Promise<Result<CardView>> {
     if (!this.getMeta('boardId')) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
     const existing = this.getCard(cardId);
     if (!existing) return { ok: false, code: 'CARD_NOT_FOUND', message: `card not found: ${cardId}` };
+    if (patch.expectedUpdatedAt !== undefined && patch.expectedUpdatedAt !== existing.updatedAt) {
+      return {
+        ok: false,
+        code: 'CARD_CHANGED',
+        message: `card ${cardId} changed since it was read (updatedAt is now ${existing.updatedAt ?? 'null'})`,
+      };
+    }
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (patch.title !== undefined) {
@@ -2341,7 +2358,12 @@ export class BoardDO extends DurableObject<Env> {
     }
     if (sets.length > 0) {
       sets.push('updated_at = ?');
-      vals.push(this.now());
+      // Strictly after the stored value, never equal to it: `expectedUpdatedAt` compares
+      // timestamps, and Workers freezes the clock inside a request, so two edits in one window
+      // would otherwise carry the same `updatedAt` and a stale precondition would pass.
+      const nowMs = Date.parse(this.now());
+      const prevMs = existing.updatedAt ? Date.parse(existing.updatedAt) : Number.NaN;
+      vals.push(new Date(Number.isNaN(prevMs) ? nowMs : Math.max(nowMs, prevMs + 1)).toISOString());
       this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
     }
     const card = this.mustGetCard(cardId);

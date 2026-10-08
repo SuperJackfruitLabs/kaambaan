@@ -106,6 +106,8 @@ act on.
 ```sh
 supi create-card <boardId> "<title>" [--spec <file|->] [--priority <n>]
                                      [--due YYYY-MM-DD] [--label <id>]...
+supi edit-card <boardId> <cardId> [--title <text>] [--spec <file|->] [--merge-spec <file|->]
+                                   [--priority <n>] [--due YYYY-MM-DD|none]
 supi move <boardId> <cardId> <stageKey>
 supi archive <boardId> <cardId>
 ```
@@ -116,6 +118,21 @@ A card created here carries **this token** as its grant — the record of who as
 `plan` and `acceptanceCriteria` get their own sections in the card drawer and every other field is
 shown under **Details**. The agent receives the whole spec either way — see
 [The spec](/use/cards/#the-spec).
+
+`edit-card` changes a card through the same edit the card drawer makes, with the same authority:
+`member` for a person, `plan` for an agent token. Only the fields you name change. `--spec`
+replaces the spec whole. `--merge-spec` merges one level deep — each top-level key you give
+replaces that key, `null` removes it, everything else is kept:
+
+```sh
+echo '{"acceptanceCriteria": ["Covers the expired-token path"], "draftNotes": null}' \
+  | supi edit-card brd_8f2c… crd_41aa… --merge-spec -
+```
+
+A merge reads the card first and writes back only if the card is unchanged since that read. If
+someone edited it in the drawer, or an agent claimed it, in between, the write is refused with a
+409 and nothing changes; run the command again to merge into the card as it now is. `--due none`
+clears the due date.
 
 ## Order and grouping
 
