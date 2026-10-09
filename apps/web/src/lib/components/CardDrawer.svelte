@@ -1839,7 +1839,7 @@
           {#if libraryRefs.length > 0}
             <div class="mb-2.5 grid gap-2" aria-label="Superlibrary artifacts">
               {#each libraryRefs as l, i (l.ref.id)}
-                <LibraryArtifact itemId={l.itemId} version={l.version} title={l.ref.title ?? l.itemId} open={i === 0} />
+                <LibraryArtifact itemId={l.itemId} version={l.version} title={l.ref.title || l.itemId} open={i === 0} />
               {/each}
             </div>
           {/if}

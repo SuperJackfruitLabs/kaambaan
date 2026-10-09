@@ -35,4 +35,16 @@ describe('Superlibrary references (spec §11: the drawer previews linked artifac
     expect(sentenceFor(new LibraryError(403, 'product_not_enabled'))).toBe('Superlibrary is not enabled for this workspace.');
     expect(sentenceFor(new LibraryError(404, 'not_found'))).toBe('This artifact is not there, or you cannot see it.');
   });
+  it('one mount reads the item once for its versions and its share info', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url);
+      if (url.endsWith('/api/v1/me')) return Response.json({ principalId: 'prn_000000000000000000a2', role: 'member' });
+      return Response.json({ item: { scope: 'workspace', title: 'T', createdBy: 'prn_000000000000000000a2' }, versions: [{ version: 1, revokedAt: null }] });
+    }));
+    const cb = embedCallbacks();
+    await cb.getVersions({ itemId: 'itm_0123456789abcdef' });
+    await cb.getShareInfo({ itemId: 'itm_0123456789abcdef' });
+    expect(urls.filter((u) => u.endsWith('/api/v1/items/itm_0123456789abcdef'))).toHaveLength(1);
+  });
 });

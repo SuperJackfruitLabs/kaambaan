@@ -47,14 +47,25 @@ interface ItemRead { item: { scope: Scope; title: string; createdBy: string; aud
 
 /** The host's callbacks for `mountArtifact` (superlibrary packages/embed README, "The host's duties"). */
 export function embedCallbacks(): Pick<MountOptions, 'getEmbedUrl' | 'getVersions' | 'getShareInfo' | 'setScope'> {
+  // One mount reads each item once: the embed asks for versions and share info separately.
+  const reads = new Map<string, Promise<ItemRead>>();
+  const readItem = (itemId: string): Promise<ItemRead> => {
+    let p = reads.get(itemId);
+    if (!p) {
+      p = libraryFetch(`/api/v1/items/${itemId}`).then((r) => jsonOf<ItemRead>(r));
+      reads.set(itemId, p);
+      p.catch(() => reads.delete(itemId));
+    }
+    return p;
+  };
   return {
     getEmbedUrl: async ({ itemId, version }) =>
       jsonOf<EmbedGrant>(await libraryFetch(`/api/v1/items/${itemId}/embed`, { method: 'POST', body: JSON.stringify(version ? { version } : {}) })),
     getVersions: async ({ itemId }) =>
-      (await jsonOf<ItemRead>(await libraryFetch(`/api/v1/items/${itemId}`))).versions.filter((v) => !v.revokedAt).map((v) => v.version),
+      (await readItem(itemId)).versions.filter((v) => !v.revokedAt).map((v) => v.version),
     getShareInfo: async ({ itemId }): Promise<ShareInfo> => {
       const [{ item }, me] = await Promise.all([
-        libraryFetch(`/api/v1/items/${itemId}`).then((r) => jsonOf<ItemRead>(r)),
+        readItem(itemId),
         libraryFetch('/api/v1/me').then((r) => jsonOf<{ principalId: string; role: 'owner' | 'member' }>(r)).catch(() => null),
       ]);
       // Superlibrary decides on widening; this only offers it to whom it would allow (its plan D12).

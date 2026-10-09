@@ -14,7 +14,10 @@
   // The embed renders every kind in a sandboxed frame on Superlibrary's content origin (spec §9).
   $effect(() => {
     const el = host;
-    if (!open || !el) return;
+    if (!open || !el) {
+      failure = null;
+      return;
+    }
     let live = true;
     let mounted: Mounted | null = null;
     failure = null;

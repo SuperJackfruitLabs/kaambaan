@@ -32,4 +32,11 @@ describe('LibraryArtifact (spec §9 Embedding, §11)', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Show preview' }));
     expect((await screen.findByRole('alert')).textContent).toContain('Superlibrary is not enabled for this workspace.');
   });
+  it('hiding the preview clears its failure message', async () => {
+    mount.mockRejectedValue(new LibraryError(404, 'not_found'));
+    render(LibraryArtifact, { itemId: 'itm_0123456789abcdef', title: 'Plan', open: true });
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Hide preview' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
 });
