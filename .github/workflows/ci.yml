@@ -38,11 +38,17 @@ jobs:
       # Boots wrangler dev (:8787) + the SvelteKit dev server (:5173) via Playwright's webServer.
       - run: pnpm --filter @superpipeline/web e2e
 
+  # Every deploy job below is gated on `github.server_url == 'https://github.com'`. This workflow
+  # also runs on forge (Forgejo Actions reads .github/workflows when .forgejo/workflows is absent),
+  # where `github.server_url` is forge's own URL. Once forge is primary, a push to forge's main
+  # reaches GitHub's main through the push mirror, and THAT push is what deploys. forge holds no
+  # CLOUDFLARE_API_TOKEN and never should: on forge these jobs are skipped, not failed.
+  #
   # Continuous deploy: after tests pass on a push to main, migrate the remote D1 + ship to Cloudflare.
   # Needs a CLOUDFLARE_API_TOKEN repo secret (Workers Scripts: Edit · D1: Edit, scoped to your account).
   deploy:
     needs: [test, e2e]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-production
@@ -79,7 +85,7 @@ jobs:
   # Pages project named `superpipeline-docs`. See docs-site/README.md for the one-time setup.
   deploy-docs:
     needs: [test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-docs
@@ -140,7 +146,7 @@ jobs:
   # `superpipeline-site`.
   deploy-landing:
     needs: [test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-landing
