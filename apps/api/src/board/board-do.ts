@@ -6007,38 +6007,40 @@ export class BoardDO extends DurableObject<Env> {
       const currentMode = decision === 'approve_manual' ? 'manual' : 'automatic';
       const nextMode = input.mode!;
       if (nextMode !== currentMode) {
-        if (currentMode === 'automatic') {
-          if (cardRow.current_run_id || cardRow.state === 'working') {
-            return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'automatic delivery has already been claimed' };
-          }
-          this.sql.exec(
-            `UPDATE cards SET current_stage_key = ?, state = 'input-required', delegate_agent_id = NULL,
-                              current_run_id = NULL, needs_human_json = ?, updated_at = ? WHERE id = ?`,
-            gate.stage_key,
-            JSON.stringify({ reason: 'review', detail: 'approved for manual delivery' }),
-            now,
-            cardId,
-          );
-        } else {
-          if (gate.live_post_url) {
-            return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'manual delivery already has a recorded live URL' };
-          }
-          this.setNeedsHuman(cardId, null);
-          this.advanceCard(cardId, gate.stage_key as string, input.actor, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
+        if (currentMode === 'automatic' && (cardRow.current_run_id || cardRow.state === 'working')) {
+          return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'automatic delivery has already been claimed' };
         }
-        this.sql.exec(`UPDATE gates SET decision = ? WHERE id = ?`, nextMode === 'manual' ? 'approve_manual' : 'approve_automatic', input.gateId);
-        this.sql.exec(
-          `INSERT INTO approval_delivery_events
-             (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
-           VALUES (?, ?, ?, 'mode_switched', ?, ?, ?, NULL, ?)`,
-          newId('ade'),
-          input.gateId,
-          subjectId,
-          currentMode,
-          nextMode,
-          input.actor,
-          now,
-        );
+        if (currentMode === 'manual' && gate.live_post_url) {
+          return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'manual delivery already has a recorded live URL' };
+        }
+        this.ctx.storage.transactionSync(() => {
+          if (currentMode === 'automatic') {
+            this.sql.exec(
+              `UPDATE cards SET current_stage_key = ?, state = 'input-required', delegate_agent_id = NULL,
+                                current_run_id = NULL, needs_human_json = ?, updated_at = ? WHERE id = ?`,
+              gate.stage_key,
+              JSON.stringify({ reason: 'review', detail: 'approved for manual delivery' }),
+              now,
+              cardId,
+            );
+          } else {
+            this.setNeedsHuman(cardId, null);
+            this.advanceCard(cardId, gate.stage_key as string, input.actor, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
+          }
+          this.sql.exec(`UPDATE gates SET decision = ? WHERE id = ?`, nextMode === 'manual' ? 'approve_manual' : 'approve_automatic', input.gateId);
+          this.sql.exec(
+            `INSERT INTO approval_delivery_events
+               (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+             VALUES (?, ?, ?, 'mode_switched', ?, ?, ?, NULL, ?)`,
+            newId('ade'),
+            input.gateId,
+            subjectId,
+            currentMode,
+            nextMode,
+            input.actor,
+            now,
+          );
+        });
       }
     }
 
@@ -7132,8 +7134,9 @@ export class BoardDO extends DurableObject<Env> {
       decidedBy: (r.decided_by as string | null) ?? null,
       comment: (r.comment as string | null) ?? null,
       resolvedAt: (r.resolved_at as string | null) ?? null,
-      summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
-      ...(approvalSubject ? { approvalSubject } : {}),
+      ...(approvalSubject
+        ? { approvalSubject }
+        : { summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)) }),
       ...(delivery ? { delivery } : {}),
     };
   }

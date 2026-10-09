@@ -429,6 +429,37 @@ describe('bound gate resolution', () => {
     }
   });
 
+  it.each([
+    ['approve_manual', 'automatic', 'approve', 'input-required'],
+    ['approve_automatic', 'manual', 'publish', 'submitted'],
+  ] as const)(
+    'rolls back card and gate changes when the %s-to-%s switch audit write fails',
+    async (decision, mode, stageKey, cardState) => {
+      const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-switch-rollback-${mode}`)) as unknown as DurableObjectStub<BoardDO>;
+      await runInDurableObject(stub, async (board: BoardDO, state) => {
+        const opened = await openBoundGate(board, state, `switch-rollback-${mode}`);
+        await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision } as never);
+        const beforeEvents = state.storage.sql.exec('SELECT COUNT(*) AS count FROM approval_delivery_events').one().count;
+        state.storage.sql.exec(
+          `CREATE TRIGGER fail_mode_switch_audit BEFORE INSERT ON approval_delivery_events
+           WHEN NEW.event = 'mode_switched'
+           BEGIN SELECT RAISE(ABORT, 'injected mode-switch audit failure'); END`,
+        );
+
+        await expect(board.updateApprovalDelivery({ gateId: opened.gate.id, actor: DECIDER, mode })).rejects.toThrow(
+          'injected mode-switch audit failure',
+        );
+        expect(state.storage.sql.exec('SELECT decision FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({ decision });
+        expect(
+          state.storage.sql
+            .exec('SELECT current_stage_key, state, current_run_id, needs_human_json FROM cards WHERE id = ?', opened.cardId)
+            .one(),
+        ).toMatchObject({ current_stage_key: stageKey, state: cardState, current_run_id: null });
+        expect(state.storage.sql.exec('SELECT COUNT(*) AS count FROM approval_delivery_events').one().count).toBe(beforeEvents);
+      });
+    },
+  );
+
   it('records a manual live URL with actor/time audit and an explicit unverified read-back status', async () => {
     const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-manual-live-url')) as unknown as DurableObjectStub<BoardDO>;
     await runInDurableObject(stub, async (board: BoardDO, state) => {
