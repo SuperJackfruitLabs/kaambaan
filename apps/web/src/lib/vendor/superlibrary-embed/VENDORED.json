@@ -1,0 +1,8 @@
+{
+  "source": "SuperJackfruitLabs/superlibrary packages/embed",
+  "commit": "0f2b2a65b5d10ad92210273731faa5c0ce406dfd",
+  "files": {
+    "superlibrary-embed.d.ts": "1f350a6755ccadcd5b1ff49fd763ce1b6f770a3f05af1679ef6adbb7e81af5bd",
+    "superlibrary-embed.js": "a5ae922b5c49283fe73c70b36cb464aaa67ab2847e570c951f4eb4f8615fb7cd"
+  }
+}

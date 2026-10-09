@@ -13,6 +13,7 @@
   import BottomNav from '$lib/components/shell/BottomNav.svelte';
   import CommandPalette from '$lib/components/CommandPalette.svelte';
   import Landing from '$lib/components/Landing.svelte';
+  import { closeCardOnEscape } from '$lib/escape';
   import BrandMark from '$lib/components/BrandMark.svelte';
 
   let { children } = $props();
@@ -24,9 +25,7 @@
 </script>
 
 <svelte:window
-  onkeydown={(e) => {
-    if (e.key === 'Escape') app.closeCard();
-  }}
+  onkeydown={(e) => closeCardOnEscape(e, () => app.closeCard())}
 />
 
 {#if app.authState === 'loading'}

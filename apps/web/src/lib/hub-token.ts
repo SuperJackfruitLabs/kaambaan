@@ -48,11 +48,16 @@ let cached: { token: string; expiresAtMs: number } | null = null;
  * Worker requested for the hub's resource. Minted alongside the app token and refreshed with it.
  */
 let cachedHubAud: { token: string; expiresAtMs: number } | null = null;
+/** The Superlibrary-audience token (spec §9 Embedding), for the card drawer. Minted by our Worker on request. */
+let cachedLibrary: { token: string; expiresAtMs: number } | null = null;
+/** False once the Worker has said this deployment has no Superlibrary: nothing to preview or relate. */
+let libraryAbsent = false;
+let libraryInFlight: Promise<string | null> | null = null;
 let lastSignIn: 'github' | 'org-plane' | null = null;
 let inFlight: Promise<string | null> | null = null;
 
 /** `exp` from the payload, without verifying — the hub verifies; this only schedules. */
-function expiryOf(jwt: string): number {
+export function expiryOf(jwt: string): number {
   try {
     const [, payload] = jwt.split('.');
     if (!payload) return 0;
@@ -74,6 +79,36 @@ function remember(token: string | null | undefined): string | null {
   const expiresAtMs = expiryOf(token);
   cached = expiresAtMs > 0 ? { token, expiresAtMs } : null;
   return token;
+}
+
+/**
+ * Every `/hub/token` request goes through here, one at a time. The Worker spends the person's
+ * rotating refresh token on each, so two overlapping requests from one tab would present the same
+ * token twice: a replay to the plane. The queue survives a failed request.
+ */
+/**
+ * A hung request must not hold the queue: it is abandoned (and answers null) after this long.
+ * The trade-off: abandoning a request the Worker has already started can lose the newest refresh
+ * token (the browser never sees its Set-Cookie), which costs a silent re-authorize. So the bound
+ * is generous, well past a slow plane, and only there to end a request that will never answer.
+ */
+const HUB_TOKEN_TIMEOUT_MS = 30_000;
+let hubTokenTail: Promise<unknown> | null = null;
+function hubTokenFetch(url: string): Promise<Response> {
+  const start = async () => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), HUB_TOKEN_TIMEOUT_MS);
+    try {
+      return await fetch(url, { credentials: 'same-origin', signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const run = hubTokenTail ? hubTokenTail.then(start) : start();
+  const mine = run.then(() => undefined, () => undefined);
+  hubTokenTail = mine;
+  void mine.then(() => { if (hubTokenTail === mine) hubTokenTail = null; });
+  return run;
 }
 
 /** What our own back end knows about the hub, and about this browser's authority. */
@@ -113,7 +148,7 @@ export function signInMode(): 'github' | 'org-plane' | null {
  */
 export async function hubStatus(): Promise<HubStatus> {
   try {
-    const res = await fetch('/hub/token', { credentials: 'same-origin' });
+    const res = await hubTokenFetch('/hub/token');
     // A non-2xx can still say which mode this is: plane mode answers a transient refresh failure
     // with a retryable 503 that names `signIn`, and reading it as hub mode would send this page
     // to the hub for a token the hub must not be asked for.
@@ -245,10 +280,46 @@ export async function hubAudienceToken(): Promise<string | null> {
   return null;
 }
 
+/**
+ * A token Superlibrary accepts for this person, or null: not signed in through the plane, a
+ * workspace without Superlibrary, or the plane declined. Null is an ordinary answer: the drawer says so.
+ */
+export function libraryConfigured(): boolean {
+  return !libraryAbsent;
+}
+
+export async function libraryToken(): Promise<string | null> {
+  if (cachedLibrary && cachedLibrary.expiresAtMs - REFRESH_MARGIN_MS > Date.now()) return cachedLibrary.token;
+  if (libraryInFlight) return libraryInFlight;
+  libraryInFlight = (async () => {
+    try {
+      const res = await hubTokenFetch('/hub/token?library=1');
+      const body = (await res.json().catch(() => null)) as { libraryToken?: string | null; libraryConfigured?: boolean } | null;
+      if (res.ok && body?.libraryConfigured === false) libraryAbsent = true;
+      const t = res.ok ? (body?.libraryToken ?? null) : null;
+      const exp = t ? expiryOf(t) : 0;
+      cachedLibrary = t && exp > 0 ? { token: t, expiresAtMs: exp } : null;
+      return cachedLibrary?.token ?? null;
+    } catch {
+      return null;
+    } finally {
+      libraryInFlight = null;
+    }
+  })();
+  return libraryInFlight;
+}
+
+/** Drop only the library token (Superlibrary answered 401). */
+export function forgetLibraryToken(): void {
+  cachedLibrary = null;
+}
+
 /** Drop the cached token — after signing out, or when the hub rejects it. */
 export function forgetHubToken(): void {
   cached = null;
   cachedHubAud = null;
+  cachedLibrary = null;
+  libraryAbsent = false;
   lastSignIn = null;
 }
 

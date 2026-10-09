@@ -51,6 +51,8 @@
     // Kept under the plane: it no longer names an issuer this Worker trusts, it names the hub's
     // resource, which the web client requests as a second token for the assignee picker.
     "HUB_ISSUER": "https://hub.agentpod.dev",
+    // Superlibrary, embedded in the card drawer. Not a credential; it names an audience to ask for.
+    "SUPERLIBRARY_AUDIENCE": "https://app.superlibrary.dev",
     // This deployment's own origin — the `redirect_uri` we register with the hub AND the `aud`
     // we now demand of every hub token (`auth/hub-jwt.ts`, `planeAudience`).
     //

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus } from './hub-token';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken, forgetLibraryToken, libraryConfigured } from './hub-token';
 
 /**
  * Carrying authority from the browser (superpipeline#43, option A).
@@ -336,5 +336,88 @@ describe('plane mode — a transient refresh failure', () => {
     expect(await hubToken()).toBeNull();
     expect((await hubStatus()).signIn).toBe('org-plane');
     expect(fetchSpy.mock.calls.every((c) => String(c[0]).startsWith('/hub/token'))).toBe(true);
+  });
+});
+
+describe('libraryToken (spec §9 Embedding)', () => {
+  const jwt = (expSec: number) => `h.${btoa(JSON.stringify({ exp: expSec })).replace(/=+$/, '')}.s`;
+  const soon = () => Math.floor(Date.now() / 1000) + 300;
+  beforeEach(() => forgetHubToken());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('asks the Worker with ?library=1, caches until a minute before expiry, and is null when none is minted', async () => {
+    const seen: string[] = [];
+    const exp = soon();
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => { seen.push(u); return Response.json({ token: 'a', hubToken: null, libraryToken: jwt(exp), signIn: 'org-plane' }); }));
+    expect(await libraryToken()).toBe(jwt(exp));
+    expect(await libraryToken()).toBe(jwt(exp));
+    expect(seen).toEqual(['/hub/token?library=1']);
+    forgetHubToken();
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ token: 'a', hubToken: null, libraryToken: null, signIn: 'org-plane' })));
+    expect(await libraryToken()).toBeNull();
+  });
+  it('two overlapping calls share one request', async () => {
+    const f = vi.fn(async () => Response.json({ libraryToken: jwt(soon()) }));
+    vi.stubGlobal('fetch', f);
+    const [a, b] = await Promise.all([libraryToken(), libraryToken()]);
+    expect(a).toBe(b);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+  it('forgetLibraryToken drops only the library token', async () => {
+    const f = vi.fn(async () => Response.json({ libraryToken: jwt(soon()) }));
+    vi.stubGlobal('fetch', f);
+    await libraryToken();
+    forgetLibraryToken();
+    await libraryToken();
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+  it('a 503 is null, not an error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ libraryToken: jwt(soon()), retryable: true }, { status: 503 })));
+    expect(await libraryToken()).toBeNull();
+  });
+  it('never has two /hub/token requests in flight, whatever asks (they would spend one rotating refresh token twice)', async () => {
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active -= 1;
+      return Response.json({ token: jwt(soon()), hubToken: null, libraryToken: jwt(soon()), hubConfigured: true, signIn: 'org-plane' });
+    }));
+    await Promise.all([hubToken(), libraryToken(), hubStatus()]);
+    expect(calls).toBeGreaterThan(1);
+    expect(peak).toBe(1);
+  });
+  it('abandons a hung /hub/token request so it cannot hold the queue', async () => {
+    const signals: Array<AbortSignal | undefined> = [];
+    vi.stubGlobal('fetch', vi.fn((_u: string, init?: RequestInit) => {
+      signals.push(init?.signal ?? undefined);
+      return signals.length === 1
+        ? new Promise<Response>((_, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('aborted'))))
+        : Promise.resolve(Response.json({ libraryToken: jwt(soon()) }));
+    }));
+    vi.useFakeTimers();
+    try {
+      const first = libraryToken();
+      const second = hubStatus();
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(await first).toBeNull();
+      expect((await second).signIn).toBe('github');
+      expect(signals[0]).toBeDefined();
+      expect(signals).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('learns from the Worker that no Superlibrary is configured, and says so until forgotten', async () => {
+    expect(libraryConfigured()).toBe(true);
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ token: 'a', libraryToken: null, libraryConfigured: false })));
+    expect(await libraryToken()).toBeNull();
+    expect(libraryConfigured()).toBe(false);
+    forgetHubToken();
+    expect(libraryConfigured()).toBe(true);
   });
 });

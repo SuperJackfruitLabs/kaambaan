@@ -26,12 +26,15 @@ const PKCE_COOKIE = 'superpipeline_plane_pkce';
 const REFRESH_COOKIE = 'superpipeline_plane_refresh';
 /** The hub-audience access token, for the assignee picker. Never sent to this Worker's API. */
 const HUB_AUD_COOKIE = 'superpipeline_plane_hub_token';
+/** The Superlibrary-audience access token, for the card drawer's viewer and related work. Never sent to this Worker's API. */
+const LIBRARY_AUD_COOKIE = 'superpipeline_plane_library_token';
 const SCOPE = 'openid profile email offline_access';
 const REFRESH_MAX_AGE_S = 30 * 24 * 3600;
 
 const pkceCookie = (v: string, maxAge: number) => `${PKCE_COOKIE}=${v}; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 const tokenCookie = (v: string, maxAge: number) => `${TOKEN_COOKIE}=${v}; Path=/hub; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 const hubAudCookie = (v: string, maxAge: number) => `${HUB_AUD_COOKIE}=${v}; Path=/hub; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+const libraryAudCookie = (v: string, maxAge: number) => `${LIBRARY_AUD_COOKIE}=${v}; Path=/hub; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 const refreshCookie = (v: string, maxAge: number) => `${REFRESH_COOKIE}=${v}; Path=/hub; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 
 interface TokenResponse { access_token?: string; refresh_token?: string; expires_in?: number }
@@ -86,6 +89,12 @@ async function tokenRequest(
 /** The hub's resource, if this deployment has a hub: `HUB_ISSUER`, which is also the hub's audience. */
 function hubResource(env: Env): string | null {
   const raw = (env.HUB_ISSUER ?? '').trim().replace(/\/+$/, '');
+  return raw === '' ? null : raw;
+}
+
+/** Superlibrary's audience, if this deployment embeds it. Accounts lets superpipeline-web request it (registry). */
+function libraryResource(env: Env): string | null {
+  const raw = (env.SUPERLIBRARY_AUDIENCE ?? '').trim().replace(/\/+$/, '');
   return raw === '' ? null : raw;
 }
 
@@ -187,18 +196,24 @@ export async function handlePlaneSignInRoute(
     headers.append('Set-Cookie', sessionClearCookie({ secure: true }));
     headers.append('Set-Cookie', tokenCookie('', 0));
     headers.append('Set-Cookie', hubAudCookie('', 0));
+    headers.append('Set-Cookie', libraryAudCookie('', 0));
     headers.append('Set-Cookie', refreshCookie('', 0));
     return new Response(null, { status: request.method === 'POST' ? 204 : 302, headers });
   }
 
   if (path === '/hub/token') {
+    // The library token only when the page asks (the card drawer), so every other caller is unchanged.
+    const wantLibrary = new URL(request.url).searchParams.get('library') === '1';
+    const libResource = wantLibrary ? libraryResource(env) : null;
+    let libTok: string | null = wantLibrary ? readCookie(request, LIBRARY_AUD_COOKIE) : null;
     const answer = (token: string | null, hubToken: string | null, headers?: Headers) =>
-      Response.json({ token, hubToken, hubConfigured: true, signIn: 'org-plane' }, headers ? { headers } : undefined);
+      Response.json({ token, hubToken, ...(wantLibrary ? { libraryToken: libTok } : {}), ...(wantLibrary && libraryResource(env) === null ? { libraryConfigured: false } : {}), hubConfigured: true, signIn: 'org-plane' }, headers ? { headers } : undefined);
     let app = readCookie(request, TOKEN_COOKIE);
     let hubTok = readCookie(request, HUB_AUD_COOKIE);
     let refresh = readCookie(request, REFRESH_COOKIE);
     const needHub = !hubTok && hubResource(env) !== null;
-    if ((app && !needHub) || !refresh) return answer(app, hubTok);
+    const needLibrary = !libTok && libResource !== null;
+    if ((app && !needHub && !needLibrary) || !refresh) return answer(app, hubTok);
 
     // Strictly in sequence, each grant spending the refresh token the previous one returned.
     // Two concurrent grants on one rotating refresh token would look like a replay to the plane.
@@ -209,12 +224,12 @@ export async function handlePlaneSignInRoute(
         // NOT a sign-out, and the refresh cookie is NOT cleared: another tab may have rotated this
         // token a moment ago and already set a newer cookie, which a clear here would overwrite.
         // The answer is to re-run authorize, which the plane's own session makes silent.
-        return Response.json({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
+        return Response.json({ token: null, hubToken: null, ...(wantLibrary ? { libraryToken: null } : {}), hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
       }
       if (!grant.ok) {
         // The plane is down or erroring. Nothing was spent; keep the cookie and say "try again".
         return Response.json(
-          { token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true },
+          { token: null, hubToken: null, ...(wantLibrary ? { libraryToken: null } : {}), hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true },
           { status: 503, headers: { 'Retry-After': '5' } },
         );
       }
@@ -230,6 +245,16 @@ export async function handlePlaneSignInRoute(
         hubTok = hub.access_token!;
         headers.append('Set-Cookie', hubAudCookie(hubTok, ttlOf(hub)));
         if (hub.refresh_token) refresh = hub.refresh_token;
+      }
+    }
+    // Third, after the hub's, with the newest refresh token. Best-effort, like the hub's: a plane that
+    // will not mint it (a workspace without Superlibrary) leaves the drawer saying so, nothing else.
+    if (needLibrary && refresh) {
+      const lib = await tokenRequest(cfg, { grant_type: 'refresh_token', refresh_token: refresh }, fetchImpl, libResource!);
+      if (lib) {
+        libTok = lib.access_token!;
+        headers.append('Set-Cookie', libraryAudCookie(libTok, ttlOf(lib)));
+        if (lib.refresh_token) refresh = lib.refresh_token;
       }
     }
     headers.append('Set-Cookie', refreshCookie(refresh ?? '', refresh ? REFRESH_MAX_AGE_S : 0));
