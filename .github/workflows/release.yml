@@ -20,6 +20,10 @@ permissions:
 jobs:
   release:
     name: Build and publish supi
+    # GitHub only. The release is published with `gh` and GitHub's token; on forge (which runs this
+    # workflow too, from .github/workflows) the tag reaches GitHub through the push mirror and the
+    # release is built there.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
 
     # One job builds every target, where agentpod's equivalent needs a matrix: `bun build
