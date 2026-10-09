@@ -247,7 +247,9 @@ describe('an evidence:read service token reaches nothing else', () => {
       const { boardId } = await aRun({ complete: true });
       const t = await hubToken();
       const auth = { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' };
-      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: auth })).status).toBe(401);
+      // A service token now reaches the board snapshot route as a service (cards:read), so the answer
+      // for a token without that scope is 403 (known, not permitted), not the human route's 401.
+      expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}`, { headers: auth })).status).toBe(403);
       expect((await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/gate_x/resolve`, {
         method: 'POST', headers: auth, body: JSON.stringify({ decision: 'approve' }),
       })).status).toBe(401);
