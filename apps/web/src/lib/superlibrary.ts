@@ -71,7 +71,12 @@ export function embedCallbacks(): Pick<MountOptions, 'getEmbedUrl' | 'getVersion
       // Superlibrary decides on widening; this only offers it to whom it would allow (its plan D12).
       return { scope: item.scope, title: item.title, boardVisible: item.audience === 'board', canWiden: me !== null && (item.createdBy === me.principalId || me.role === 'owner') };
     },
-    setScope: async ({ itemId, scope }) => jsonOf(await libraryFetch(`/api/v1/items/${itemId}/scope`, { method: 'POST', body: JSON.stringify({ scope }) })),
+    setScope: async ({ itemId, scope }) => {
+      const done = await jsonOf(await libraryFetch(`/api/v1/items/${itemId}/scope`, { method: 'POST', body: JSON.stringify({ scope }) }));
+      // The embed asks for share info right after a widen; it must see the new scope, not the cached read.
+      reads.delete(itemId);
+      return done;
+    },
   };
 }
 

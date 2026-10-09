@@ -41,4 +41,9 @@ describe('Related prior work (superlibrary spec §11)', () => {
     expect(await screen.findByText('Odd')).toBeTruthy();
     expect(screen.queryByRole('link', { name: 'Odd' })).toBeNull();
   });
+  it('an empty title falls back to the item id, so the link is never invisible', async () => {
+    related.mockResolvedValue([{ itemId: 'itm_0123456789abcdef', title: '', kind: 'artifact', outcome: 'completed', snippet: '', url: 'https://app.superlibrary.dev/a/itm_0123456789abcdef' }]);
+    render(RelatedWork, { cardId: CARD });
+    expect(await screen.findByRole('link', { name: 'itm_0123456789abcdef' })).toBeTruthy();
+  });
 });

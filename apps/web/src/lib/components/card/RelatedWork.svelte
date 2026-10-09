@@ -37,9 +37,9 @@
           <div class="flex flex-wrap items-baseline gap-2">
             <span class="mono text-[10px] uppercase tracking-wide">{outcomeWord(r.outcome)}</span>
             {#if libraryRef(r.url)}
-              <a href={r.url} target="_blank" rel="noopener noreferrer" class="flex min-h-[44px] min-w-0 flex-1 items-center text-xs font-medium [overflow-wrap:anywhere] hover:underline">{r.title}</a>
+              <a href={r.url} target="_blank" rel="noopener noreferrer" class="flex min-h-[44px] min-w-0 flex-1 items-center text-xs font-medium [overflow-wrap:anywhere] hover:underline">{r.title || r.itemId}</a>
             {:else}
-              <span class="min-w-0 flex-1 text-xs font-medium [overflow-wrap:anywhere]">{r.title}</span>
+              <span class="min-w-0 flex-1 text-xs font-medium [overflow-wrap:anywhere]">{r.title || r.itemId}</span>
             {/if}
           </div>
           {#if r.snippet}<p class="text-muted-foreground mt-1 line-clamp-3 text-xs [overflow-wrap:anywhere]">{r.snippet}</p>{/if}

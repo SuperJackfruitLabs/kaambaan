@@ -47,4 +47,19 @@ describe('Superlibrary references (spec §11: the drawer previews linked artifac
     await cb.getShareInfo!({ itemId: 'itm_0123456789abcdef' });
     expect(urls.filter((u) => u.endsWith('/api/v1/items/itm_0123456789abcdef'))).toHaveLength(1);
   });
+  it('after a widen, share info is read again and shows the new scope', async () => {
+    let scope = 'board:brd_00000000000000b1';
+    let reads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/scope')) { scope = 'workspace'; return Response.json({ scope }); }
+      if (url.endsWith('/api/v1/me')) return Response.json({ principalId: 'prn_000000000000000000a2', role: 'owner' });
+      reads += 1;
+      return Response.json({ item: { scope, title: 'T', createdBy: 'prn_000000000000000000a2' }, versions: [] });
+    }));
+    const cb = embedCallbacks();
+    expect((await cb.getShareInfo!({ itemId: 'itm_0123456789abcdef' })).scope).toBe('board:brd_00000000000000b1');
+    await cb.setScope!({ itemId: 'itm_0123456789abcdef', scope: 'workspace' });
+    expect((await cb.getShareInfo!({ itemId: 'itm_0123456789abcdef' })).scope).toBe('workspace');
+    expect(reads).toBe(2);
+  });
 });
