@@ -224,12 +224,12 @@ export async function handlePlaneSignInRoute(
         // NOT a sign-out, and the refresh cookie is NOT cleared: another tab may have rotated this
         // token a moment ago and already set a newer cookie, which a clear here would overwrite.
         // The answer is to re-run authorize, which the plane's own session makes silent.
-        return Response.json({ token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
+        return Response.json({ token: null, hubToken: null, ...(wantLibrary ? { libraryToken: null } : {}), hubConfigured: true, signIn: 'org-plane', reauthorize: '/auth/login' });
       }
       if (!grant.ok) {
         // The plane is down or erroring. Nothing was spent; keep the cookie and say "try again".
         return Response.json(
-          { token: null, hubToken: null, hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true },
+          { token: null, hubToken: null, ...(wantLibrary ? { libraryToken: null } : {}), hubConfigured: true, signIn: 'org-plane', error: 'plane_unavailable', retryable: true },
           { status: 503, headers: { 'Retry-After': '5' } },
         );
       }

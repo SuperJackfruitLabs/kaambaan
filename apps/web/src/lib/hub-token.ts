@@ -79,6 +79,21 @@ function remember(token: string | null | undefined): string | null {
   return token;
 }
 
+/**
+ * Every `/hub/token` request goes through here, one at a time. The Worker spends the person's
+ * rotating refresh token on each, so two overlapping requests from one tab would present the same
+ * token twice: a replay to the plane. The queue survives a failed request.
+ */
+let hubTokenTail: Promise<unknown> | null = null;
+function hubTokenFetch(url: string): Promise<Response> {
+  const start = () => fetch(url, { credentials: 'same-origin' });
+  const run = hubTokenTail ? hubTokenTail.then(start) : start();
+  const mine = run.then(() => undefined, () => undefined);
+  hubTokenTail = mine;
+  void mine.then(() => { if (hubTokenTail === mine) hubTokenTail = null; });
+  return run;
+}
+
 /** What our own back end knows about the hub, and about this browser's authority. */
 export interface HubStatus {
   /**
@@ -116,7 +131,7 @@ export function signInMode(): 'github' | 'org-plane' | null {
  */
 export async function hubStatus(): Promise<HubStatus> {
   try {
-    const res = await fetch('/hub/token', { credentials: 'same-origin' });
+    const res = await hubTokenFetch('/hub/token');
     // A non-2xx can still say which mode this is: plane mode answers a transient refresh failure
     // with a retryable 503 that names `signIn`, and reading it as hub mode would send this page
     // to the hub for a token the hub must not be asked for.
@@ -257,7 +272,7 @@ export async function libraryToken(): Promise<string | null> {
   if (libraryInFlight) return libraryInFlight;
   libraryInFlight = (async () => {
     try {
-      const res = await fetch('/hub/token?library=1', { credentials: 'same-origin' });
+      const res = await hubTokenFetch('/hub/token?library=1');
       const body = (await res.json().catch(() => null)) as { libraryToken?: string | null } | null;
       const t = res.ok ? (body?.libraryToken ?? null) : null;
       const exp = t ? expiryOf(t) : 0;

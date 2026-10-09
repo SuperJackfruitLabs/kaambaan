@@ -379,6 +379,27 @@ describe('plane sign-in — a third, Superlibrary-audience token for the card dr
     expect(await res.json()).toEqual({ token: 'app1', hubToken: 'hub1', libraryToken: null, hubConfigured: true, signIn: 'org-plane' });
     expect(cookies(res).get('superpipeline_plane_refresh')).toBe('r1');
   });
+  it('a refused library grant after a successful hub grant keeps the hub grant\'s new refresh token', async () => {
+    const fake = byResource3({ libraryRefuses: true });
+    fake.tokens.hub = await planeToken({}, { aud: HUB_RES });
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', fake.impl))!;
+    expect(((await res.json()) as { libraryToken: unknown }).libraryToken).toBeNull();
+    expect(cookies(res).get('superpipeline_plane_refresh')).toBe('r2');
+  });
+  it('a refused refresh grant keeps the answer\'s shape when the library was asked for', async () => {
+    const impl = (async () => Response.json({ error: 'invalid_grant' }, { status: 400 })) as unknown as typeof fetch;
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', impl))!;
+    expect(await res.json()).toMatchObject({ token: null, libraryToken: null, reauthorize: '/auth/login' });
+  });
+  it('a plane outage keeps the answer\'s shape when the library was asked for', async () => {
+    const impl = (async () => new Response('down', { status: 503 })) as unknown as typeof fetch;
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', impl))!;
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ libraryToken: null, retryable: true });
+  });
   it('makes no library request when no Superlibrary is configured', async () => {
     const fake = byResource3();
     const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_refresh=r1' } });

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken } from './hub-token';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken, forgetLibraryToken } from './hub-token';
 
 /**
  * Carrying authority from the browser (superpipeline#43, option A).
@@ -341,10 +341,13 @@ describe('plane mode — a transient refresh failure', () => {
 
 describe('libraryToken (spec §9 Embedding)', () => {
   const jwt = (expSec: number) => `h.${btoa(JSON.stringify({ exp: expSec })).replace(/=+$/, '')}.s`;
+  const soon = () => Math.floor(Date.now() / 1000) + 300;
+  beforeEach(() => forgetHubToken());
+  afterEach(() => vi.unstubAllGlobals());
+
   it('asks the Worker with ?library=1, caches until a minute before expiry, and is null when none is minted', async () => {
-    forgetHubToken();
     const seen: string[] = [];
-    const exp = Math.floor(Date.now() / 1000) + 300;
+    const exp = soon();
     vi.stubGlobal('fetch', vi.fn(async (u: string) => { seen.push(u); return Response.json({ token: 'a', hubToken: null, libraryToken: jwt(exp), signIn: 'org-plane' }); }));
     expect(await libraryToken()).toBe(jwt(exp));
     expect(await libraryToken()).toBe(jwt(exp));
@@ -352,6 +355,40 @@ describe('libraryToken (spec §9 Embedding)', () => {
     forgetHubToken();
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ token: 'a', hubToken: null, libraryToken: null, signIn: 'org-plane' })));
     expect(await libraryToken()).toBeNull();
-    vi.unstubAllGlobals();
+  });
+  it('two overlapping calls share one request', async () => {
+    const f = vi.fn(async () => Response.json({ libraryToken: jwt(soon()) }));
+    vi.stubGlobal('fetch', f);
+    const [a, b] = await Promise.all([libraryToken(), libraryToken()]);
+    expect(a).toBe(b);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+  it('forgetLibraryToken drops only the library token', async () => {
+    const f = vi.fn(async () => Response.json({ libraryToken: jwt(soon()) }));
+    vi.stubGlobal('fetch', f);
+    await libraryToken();
+    forgetLibraryToken();
+    await libraryToken();
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+  it('a 503 is null, not an error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ libraryToken: jwt(soon()), retryable: true }, { status: 503 })));
+    expect(await libraryToken()).toBeNull();
+  });
+  it('never has two /hub/token requests in flight, whatever asks (they would spend one rotating refresh token twice)', async () => {
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      active -= 1;
+      return Response.json({ token: jwt(soon()), hubToken: null, libraryToken: jwt(soon()), hubConfigured: true, signIn: 'org-plane' });
+    }));
+    await Promise.all([hubToken(), libraryToken(), hubStatus()]);
+    expect(calls).toBeGreaterThan(1);
+    expect(peak).toBe(1);
   });
 });
