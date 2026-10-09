@@ -1,0 +1,18 @@
+{
+ "events": [
+  {
+   "close": false,
+   "id": "171-imported-1791554189",
+   "kind": "imported",
+   "message": "Imported to forge as https://forge.superjackfruit.com/SuperJackfruitLabs/superpipeline/pulls/2. The review and merge happen there; this PR is updated when it merges or closes.",
+   "pr": 171
+  },
+  {
+   "id": "171-closed-1791554248",
+   "pr": 171,
+   "kind": "closed",
+   "message": "The forge PR https://forge.superjackfruit.com/SuperJackfruitLabs/superpipeline/pulls/2 was closed without merging.",
+   "close": false
+  }
+ ]
+}
