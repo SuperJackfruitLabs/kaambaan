@@ -33,13 +33,15 @@ import {
   type JsonValue,
   type StaleCardView,
 } from './board/board-do';
-import type { LinkKind } from './board/links';
+import { isEnforcedKind, type LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
+import { cardLinksBody } from './card-links';
+import { serviceRoute } from './service-routes';
 import { logReporter } from './superwitness/log';
 import { reportingEnabled } from './superwitness/config';
-import { listExternalLinksFor, addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
+import { addExternalLink, removeExternalLink, deleteExternalLinksForCard } from './db/card-links-external';
 import { resolveReferenceInput } from './references/resolve';
 import { handleMcpRequest } from './mcp/server';
 import { resolveMcpAuth, unauthorized, protectedResourceMetadata, MCP_PROTECTED_RESOURCE_PATH } from './mcp/auth';
@@ -139,6 +141,7 @@ function statusForCode(code: BoardErrorCode): number {
       return 409;
     case 'UNKNOWN_STAGE':
     case 'INVALID_URL':
+    case 'UNKNOWN_EVENT':
     case 'INVALID_DELIVERY':
     case 'INVALID_USAGE':
     case 'INVALID_STAGES':
@@ -244,52 +247,6 @@ function statusForExternalLinkCode(code: string): number {
   }
 }
 
-/**
- * Names for the boards in `boardIds`, but ONLY the ones `tenantId` actually owns — a board id that
- * names another tenant's board, or no board at all, simply has no entry in the returned map.
- *
- * This is the read-side guard for `GET .../cards/:cardId/links`'s `otherBoardName`: a cross-board
- * advisory row's write is already checked against `FOREIGN_BOARD` (`addExternalLink`), but this
- * read must not assume every row in `card_links_external` got there through that guard — a title
- * is content, and resolving one for a board outside the tenant would disclose more than the 404
- * that guard answers with. `tenant_id = ?` first, like every other D1 read in this codebase.
- */
-async function boardNamesById(db: D1Database, tenantId: string, boardIds: string[]): Promise<Map<string, string>> {
-  const ids = [...new Set(boardIds)];
-  if (ids.length === 0) return new Map();
-  const placeholders = ids.map(() => '?').join(', ');
-  const { results } = await db
-    .prepare(`SELECT id, name FROM boards WHERE tenant_id = ? AND id IN (${placeholders})`)
-    .bind(tenantId, ...ids)
-    .all<{ id: string; name: string }>();
-  return new Map((results ?? []).map((row) => [row.id, row.name]));
-}
-
-/**
- * The title of one card on another board, for one advisory edge's tooltip — or `null` if it
- * cannot be read, for any reason. This is the one place a cross-DO read happens for a cross-board
- * edge, and it is deliberately narrow: on-demand, per row, called only from the `GET .../links`
- * route, never from `listExternalLinksFor` (the D1 module stays free of cross-DO concerns) and
- * never consulted by a claim or advance decision — the read is stale the instant it returns, which
- * is exactly why the edge it labels is advisory rather than enforced, and that does not change
- * just because this read is now a little more informative than an id.
- *
- * Degrades rather than fails: an uninitialized board, a deleted card, or a thrown error (the DO
- * being genuinely unavailable) all come back `null`, wrapped PER CALL so one bad reference cannot
- * take the rest of a card's blocker list down with it — a 500 here would be a worse outcome than
- * the id the drawer already falls back to showing.
- *
- * Callers must already have confirmed `boardId` belongs to `tenantId` (see `boardNamesById`); this
- * function does not check tenancy itself, so it must never be reached for a foreign board.
- */
-async function getOtherCardTitle(env: Env, tenantId: string, boardId: string, cardId: string): Promise<string | null> {
-  try {
-    const result = await boardStub(env, tenantId, boardId).getCardView(cardId);
-    return result.ok ? result.value.title : null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * What an error nobody planned for looks like on the wire.
@@ -1789,6 +1746,10 @@ const worker = {
     const evidenceMatch = boardId && request.method === 'GET' ? rest.match(/^runs\/([^/]+)\/evidence$/) : null;
     if (evidenceMatch) return runEvidence(request, env, boardId!, evidenceMatch[1]!);
 
+    // A service token (Superlibrary) reading cards or registering a push config; any other bearer falls through.
+    const asService = await serviceRoute(request, env, path);
+    if (asService) return asService;
+
     // Resolve the caller by route type: agent routes carry a token; the GitHub webhook
     // self-authenticates (HMAC) and carries ?tenant=; everything else is a human (session cookie).
     // `gates/pending` joins `claims` and `runs/*` as an agent route. It is a
@@ -2577,12 +2538,12 @@ const worker = {
             { status: 400 },
           );
         }
-        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent') {
+        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent' && body.kind !== 'supersedes') {
           return Response.json(
             {
               error: {
                 code: 'INVALID_LINK_KIND',
-                message: `kind must be 'blocks', 'relates' or 'parent', got ${JSON.stringify(body.kind)}`,
+                message: `kind must be 'blocks', 'relates', 'parent' or 'supersedes', got ${JSON.stringify(body.kind)}`,
               },
             },
             { status: 400 },
@@ -2618,6 +2579,14 @@ const worker = {
               { status: 400 },
             );
           }
+          // `supersedes` names a card's replacement on its own board (P7); the advisory store has no
+          // such kind and its D1 CHECK stays as it is.
+          if (kind === 'supersedes') {
+            return Response.json(
+              { error: { code: 'INVALID_LINK_KIND', message: 'supersedes links cards on one board' } },
+              { status: 400 },
+            );
+          }
           if (request.method === 'POST') {
             const result = await addExternalLink(env.DB, tenantId, {
               from: { boardId, cardId: fromCardId },
@@ -2634,17 +2603,24 @@ const worker = {
           return Response.json({ ok: true, enforced: false as const });
         }
 
+        if (kind === 'supersedes' && fromCardId === toCardId) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'a card cannot supersede itself' } },
+            { status: 400 },
+          );
+        }
+
         // Same-board: Task 12's enforced edge on the DO, unchanged from Task 17a except that the
         // response now names its own `enforced` boolean too, matching the cross-board arm above so
         // a caller never has to infer enforcement from whether `toBoardId` was sent.
         if (request.method === 'POST') {
           const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
           if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-          return Response.json({ link: { ...result.value, enforced: true as const } }, { status: 201 });
+          return Response.json({ link: { ...result.value, enforced: isEnforcedKind(kind) } }, { status: 201 });
         }
         const result = await stub.removeLink(fromCardId, toCardId, kind);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-        return Response.json({ ...result.value, enforced: true as const });
+        return Response.json({ ...result.value, enforced: isEnforcedKind(kind) });
       }
 
       // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
@@ -2769,54 +2745,7 @@ const worker = {
       const cardLinksMatch = rest.match(/^cards\/([^/]+)\/links$/);
       if (cardLinksMatch && request.method === 'GET') {
         const cardId = cardLinksMatch[1]!;
-        const [links, externalLinks] = await Promise.all([
-          stub.listLinks(cardId),
-          listExternalLinksFor(env.DB, tenantId, cardId),
-        ]);
-
-        // The other end of each advisory edge — `listExternalLinksFor` matches `cardId` from
-        // EITHER side, so which field holds "the other card" depends on the row's direction.
-        const otherEnds = externalLinks.map((l) =>
-          l.fromCardId === cardId
-            ? { boardId: l.toBoardId, cardId: l.toCardId }
-            : { boardId: l.fromBoardId, cardId: l.fromCardId },
-        );
-        // Tenant-scoped by the WHERE clause itself: a board this tenant does not own is simply
-        // absent from the map. That is deliberate defence in depth, not redundant with
-        // `addExternalLink`'s own `FOREIGN_BOARD` guard at write time — this read must not assume
-        // every row in the table got there through that guard. Boards not owned by the tenant, or
-        // no longer present at all, degrade to `otherBoardName: null` the same way an unresolved
-        // title does, never a leak or a failure.
-        const boardNames = await boardNamesById(env.DB, tenantId, otherEnds.map((e) => e.boardId));
-        // One on-demand, per-row cross-DO read per advisory edge, run in parallel rather than
-        // sequentially — not batched into a single multi-card DO call. Considered and rejected for
-        // now: these rows are hand-added one at a time through a board-picker dialogue, so the
-        // realistic count for one card is a handful at most, and rows just as often name DIFFERENT
-        // boards (nothing to batch within) as the same one. A batched "read several cards" RPC
-        // would mean a new Durable Object method, which is out of this route's scope. Skipped
-        // entirely — no DO call at all — for any end whose board did not resolve above, so a
-        // foreign board is never even asked, not just never shown.
-        const otherTitles = await Promise.all(
-          otherEnds.map((e) => (boardNames.has(e.boardId) ? getOtherCardTitle(env, tenantId, e.boardId, e.cardId) : null)),
-        );
-
-        return Response.json({
-          // `enforced` must mean what it says: true only for a same-board edge that can actually
-          // refuse a claim. `blockedWhere` has two clauses — an unresolved `blocks` edge pointing
-          // AT a card, and an open child (`parent`) pointing FROM one — so both `blocks` and
-          // `parent` genuinely enforce something; `relates` is decoration, consulted nowhere.
-          // Stamping every kind `true` unconditionally told a client a `relates` edge refuses a
-          // claim it does not — unreachable today only because of a web-side defect being fixed
-          // separately, and the whole point of this flag is that a client should never have to
-          // infer enforcement itself, including for the one kind that has none.
-          links: links.map((l) => ({ ...l, enforced: l.kind !== 'relates' })),
-          externalLinks: externalLinks.map((l, i) => ({
-            ...l,
-            enforced: false as const,
-            otherBoardName: boardNames.get(otherEnds[i]!.boardId) ?? null,
-            otherCardTitle: otherTitles[i] ?? null,
-          })),
-        });
+        return Response.json(await cardLinksBody(env, tenantId, stub, cardId));
       }
 
       // GET /v1/boards/:id/events — the board's own event log (docs/03).
@@ -3111,6 +3040,9 @@ const worker = {
         // person (session cookie or dev headers) still names the subscriber with `X-Agent-Id`.
         const agentId = agent ? agent.agentId : request.headers.get('X-Agent-Id');
         if (!agentId || agentId.trim() === '') return Response.json({ error: 'X-Agent-Id required' }, { status: 400 });
+        // `svc:<prn>` names a service's own subscription (serviceRoute). registerPushConfig upserts on
+        // (agent_id, url), so a person naming one could overwrite a service's config.
+        if (agentId.startsWith('svc:')) return Response.json({ error: 'X-Agent-Id may not name a service' }, { status: 400 });
         const body = (await request.json()) as { url: string; token: string; capabilities?: string[]; events?: string[] };
         // Built from named fields rather than `...body`: `agentId` is the caller's own identity,
         // asserted by the `X-Agent-Id` header above — `as` strips nothing at runtime, so a body
@@ -3118,6 +3050,9 @@ const worker = {
         // caller could register the subscription under any agent id it liked while authenticating
         // as a different one). A cast is not validation, so the route has to name what it accepts
         // rather than forward what it received.
+        if (body.events !== undefined && (!Array.isArray(body.events) || body.events.some((e) => typeof e !== 'string'))) {
+          return Response.json({ error: { code: 'INVALID_BODY', message: '`events` must be an array of event names' } }, { status: 400 });
+        }
         const result = await stub.registerPushConfig({
           agentId,
           url: body.url,

@@ -38,12 +38,15 @@ import { enforcedBadge, advisoryBadge, type BlockedBadge, type EnforcedBlocker }
 
 export type EdgeKind = 'blocks' | 'relates';
 
+/** `supersedes` is same-board only (P7), so it is a kind of `RemoveArgs` and `EdgeRow` but never of an advisory edge. */
+export type SameBoardEdgeKind = EdgeKind | 'supersedes';
+
 /** Exactly the argument tuple `removeLink(boardId, fromCardId, toCardId, kind, toBoardId?)` takes. */
 export interface RemoveArgs {
   boardId: string;
   fromCardId: string;
   toCardId: string;
-  kind: EdgeKind;
+  kind: SameBoardEdgeKind;
   toBoardId?: string;
 }
 
@@ -79,8 +82,14 @@ export interface BlockedByRow {
 export interface EdgeRow {
   cardId: string;
   title: string;
-  kind: EdgeKind;
+  kind: SameBoardEdgeKind;
   remove: RemoveArgs;
+}
+
+/** A `supersedes` edge seen from one card: it replaces the other, or the other replaces it. */
+export interface SupersedesRow extends EdgeRow {
+  kind: 'supersedes';
+  direction: 'supersedes' | 'superseded-by';
 }
 
 export interface AdvisoryRow {
@@ -100,13 +109,15 @@ export interface LinkGroups {
   resolvedBlockedBy: EdgeRow[];
   blocks: EdgeRow[];
   relates: EdgeRow[];
+  /** Same-board `supersedes` edges, either direction. Informational: neither card is blocked. */
+  supersedes: SupersedesRow[];
   advisory: AdvisoryRow[];
 }
 
 interface SameBoardLinkLike {
   fromCardId: string;
   toCardId: string;
-  kind: string; // 'blocks' | 'relates' | 'parent' — only the first two are grouped here
+  kind: string; // 'blocks' | 'relates' | 'parent' | 'supersedes' — `parent` is not grouped here
 }
 
 interface ExternalLinkLike {
@@ -170,6 +181,20 @@ export function buildLinkGroups(
       };
     });
 
+  const supersedes: SupersedesRow[] = links
+    .filter((l) => l.kind === 'supersedes')
+    .map((l) => {
+      const thisIsNewer = l.fromCardId === cardId;
+      const otherId = thisIsNewer ? l.toCardId : l.fromCardId;
+      return {
+        cardId: otherId,
+        title: titleOf(otherId),
+        kind: 'supersedes' as const,
+        direction: thisIsNewer ? ('supersedes' as const) : ('superseded-by' as const),
+        remove: { boardId, fromCardId: l.fromCardId, toCardId: l.toCardId, kind: 'supersedes' as const },
+      };
+    });
+
   const advisory: AdvisoryRow[] = externalLinks.map((l) => {
     const thisIsFrom = l.fromCardId === cardId;
     const otherCardId = thisIsFrom ? l.toCardId : l.fromCardId;
@@ -189,5 +214,5 @@ export function buildLinkGroups(
     };
   });
 
-  return { blockedBy: blockedByRows, resolvedBlockedBy, blocks, relates, advisory };
+  return { blockedBy: blockedByRows, resolvedBlockedBy, blocks, relates, supersedes, advisory };
 }

@@ -667,13 +667,13 @@ export function unarchiveCard(boardId: string, cardId: string): Promise<Response
 }
 
 /** Dependencies and sub-task containment (spec §3.4) — one table on the DO, told apart by `kind`. */
-export type LinkKind = 'blocks' | 'relates' | 'parent';
+export type LinkKind = 'blocks' | 'relates' | 'parent' | 'supersedes';
 
 /**
  * A same-board edge (Task 12's `card_links`, read on the claim path). NOT always enforced: the
- * route stamps `enforced: kind !== 'relates'` (whole-branch review fix, commit `166abfe`) — a
- * `relates` edge is decoration, consulted nowhere `blockedWhere` looks, so it reads `false` here
- * exactly like a cross-board `ExternalLink` does, even though it lives in the same-board store.
+ * route stamps `enforced` true only for `blocks` and `parent` — `relates` and `supersedes` are
+ * decoration, consulted nowhere `blockedWhere` looks, so they read `false` here exactly like a
+ * cross-board `ExternalLink` does, even though they live in the same-board store.
  */
 export interface Link {
   fromCardId: string;

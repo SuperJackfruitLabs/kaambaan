@@ -8,7 +8,7 @@ sidebar:
 
 <!-- Generated from packages/cli/src/commands.ts by `pnpm -F @superpipeline/cli reference`. Do not edit by hand: CI fails when this file differs from what the generator writes. -->
 
-Edges between cards: `blocks`, `relates` and `parent`. A same-board `blocks` edge is enforced — the blocked card cannot be claimed. An edge to a card on another board is advisory: shown, never enforced.
+Edges between cards: `blocks`, `relates`, `parent` and `supersedes`. A same-board `blocks` edge is enforced — the blocked card cannot be claimed. An edge to a card on another board is advisory: shown, never enforced.
 
 Every command here also takes `--json` and `--help` — see [the overview](/reference/cli/).
 
@@ -17,7 +17,7 @@ Every command here also takes `--json` and `--help` — see [the overview](/refe
 Declares an edge from one card to another. `<boardId>` is the from-card's board. A same-board `blocks` edge stops the blocked card being claimed until its blocker is done; with `--to-board` the edge crosses boards and is advisory only.
 
 ```sh
-supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]
+supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent|supersedes [--to-board <boardId>]
 ```
 
 | argument | meaning |
@@ -28,7 +28,7 @@ supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--
 
 | flag | type | default | meaning |
 |---|---|---|---|
-| `--kind blocks\|relates\|parent` | one of `blocks`, `relates`, `parent` | **required** | `blocks`: the from-card blocks the to-card (enforced on the same board); `relates`: an informational edge; `parent`: the from-card contains the to-card as a sub-task |
+| `--kind blocks\|relates\|parent\|supersedes` | one of `blocks`, `relates`, `parent`, `supersedes` | **required** | `blocks`: the from-card blocks the to-card (enforced on the same board); `relates`: an informational edge; `parent`: the from-card contains the to-card as a sub-task; `supersedes`: the from-card is the newer card and replaces the to-card (same board only) |
 | `--to-board <boardId>` | string | the same board as `<boardId>` | the board the to-card is on. Naming another board makes the edge advisory — stored and shown, never enforced — and `link add` prints a notice saying so before it sends anything |
 
 **Who may run it**
@@ -43,7 +43,7 @@ supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--
 **Exit status** `0` on success. `1` when:
 
 - a card id is missing
-- `--kind` is missing or not one of `blocks`, `relates`, `parent`
+- `--kind` is missing or not one of `blocks`, `relates`, `parent`, `supersedes`
 - there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
 
 **Example**
@@ -58,7 +58,7 @@ supi link add brd_8f2c… crd_41aa… crd_0d1e… --kind relates --to-board brd_
 Removes the edge with exactly this from-card, to-card and kind.
 
 ```sh
-supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]
+supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent|supersedes [--to-board <boardId>]
 ```
 
 | argument | meaning |
@@ -69,7 +69,7 @@ supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--t
 
 | flag | type | default | meaning |
 |---|---|---|---|
-| `--kind blocks\|relates\|parent` | one of `blocks`, `relates`, `parent` | **required** | `blocks`: the from-card blocks the to-card (enforced on the same board); `relates`: an informational edge; `parent`: the from-card contains the to-card as a sub-task |
+| `--kind blocks\|relates\|parent\|supersedes` | one of `blocks`, `relates`, `parent`, `supersedes` | **required** | `blocks`: the from-card blocks the to-card (enforced on the same board); `relates`: an informational edge; `parent`: the from-card contains the to-card as a sub-task; `supersedes`: the from-card is the newer card and replaces the to-card (same board only) |
 | `--to-board <boardId>` | string | the same board as `<boardId>` | the board the to-card is on. Naming another board makes the edge advisory — stored and shown, never enforced — and `link add` prints a notice saying so before it sends anything |
 
 **Who may run it**
@@ -84,7 +84,7 @@ supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--t
 **Exit status** `0` on success. `1` when:
 
 - a card id is missing
-- `--kind` is missing or not one of `blocks`, `relates`, `parent`
+- `--kind` is missing or not one of `blocks`, `relates`, `parent`, `supersedes`
 - there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
 
 **Example**

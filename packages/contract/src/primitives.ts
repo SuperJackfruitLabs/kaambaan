@@ -143,6 +143,7 @@ export const ReferenceSourceType = z.enum([
   'branch',
   'commit',
   'doc',
+  'artifact',
   'url',
 ]);
 export type ReferenceSourceType = z.infer<typeof ReferenceSourceType>;

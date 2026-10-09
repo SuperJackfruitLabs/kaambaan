@@ -154,7 +154,7 @@ export const GROUPS: GroupSpec[] = [
     label: "Links",
     description: "supi link add, link rm and link list.",
     intro:
-      "Edges between cards: `blocks`, `relates` and `parent`. A same-board `blocks` edge is enforced — the " +
+      "Edges between cards: `blocks`, `relates`, `parent` and `supersedes`. A same-board `blocks` edge is enforced — the " +
       "blocked card cannot be claimed. An edge to a card on another board is advisory: shown, never enforced.",
   },
   {
@@ -209,13 +209,14 @@ const COMMENT: FlagSpec = {
 
 const LINK_KIND: FlagSpec = {
   name: "--kind",
-  value: "blocks|relates|parent",
+  value: "blocks|relates|parent|supersedes",
   type: "enum",
-  choices: ["blocks", "relates", "parent"],
+  choices: ["blocks", "relates", "parent", "supersedes"],
   required: true,
   description:
     "`blocks`: the from-card blocks the to-card (enforced on the same board); `relates`: an informational " +
-    "edge; `parent`: the from-card contains the to-card as a sub-task",
+    "edge; `parent`: the from-card contains the to-card as a sub-task; `supersedes`: the from-card is the newer " +
+    "card and replaces the to-card (same board only)",
 };
 
 const TO_BOARD: FlagSpec = {
@@ -915,7 +916,7 @@ export const COMMANDS: CommandSpec[] = [
     routes: [{ method: "POST", path: "/v1/boards/:boardId/links" }],
     access: { role: "member", agent: "plan" },
     output: "JSON: the edge; a cross-board edge is preceded by a notice that it is advisory",
-    fails: ["a card id is missing", "`--kind` is missing or not one of `blocks`, `relates`, `parent`"],
+    fails: ["a card id is missing", "`--kind` is missing or not one of `blocks`, `relates`, `parent`, `supersedes`"],
     examples: [
       "supi link add brd_8f2c… crd_41aa… crd_77b3… --kind blocks",
       "supi link add brd_8f2c… crd_41aa… crd_0d1e… --kind relates --to-board brd_93fa…",
@@ -931,7 +932,7 @@ export const COMMANDS: CommandSpec[] = [
     routes: [{ method: "DELETE", path: "/v1/boards/:boardId/links" }],
     access: { role: "member", agent: "plan" },
     output: "JSON: the server's response",
-    fails: ["a card id is missing", "`--kind` is missing or not one of `blocks`, `relates`, `parent`"],
+    fails: ["a card id is missing", "`--kind` is missing or not one of `blocks`, `relates`, `parent`, `supersedes`"],
     examples: ["supi link rm brd_8f2c… crd_41aa… crd_77b3… --kind blocks"],
   },
   {

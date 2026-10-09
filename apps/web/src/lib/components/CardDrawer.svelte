@@ -121,13 +121,14 @@
   const linkGroups = $derived(
     card && boardId
       ? buildLinkGroups(boardId, card.id, card.blockedBy, cardLinks.links, cardLinks.externalLinks, (id) => app.cardById(id)?.title ?? id)
-      : { blockedBy: [], resolvedBlockedBy: [], blocks: [], relates: [], advisory: [] },
+      : { blockedBy: [], resolvedBlockedBy: [], blocks: [], relates: [], supersedes: [], advisory: [] },
   );
   const hasAnyLink = $derived(
     linkGroups.blockedBy.length > 0 ||
       linkGroups.resolvedBlockedBy.length > 0 ||
       linkGroups.blocks.length > 0 ||
       linkGroups.relates.length > 0 ||
+      linkGroups.supersedes.length > 0 ||
       linkGroups.advisory.length > 0,
   );
 
@@ -1375,6 +1376,22 @@
               {#each linkGroups.relates as row (edgeKey(row.remove))}
                 {@const key = edgeKey(row.remove)}
                 <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                  <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
+                    {removingKeys.has(key) ? '…' : 'remove'}
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          {#if linkGroups.supersedes.length > 0}
+            <div class="text-muted-foreground mono mb-1 text-[10px] uppercase tracking-widest">supersedes / superseded by</div>
+            <div class="mb-2.5 space-y-1.5">
+              {#each linkGroups.supersedes as row (edgeKey(row.remove))}
+                {@const key = edgeKey(row.remove)}
+                <div class="bg-inset border-border mono flex items-center gap-2 rounded-[7px] border px-2.5 py-1.5 text-[11px]">
+                  <span class="text-muted-foreground shrink-0 text-[10px]">{row.direction === 'supersedes' ? 'replaces' : 'replaced by'}</span>
                   <span class="min-w-0 flex-1 truncate">{row.title}</span>
                   <button onclick={() => void onRemoveLink(row.remove)} disabled={removingKeys.has(key)} class="text-muted-foreground hover:text-coral shrink-0 text-[10px] disabled:opacity-50">
                     {removingKeys.has(key) ? '…' : 'remove'}

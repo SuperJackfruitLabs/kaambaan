@@ -371,6 +371,10 @@ export async function resolveHubAgent(request: Request, env: Env): Promise<Agent
 
 /** Read a run's evidence (superwitness contract C4). */
 export const EVIDENCE_READ = 'evidence:read';
+/** Read boards and cards as a service (Superlibrary's ingest). */
+export const CARDS_READ = 'cards:read';
+/** Register a push config as a service, for record events only. */
+export const PUSH_WRITE = 'push:write';
 
 export interface ServicePrincipal {
   /** The hub's `prn_…`. Not a local user or agent: a service has neither here. */

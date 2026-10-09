@@ -2,7 +2,10 @@
  * Card-to-card edges: pure predicates, kept out of the Durable Object so they can be tested.
  */
 
-export type LinkKind = 'blocks' | 'relates' | 'parent';
+export type LinkKind = 'blocks' | 'relates' | 'parent' | 'supersedes';
+
+/** Whether a same-board edge of this kind can refuse a claim: only `blocks` and `parent` do. */
+export const isEnforcedKind = (kind: LinkKind): boolean => kind === 'blocks' || kind === 'parent';
 
 export interface LinkRow {
   fromCardId: string;
@@ -10,7 +13,7 @@ export interface LinkRow {
   kind: LinkKind;
 }
 
-/** The kinds that impose an order, and can therefore deadlock. `relates` is decoration. */
+/** The kinds that impose an order, and can therefore deadlock. `relates` and `supersedes` are decoration (`supersedes`: `from` is the newer card, `to` the one it replaces; same board only). */
 const ORDERING: ReadonlySet<LinkKind> = new Set<LinkKind>(['blocks', 'parent']);
 
 /**

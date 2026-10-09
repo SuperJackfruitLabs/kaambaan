@@ -288,3 +288,18 @@ describe('buildLinkGroups', () => {
     });
   });
 });
+
+describe('supersedes edges', () => {
+  it('groups a same-board supersedes edge with its direction, in neither blocks nor relates', () => {
+    const edge = { fromCardId: 'card_new', toCardId: 'card_old', kind: 'supersedes' };
+    const asNew = buildLinkGroups('brd_1', 'card_new', [], [edge], [], titleOf);
+    const asOld = buildLinkGroups('brd_1', 'card_old', [], [edge], [], titleOf);
+    expect(asNew.supersedes).toMatchObject([{ cardId: 'card_old', direction: 'supersedes', remove: { kind: 'supersedes', fromCardId: 'card_new', toCardId: 'card_old' } }]);
+    expect(asOld.supersedes).toMatchObject([{ cardId: 'card_new', direction: 'superseded-by' }]);
+    for (const g of [asNew, asOld]) {
+      expect(g.blocks).toHaveLength(0);
+      expect(g.relates).toHaveLength(0);
+      expect(g.blockedBy).toHaveLength(0);
+    }
+  });
+});

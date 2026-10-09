@@ -14,8 +14,11 @@ export interface PushDelivery {
 
 export type PushSender = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ) => Promise<{ status: number }>;
+
+/** How long one push may take. A slow or down endpoint must not hold up the rest of the drain. */
+export const PUSH_TIMEOUT_MS = 10_000;
 
 export interface PushOutcome {
   id: number;
@@ -23,7 +26,7 @@ export interface PushOutcome {
   status: number;
 }
 
-export async function signAndSend(delivery: PushDelivery, sender: PushSender): Promise<PushOutcome> {
+export async function signAndSend(delivery: PushDelivery, sender: PushSender, timeoutMs = PUSH_TIMEOUT_MS): Promise<PushOutcome> {
   const signature = await hmacSignatureHeader(delivery.token, delivery.body);
   let event = '';
   try {
@@ -31,14 +34,29 @@ export async function signAndSend(delivery: PushDelivery, sender: PushSender): P
   } catch {
     event = '';
   }
+  // The abort signal cuts a real fetch; the race cuts a sender that ignores it.
+  const abort = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      abort.abort();
+      reject(new Error('push timed out'));
+    }, timeoutMs);
+  });
   try {
-    const res = await sender(delivery.url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Superpipeline-Signature': signature, 'X-Superpipeline-Event': event },
-      body: delivery.body,
-    });
+    const res = await Promise.race([
+      sender(delivery.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Superpipeline-Signature': signature, 'X-Superpipeline-Event': event },
+        body: delivery.body,
+        signal: abort.signal,
+      }),
+      timedOut,
+    ]);
     return { id: delivery.id, ok: res.status >= 200 && res.status < 300, status: res.status };
   } catch {
     return { id: delivery.id, ok: false, status: 0 };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
