@@ -32,6 +32,7 @@
     type Milestone,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
+  import { gateDecisionForOption } from '$lib/gate-delivery';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
   import { buildLinkGroups, edgeKey, type RemoveArgs } from '$lib/components/link-groups';
@@ -1165,7 +1166,7 @@
                   {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
                     <Button
                       size="sm"
-                      onclick={() => onResolve('approve')}
+                      onclick={() => onResolve(gateDecisionForOption(opt.name))}
                       class="flex-1"
                     >{opt.title}</Button>
                   {:else if opt.name === 'request_changes'}

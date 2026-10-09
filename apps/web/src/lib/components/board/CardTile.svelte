@@ -2,6 +2,7 @@
   import { displayAgent } from '$lib/names';
   import type { Card, Reference } from '$lib/api';
   import { resolveGate, type GateDecision } from '$lib/api';
+  import { gateDecisionForOption } from '$lib/gate-delivery';
   import { app } from '$lib/stores/app.svelte';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { cardDraggable } from '$lib/dnd';
@@ -426,7 +427,7 @@
         { name: 'reject', title: 'Reject', interactive: false },
       ]) as opt (opt.name)}
         {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
-          <Button size="sm" onclick={(e: MouseEvent) => onGateResolve(e, 'approve')}>{opt.title}</Button>
+          <Button size="sm" onclick={(e: MouseEvent) => onGateResolve(e, gateDecisionForOption(opt.name))}>{opt.title}</Button>
         {:else if opt.name === 'request_changes'}
           <Button size="sm" variant="outline" onclick={() => app.openCard(card.id)}>{opt.title}</Button>
         {:else if opt.name === 'reject'}

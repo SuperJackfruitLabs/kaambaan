@@ -353,7 +353,7 @@ export interface Gate {
   };
 }
 
-export type GateDecision = 'approve' | 'request_changes' | 'reject';
+export type GateDecision = 'approve' | 'approve_manual' | 'approve_automatic' | 'request_changes' | 'reject';
 
 /**
  * A question an agent stopped to ask (docs/04 §4). The card waits in `input-required` while the

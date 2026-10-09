@@ -82,6 +82,18 @@ function utf8(value: SubjectRow['canonical_bytes']): string {
   return new TextDecoder().decode(value);
 }
 
+function base64(value: SubjectRow['canonical_bytes']): string {
+  const bytes =
+    typeof value === 'string'
+      ? new TextEncoder().encode(value)
+      : value instanceof ArrayBuffer
+        ? new Uint8Array(value)
+        : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 async function openBoundGate(
   board: BoardDO,
   state: DurableObjectState,
@@ -254,6 +266,22 @@ describe('approval-subject completion is race-safe and atomic', () => {
       expect(state.storage.sql.exec('SELECT active_approval_subject_id FROM cards WHERE id = ?', made.value.id).one()).toEqual({
         active_approval_subject_id: null,
       });
+      expect(
+        state.storage.sql
+          .exec('SELECT status, outcome, ended_at, handoff_json, completion FROM runs WHERE id = ?', claim.runId)
+          .one(),
+      ).toEqual({
+        status: 'working',
+        outcome: null,
+        ended_at: null,
+        handoff_json: null,
+        completion: null,
+      });
+      expect(state.storage.sql.exec('SELECT current_stage_key, state, current_run_id FROM cards WHERE id = ?', made.value.id).one()).toEqual({
+        current_stage_key: 'draft',
+        state: 'working',
+        current_run_id: claim.runId,
+      });
     });
   });
 });
@@ -315,6 +343,37 @@ describe('bound gate resolution', () => {
       });
     });
   });
+
+  it.each(['approve_manual', 'approve_automatic'] as const)(
+    'persists %s as the delivery choice while approving the exact digest',
+    async (decision) => {
+      const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-delivery-${decision}`)) as unknown as DurableObjectStub<BoardDO>;
+      await runInDurableObject(stub, async (board: BoardDO, state) => {
+        const opened = await openBoundGate(board, state, decision);
+        const result = await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision } as never);
+        expect(result).toMatchObject({ ok: true, value: { currentStageKey: 'publish' } });
+        expect(state.storage.sql.exec('SELECT decision FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({ decision });
+      });
+    },
+  );
+
+  it.each(['request_changes', 'reject'] as const)(
+    '%s retires the bound subject and clears the active pointer',
+    async (decision) => {
+      const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-negative-${decision}`)) as unknown as DurableObjectStub<BoardDO>;
+      await runInDurableObject(stub, async (board: BoardDO, state) => {
+        const opened = await openBoundGate(board, state, decision);
+        const result = await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision } as never);
+        expect(result.ok).toBe(true);
+        expect(
+          state.storage.sql.exec('SELECT status, invalidation_reason FROM approval_subjects WHERE id = ?', opened.subject.id).one(),
+        ).toEqual({ status: 'invalidated', invalidation_reason: `gate.${decision}` });
+        expect(state.storage.sql.exec('SELECT active_approval_subject_id FROM cards WHERE id = ?', opened.cardId).one()).toEqual({
+          active_approval_subject_id: null,
+        });
+      });
+    },
+  );
 });
 
 describe('authoritative rendering and invalidation', () => {
@@ -354,6 +413,22 @@ describe('authoritative rendering and invalidation', () => {
         invalidation_reason: 'card.spec_changed',
       });
       expect(state.storage.sql.exec('SELECT status FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({ status: 'cancelled' });
+      expect(state.storage.sql.exec('SELECT active_approval_subject_id FROM cards WHERE id = ?', opened.cardId).one()).toEqual({
+        active_approval_subject_id: null,
+      });
+    });
+  });
+
+  it('invalidates the frozen subject when other card review context is edited', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-invalidate-card-edit')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'invalidate-card-edit');
+      const updated = await board.updateCard(opened.cardId, { title: 'Edited after rendering' });
+      expect(updated.ok).toBe(true);
+      expect(state.storage.sql.exec('SELECT status, invalidation_reason FROM approval_subjects WHERE id = ?', opened.subject.id).one()).toEqual({
+        status: 'invalidated',
+        invalidation_reason: 'card.changed',
+      });
       expect(state.storage.sql.exec('SELECT active_approval_subject_id FROM cards WHERE id = ?', opened.cardId).one()).toEqual({
         active_approval_subject_id: null,
       });
@@ -421,6 +496,7 @@ describe('run-fenced approval-subject verify route', () => {
     let leaseEpoch = 0;
     let expectedSubjectId = '';
     let expectedDigest = '';
+    let expectedCanonicalBase64 = '';
 
     await runInDurableObject(stub, async (board: BoardDO, state) => {
       const opened = await openBoundGate(board, state, 'verify', { boardId, tenantId });
@@ -432,48 +508,74 @@ describe('run-fenced approval-subject verify route', () => {
       leaseEpoch = claim.leaseEpoch;
       expectedSubjectId = opened.subject.id;
       expectedDigest = opened.subject.digest;
+      expectedCanonicalBase64 = base64(opened.subject.canonical_bytes);
     });
 
+    const expected = {
+      expectedSchema: 'social-publish/v1',
+      expectedSubjectId,
+      expectedDigest,
+      expectedAccount: ACCOUNT,
+    };
     const url = `https://api.test/v1/boards/${boardId}/runs/${runId}/approval-subject/verify`;
     const wrongOwner = await SELF.fetch(url, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': 'agt_fixture_intruder' }),
-      body: JSON.stringify({ leaseEpoch, expectedSchema: 'social-publish/v1' }),
+      body: JSON.stringify({ leaseEpoch, ...expected }),
     });
     expect(wrongOwner.status).toBe(403);
 
     const stale = await SELF.fetch(url, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
-      body: JSON.stringify({ leaseEpoch: leaseEpoch + 1, expectedSchema: 'social-publish/v1' }),
+      body: JSON.stringify({ leaseEpoch: leaseEpoch + 1, ...expected }),
     });
     expect(stale.status).toBe(409);
 
     const wrongSchema = await SELF.fetch(url, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
-      body: JSON.stringify({ leaseEpoch, expectedSchema: 'other/v1' }),
+      body: JSON.stringify({ leaseEpoch, ...expected, expectedSchema: 'other/v1' }),
     });
     expect(wrongSchema.status).toBe(409);
 
-    const verified = await SELF.fetch(url, {
+    const missingExactDigest = await SELF.fetch(url, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
       body: JSON.stringify({ leaseEpoch, expectedSchema: 'social-publish/v1' }),
     });
+    expect(missingExactDigest.status).toBe(400);
+
+    const verified = await SELF.fetch(url, {
+      method: 'POST',
+      headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
+      body: JSON.stringify({
+        leaseEpoch,
+        expectedSchema: 'social-publish/v1',
+        expectedSubjectId,
+        expectedDigest,
+        expectedAccount: ACCOUNT,
+      }),
+    });
     expect(verified.status).toBe(200);
-    expect(await verified.json()).toMatchObject({
+    const body = await verified.json<Record<string, unknown>>();
+    expect(body).toMatchObject({
       boardId,
+      projectId: 'prj_fixture',
+      cardId: expect.any(String),
       runId,
       stageKey: 'publish',
+      expiresAt: '2030-01-02T03:04:05Z',
+      canonicalBytesBase64: expectedCanonicalBase64,
       subject: {
         id: expectedSubjectId,
         digest: expectedDigest,
         schema: 'social-publish/v1',
         account: ACCOUNT,
       },
-      gate: { decision: 'approve', decidedBy: DECIDER },
+      gate: { decision: 'approve', decidedBy: DECIDER, resolvedAt: expect.any(String) },
     });
+    expect((body.subject as { canonical: { cardId: string } }).canonical.cardId).toBe(body.cardId);
   });
 
   it.each([
@@ -506,6 +608,8 @@ describe('run-fenced approval-subject verify route', () => {
     const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${tenantId}:${boardId}`)) as unknown as DurableObjectStub<BoardDO>;
     let runId = '';
     let leaseEpoch = 0;
+    let expectedSubjectId = '';
+    let expectedDigest = '';
 
     await runInDurableObject(stub, async (board: BoardDO, state) => {
       const opened = await openBoundGate(board, state, `verify-${name}`, { boardId, tenantId });
@@ -515,15 +619,57 @@ describe('run-fenced approval-subject verify route', () => {
       if (!claim.claimed) throw new Error('publisher fixture was not claimable');
       runId = claim.runId;
       leaseEpoch = claim.leaseEpoch;
+      expectedSubjectId = opened.subject.id;
+      expectedDigest = opened.subject.digest;
       mutate(state.storage.sql, opened.subject.id, opened.cardId, opened.gate.id);
     });
 
     const response = await SELF.fetch(`https://api.test/v1/boards/${boardId}/runs/${runId}/approval-subject/verify`, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
-      body: JSON.stringify({ leaseEpoch, expectedSchema: 'social-publish/v1' }),
+      body: JSON.stringify({
+        leaseEpoch,
+        expectedSchema: 'social-publish/v1',
+        expectedSubjectId,
+        expectedDigest,
+        expectedAccount: ACCOUNT,
+      }),
     });
     expect(response.status).toBe(expectedStatus);
+  });
+
+  it.each([
+    {
+      name: 'card-to-subject project join',
+      mutate: (sql: SqlStorage) => sql.exec(`UPDATE cards SET project_id = 'prj_other'`),
+    },
+    {
+      name: 'configured x-publish stage',
+      mutate: (sql: SqlStorage) => {
+        const stages = STAGES.map((stage) => (stage.key === 'publish' ? { ...stage, owner: 'other-capability' } : stage));
+        sql.exec(`UPDATE meta SET v = ? WHERE k = 'stages'`, JSON.stringify(stages));
+      },
+    },
+  ])('refuses a broken $name', async ({ name, mutate }) => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-verify-join-${name}`)) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, name);
+      const approved = await board.resolveGate(boundDecision(opened.gate, opened.subject) as never);
+      if (!approved.ok) throw new Error(approved.message);
+      const claim = await board.claim({ agentId: PUBLISHER, capabilities: ['x-publish'] });
+      if (!claim.claimed) throw new Error('publisher fixture was not claimable');
+      mutate(state.storage.sql);
+      const verified = await board.verifyApprovalSubject({
+        runId: claim.runId,
+        leaseEpoch: claim.leaseEpoch,
+        agentId: PUBLISHER,
+        expectedSchema: 'social-publish/v1',
+        expectedSubjectId: opened.subject.id,
+        expectedDigest: opened.subject.digest,
+        expectedAccount: ACCOUNT,
+      });
+      expect(verified).toMatchObject({ ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED' });
+    });
   });
 
   it('returns 410 for an expired otherwise-valid subject', async () => {
@@ -532,6 +678,8 @@ describe('run-fenced approval-subject verify route', () => {
     const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${tenantId}:${boardId}`)) as unknown as DurableObjectStub<BoardDO>;
     let runId = '';
     let leaseEpoch = 0;
+    let expectedSubjectId = '';
+    let expectedDigest = '';
 
     await runInDurableObject(stub, async (board: BoardDO, state) => {
       const opened = await openBoundGate(board, state, 'verify-expired', {
@@ -545,14 +693,45 @@ describe('run-fenced approval-subject verify route', () => {
       if (!claim.claimed) throw new Error('publisher fixture was not claimable');
       runId = claim.runId;
       leaseEpoch = claim.leaseEpoch;
+      expectedSubjectId = opened.subject.id;
+      expectedDigest = opened.subject.digest;
     });
 
     const response = await SELF.fetch(`https://api.test/v1/boards/${boardId}/runs/${runId}/approval-subject/verify`, {
       method: 'POST',
       headers: auth(tenantId, { 'X-Agent-Id': PUBLISHER }),
-      body: JSON.stringify({ leaseEpoch, expectedSchema: 'social-publish/v1' }),
+      body: JSON.stringify({
+        leaseEpoch,
+        expectedSchema: 'social-publish/v1',
+        expectedSubjectId,
+        expectedDigest,
+        expectedAccount: ACCOUNT,
+      }),
     });
     expect(response.status).toBe(410);
+  });
+});
+
+describe('bound gate notification', () => {
+  it('carries immutable subject metadata and a private review route, never mutable handoff text', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-bound-notification')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'notification');
+      const [pending] = await board.pendingGateDeliveries();
+      expect(pending).toMatchObject({
+        cardId: opened.cardId,
+        gateId: opened.gate.id,
+        handoffSummary: null,
+        reviewUrl: `/b/brd_fixture_notification/c/${opened.cardId}`,
+        approvalSubject: {
+          id: opened.subject.id,
+          digest: opened.subject.digest,
+          schema: 'social-publish/v1',
+          revision: 1,
+        },
+      });
+      expect(JSON.stringify(pending)).not.toContain('Exact fixture text');
+    });
   });
 });
 

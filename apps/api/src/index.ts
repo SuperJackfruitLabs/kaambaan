@@ -3268,15 +3268,30 @@ const worker = {
       const approvalVerifyMatch = rest.match(/^runs\/([^/]+)\/approval-subject\/verify$/);
       if (approvalVerifyMatch && request.method === 'POST') {
         const p = (await request.json()) as {
-          leaseEpoch: number;
-          expectedSchema: string;
+          leaseEpoch?: number;
+          expectedSchema?: string;
           expectedSubjectId?: string;
           expectedDigest?: string;
           expectedAccount?: JsonValue;
         };
+        if (
+          !Number.isInteger(p.leaseEpoch) ||
+          typeof p.expectedSchema !== 'string' ||
+          p.expectedSchema.length === 0 ||
+          typeof p.expectedSubjectId !== 'string' ||
+          p.expectedSubjectId.length === 0 ||
+          typeof p.expectedDigest !== 'string' ||
+          !/^sha256:[0-9a-f]{64}$/.test(p.expectedDigest) ||
+          p.expectedAccount === undefined
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_APPROVAL_SUBJECT', message: 'leaseEpoch and exact schema, subject id, digest, and account are required' } },
+            { status: 400 },
+          );
+        }
         const result = await stub.verifyApprovalSubject({
           runId: approvalVerifyMatch[1]!,
-          leaseEpoch: p.leaseEpoch,
+          leaseEpoch: p.leaseEpoch!,
           agentId: agent!.agentId,
           expectedSchema: p.expectedSchema,
           expectedSubjectId: p.expectedSubjectId,
@@ -3391,10 +3406,16 @@ const worker = {
           approvalSubjectId?: string;
           approvalSubjectDigest?: string;
         };
+        const localDeciderId = user?.userId ?? 'usr_dev';
+        const gateView = await stub.getGate(gateMatch[1]!);
+        const principalIds =
+          gateView.ok && gateView.value.approvalSubject
+            ? await principalIdsFor(env.DB, tenantId, [localDeciderId])
+            : new Map<string, string>();
         const result = await stub.resolveGate({
           gateId: gateMatch[1]!,
           decision: gp.decision,
-          decidedBy: user?.userId ?? 'usr_dev',
+          decidedBy: principalIds.get(localDeciderId) ?? localDeciderId,
           comment: gp.comment,
           approvalSubjectId: gp.approvalSubjectId,
           approvalSubjectDigest: gp.approvalSubjectDigest,

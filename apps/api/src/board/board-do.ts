@@ -167,10 +167,14 @@ export interface ApprovalSubjectView {
 
 export interface ApprovalSubjectVerification {
   boardId: string;
+  projectId: string;
+  cardId: string;
   runId: string;
   stageKey: string;
+  canonicalBytesBase64: string;
+  expiresAt: string;
   subject: ApprovalSubjectView & { account: JsonValue };
-  gate: { id: string; decision: string; decidedBy: string };
+  gate: { id: string; decision: string; decidedBy: string; resolvedAt: string };
 }
 
 /** RFC 8785/JCS serialization for JSON values (ECMAScript primitives, sorted object keys). */
@@ -185,6 +189,19 @@ function canonicalJson(value: JsonValue): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
     .join(',')}}`;
+}
+
+function storedBytes(value: SqlStorageValue): Uint8Array {
+  if (typeof value === 'string') return new TextEncoder().encode(value);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError('approval subject canonical bytes are not binary');
+}
+
+function bytesBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
 }
 
 /**
@@ -800,9 +817,15 @@ export interface RunEvidence {
 
 const EVIDENCE_DECISION: Record<string, RunEvidenceGate['decision']> = {
   approve: 'approved',
+  approve_manual: 'approved',
+  approve_automatic: 'approved',
   request_changes: 'changes_requested',
   reject: 'rejected',
 };
+
+function isApproveDecision(decision: GateDecision): boolean {
+  return decision === 'approve' || decision === 'approve_manual' || decision === 'approve_automatic';
+}
 
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
 export interface UsageInput {
@@ -954,8 +977,12 @@ export interface GatePendingBody {
   returnStageKey: string;
   cardTitle: string;
   producedBy: string;
-  /** What the reviewer is being asked to approve; null when nothing was handed forward. */
+  /** What the reviewer is being asked to approve; null for generic handoff-free gates. */
   handoffSummary: string | null;
+  /** Immutable metadata for a digest-bound gate; canonical payload stays behind the authenticated route. */
+  approvalSubject?: Pick<ApprovalSubjectView, 'id' | 'digest' | 'schema' | 'revision'>;
+  /** Authenticated web route for reviewing the authoritative subject. */
+  reviewUrl?: string;
   options: Array<{ id: string; label: string }>;
   /** When the gate opened. The gate's own clock, so a re-read is byte-identical. */
   ts: string;
@@ -1399,9 +1426,9 @@ export interface BoardStub {
     leaseEpoch: number;
     agentId?: string | null;
     expectedSchema: string;
-    expectedSubjectId?: string;
-    expectedDigest?: string;
-    expectedAccount?: JsonValue;
+    expectedSubjectId: string;
+    expectedDigest: string;
+    expectedAccount: JsonValue;
   }): Promise<Result<ApprovalSubjectVerification>>;
 
   /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
@@ -2832,9 +2859,15 @@ export class BoardDO extends DurableObject<Env> {
       sets.push('title = ?');
       vals.push(patch.title);
     }
+    const normalizedSpec =
+      patch.spec === undefined
+        ? undefined
+        : this.getMeta('dueBackfillDone')
+          ? stripStaleSpecKeys(patch.spec)
+          : patch.spec;
     if (patch.spec !== undefined) {
       sets.push('spec_json = ?');
-      vals.push(JSON.stringify(this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(patch.spec) : patch.spec));
+      vals.push(JSON.stringify(normalizedSpec));
     }
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
@@ -2883,7 +2916,7 @@ export class BoardDO extends DurableObject<Env> {
       const prevMs = existing.updatedAt ? Date.parse(existing.updatedAt) : Number.NaN;
       vals.push(new Date(Number.isNaN(prevMs) ? nowMs : Math.max(nowMs, prevMs + 1)).toISOString());
       this.ctx.storage.transactionSync(() => {
-        if (patch.spec !== undefined) this.invalidateApprovalSubject(cardId, 'card.spec_changed', null);
+        this.invalidateApprovalSubject(cardId, patch.spec !== undefined ? 'card.spec_changed' : 'card.changed', null);
         this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
       });
     }
@@ -4989,9 +5022,9 @@ export class BoardDO extends DurableObject<Env> {
     leaseEpoch: number;
     agentId?: string | null;
     expectedSchema: string;
-    expectedSubjectId?: string;
-    expectedDigest?: string;
-    expectedAccount?: JsonValue;
+    expectedSubjectId: string;
+    expectedDigest: string;
+    expectedAccount: JsonValue;
   }): Promise<Result<ApprovalSubjectVerification>> {
     const auth = this.authorizeRun(input);
     if (!auth.ok) return auth;
@@ -5011,6 +5044,7 @@ export class BoardDO extends DurableObject<Env> {
       .exec(`SELECT * FROM gates WHERE approval_subject_id = ? AND card_id = ? ORDER BY rowid DESC LIMIT 1`, subjectId, cardId)
       .toArray()[0];
     const subject = this.approvalSubjectView(subjectId);
+    const stage = this.stages().find((candidate) => candidate.key === (run.stage_key as string));
     if (
       !subjectRow ||
       !subject ||
@@ -5018,16 +5052,21 @@ export class BoardDO extends DurableObject<Env> {
       subjectRow.card_id !== cardId ||
       !gate ||
       gate.status !== 'resolved' ||
-      gate.decision !== 'approve' ||
+      !isApproveDecision(gate.decision as GateDecision) ||
       gate.approval_subject_digest !== subject.digest ||
-      !gate.decided_by
+      gate.stage_key !== subjectRow.gate_stage_key ||
+      !gate.decided_by ||
+      !gate.resolved_at ||
+      !stage ||
+      stage.ownerKind !== 'capability' ||
+      !stageCapabilitiesMet(stage, ['x-publish'])
     ) {
       return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject and gate binding is not valid' };
     }
     if (
       subject.schema !== input.expectedSchema ||
-      (input.expectedSubjectId !== undefined && input.expectedSubjectId !== subject.id) ||
-      (input.expectedDigest !== undefined && input.expectedDigest !== subject.digest)
+      input.expectedSubjectId !== subject.id ||
+      input.expectedDigest !== subject.digest
     ) {
       return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject does not match executor expectations' };
     }
@@ -5035,10 +5074,18 @@ export class BoardDO extends DurableObject<Env> {
     const canonical = record(subject.canonical);
     const account = canonical?.account as JsonValue | undefined;
     const timing = record(canonical?.timing);
-    if (!account || !timing || !nonEmptyString(timing.expiresAt)) {
-      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject lacks account or expiry binding' };
+    const projectId = (cardRow.project_id as string | null | undefined) ?? null;
+    if (
+      !account ||
+      !timing ||
+      !nonEmptyString(timing.expiresAt) ||
+      !projectId ||
+      canonical?.cardId !== cardId ||
+      canonical.projectId !== projectId
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject lacks its card, project, account, or expiry binding' };
     }
-    if (input.expectedAccount !== undefined && canonicalJson(input.expectedAccount) !== canonicalJson(account)) {
+    if (canonicalJson(input.expectedAccount) !== canonicalJson(account)) {
       return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject account does not match executor expectations' };
     }
     if (Date.parse(timing.expiresAt) <= this.nowMs()) {
@@ -5049,13 +5096,18 @@ export class BoardDO extends DurableObject<Env> {
       ok: true,
       value: {
         boardId,
+        projectId,
+        cardId,
         runId: input.runId,
         stageKey: run.stage_key as string,
+        canonicalBytesBase64: bytesBase64(storedBytes(subjectRow.canonical_bytes)),
+        expiresAt: timing.expiresAt,
         subject: { ...subject, account },
         gate: {
           id: gate.id as string,
           decision: gate.decision as string,
           decidedBy: gate.decided_by as string,
+          resolvedAt: gate.resolved_at as string,
         },
       },
     };
@@ -5448,13 +5500,18 @@ export class BoardDO extends DurableObject<Env> {
     // The handoff lands on the RUN as well as the card: the card's copy is what the next claim
     // reads and is overwritten at every stage; this one is the permanent record of what this stage
     // said when it finished.
-    this.sql.exec(
-      `UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ?, handoff_json = ? WHERE id = ?`,
-      now,
-      handoffJson,
-      input.runId,
-    );
-    this.cancelElicitationsForRun(input.runId);
+    const endRun = () => {
+      this.sql.exec(
+        `UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ?, handoff_json = ? WHERE id = ?`,
+        now,
+        handoffJson,
+        input.runId,
+      );
+      this.cancelElicitationsForRun(input.runId);
+    };
+    // A digest-bound completion commits its run/card/subject/gate binding together below. Generic
+    // completions retain their established order and behaviour.
+    if (!approvalSubject) endRun();
 
     /**
      * Completion is earned, not announced.
@@ -5469,10 +5526,10 @@ export class BoardDO extends DurableObject<Env> {
      * impossible to say. It is recorded on the run, because routing around a check is a legitimate
      * act and a silent one is not.
      */
-    const stages = this.stages();
     const stage = stages.find((st) => st.key === card.currentStageKey);
     const cardOverride = (card.spec as { completion?: CompletionRequirement } | null | undefined)?.completion;
     const requirement = cardOverride ?? stage?.completion;
+    let approvalCompletionRecord: Record<string, unknown> | null = null;
 
     const returnsSoFar = Number(this.getCardRow(cardId)?.auto_returns ?? 0);
     const route = routeOutcome(
@@ -5497,16 +5554,25 @@ export class BoardDO extends DurableObject<Env> {
     // one automatic rework naming what to add, then a person.
     if (route.kind === 'refuse') refusals.push(route.reason);
 
-    if (requirement || input.outcome !== undefined || refusals.length > 0) {
-      this.recordRunCompletion(input.runId, {
+    const completionRecord =
+      requirement || input.outcome !== undefined || refusals.length > 0
+        ? {
         ...(verdict ?? { met: refusals.length === 0 }),
         ...(refusals.length > 0 ? { met: false, reason: refusals.join('; ') } : {}),
         ...(requirement ? { override: cardOverride !== undefined } : {}),
         ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
-      });
+          }
+        : null;
+    if (completionRecord) {
+      if (approvalSubject && refusals.length === 0 && route.kind === 'advance') {
+        approvalCompletionRecord = completionRecord;
+      } else {
+        this.recordRunCompletion(input.runId, completionRecord);
+      }
     }
 
     if (refusals.length > 0) {
+      if (approvalSubject) endRun();
       const why = refusals.join('; ');
       // Blocked, not failed (D1): the agent asserted something untrue. The run says so whatever
       // happens to the card next.
@@ -5534,6 +5600,7 @@ export class BoardDO extends DurableObject<Env> {
     }
 
     if (route.kind === 'return' || route.kind === 'park') {
+      if (approvalSubject) endRun();
       const findings = input.findings!.trim();
       // The findings go on the thread, where people read, as the judge's own words.
       this.writeComment(cardId, { kind: 'agent', id: run.agent_id as string, name: null }, findings);
@@ -5558,7 +5625,15 @@ export class BoardDO extends DurableObject<Env> {
       return { ok: true, value: this.mustGetCard(cardId) };
     }
 
-    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId, approvalSubject);
+    if (approvalSubject) {
+      this.ctx.storage.transactionSync(() => {
+        endRun();
+        if (approvalCompletionRecord) this.recordRunCompletion(input.runId, approvalCompletionRecord);
+        this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId, approvalSubject);
+      });
+    } else {
+      this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId, null);
+    }
     // After advanceCard: a human gate it opened judges this run, so the run reports `waiting`.
     this.reportRun(input.runId);
     await this.scheduleReclaim();
@@ -5755,11 +5830,12 @@ export class BoardDO extends DurableObject<Env> {
       now,
       input.gateId,
     );
-    if (input.decision === 'approve') {
+    if (isApproveDecision(input.decision)) {
       // The approver becomes the producer of any chained gate (keeps separation-of-duties intact).
       // An approval produces no new work, so a chained gate judges the same run's work.
       this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
     } else if (input.decision === 'request_changes') {
+      if (boundSubjectId) this.invalidateApprovalSubject(cardId, 'gate.request_changes', input.decidedBy);
       // Keep the agent's prior handoff and add the reviewer's feedback so rework has full context.
       const prior = this.parseHandoff(this.getCardHandoffJson(cardId));
       const merged =
@@ -5777,6 +5853,7 @@ export class BoardDO extends DurableObject<Env> {
       this.emit('card.changes_requested', { cardId, gateId: input.gateId, to: gate.return_stage_key });
       this.notifyWorkAvailable(cardId); // back on a claimable stage for rework
     } else {
+      if (boundSubjectId) this.invalidateApprovalSubject(cardId, 'gate.reject', input.decidedBy);
       this.sql.exec(
         `UPDATE cards SET state = 'rejected', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
         now,
@@ -7272,9 +7349,15 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = gate.card_id as string;
     const card = this.getCard(cardId);
     if (!card) return null;
+    const boardId = this.getMeta('boardId');
+    const subjectId = (gate.approval_subject_id as string | null) ?? null;
+    const subject = subjectId ? this.approvalSubjectView(subjectId) : null;
+    const approvalSubject = subject
+      ? { id: subject.id, digest: subject.digest, schema: subject.schema, revision: subject.revision }
+      : null;
     return {
       event: 'gate.pending',
-      boardId: this.getMeta('boardId'),
+      boardId,
       // `?? ''` rather than omitted: see `GatePendingBody.boardName`.
       boardName: this.getMeta('name') ?? '',
       cardId,
@@ -7289,7 +7372,13 @@ export class BoardDO extends DurableObject<Env> {
       // the only way to read it is to leave for the board. That was the state
       // for a day (supermessage#37) because every test asserted the gate's
       // SHAPE rather than whether a human could act on one.
-      handoffSummary: handoffSummary(this.getCardHandoffJson(cardId)),
+      handoffSummary: approvalSubject ? null : handoffSummary(this.getCardHandoffJson(cardId)),
+      ...(approvalSubject
+        ? {
+            approvalSubject,
+            reviewUrl: `/b/${encodeURIComponent(boardId!)}/c/${encodeURIComponent(cardId)}`,
+          }
+        : {}),
       // `id`/`label`, not `name`/`title`: the wire names are pinned by
       // agentpod fixtures/ecosystem-identity/matrix_gate_events.json, which
       // three repos validate against. The board's own vocabulary stops here.
