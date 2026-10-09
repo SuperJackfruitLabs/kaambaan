@@ -44,6 +44,8 @@
   import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
   import CardComments from '$lib/components/card/CardComments.svelte';
   import CardResume from '$lib/components/card/CardResume.svelte';
+  import LibraryArtifact from '$lib/components/card/LibraryArtifact.svelte';
+  import { libraryRef } from '$lib/superlibrary';
 
   // ---- derived from store ----
   const cardId = $derived(app.openCardId);
@@ -69,6 +71,9 @@
   );
   const elicitation = $derived(cardId ? app.elicitationForCard(cardId) : undefined);
   const refs = $derived(cardId ? app.referencesForCard(cardId) : []);
+  /** Superlibrary links preview in the embedded viewer; the first opens itself (superlibrary decision O6). */
+  const libraryRefs = $derived(refs.flatMap((r) => { const l = libraryRef(r.url); return l ? [{ ref: r, ...l }] : []; }));
+  const otherRefs = $derived(refs.filter((r) => libraryRef(r.url) === null));
   const boardId = $derived(app.boardId);
   const stageName = $derived(
     card && app.board ? (app.board.stages.find((s) => s.key === card.currentStageKey)?.name ?? card.currentStageKey) : '',
@@ -1831,9 +1836,16 @@
         <!-- references -->
         <section class="sec">
           <div class="sec-h eyebrow">references</div>
-          {#if refs.length > 0}
+          {#if libraryRefs.length > 0}
+            <div class="mb-2.5 grid gap-2" aria-label="Superlibrary artifacts">
+              {#each libraryRefs as l, i (l.ref.id)}
+                <LibraryArtifact itemId={l.itemId} version={l.version} title={l.ref.title ?? l.itemId} open={i === 0} />
+              {/each}
+            </div>
+          {/if}
+          {#if otherRefs.length > 0}
             <div class="mb-2.5 flex flex-wrap gap-1.5">
-              {#each refs as ref (ref.id)}
+              {#each otherRefs as ref (ref.id)}
                 {@const href = safeHref(ref.url)}
                 {@const inner = `${refLabel(ref)}${subStateLabel(ref) ? ` · ${subStateLabel(ref)}` : ''}`}
                 {#if href}
