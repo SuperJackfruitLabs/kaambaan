@@ -482,6 +482,43 @@ describe('bound gate resolution', () => {
     });
   });
 
+  /**
+   * Regression target: removing or ignoring the chosen reminder time must leave this test red.
+   * A manually approved post with no recorded URL stays quiet before that instant, then tells the
+   * operator in Needs you that they can record the URL or switch the unchanged digest to automatic.
+   */
+  it('reminds at the chosen time when manual delivery still has no live URL', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-manual-reminder')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'manual-reminder');
+      await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_manual' } as never);
+      const remindAt = '2029-01-02T03:04:05.000Z';
+
+      const scheduled = await board.updateApprovalDelivery({
+        gateId: opened.gate.id,
+        actor: DECIDER,
+        remindAt,
+      } as never);
+      expect(scheduled).toMatchObject({
+        ok: true,
+        value: { delivery: { mode: 'manual', liveUrl: null, remindAt } },
+      });
+
+      await board.sweepBoard('2029-01-02T03:04:04.999Z');
+      expect((await board.getNotifications()).filter((note) => note.kind === 'approval-delivery-reminder')).toHaveLength(0);
+
+      await board.sweepBoard(remindAt);
+      const reminders = (await board.getNotifications()).filter((note) => note.kind === 'approval-delivery-reminder');
+      expect(reminders).toHaveLength(1);
+      expect(reminders[0]).toMatchObject({ cardId: opened.cardId, userId: 'usr_fixture_owner' });
+      expect(reminders[0]!.body).toContain('record the live post URL');
+      expect(reminders[0]!.body).toContain('switch to automatic');
+      expect((await board.staleCards({ nowIso: remindAt, attention: true })).find((card) => card.cardId === opened.cardId)).toMatchObject({
+        why: { kind: 'needs-human', detail: expect.stringContaining('live post URL') },
+      });
+    });
+  });
+
   it('serves the audited delivery workflow through the signed-in human route', async () => {
     const tenantId = 'tnt_delivery_route';
     const boardId = 'brd_delivery_route';
