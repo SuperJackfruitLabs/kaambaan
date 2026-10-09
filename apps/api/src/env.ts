@@ -22,6 +22,8 @@ export interface Env {
    * the tenant external mapping takes.
    */
   HUB_ISSUER?: string;
+  /** Superlibrary's audience (spec §9 Embedding). Set: the card drawer may ask for a token for it. Unset: no library. */
+  SUPERLIBRARY_AUDIENCE?: string;
   /**
    * The Organization plane (accounts `2026-10-06-issuer-contract.md` §1). **`ORG_PLANE_ISSUER` is the
    * switch**: unset means this deployment verifies the hub's tokens exactly as before. Set means it

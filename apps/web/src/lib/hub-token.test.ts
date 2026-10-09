@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus } from './hub-token';
+import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken } from './hub-token';
 
 /**
  * Carrying authority from the browser (superpipeline#43, option A).
@@ -336,5 +336,22 @@ describe('plane mode — a transient refresh failure', () => {
     expect(await hubToken()).toBeNull();
     expect((await hubStatus()).signIn).toBe('org-plane');
     expect(fetchSpy.mock.calls.every((c) => String(c[0]).startsWith('/hub/token'))).toBe(true);
+  });
+});
+
+describe('libraryToken (spec §9 Embedding)', () => {
+  const jwt = (expSec: number) => `h.${btoa(JSON.stringify({ exp: expSec })).replace(/=+$/, '')}.s`;
+  it('asks the Worker with ?library=1, caches until a minute before expiry, and is null when none is minted', async () => {
+    forgetHubToken();
+    const seen: string[] = [];
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => { seen.push(u); return Response.json({ token: 'a', hubToken: null, libraryToken: jwt(exp), signIn: 'org-plane' }); }));
+    expect(await libraryToken()).toBe(jwt(exp));
+    expect(await libraryToken()).toBe(jwt(exp));
+    expect(seen).toEqual(['/hub/token?library=1']);
+    forgetHubToken();
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ token: 'a', hubToken: null, libraryToken: null, signIn: 'org-plane' })));
+    expect(await libraryToken()).toBeNull();
+    vi.unstubAllGlobals();
   });
 });

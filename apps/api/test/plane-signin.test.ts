@@ -315,3 +315,79 @@ describe('plane sign-in — a second, hub-audience token for the assignee picker
   });
 });
 
+
+describe('plane sign-in — a third, Superlibrary-audience token for the card drawer, on request', () => {
+  const LIB = 'https://app.superlibrary.dev';
+  const HUB_RES = 'https://hub.agentpod.test';
+  function byResource3(opts: { libraryRefuses?: boolean } = {}) {
+    const tokenRequests: URLSearchParams[] = [];
+    let n = 0;
+    const tokens = { app: '', hub: '', lib: '' };
+    const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === PLANE_JWKS) return new Response((await planeKeys()).jwksBody, { headers: { 'content-type': 'application/json' } });
+      if (url === `${PLANE}/api/auth/oauth2/token`) {
+        const form = new URLSearchParams(String(init?.body));
+        tokenRequests.push(form);
+        const resource = form.get('resource');
+        if (resource === LIB && opts.libraryRefuses) return Response.json({ error: 'invalid_target' }, { status: 400 });
+        n += 1;
+        const access = resource === LIB ? tokens.lib : resource === HUB_RES ? tokens.hub : tokens.app;
+        return Response.json({ access_token: access, refresh_token: `r${n + 1}`, expires_in: 300 });
+      }
+      return new Response('unexpected', { status: 599 });
+    }) as unknown as typeof fetch;
+    return { impl, tokenRequests, tokens };
+  }
+  const env3 = () => envOn({ HUB_ISSUER: HUB_RES, SUPERLIBRARY_AUDIENCE: LIB });
+
+  it('/hub/token?library=1 renews app, hub, then library, each with the newest refresh token', async () => {
+    const fake = byResource3();
+    fake.tokens.app = await planeToken();
+    fake.tokens.hub = await planeToken({}, { aud: HUB_RES });
+    fake.tokens.lib = await planeToken({}, { aud: LIB });
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', fake.impl))!;
+    expect(await res.json()).toEqual({ token: fake.tokens.app, hubToken: fake.tokens.hub, libraryToken: fake.tokens.lib, hubConfigured: true, signIn: 'org-plane' });
+    expect(fake.tokenRequests.map((f) => [f.get('resource'), f.get('refresh_token')])).toEqual([[APP_AUD, 'r1'], [HUB_RES, 'r2'], [LIB, 'r3']]);
+    const c = cookies(res);
+    expect(c.get('superpipeline_plane_library_token')).toBe(fake.tokens.lib);
+    expect(c.get('superpipeline_plane_refresh')).toBe('r4');
+  });
+  it('without ?library=1 it never asks for the library and answers as before', async () => {
+    const fake = byResource3();
+    fake.tokens.app = await planeToken();
+    fake.tokens.hub = await planeToken({}, { aud: HUB_RES });
+    const req = new Request('https://api.test/hub/token', { headers: { Cookie: 'superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', fake.impl))!;
+    expect(await res.json()).toEqual({ token: fake.tokens.app, hubToken: fake.tokens.hub, hubConfigured: true, signIn: 'org-plane' });
+    expect(fake.tokenRequests.map((f) => f.get('resource'))).toEqual([APP_AUD, HUB_RES]);
+  });
+  it('serves a live library cookie without calling the plane', async () => {
+    const fake = byResource3();
+    const req = new Request('https://api.test/hub/token?library=1', {
+      headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_hub_token=hub1; superpipeline_plane_library_token=lib1; superpipeline_plane_refresh=r1' },
+    });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', fake.impl))!;
+    expect(await res.json()).toEqual({ token: 'app1', hubToken: 'hub1', libraryToken: 'lib1', hubConfigured: true, signIn: 'org-plane' });
+    expect(fake.tokenRequests).toHaveLength(0);
+  });
+  it('a plane that will not mint the library token leaves the others and the refresh token intact', async () => {
+    const fake = byResource3({ libraryRefuses: true });
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_hub_token=hub1; superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, env3(), '/hub/token', fake.impl))!;
+    expect(await res.json()).toEqual({ token: 'app1', hubToken: 'hub1', libraryToken: null, hubConfigured: true, signIn: 'org-plane' });
+    expect(cookies(res).get('superpipeline_plane_refresh')).toBe('r1');
+  });
+  it('makes no library request when no Superlibrary is configured', async () => {
+    const fake = byResource3();
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, envOn({ SUPERLIBRARY_AUDIENCE: '' }), '/hub/token', fake.impl))!;
+    expect((await res.json() as { libraryToken?: unknown }).libraryToken).toBeNull();
+    expect(fake.tokenRequests).toHaveLength(0);
+  });
+  it('logout clears the library cookie too', async () => {
+    const res = (await handlePlaneSignInRoute(new Request('https://api.test/auth/logout'), envOn(), '/auth/logout'))!;
+    expect(cookies(res).get('superpipeline_plane_library_token')).toBe('');
+  });
+});
