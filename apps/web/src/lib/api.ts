@@ -667,7 +667,7 @@ export function unarchiveCard(boardId: string, cardId: string): Promise<Response
 }
 
 /** Dependencies and sub-task containment (spec §3.4) — one table on the DO, told apart by `kind`. */
-export type LinkKind = 'blocks' | 'relates' | 'parent';
+export type LinkKind = 'blocks' | 'relates' | 'parent' | 'supersedes';
 
 /**
  * A same-board edge (Task 12's `card_links`, read on the claim path). NOT always enforced: the

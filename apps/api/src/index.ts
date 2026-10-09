@@ -2538,12 +2538,12 @@ const worker = {
             { status: 400 },
           );
         }
-        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent') {
+        if (body.kind !== 'blocks' && body.kind !== 'relates' && body.kind !== 'parent' && body.kind !== 'supersedes') {
           return Response.json(
             {
               error: {
                 code: 'INVALID_LINK_KIND',
-                message: `kind must be 'blocks', 'relates' or 'parent', got ${JSON.stringify(body.kind)}`,
+                message: `kind must be 'blocks', 'relates', 'parent' or 'supersedes', got ${JSON.stringify(body.kind)}`,
               },
             },
             { status: 400 },
@@ -2576,6 +2576,14 @@ const worker = {
                     "A parent edge carries a rule — a parent does not advance while a child is open — and an advisory containment relationship is one that fails to contain. Use a project to group cards across boards.",
                 },
               },
+              { status: 400 },
+            );
+          }
+          // `supersedes` names a card's replacement on its own board (P7); the advisory store has no
+          // such kind and its D1 CHECK stays as it is.
+          if (kind === 'supersedes') {
+            return Response.json(
+              { error: { code: 'INVALID_LINK_KIND', message: 'supersedes links cards on one board' } },
               { status: 400 },
             );
           }

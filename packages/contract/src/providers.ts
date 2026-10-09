@@ -88,7 +88,22 @@ function repoShapes(
   return { sourceType: 'url' };
 }
 
+/** `itm_` + 16 hex, optionally followed by `/v/<n>`: the shapes of a Superlibrary item link. */
+const SUPERLIBRARY_ITEM = /^itm_[0-9a-f]{16}$/;
+
 export const PROVIDERS: ProviderDef[] = [
+  {
+    key: 'superlibrary',
+    verification: 'none',
+    owns: (host) => host === 'app.superlibrary.dev',
+    read: (segments) => {
+      const [a, id, v, n, ...rest] = segments;
+      if (a !== 'a' || !id || !SUPERLIBRARY_ITEM.test(id)) return null;
+      if (v === undefined && n === undefined) return { sourceType: 'artifact', externalId: id };
+      if (v === 'v' && n !== undefined && rest.length === 0 && /^[1-9][0-9]*$/.test(n)) return { sourceType: 'artifact', externalId: id };
+      return null;
+    },
+  },
   {
     key: 'github',
     // Raw and API hosts are recognised as `github` too: a reference to a raw file is a reference

@@ -95,7 +95,7 @@ export async function cardLinksBody(env: Env, tenantId: string, stub: BoardStub,
         // claim it does not — unreachable today only because of a web-side defect being fixed
         // separately, and the whole point of this flag is that a client should never have to
         // infer enforcement itself, including for the one kind that has none.
-        links: links.map((l) => ({ ...l, enforced: l.kind !== 'relates' })),
+        links: links.map((l) => ({ ...l, enforced: l.kind === 'blocks' || l.kind === 'parent' })),
         externalLinks: externalLinks.map((l, i) => ({
           ...l,
           enforced: false as const,

@@ -546,14 +546,14 @@ async function main(argv: string[]): Promise<void> {
      * a printed warning that can't hang on absent stdin was preferred over one that can.
      */
     case "link": {
-      const LINK_KINDS = ["blocks", "relates", "parent"] as const;
+      const LINK_KINDS = ["blocks", "relates", "parent", "supersedes"] as const;
       const sub = pos[0];
 
       if (sub === "add" || sub === "rm") {
         const boardId = pos[1];
         const fromCardId = pos[2];
         const toCardId = pos[3];
-        const usage = `usage: supi link ${sub} <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]`;
+        const usage = `usage: supi link ${sub} <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent|supersedes [--to-board <boardId>]`;
         if (!boardId || !fromCardId || !toCardId) fail(usage);
         const kind = flag(rest, "--kind");
         if (!kind || !(LINK_KINDS as readonly string[]).includes(kind)) {
@@ -585,8 +585,8 @@ async function main(argv: string[]): Promise<void> {
       }
 
       fail(
-        "usage: supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]\n" +
-          "  supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent [--to-board <boardId>]\n" +
+        "usage: supi link add <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent|supersedes [--to-board <boardId>]\n" +
+          "  supi link rm <boardId> <fromCardId> <toCardId> --kind blocks|relates|parent|supersedes [--to-board <boardId>]\n" +
           "  supi link list <boardId> <cardId>",
       );
     }
