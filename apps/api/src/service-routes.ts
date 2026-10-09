@@ -3,7 +3,7 @@ import { CARDS_READ, PUSH_WRITE, resolveHubService } from './auth/resolve';
 import { boardStub } from './board/stub';
 import { boardNamesById, cardLinksBody } from './card-links';
 import { listBoards } from './db/catalog';
-import { isRecordEvent } from './push/events';
+import { SUBSCRIBABLE_EVENTS, isRecordEvent } from './push/events';
 
 /**
  * A service (Superlibrary) reading boards and cards, and registering a push config. Every answer
@@ -64,10 +64,13 @@ export async function serviceRoute(request: Request, env: Env, path: string): Pr
   if (
     !body || typeof body.url !== 'string' || typeof body.token !== 'string' || body.token === '' ||
     !Array.isArray(body.events) || body.events.length === 0 ||
-    !body.events.every((e): e is string => typeof e === 'string' && isRecordEvent(e))
+    !body.events.every((e): e is string => typeof e === 'string')
   ) {
-    return refuse(400, 'INVALID_BODY', 'url, token and record events are required');
+    return refuse(400, 'INVALID_BODY', 'url, token and events are required');
   }
+  const unknown = body.events.filter((e) => !SUBSCRIBABLE_EVENTS.has(e));
+  if (unknown.length > 0) return refuse(400, 'UNKNOWN_EVENT', `cannot subscribe to: ${unknown.join(', ')}`);
+  if (!body.events.every(isRecordEvent)) return refuse(400, 'INVALID_BODY', 'a service may subscribe to record events only');
   const result = await boardStub(env, svc.tenantId, boardId).registerPushConfig({
     agentId: `svc:${svc.principalId}`,
     url: body.url,

@@ -3025,6 +3025,9 @@ const worker = {
         // person (session cookie or dev headers) still names the subscriber with `X-Agent-Id`.
         const agentId = agent ? agent.agentId : request.headers.get('X-Agent-Id');
         if (!agentId || agentId.trim() === '') return Response.json({ error: 'X-Agent-Id required' }, { status: 400 });
+        // `svc:<prn>` names a service's own subscription (serviceRoute). registerPushConfig upserts on
+        // (agent_id, url), so a person naming one could overwrite a service's config.
+        if (agentId.startsWith('svc:')) return Response.json({ error: 'X-Agent-Id may not name a service' }, { status: 400 });
         const body = (await request.json()) as { url: string; token: string; capabilities?: string[]; events?: string[] };
         // Built from named fields rather than `...body`: `agentId` is the caller's own identity,
         // asserted by the `X-Agent-Id` header above — `as` strips nothing at runtime, so a body

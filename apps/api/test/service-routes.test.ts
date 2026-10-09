@@ -170,7 +170,12 @@ describe('a service registering a push config (hub issuer)', () => {
       const { boardId } = await seedBoardWithResolvedGate();
       const t = await hubToken({ scope: 'push:write' });
       const p = `/v1/boards/${boardId}/push-configs`;
-      expect((await post(p, t, { url: 'https://library.example.com/x', token: 'd', events: ['work.available'] })).status).toBe(400);
+      const known = await post(p, t, { url: 'https://library.example.com/x', token: 'd', events: ['work.available'] });
+      expect(known.status).toBe(400);
+      expect(((await known.json()) as { error: { code: string } }).error.code).toBe('INVALID_BODY');
+      const unknown = await post(p, t, { url: 'https://library.example.com/x', token: 'd', events: ['card.nonsense'] });
+      expect(unknown.status).toBe(400);
+      expect(((await unknown.json()) as { error: { code: string } }).error.code).toBe('UNKNOWN_EVENT');
       expect((await post(p, t, { url: 'https://library.example.com/x', token: 'd', events: [] })).status).toBe(400);
       expect((await post(p, t, { url: 'https://library.example.com/x', events: ['card.updated'] })).status).toBe(400);
     });
@@ -215,6 +220,40 @@ describe('the same routes in Organization-plane mode (the production path)', () 
       // Another org's service cannot see this org's board.
       expect(other).not.toBe(tenant);
       expect((await get(path, await svcToken({ org: OTHER_ORG }))).status).toBe(404);
+    });
+  });
+});
+
+describe('a bearer that is not a service stays on the existing routes', () => {
+  it('a person with a plane bearer reads the board as before (200), not as a service', async () => {
+    await withOrgPlane(async () => {
+      const tenant = await ensureOrgTenant(env.DB, ORG);
+      const { boardId, cardId } = await seedBoardWithResolvedGate({ tenant });
+      const human = await planeToken();
+      expect((await get(`/v1/boards/${boardId}`, human)).status).toBe(200);
+      expect((await get(`/v1/boards/${boardId}/cards/${cardId}`, human)).status).toBe(200);
+    });
+  });
+});
+
+describe('a person cannot name a service as the subscriber', () => {
+  it('refuses X-Agent-Id svc:<prn> on the human push-config route and leaves the service config alone', async () => {
+    await legacy(async () => {
+      const { boardId } = await seedBoardWithResolvedGate();
+      const url = 'https://library.example.com/own';
+      const svc = await post(`/v1/boards/${boardId}/push-configs`, await hubToken({ scope: 'push:write' }), { url, token: 'service-token', events: ['card.updated'] });
+      expect(svc.status).toBe(201);
+      const r = await SELF.fetch(`https://api.test/v1/boards/${boardId}/push-configs`, {
+        method: 'POST',
+        headers: { 'X-Tenant-Id': TENANT, 'X-User-Id': 'usr_owner', 'X-Agent-Id': 'svc:prn_0123456789abcdef0f01', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, token: 'attacker-token', events: ['card.updated'] }),
+      });
+      expect(r.status).toBe(400);
+      const tokens = await runInDurableObject(
+        env.BOARD_DO.get(env.BOARD_DO.idFromName(`${TENANT}:${boardId}`)),
+        async (_i, state) => state.storage.sql.exec(`SELECT token FROM push_configs WHERE agent_id LIKE 'svc:%'`).toArray().map((x) => x.token),
+      );
+      expect(tokens).toEqual(['service-token']);
     });
   });
 });
