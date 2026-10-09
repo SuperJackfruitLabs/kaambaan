@@ -942,6 +942,7 @@ export interface GateView {
   delivery?: {
     mode: 'manual' | 'automatic';
     liveUrl: string | null;
+    remindAt: string | null;
     readBackStatus: 'not_checked' | 'matched' | 'mismatch';
     recordedBy: string | null;
     recordedAt: string | null;
@@ -1529,6 +1530,7 @@ export interface BoardStub {
     actor: string;
     mode?: 'manual' | 'automatic';
     liveUrl?: string;
+    remindAt?: string;
   }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>>;
   answerElicitation(input: {
     elicitationId: string;
@@ -2069,6 +2071,16 @@ export class BoardDO extends DurableObject<Env> {
     }
     try {
       this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_readback_status TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_remind_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_reminder_notified_at TEXT`);
     } catch {
       // column already exists
     }
@@ -4369,6 +4381,22 @@ export class BoardDO extends DurableObject<Env> {
       this.emit('overdue.sweep_failed', { reason: String(err) });
     }
 
+    const deliveryReminders = this.sql
+      .exec(
+        `SELECT id, card_id FROM gates
+          WHERE status = 'resolved' AND decision = 'approve_manual'
+            AND live_post_url IS NULL AND live_post_remind_at IS NOT NULL
+            AND live_post_remind_at <= ? AND live_post_reminder_notified_at IS NULL`,
+        nowIso,
+      )
+      .toArray();
+    for (const gate of deliveryReminders) {
+      const detail = 'record the live post URL or switch to automatic';
+      this.notify('approval-delivery-reminder', gate.card_id as string, `Manual delivery is waiting: ${detail}.`);
+      this.setNeedsHuman(gate.card_id as string, { reason: 'review', detail });
+      this.sql.exec(`UPDATE gates SET live_post_reminder_notified_at = ? WHERE id = ?`, nowIso, gate.id as string);
+    }
+
     // Its own try/catch, for the reason the backfill above has one: three jobs share this sweep, and
     // a failure in any of them must not silently disable the other two. `schedulesFired` is still
     // reported as 0 when firing failed, which is honest — nothing fired.
@@ -5946,6 +5974,7 @@ export class BoardDO extends DurableObject<Env> {
     actor: string;
     mode?: 'manual' | 'automatic';
     liveUrl?: string;
+    remindAt?: string;
   }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>> {
     const gate = this.sql.exec(`SELECT * FROM gates WHERE id = ?`, input.gateId).toArray()[0];
     if (!gate) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${input.gateId}` };
@@ -5964,12 +5993,25 @@ export class BoardDO extends DurableObject<Env> {
     if (!cardRow || cardRow.active_approval_subject_id !== subjectId || subject?.status !== 'active') {
       return { ok: false, code: 'APPROVAL_SUBJECT_MISMATCH', message: 'the approved subject is no longer active' };
     }
-    if ((input.mode === undefined) === (input.liveUrl === undefined)) {
-      return { ok: false, code: 'INVALID_APPROVAL_DELIVERY', message: 'provide exactly one of mode or liveUrl' };
+    const changes = [input.mode, input.liveUrl, input.remindAt].filter((value) => value !== undefined);
+    if (changes.length !== 1) {
+      return { ok: false, code: 'INVALID_APPROVAL_DELIVERY', message: 'provide exactly one of mode, liveUrl or remindAt' };
     }
 
     const now = this.now();
-    if (input.liveUrl !== undefined) {
+    if (input.remindAt !== undefined) {
+      if (decision !== 'approve_manual' || gate.live_post_url) {
+        return { ok: false, code: 'APPROVAL_DELIVERY_NOT_MANUAL', message: 'a reminder is scheduled only for unpublished manual delivery' };
+      }
+      if (!Number.isFinite(Date.parse(input.remindAt))) {
+        return { ok: false, code: 'INVALID_APPROVAL_DELIVERY', message: 'remindAt must be an ISO timestamp' };
+      }
+      this.sql.exec(
+        `UPDATE gates SET live_post_remind_at = ?, live_post_reminder_notified_at = NULL WHERE id = ?`,
+        input.remindAt,
+        input.gateId,
+      );
+    } else if (input.liveUrl !== undefined) {
       if (decision !== 'approve_manual') {
         return { ok: false, code: 'APPROVAL_DELIVERY_NOT_MANUAL', message: 'a live URL is recorded only for manual delivery' };
       }
@@ -7117,6 +7159,7 @@ export class BoardDO extends DurableObject<Env> {
         ? {
             mode: (decision === 'approve_manual' ? 'manual' : 'automatic') as 'manual' | 'automatic',
             liveUrl: (r.live_post_url as string | null) ?? null,
+            remindAt: (r.live_post_remind_at as string | null) ?? null,
             readBackStatus: ((r.live_post_readback_status as 'not_checked' | 'matched' | 'mismatch' | null) ?? 'not_checked'),
             recordedBy: (r.live_post_url_recorded_by as string | null) ?? null,
             recordedAt: (r.live_post_url_recorded_at as string | null) ?? null,
