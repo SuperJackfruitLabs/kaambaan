@@ -210,7 +210,7 @@
     const bid = app.boardId;
     const g = gate;
     if (!bid || !g) return;
-    const res = await resolveGate(bid, g.id, decision);
+    const res = await resolveGate(bid, g.id, decision, undefined, g.approvalSubject);
     if (res.ok) {
       app.closeCard(); // close drawer if open for this card
       await app.refresh();
@@ -425,7 +425,7 @@
         { name: 'request_changes', title: 'Request changes', interactive: true },
         { name: 'reject', title: 'Reject', interactive: false },
       ]) as opt (opt.name)}
-        {#if opt.name === 'approve'}
+        {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
           <Button size="sm" onclick={(e: MouseEvent) => onGateResolve(e, 'approve')}>{opt.title}</Button>
         {:else if opt.name === 'request_changes'}
           <Button size="sm" variant="outline" onclick={() => app.openCard(card.id)}>{opt.title}</Button>

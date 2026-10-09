@@ -344,6 +344,13 @@ export interface Gate {
   resolvedAt?: string | null;
   /** What is being approved — the readable part of the handoff. On pending gates in the snapshot. Text only. */
   summary?: string | null;
+  approvalSubject?: {
+    id: string;
+    digest: string;
+    schema: string;
+    revision: number;
+    canonical: Record<string, unknown>;
+  };
 }
 
 export type GateDecision = 'approve' | 'request_changes' | 'reject';
@@ -859,11 +866,17 @@ export function resolveGate(
   gateId: string,
   decision: GateDecision,
   comment?: string,
+  approvalSubject?: Pick<NonNullable<Gate['approvalSubject']>, 'id' | 'digest'>,
 ): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/gates/${gateId}/resolve`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ decision, comment }),
+    body: JSON.stringify({
+      decision,
+      comment,
+      approvalSubjectId: approvalSubject?.id,
+      approvalSubjectDigest: approvalSubject?.digest,
+    }),
   }).then(noteAuth);
 }
 

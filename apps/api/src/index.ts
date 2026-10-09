@@ -147,6 +147,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_USAGE':
     case 'INVALID_STAGES':
     case 'INVALID_OUTCOME':
+    case 'INVALID_APPROVAL_SUBJECT':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -162,6 +163,8 @@ function statusForCode(code: BoardErrorCode): number {
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
+    case 'APPROVAL_SUBJECT_MISMATCH':
+    case 'APPROVAL_SUBJECT_NOT_VERIFIED':
     // The question was already settled (answered, or retired with its run) — a conflict with the
     // state the caller believed in, not a bad request. Retrying it will never succeed.
     case 'ELICITATION_NOT_PENDING':
@@ -174,7 +177,10 @@ function statusForCode(code: BoardErrorCode): number {
     // The caller authenticated, but this run is another agent's: a permanent refusal of an
     // understood request, and deliberately NOT the 409 that means "your lease lapsed, re-claim".
     case 'NOT_RUN_OWNER':
+    case 'APPROVAL_DECIDER_NOT_ALLOWED':
       return 403;
+    case 'APPROVAL_SUBJECT_EXPIRED':
+      return 410;
     case 'INVALID_SIGNATURE':
       return 401;
     case 'NOT_CONFIGURED':
@@ -3257,6 +3263,30 @@ const worker = {
         return Response.json(result.value);
       }
 
+      // The publisher's final authenticated lease fence. Authoritative stored bytes are returned
+      // only while the run/card/stage/subject/gate/account/expiry binding still agrees.
+      const approvalVerifyMatch = rest.match(/^runs\/([^/]+)\/approval-subject\/verify$/);
+      if (approvalVerifyMatch && request.method === 'POST') {
+        const p = (await request.json()) as {
+          leaseEpoch: number;
+          expectedSchema: string;
+          expectedSubjectId?: string;
+          expectedDigest?: string;
+          expectedAccount?: JsonValue;
+        };
+        const result = await stub.verifyApprovalSubject({
+          runId: approvalVerifyMatch[1]!,
+          leaseEpoch: p.leaseEpoch,
+          agentId: agent!.agentId,
+          expectedSchema: p.expectedSchema,
+          expectedSubjectId: p.expectedSubjectId,
+          expectedDigest: p.expectedDigest,
+          expectedAccount: p.expectedAccount,
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
+      }
+
       // POST /v1/boards/:id/runs/:runId/:action — agent run verbs (docs/04 §3)
       const runMatch = rest.match(/^runs\/([^/]+)\/([^/]+)$/);
       if (runMatch && request.method === 'POST') {
@@ -3355,12 +3385,19 @@ const worker = {
       // POST /v1/boards/:id/gates/:gateId/resolve — the signed-in human resolves an approval gate (docs/08 §6)
       const gateMatch = rest.match(/^gates\/([^/]+)\/resolve$/);
       if (gateMatch && request.method === 'POST') {
-        const gp = (await request.json()) as { decision: GateDecision; comment?: string };
+        const gp = (await request.json()) as {
+          decision: GateDecision;
+          comment?: string;
+          approvalSubjectId?: string;
+          approvalSubjectDigest?: string;
+        };
         const result = await stub.resolveGate({
           gateId: gateMatch[1]!,
           decision: gp.decision,
           decidedBy: user?.userId ?? 'usr_dev',
           comment: gp.comment,
+          approvalSubjectId: gp.approvalSubjectId,
+          approvalSubjectDigest: gp.approvalSubjectDigest,
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });

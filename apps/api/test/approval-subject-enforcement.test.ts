@@ -208,7 +208,7 @@ describe('approval-subject creation refuses bad input without mutating the run',
 
       expect(state.storage.sql.exec('SELECT id FROM approval_subjects').toArray()).toHaveLength(0);
       expect(state.storage.sql.exec('SELECT id FROM gates').toArray()).toHaveLength(0);
-      expect(state.storage.sql.exec('SELECT status FROM runs WHERE id = ?', claim.runId).one()).toEqual({ status: 'active' });
+      expect(state.storage.sql.exec('SELECT status FROM runs WHERE id = ?', claim.runId).one()).toEqual({ status: 'working' });
       expect(state.storage.sql.exec('SELECT current_stage_key FROM cards WHERE id = ?', made.value.id).one()).toEqual({
         current_stage_key: 'draft',
       });

@@ -104,6 +104,10 @@ export const Stage = z.object({
    */
   instructions: z.string().min(1).max(4000).optional(),
   gate: StageGate.default('none'),
+  /** Opts a human approval gate into an immutable, digest-bound subject contract. */
+  approvalSubjectSchema: z.string().min(1).optional(),
+  /** Snapshot of human principals allowed to decide that immutable subject. */
+  approvalDeciderPrincipalIds: z.array(z.string().min(1)).optional(),
   /**
    * The stage's standing rule for what a completion must carry, enforced by `evaluateCompletion`.
    * It has been on the Board DO (`board-do.ts:115`) and absent here since it shipped; a contract

@@ -664,7 +664,7 @@
   async function onResolve(decision: GateDecision): Promise<void> {
     if (!boardId || !gate) return;
     const comment = gateComment.trim() || undefined;
-    const res = await resolveGate(boardId, gate.id, decision, comment);
+    const res = await resolveGate(boardId, gate.id, decision, comment, gate.approvalSubject);
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
       /**
@@ -1150,10 +1150,19 @@
                 </p>
               {/if}
 
+              {#if gate.approvalSubject}
+                <div class="bg-inset border-border mono mb-3 rounded-[7px] border p-2.5 text-[11px]">
+                  <div class="mb-1 font-semibold">Immutable approval subject · revision {gate.approvalSubject.revision}</div>
+                  <div class="text-muted-foreground break-all">{gate.approvalSubject.id}</div>
+                  <div class="text-muted-foreground break-all">{gate.approvalSubject.digest}</div>
+                  <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(gate.approvalSubject.canonical, null, 2)}</pre>
+                </div>
+              {/if}
+
               <!-- gate action buttons — driven by effectiveOptions -->
               <div class="triad flex gap-2 flex-wrap">
                 {#each effectiveOptions as opt (opt.name)}
-                  {#if opt.name === 'approve'}
+                  {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
                     <Button
                       size="sm"
                       onclick={() => onResolve('approve')}

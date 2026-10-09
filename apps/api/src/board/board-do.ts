@@ -157,6 +157,22 @@ interface PreparedApprovalSubject {
   createdAt: string;
 }
 
+export interface ApprovalSubjectView {
+  id: string;
+  digest: string;
+  schema: string;
+  revision: number;
+  canonical: JsonValue;
+}
+
+export interface ApprovalSubjectVerification {
+  boardId: string;
+  runId: string;
+  stageKey: string;
+  subject: ApprovalSubjectView & { account: JsonValue };
+  gate: { id: string; decision: string; decidedBy: string };
+}
+
 /** RFC 8785/JCS serialization for JSON values (ECMAScript primitives, sorted object keys). */
 function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
@@ -215,6 +231,90 @@ const DEFAULT_GATE_OPTIONS: GateOption[] = [
   { name: 'request_changes', title: 'Request changes', interactive: true },
   { name: 'reject', title: 'Reject' },
 ];
+
+/** Delivery is chosen by the human; both choices approve the same immutable digest. */
+const APPROVAL_SUBJECT_GATE_OPTIONS: GateOption[] = [
+  { name: 'approve_manual', title: "Approve — I'll post it myself" },
+  { name: 'approve_automatic', title: 'Approve — post automatically' },
+  { name: 'request_changes', title: 'Request changes', interactive: true },
+  { name: 'reject', title: 'Reject' },
+];
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/** Validate the complete public social-publish/v1 payload before any durable write. */
+function socialPublishPayloadError(value: unknown): string | null {
+  const payload = record(value);
+  if (!payload) return 'publicationPayload must be an object';
+  if (payload.channel !== 'x') return 'publicationPayload.channel must be "x"';
+
+  const account = record(payload.account);
+  if (!account || account.platform !== 'x' || !nonEmptyString(account.userId) || !nonEmptyString(account.username)) {
+    return 'publicationPayload.account must identify an x userId and username';
+  }
+
+  if (!Array.isArray(payload.items) || payload.items.length === 0) return 'publicationPayload.items must not be empty';
+  for (let position = 0; position < payload.items.length; position += 1) {
+    const item = record(payload.items[position]);
+    if (!item || !Number.isInteger(item.index) || item.index !== position || !nonEmptyString(item.text)) {
+      return `publicationPayload.items[${position}] needs its ordered index and exact text`;
+    }
+    if (!Array.isArray(item.media)) return `publicationPayload.items[${position}].media must be an array`;
+    for (let mediaIndex = 0; mediaIndex < item.media.length; mediaIndex += 1) {
+      const media = record(item.media[mediaIndex]);
+      if (
+        !media ||
+        !nonEmptyString(media.objectRef) ||
+        typeof media.sha256 !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(media.sha256) ||
+        !nonEmptyString(media.mime) ||
+        !Number.isInteger(media.size) ||
+        (media.size as number) < 0 ||
+        typeof media.altText !== 'string' ||
+        !nonEmptyString(media.rightsRef)
+      ) {
+        return `publicationPayload.items[${position}].media[${mediaIndex}] is incomplete`;
+      }
+    }
+    for (const key of ['replyToPostId', 'quotePostId'] as const) {
+      if (item[key] !== null && !nonEmptyString(item[key])) {
+        return `publicationPayload.items[${position}].${key} must be null or a post id`;
+      }
+    }
+  }
+
+  const timing = record(payload.timing);
+  if (
+    !timing ||
+    (timing.mode !== 'immediate' && timing.mode !== 'scheduled') ||
+    (timing.notBefore !== null && !nonEmptyString(timing.notBefore)) ||
+    !nonEmptyString(timing.expiresAt) ||
+    Number.isNaN(Date.parse(timing.expiresAt)) ||
+    (timing.notBefore !== null && Number.isNaN(Date.parse(timing.notBefore as string))) ||
+    (timing.mode === 'scheduled' && timing.notBefore === null)
+  ) {
+    return 'publicationPayload.timing is invalid';
+  }
+  if (!Array.isArray(payload.evidenceRefs) || !payload.evidenceRefs.every(nonEmptyString)) {
+    return 'publicationPayload.evidenceRefs must be an array of references';
+  }
+  const policy = record(payload.policy);
+  if (
+    !policy ||
+    typeof policy.allowThread !== 'boolean' ||
+    !nonEmptyString(policy.duplicatePolicyId) ||
+    !nonEmptyString(policy.floodPolicyId)
+  ) {
+    return 'publicationPayload.policy is invalid';
+  }
+  return null;
+}
 
 /** A pipeline stage (board column). `ownerKind`/`owner` drive agent claim routing (docs/01, docs/04). */
 /**
@@ -813,6 +913,8 @@ export interface GateView {
    * deciding blind. Plain text — a reader must render it as text.
    */
   summary?: string | null;
+  /** Present only for an opt-in digest-bound gate; loaded from immutable subject storage. */
+  approvalSubject?: ApprovalSubjectView;
 }
 
 /**
@@ -1107,6 +1209,11 @@ export type BoardErrorCode =
   | 'STALE_LEASE'
   | 'GATE_NOT_FOUND'
   | 'GATE_NOT_PENDING'
+  | 'INVALID_APPROVAL_SUBJECT'
+  | 'APPROVAL_DECIDER_NOT_ALLOWED'
+  | 'APPROVAL_SUBJECT_MISMATCH'
+  | 'APPROVAL_SUBJECT_NOT_VERIFIED'
+  | 'APPROVAL_SUBJECT_EXPIRED'
   | 'ELICITATION_NOT_FOUND'
   | 'ELICITATION_NOT_PENDING'
   | 'INVALID_ANSWER'
@@ -1287,6 +1394,15 @@ export interface BoardStub {
   listRunComments(input: { runId: string; agentId: string | null }): Promise<Result<CommentView[]>>;
   /** Post as the agent holding `runId`, on that run's card (the MCP post tool). */
   addRunComment(input: { runId: string; agentId: string; agentName: string | null; body: string }): Promise<Result<CommentView>>;
+  verifyApprovalSubject(input: {
+    runId: string;
+    leaseEpoch: number;
+    agentId?: string | null;
+    expectedSchema: string;
+    expectedSubjectId?: string;
+    expectedDigest?: string;
+    expectedAccount?: JsonValue;
+  }): Promise<Result<ApprovalSubjectVerification>>;
 
   /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
   getRunEvidence(runId: string): Promise<Result<RunEvidence>>;
@@ -1365,6 +1481,8 @@ export interface BoardStub {
     decision: GateDecision;
     decidedBy: string;
     comment?: string;
+    approvalSubjectId?: string;
+    approvalSubjectDigest?: string;
   }): Promise<Result<CardView>>;
   answerElicitation(input: {
     elicitationId: string;
@@ -2474,6 +2592,7 @@ export class BoardDO extends DurableObject<Env> {
     }
     const unresolvedBlockers = this.unresolvedBlockerCount(cardId);
     const now = this.now();
+    this.invalidateApprovalSubject(cardId, 'card.route_changed', actorUserId ?? null);
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
@@ -2763,7 +2882,10 @@ export class BoardDO extends DurableObject<Env> {
       const nowMs = Date.parse(this.now());
       const prevMs = existing.updatedAt ? Date.parse(existing.updatedAt) : Number.NaN;
       vals.push(new Date(Number.isNaN(prevMs) ? nowMs : Math.max(nowMs, prevMs + 1)).toISOString());
-      this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
+      this.ctx.storage.transactionSync(() => {
+        if (patch.spec !== undefined) this.invalidateApprovalSubject(cardId, 'card.spec_changed', null);
+        this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
+      });
     }
     const card = this.mustGetCard(cardId);
     this.emit('card.updated', { card });
@@ -4862,6 +4984,83 @@ export class BoardDO extends DurableObject<Env> {
     return { comments: kept, commentsOmitted: live.length - kept.length };
   }
 
+  async verifyApprovalSubject(input: {
+    runId: string;
+    leaseEpoch: number;
+    agentId?: string | null;
+    expectedSchema: string;
+    expectedSubjectId?: string;
+    expectedDigest?: string;
+    expectedAccount?: JsonValue;
+  }): Promise<Result<ApprovalSubjectVerification>> {
+    const auth = this.authorizeRun(input);
+    if (!auth.ok) return auth;
+    const boardId = this.getMeta('boardId');
+    if (!boardId) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+
+    const run = auth.run;
+    const cardId = run.card_id as string;
+    const cardRow = this.getCardRow(cardId);
+    const subjectId = (cardRow?.active_approval_subject_id as string | null | undefined) ?? null;
+    if (!cardRow || cardRow.current_stage_key !== run.stage_key || !subjectId) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'the run is not bound to an active approval subject' };
+    }
+
+    const subjectRow = this.sql.exec(`SELECT * FROM approval_subjects WHERE id = ?`, subjectId).toArray()[0];
+    const gate = this.sql
+      .exec(`SELECT * FROM gates WHERE approval_subject_id = ? AND card_id = ? ORDER BY rowid DESC LIMIT 1`, subjectId, cardId)
+      .toArray()[0];
+    const subject = this.approvalSubjectView(subjectId);
+    if (
+      !subjectRow ||
+      !subject ||
+      subjectRow.status !== 'active' ||
+      subjectRow.card_id !== cardId ||
+      !gate ||
+      gate.status !== 'resolved' ||
+      gate.decision !== 'approve' ||
+      gate.approval_subject_digest !== subject.digest ||
+      !gate.decided_by
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject and gate binding is not valid' };
+    }
+    if (
+      subject.schema !== input.expectedSchema ||
+      (input.expectedSubjectId !== undefined && input.expectedSubjectId !== subject.id) ||
+      (input.expectedDigest !== undefined && input.expectedDigest !== subject.digest)
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject does not match executor expectations' };
+    }
+
+    const canonical = record(subject.canonical);
+    const account = canonical?.account as JsonValue | undefined;
+    const timing = record(canonical?.timing);
+    if (!account || !timing || !nonEmptyString(timing.expiresAt)) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject lacks account or expiry binding' };
+    }
+    if (input.expectedAccount !== undefined && canonicalJson(input.expectedAccount) !== canonicalJson(account)) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject account does not match executor expectations' };
+    }
+    if (Date.parse(timing.expiresAt) <= this.nowMs()) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_EXPIRED', message: 'approval subject has expired' };
+    }
+
+    return {
+      ok: true,
+      value: {
+        boardId,
+        runId: input.runId,
+        stageKey: run.stage_key as string,
+        subject: { ...subject, account },
+        gate: {
+          id: gate.id as string,
+          decision: gate.decision as string,
+          decidedBy: gate.decided_by as string,
+        },
+      },
+    };
+  }
+
   /**
    * A run as evidence (superwitness contract C4; charter evidence-joins-on-the-work-run decisions
    * 4 and 5). Read-only. Gates: those this run opened, plus legacy gates (null run_id) on the same
@@ -5226,10 +5425,22 @@ export class BoardDO extends DurableObject<Env> {
     const stages = this.stages();
     const stageIndex = stages.findIndex((stage) => stage.key === card.currentStageKey);
     const nextStage = stageIndex === -1 ? undefined : stages[stageIndex + 1];
-    const approvalSubject =
-      nextStage?.approvalSubjectSchema && nextStage.gate === 'approval' && !this.isAgentClaimable(nextStage)
-        ? await this.prepareApprovalSubject(card, nextStage, input.handoff, input.runId, run.agent_id as string)
-        : null;
+    let approvalSubject: PreparedApprovalSubject | null = null;
+    if (nextStage?.approvalSubjectSchema && nextStage.gate === 'approval' && !this.isAgentClaimable(nextStage)) {
+      const prepared = await this.prepareApprovalSubject(card, nextStage, input.handoff, input.runId, run.agent_id as string);
+      if (!prepared.ok) return prepared;
+      approvalSubject = prepared.value;
+
+      // SHA-256 is asynchronous. A Durable Object may admit another request while it is awaited,
+      // so fence again before the first write. The winning completion ends the run synchronously;
+      // every concurrent completion then observes a stale lease instead of colliding mid-transaction.
+      const fenced = this.authorizeRun(input);
+      if (!fenced.ok) return fenced;
+      const current = this.getCard(cardId);
+      if (!current || current.currentStageKey !== card.currentStageKey || (fenced.run.card_id as string) !== cardId) {
+        return { ok: false, code: 'STALE_LEASE', message: 'the card moved while the approval subject was prepared' };
+      }
+    }
     const now = this.now();
     // Computed here rather than further down, because the run's own record needs it too. Same
     // expression the card gets below; `undefined` (no handoff given) stays NULL in both.
@@ -5491,6 +5702,8 @@ export class BoardDO extends DurableObject<Env> {
     decision: GateDecision;
     decidedBy: string;
     comment?: string;
+    approvalSubjectId?: string;
+    approvalSubjectDigest?: string;
   }): Promise<Result<CardView>> {
     const gate = this.sql.exec(`SELECT * FROM gates WHERE id = ?`, input.gateId).toArray()[0];
     if (!gate) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${input.gateId}` };
@@ -5500,6 +5713,38 @@ export class BoardDO extends DurableObject<Env> {
     if (input.decidedBy === (gate.produced_by as string)) {
       return { ok: false, code: 'SEPARATION_OF_DUTIES', message: 'the producer cannot resolve their own gate' };
     }
+
+    const boundSubjectId = (gate.approval_subject_id as string | null) ?? null;
+    if (boundSubjectId) {
+      const deciders = JSON.parse((gate.approval_decider_ids_json as string | null) ?? '[]') as string[];
+      if (input.decidedBy.startsWith('agt_') || !deciders.includes(input.decidedBy)) {
+        return {
+          ok: false,
+          code: 'APPROVAL_DECIDER_NOT_ALLOWED',
+          message: 'this principal is not an authorized human decider for the approval subject',
+        };
+      }
+      if (
+        input.approvalSubjectId !== boundSubjectId ||
+        input.approvalSubjectDigest !== (gate.approval_subject_digest as string)
+      ) {
+        return {
+          ok: false,
+          code: 'APPROVAL_SUBJECT_MISMATCH',
+          message: 'the rendered approval subject id and digest no longer match this gate',
+        };
+      }
+      const subject = this.sql.exec(`SELECT status, digest FROM approval_subjects WHERE id = ?`, boundSubjectId).toArray()[0];
+      if (
+        !subject ||
+        subject.status !== 'active' ||
+        subject.digest !== gate.approval_subject_digest ||
+        this.getCardRow(gate.card_id as string)?.active_approval_subject_id !== boundSubjectId
+      ) {
+        return { ok: false, code: 'APPROVAL_SUBJECT_MISMATCH', message: 'the approval subject is no longer active' };
+      }
+    }
+
     const cardId = gate.card_id as string;
     const now = this.now();
     this.sql.exec(
@@ -6132,27 +6377,67 @@ export class BoardDO extends DurableObject<Env> {
     if (pending.runId) this.reportRun(pending.runId);
   }
 
+  /** Retire the active subject without deleting its immutable audit row. */
+  private invalidateApprovalSubject(cardId: string, reason: string, invalidatedBy: string | null): void {
+    const cardRow = this.getCardRow(cardId);
+    const subjectId = (cardRow?.active_approval_subject_id as string | null | undefined) ?? null;
+    if (!subjectId) return;
+    const now = this.now();
+    this.sql.exec(
+      `UPDATE approval_subjects
+          SET status = 'invalidated', invalidated_at = ?, invalidated_by = ?, invalidation_reason = ?
+        WHERE id = ? AND status = 'active'`,
+      now,
+      invalidatedBy,
+      reason,
+      subjectId,
+    );
+    this.sql.exec(
+      `UPDATE gates SET status = 'cancelled', resolved_at = ?
+        WHERE approval_subject_id = ? AND status = 'pending'`,
+      now,
+      subjectId,
+    );
+    this.sql.exec(`UPDATE cards SET active_approval_subject_id = NULL WHERE id = ?`, cardId);
+
+    const stage = this.stages().find((candidate) => candidate.key === (cardRow?.current_stage_key as string));
+    if (stage && this.isAgentClaimable(stage)) {
+      // A publisher may already be looking for work. Parking the card prevents a fresh claim; any
+      // existing run is fenced again by verifyApprovalSubject before it may cause a side effect.
+      this.sql.exec(
+        `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
+        now,
+        cardId,
+      );
+    }
+  }
+
   private async prepareApprovalSubject(
     card: CardView,
     stage: StageDef,
     handoff: JsonValue | undefined,
     runId: string,
     producedBy: string,
-  ): Promise<PreparedApprovalSubject> {
+  ): Promise<Result<PreparedApprovalSubject>> {
+    const invalid = (message: string): Result<PreparedApprovalSubject> => ({
+      ok: false,
+      code: 'INVALID_APPROVAL_SUBJECT',
+      message,
+    });
     if (stage.approvalSubjectSchema !== 'social-publish/v1') {
-      throw new TypeError(`unsupported approval subject schema: ${stage.approvalSubjectSchema ?? ''}`);
+      return invalid(`unsupported approval subject schema: ${stage.approvalSubjectSchema ?? ''}`);
     }
-    if (!stage.approvalDeciderPrincipalIds?.length) {
-      throw new TypeError(`stage "${stage.key}" needs at least one approval decider principal`);
+    if (!stage.approvalDeciderPrincipalIds?.length || stage.approvalDeciderPrincipalIds.some((id) => !nonEmptyString(id))) {
+      return invalid(`stage "${stage.key}" needs at least one approval decider principal`);
     }
-    if (card.projectId === null) throw new TypeError('approval subject card needs a project');
+    if (card.projectId === null) return invalid('approval subject card needs a project');
     if (handoff === null || typeof handoff !== 'object' || Array.isArray(handoff)) {
-      throw new TypeError('approval subject handoff must be an object');
+      return invalid('approval subject handoff must be an object');
     }
     const payload = handoff.publicationPayload;
-    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-      throw new TypeError('approval subject handoff needs publicationPayload');
-    }
+    const payloadError = socialPublishPayloadError(payload);
+    if (payloadError) return invalid(payloadError);
+
     const prior = this.sql
       .exec(
         `SELECT COALESCE(MAX(revision), 0) AS revision FROM approval_subjects WHERE card_id = ? AND schema = ?`,
@@ -6161,25 +6446,33 @@ export class BoardDO extends DurableObject<Env> {
       )
       .one();
     const revision = Number(prior.revision) + 1;
-    const canonical = canonicalJson({
-      ...payload,
-      schema: stage.approvalSubjectSchema,
-      cardId: card.id,
-      projectId: card.projectId,
-      revision,
-    });
+    let canonical: string;
+    try {
+      canonical = canonicalJson({
+        ...(payload as Record<string, JsonValue>),
+        schema: stage.approvalSubjectSchema,
+        cardId: card.id,
+        projectId: card.projectId,
+        revision,
+      });
+    } catch (error) {
+      return invalid((error as Error).message);
+    }
     const canonicalBytes = new TextEncoder().encode(canonical);
     const hash = await crypto.subtle.digest('SHA-256', canonicalBytes);
     const digest = `sha256:${[...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
     return {
-      id: newId('aps'),
-      schema: stage.approvalSubjectSchema,
-      revision,
-      canonicalBytes,
-      digest,
-      producerRunId: runId,
-      producedBy,
-      createdAt: this.now(),
+      ok: true,
+      value: {
+        id: newId('aps'),
+        schema: stage.approvalSubjectSchema,
+        revision,
+        canonicalBytes,
+        digest,
+        producerRunId: runId,
+        producedBy,
+        createdAt: this.now(),
+      },
     };
   }
 
@@ -6223,7 +6516,7 @@ export class BoardDO extends DurableObject<Env> {
         stageKey,
         returnStageKey,
         producedBy,
-        JSON.stringify(DEFAULT_GATE_OPTIONS),
+        JSON.stringify(approvalSubject ? APPROVAL_SUBJECT_GATE_OPTIONS : DEFAULT_GATE_OPTIONS),
         now,
         runId,
         approvalSubject?.id ?? null,
@@ -6540,20 +6833,7 @@ export class BoardDO extends DurableObject<Env> {
     return this.sql
       .exec(`SELECT * FROM gates WHERE status = 'pending' ORDER BY created_at ASC`)
       .toArray()
-      .map((r) => ({
-        id: r.id as string,
-        cardId: r.card_id as string,
-        stageKey: r.stage_key as string,
-        status: r.status as 'pending' | 'resolved',
-        decision: (r.decision as string | null) ?? null,
-        options: JSON.parse(r.options_json as string) as GateOption[],
-        producedBy: r.produced_by as string,
-        createdAt: r.created_at as string,
-        decidedBy: (r.decided_by as string | null) ?? null,
-        comment: (r.comment as string | null) ?? null,
-        resolvedAt: (r.resolved_at as string | null) ?? null,
-        summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
-      }));
+      .map((r) => this.rowToGate(r as Row));
   }
 
   /**
@@ -6573,6 +6853,8 @@ export class BoardDO extends DurableObject<Env> {
 
   /** One gate row as a `GateView`. Shared, so one gate and a card's gates cannot disagree. */
   private rowToGate(r: Row): GateView {
+    const subjectId = (r.approval_subject_id as string | null) ?? null;
+    const approvalSubject = subjectId ? this.approvalSubjectView(subjectId) : null;
     return {
       id: r.id as string,
       cardId: r.card_id as string,
@@ -6585,6 +6867,25 @@ export class BoardDO extends DurableObject<Env> {
       decidedBy: (r.decided_by as string | null) ?? null,
       comment: (r.comment as string | null) ?? null,
       resolvedAt: (r.resolved_at as string | null) ?? null,
+      summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
+      ...(approvalSubject ? { approvalSubject } : {}),
+    };
+  }
+
+  private approvalSubjectView(id: string): ApprovalSubjectView | null {
+    const row = this.sql.exec(`SELECT * FROM approval_subjects WHERE id = ?`, id).toArray()[0];
+    if (!row) return null;
+    const stored = row.canonical_bytes as string | ArrayBuffer | ArrayBufferView;
+    const canonicalText =
+      typeof stored === 'string'
+        ? stored
+        : new TextDecoder().decode(stored instanceof ArrayBuffer ? new Uint8Array(stored) : stored);
+    return {
+      id: row.id as string,
+      digest: row.digest as string,
+      schema: row.schema as string,
+      revision: Number(row.revision),
+      canonical: JSON.parse(canonicalText) as JsonValue,
     };
   }
 
