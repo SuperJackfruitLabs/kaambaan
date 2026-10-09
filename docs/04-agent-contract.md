@@ -70,7 +70,7 @@ semantics. Signatures are illustrative (finalized as zod schemas in `packages/co
 | `requestInput` | agent → Superpipeline | Ask the human a question / present choices (elicitation + signal) | Task → `input-required` |
 | `addReference` | agent → Superpipeline | Attach an external link (GitHub PR/issue, repo, doc) | idempotent upsert on `(cardId, url)`. **MCP only** — the REST route is human-auth ([05 §3](./05-integration-surfaces.md)) |
 | `submitForReview` | agent → Superpipeline | Hand a gated stage to a human approver | Task → `input-required` (`select` signal) |
-| `complete` | agent → Superpipeline | Finish the stage successfully with structured handoff | Task → `completed`; card advances |
+| `complete` | agent → Superpipeline | End the turn with structured handoff and an `outcome` (`pass` \| `changes-needed` + `findings` \| `needs-person` + `question`/`url`) | `pass`: Task → `completed`; card advances. `changes-needed`: card returns to the stage's `returnStage` (≤2 automatic returns, then parks). `needs-person`: run ends `blocked`, card parks on an elicitation; answering re-queues the same stage with the answer and `workSoFar` |
 | `block` | agent → Superpipeline | Escalate; cannot proceed without human help | Task → `input-required`/blocked |
 | `release` / `fail` | agent → Superpipeline | Give the claim back / report failure | Task → `submitted` (reclaim) / `failed` |
 | `answerElicitation` | human → Superpipeline | Answer an agent's question (pick an option / free text) | Task → `working`; the asking agent reads the answer off its run |

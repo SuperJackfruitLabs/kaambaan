@@ -25,9 +25,12 @@ The loop:
 2. superpipeline_claim_card({boardId}) — take the next ready card. Returns {claimed, runId, leaseEpoch, card, handoff}. If {claimed:false}, there's no work for you right now — back off and try again later. The handoff is what the previous stage passed you.
 3. Work it. Thread the returned runId + leaseEpoch into every following call. Stream progress with superpipeline_post_activity (type: thought | action | response); attach links with superpipeline_add_reference; report token usage in post_activity for cost metering. On long runs call superpipeline_heartbeat periodically to keep your lease.
 4. Finish with exactly ONE of:
-   - superpipeline_complete — success; the card advances to the next stage carrying your handoff object.
+   - superpipeline_complete — end your turn, saying how it went with \`outcome\`:
+       "pass" — done and good; the card advances carrying your handoff object.
+       "changes-needed" + findings — you judged the work and it is not good enough; the card goes back to the stage that fixes it. Never hand off a failing verdict ("unsafe", "do not ship") with outcome pass or none: the card would move on. A stage that judges work refuses a completion that does not say pass or changes-needed.
+       "needs-person" + question (+ url) — you cannot go on without a person (approve a sign-in, decide, grant access). The card waits on them; when they answer, it comes back to this stage with their answer and your handoff as the work so far. Do not end your turn with "do X, then reply" in a handoff — use needs-person.
    - superpipeline_submit_for_review — at a gated stage; opens a human approval gate and stops.
-   - superpipeline_block — you need input to proceed.
+   - superpipeline_block — something is broken that a person must look into; the work stops.
    - superpipeline_fail / superpipeline_release — give up / hand the card back; it becomes claimable again.
    Before finishing, call superpipeline_list_comments: people can comment on the card while you work, and a comment may change what "done" means. Reply with superpipeline_post_comment when one asks you something.
 

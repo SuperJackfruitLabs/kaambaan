@@ -63,6 +63,7 @@ import {
   type AgentScope,
 } from './auth/scopes';
 import { capabilityTag, capabilityTags, stageRequiredCapabilities, isKnownProvider, providerKeys } from '@superpipeline/contract';
+import type { StageOutcome } from '@superpipeline/contract';
 import { listMembers, addMember, setMemberRole, removeMember, ownerCount, permits, asRole, mayOwnWork, type Capability } from './db/members';
 import {
   listCapabilities,
@@ -145,6 +146,7 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_DELIVERY':
     case 'INVALID_USAGE':
     case 'INVALID_STAGES':
+    case 'INVALID_OUTCOME':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -2111,6 +2113,7 @@ const worker = {
           wipLimit: body.wipLimit,
           instructions: body.instructions,
           completion: body.completion,
+          returnStage: body.returnStage,
         });
         if (!result.ok) {
           // `UNKNOWN_STAGE` is a 400 in the shared mapping, which is right where the stage is in
@@ -3269,6 +3272,11 @@ const worker = {
           result?: JsonValue;
           signal?: string;
           handoff?: JsonValue;
+          outcome?: StageOutcome;
+          findings?: string;
+          question?: string;
+          url?: string;
+          options?: JsonValue;
           output?: JsonValue;
           reason?: string;
           usage?: { model?: string; inputTokens?: number; outputTokens?: number; costUsd?: number };
@@ -3301,7 +3309,18 @@ const worker = {
               'activity',
             );
           case 'complete':
-            return respond(await stub.complete({ ...lease, handoff: p.handoff }), 'card');
+            return respond(
+              await stub.complete({
+                ...lease,
+                handoff: p.handoff,
+                outcome: p.outcome,
+                findings: p.findings,
+                question: p.question,
+                url: p.url,
+                options: p.options,
+              }),
+              'card',
+            );
           case 'block':
             return respond(await stub.block({ ...lease, reason: p.reason ?? '' }), 'card');
           case 'fail':

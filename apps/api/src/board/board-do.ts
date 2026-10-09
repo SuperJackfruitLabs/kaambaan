@@ -6,6 +6,7 @@ import { grantPermitsAgent, isControlPairEnforced } from '../auth/grant-match';
 import { capabilityTag, normalizeRequirement, stageCapabilitiesMet } from '@superpipeline/contract';
 import { parseElicitationOptions } from './elicitation';
 import { evaluateCompletion, type CompletionRequirement } from '@superpipeline/contract';
+import { outcomeInputError, returnStageError, routeOutcome, type StageOutcome } from '@superpipeline/contract';
 import { verifyGithubSignature, verifyForgeSignature } from '../references/github-signature';
 import { mapGithubEvent } from '../references/github-events';
 import { mapForgeEvent } from '../references/forge-events';
@@ -104,6 +105,14 @@ const MAX_SPLIT_CHILDREN = 20;
 const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
 /** Consecutive failed/reclaimed runs before a card auto-blocks for a human (docs/08 §4, ⚠️ OPEN). */
 const CIRCUIT_BREAKER_LIMIT = 2;
+/**
+ * How many times a judging stage's `changes-needed` may send a card back on its own before the
+ * next one parks it for a person. The breaker's number, on purpose: an automatic return is the
+ * board retrying on the agent's behalf, and it gets the same patience a crash does.
+ */
+const MAX_AUTOMATIC_RETURNS = CIRCUIT_BREAKER_LIMIT;
+/** The outcomes `complete` accepts (`StageOutcome`), for a caller that did not parse. */
+const OUTCOMES: ReadonlySet<string> = new Set<StageOutcome>(['pass', 'changes-needed', 'needs-person']);
 /** Push delivery attempts before a delivery is dead-lettered (docs/05 §4). */
 const MAX_PUSH_ATTEMPTS = 5;
 /** One config's share of a single drain. */
@@ -203,6 +212,8 @@ export interface StagePatch {
   wipLimit?: number | null;
   instructions?: string | null;
   completion?: CompletionRequirement | null;
+  /** `null` removes it — the stage stops judging. */
+  returnStage?: string | null;
 }
 
 export const STAGE_INSTRUCTIONS_MAX = 4000;
@@ -285,6 +296,13 @@ export interface StageDef {
    * every stage behaved before this existed.
    */
   completion?: CompletionRequirement;
+  /**
+   * Where a run's `outcome: 'changes-needed'` sends the card — an earlier stage's key
+   * (`returnStageError` in @superpipeline/contract). Declaring it makes this a judging stage: a
+   * completion here must say `pass` or `changes-needed`, and silence is refused. Absent, the stage
+   * behaves exactly as it did before outcomes existed.
+   */
+  returnStage?: string;
   /**
    * The stage's standing rule, handed to the agent in its prompt. A stage's, never a card's:
    * it governs every card that reaches the stage and every agent that can claim it.
@@ -1084,6 +1102,8 @@ export type BoardErrorCode =
   | 'TOO_MANY_CHILDREN'
   | 'NOTHING_TO_SPLIT'
   | 'INVALID_COMMENT'
+  /** `complete` named an outcome without what it needs (`outcomeInputError`), or no outcome at all. */
+  | 'INVALID_OUTCOME'
   | 'COMMENT_NOT_FOUND'
   | 'NOT_COMMENT_AUTHOR'
   | 'NO_RUN_ON_CARD'
@@ -1192,7 +1212,7 @@ export interface BoardStub {
   getProfiles(): Promise<ProfileView[]>;
   heartbeat(input: RunVerbInput): Promise<Result<{ acknowledged: true }>>;
   postActivity(input: AgentActivityInput): Promise<Result<{ accepted: true; cardState: TaskState }>>;
-  complete(input: RunVerbInput & { handoff?: JsonValue }): Promise<Result<CardView>>;
+  complete(input: CompleteVerbInput): Promise<Result<CardView>>;
   block(input: RunVerbInput & { reason: string }): Promise<Result<CardView>>;
   fail(input: RunVerbInput & { reason: string }): Promise<Result<CardView>>;
   release(input: RunVerbInput & { reason?: string }): Promise<Result<CardView>>;
@@ -1349,6 +1369,22 @@ export interface RunVerbInput {
   runId: string;
   leaseEpoch: number;
   agentId?: string | null;
+}
+
+/**
+ * `complete`, with the kind of finish it is (`StageOutcome` in @superpipeline/contract).
+ *
+ * Every field past `handoff` is optional and absent on every caller that predates outcomes, which
+ * then behaves exactly as before — except on a stage that declares a `returnStage`, where silence
+ * is no longer read as a pass.
+ */
+export interface CompleteVerbInput extends RunVerbInput {
+  handoff?: JsonValue;
+  outcome?: StageOutcome;
+  findings?: string;
+  question?: string;
+  url?: string;
+  options?: JsonValue;
 }
 
 /**
@@ -1711,6 +1747,20 @@ export class BoardDO extends DurableObject<Env> {
      */
     try {
       this.sql.exec(`ALTER TABLE cards ADD COLUMN completion_rework_json TEXT`);
+    } catch {
+      // column already exists
+    }
+    /**
+     * How many times a judging stage's `changes-needed` has sent this card back on its own since a
+     * person last acted on it (`MAX_AUTOMATIC_RETURNS`).
+     *
+     * Per CARD, not per stage visit like `completion_rework_json`: a return IS a new visit, so a
+     * per-visit count would reset on every lap of the fix → judge loop it exists to stop. Nothing
+     * automatic resets it — not a later pass, which would let two judges take turns forever — only
+     * a person: `resumeCard`, `moveCard`, a reviewer's request-changes. Internal; not on `CardView`.
+     */
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN auto_returns INTEGER NOT NULL DEFAULT 0`);
     } catch {
       // column already exists
     }
@@ -2394,7 +2444,7 @@ export class BoardDO extends DurableObject<Env> {
     }
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
-              failure_count = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
+              failure_count = 0, auto_returns = 0, updated_at = ?, queued_by = COALESCE(?, queued_by),
               -- Moves WITH the pair, never apart. A human re-queueing an agent-queued card
               -- becomes its queuer, and leaving the agent id standing would make the card read
               -- "queued by <some agent>" about a dispatch the operator personally authorised.
@@ -2512,7 +2562,7 @@ export class BoardDO extends DurableObject<Env> {
     this.sql.exec(
       `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
               failure_count = 0, needs_human_json = NULL, completion_rework_json = NULL, pending_advance_json = NULL,
-              handoff_json = ?, updated_at = ?, queued_by = ?, queued_by_agent_id = NULL,
+              auto_returns = 0, handoff_json = ?, updated_at = ?, queued_by = ?, queued_by_agent_id = NULL,
               queued_grant = CASE WHEN ? IS NULL THEN queued_grant ELSE ? END
         WHERE id = ?`,
       targetKey,
@@ -2721,6 +2771,12 @@ export class BoardDO extends DurableObject<Env> {
       // in both to whichever came first, and the other would be unreachable.
       return { ok: false, code: 'INVALID_STAGES', message: `two stages share the key "${duplicate}"` };
     }
+    // Across the NEW pipeline, so removing or reordering the stage another one returns to is
+    // refused here rather than leaving a judge whose failing verdict has nowhere to go.
+    for (const s of stages) {
+      const bad = returnStageError(s, stages);
+      if (bad) return { ok: false, code: 'INVALID_STAGES', message: bad };
+    }
 
     const kept = new Set(keys);
     for (const existing of this.stages()) {
@@ -2807,8 +2863,15 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
+    if (patch.returnStage !== undefined) {
+      if (patch.returnStage === null) delete next.returnStage;
+      else next.returnStage = patch.returnStage;
+    }
+
     const invalid = stageFieldError(next);
     if (invalid) return { ok: false, code: 'INVALID_STAGES', message: invalid };
+    const badReturn = returnStageError(next, stages);
+    if (badReturn) return { ok: false, code: 'INVALID_STAGES', message: badReturn };
 
     const normalized = normalizeStageRouting(next);
     const ordered = stages.map((s, i) => (i === index ? normalized : s));
@@ -4622,6 +4685,18 @@ export class BoardDO extends DurableObject<Env> {
         return { ok: false, code: 'NO_RUN_ON_CARD', message: 'an agent may comment only on a card its live run holds' };
       }
     }
+    return { ok: true, value: this.writeComment(input.cardId, input.author, input.body) };
+  }
+
+  /**
+   * Write a comment, with no say over whether this author may.
+   *
+   * `addComment` is the door, and it checks; this is the room behind it, for the board's own writes
+   * on someone's behalf — a judge's findings land as the judge's comment after its run has ended,
+   * which `addComment`'s live-run rule would refuse.
+   */
+  private writeComment(cardId: string, author: CommentView['author'], body: string): CommentView {
+    const input = { cardId, author, body };
     const id = newId('cmt');
     // Strictly after the newest comment on this card: Workers freezes the clock inside a request,
     // and a thread ordered by a timestamp two comments share is a thread whose order is a guess.
@@ -4645,7 +4720,7 @@ export class BoardDO extends DurableObject<Env> {
     // The event names the comment, never its text: the event log is kept for good, and a body
     // copied into it would outlive the author deleting it.
     this.emit('card.comment.added', { cardId: input.cardId, commentId: id, authorKind: input.author.kind });
-    return { ok: true, value: this.commentRows(input.cardId).find((c) => c.id === id)! };
+    return this.commentRows(input.cardId).find((c) => c.id === id)!;
   }
 
   async deleteComment(input: { cardId: string; commentId: string; userId: string }): Promise<Result<CommentView>> {
@@ -5051,12 +5126,33 @@ export class BoardDO extends DurableObject<Env> {
     return { ok: true, value: { accepted: true, cardState } };
   }
 
-  /** Finish a stage successfully, store the handoff, and advance the card (or mark it done). */
-  async complete(input: RunVerbInput & { handoff?: JsonValue }): Promise<Result<CardView>> {
+  /**
+   * Finish a turn on a card, and say what kind of finish it is (`StageOutcome`).
+   *
+   * `pass` (or nothing, on a stage that judges nothing) stores the handoff and advances the card —
+   * what this always did. `changes-needed` sends it BACK to the stage's `returnStage` with the
+   * findings, bounded by `MAX_AUTOMATIC_RETURNS`. `needs-person` parks it on a question and is
+   * handled before anything here treats the run as finished: see `waitOnPerson`.
+   */
+  async complete(input: CompleteVerbInput): Promise<Result<CardView>> {
     const auth = this.authorizeRun(input);
     if (!auth.ok) return auth;
     const run = auth.run;
     const cardId = run.card_id as string;
+
+    // Refused BEFORE the run ends, so a malformed call is something the agent corrects on the same
+    // run rather than a card the board has to reason about. The REST surface casts rather than
+    // parses, so the vocabulary is checked here too.
+    if (input.outcome !== undefined && !OUTCOMES.has(input.outcome)) {
+      return { ok: false, code: 'INVALID_OUTCOME', message: `outcome must be one of ${[...OUTCOMES].join(', ')}` };
+    }
+    const outcomeError = outcomeInputError(input);
+    if (outcomeError) return { ok: false, code: 'INVALID_OUTCOME', message: outcomeError };
+    if (input.findings !== undefined && new TextEncoder().encode(input.findings).length > COMMENT_MAX_BYTES) {
+      return { ok: false, code: 'INVALID_OUTCOME', message: `findings are at most ${COMMENT_MAX_BYTES} bytes — link anything longer` };
+    }
+    if (input.outcome === 'needs-person') return this.waitOnPerson(input, run);
+
     const now = this.now();
     // Computed here rather than further down, because the run's own record needs it too. Same
     // expression the card gets below; `undefined` (no handoff given) stays NULL in both.
@@ -5087,45 +5183,198 @@ export class BoardDO extends DurableObject<Env> {
      * impossible to say. It is recorded on the run, because routing around a check is a legitimate
      * act and a silent one is not.
      */
-    const stage = this.stages().find((st) => st.key === card.currentStageKey);
+    const stages = this.stages();
+    const stage = stages.find((st) => st.key === card.currentStageKey);
     const cardOverride = (card.spec as { completion?: CompletionRequirement } | null | undefined)?.completion;
     const requirement = cardOverride ?? stage?.completion;
 
+    const returnsSoFar = Number(this.getCardRow(cardId)?.auto_returns ?? 0);
+    const route = routeOutcome(
+      { key: card.currentStageKey, ...(stage?.returnStage ? { returnStage: stage.returnStage } : {}) },
+      input,
+      { returnsSoFar, limit: MAX_AUTOMATIC_RETURNS },
+    );
+
+    const refusals: string[] = [];
+    let verdict: ReturnType<typeof evaluateCompletion> | null = null;
     if (requirement) {
-      const verdict = evaluateCompletion(requirement, {
+      verdict = evaluateCompletion(requirement, {
         handoff: input.handoff,
         references: this.sql
           .exec(`SELECT provider, source_type AS sourceType FROM card_references WHERE card_id = ?`, cardId)
           .toArray()
           .map((r) => ({ provider: r.provider as string, sourceType: r.sourceType as string })),
       });
-      this.recordRunCompletion(input.runId, { ...verdict, override: cardOverride !== undefined });
+      if (!verdict.met) refusals.push(verdict.reason ?? 'the completion requirement was not met');
+    }
+    // A judging stage that said nothing has not said it passed. Same path as a missing handoff key:
+    // one automatic rework naming what to add, then a person.
+    if (route.kind === 'refuse') refusals.push(route.reason);
 
-      if (!verdict.met) {
-        // Blocked, not failed (D1): the agent asserted something untrue. The run says so whatever
-        // happens to the card next.
-        this.sql.exec(`UPDATE runs SET outcome = 'blocked' WHERE id = ?`, input.runId);
-        const reason = `this stage was not finished: ${verdict.reason}`;
-        this.reworkOrPark(cardId, card.currentStageKey, input.runId, verdict.reason ?? 'the completion requirement was not met', input.handoff);
-        // On the card's own replay, as an `error`: a refusal a reader has to reconstruct from
-        // run outcomes is a refusal most readers will miss.
-        this.sql.exec(
-          `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
-           VALUES (?, ?, 'error', 0, ?, NULL, ?, ?)`,
-          input.runId,
+    if (requirement || input.outcome !== undefined || refusals.length > 0) {
+      this.recordRunCompletion(input.runId, {
+        ...(verdict ?? { met: refusals.length === 0 }),
+        ...(refusals.length > 0 ? { met: false, reason: refusals.join('; ') } : {}),
+        ...(requirement ? { override: cardOverride !== undefined } : {}),
+        ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
+      });
+    }
+
+    if (refusals.length > 0) {
+      const why = refusals.join('; ');
+      // Blocked, not failed (D1): the agent asserted something untrue. The run says so whatever
+      // happens to the card next.
+      this.sql.exec(`UPDATE runs SET outcome = 'blocked' WHERE id = ?`, input.runId);
+      const reason = `this stage was not finished: ${why}`;
+      this.reworkOrPark(cardId, card.currentStageKey, input.runId, why, input.handoff);
+      // On the card's own replay, as an `error`: a refusal a reader has to reconstruct from
+      // run outcomes is a refusal most readers will miss.
+      this.sql.exec(
+        `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
+         VALUES (?, ?, 'error', 0, ?, NULL, ?, ?)`,
+        input.runId,
+        cardId,
+        reason,
+        JSON.stringify({
+          parameter: requirement ?? { returnStage: stage?.returnStage ?? null },
+          result: verdict ?? { met: false, reason: why },
+          signal: null,
+        }),
+        now,
+      );
+      this.reportRun(input.runId);
+      await this.scheduleReclaim();
+      return { ok: true, value: this.mustGetCard(cardId) };
+    }
+
+    if (route.kind === 'return' || route.kind === 'park') {
+      const findings = input.findings!.trim();
+      // The findings go on the thread, where people read, as the judge's own words.
+      this.writeComment(cardId, { kind: 'agent', id: run.agent_id as string, name: null }, findings);
+      // A return stage written before validation existed, or left dangling by a board created with
+      // one, is a return nobody can follow: the card stops for a person rather than going nowhere.
+      const broken = route.kind === 'return' && stage ? returnStageError(stage, stages) : null;
+      if (route.kind === 'return' && !broken) {
+        this.returnCard(cardId, card.currentStageKey, route.to, input.runId, findings, input.handoff, returnsSoFar + 1);
+      } else {
+        const why = broken ?? (route.kind === 'park' ? route.reason : '');
+        const detail = `${why}. Findings: ${findings}`;
+        const repeated = route.kind === 'park' && route.repeated;
+        this.parkForHuman(
           cardId,
-          reason,
-          JSON.stringify({ parameter: requirement, result: verdict, signal: null }),
-          now,
+          repeated ? { reason: 'repeated-failure', failureCount: returnsSoFar + 1, detail } : { reason: 'blocked', detail },
         );
-        this.reportRun(input.runId);
-        await this.scheduleReclaim();
-        return { ok: true, value: this.mustGetCard(cardId) };
+        this.emit('card.blocked', { cardId, reason: detail, ...(repeated ? { brokeCircuit: true } : {}) });
+        this.notify(repeated ? 'failed' : 'blocked', cardId, detail);
       }
+      this.reportRun(input.runId);
+      await this.scheduleReclaim();
+      return { ok: true, value: this.mustGetCard(cardId) };
     }
 
     this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId);
     // After advanceCard: a human gate it opened judges this run, so the run reports `waiting`.
+    this.reportRun(input.runId);
+    await this.scheduleReclaim();
+    return { ok: true, value: this.mustGetCard(cardId) };
+  }
+
+  /**
+   * Send a card back to an earlier stage on a judge's `changes-needed`.
+   *
+   * The handoff the fixer receives is the judge's own, with the findings lifted into `feedback` —
+   * the key a reviewer's request-changes already uses and AgentPod's card prompt renders as its own
+   * section — and kept verbatim in `findings` beside `returnedFrom`. The return is a fresh visit to
+   * the target stage, so the breaker count starts over there; `auto_returns` is what bounds the loop.
+   */
+  private returnCard(
+    cardId: string,
+    fromStageKey: string,
+    toStageKey: string,
+    runId: string,
+    findings: string,
+    judgeHandoff: JsonValue | undefined,
+    returns: number,
+  ): void {
+    const carried = {
+      feedback: `Sent back from "${fromStageKey}": changes are needed.\n\n${findings}`,
+      findings,
+      returnedFrom: fromStageKey,
+    };
+    const merged =
+      judgeHandoff && typeof judgeHandoff === 'object' && !Array.isArray(judgeHandoff)
+        ? { ...judgeHandoff, ...carried }
+        : { ...carried, ...(judgeHandoff !== undefined ? { judgeHandoff } : {}) };
+    this.sql.exec(
+      `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL,
+              failure_count = 0, needs_human_json = NULL, handoff_json = ?, auto_returns = ?, updated_at = ? WHERE id = ?`,
+      toStageKey,
+      JSON.stringify(merged),
+      returns,
+      this.now(),
+      cardId,
+    );
+    this.emit('card.returned', { cardId, from: fromStageKey, to: toStageKey, runId, returns });
+    this.notify('rework', cardId, `Sent back to "${toStageKey}" from "${fromStageKey}": ${findings}`);
+    this.notifyWorkAvailable(cardId);
+  }
+
+  /**
+   * Park a card on a person, at the agent's request: `complete` with `outcome: 'needs-person'`.
+   *
+   * An agent that needed a person to approve a device sign-in ended its turn with the link, and the
+   * board read that as a finished handoff missing a field — refused it, reworked it, refused it
+   * again and parked the card as a broken handoff. Nothing was broken; the agent had no way to say
+   * "I am waiting on somebody" that ended its turn.
+   *
+   * This is that way, and it is the existing question, not a new kind of wait: an `elicitation`
+   * row, so the question shows in Needs you, on the card, and in the board's chat room exactly as
+   * a live run's question does. What differs is that the run ENDS — the harness has stopped, and a
+   * lease nobody heartbeats would be reclaimed as a crash. Answering it (`answerElicitation`)
+   * re-queues the same stage with the answer and this run's handoff as the work so far.
+   *
+   * Not a failure and not a refusal: `failure_count` and the stage's one automatic rework are both
+   * untouched, and the completion requirement is not evaluated — nothing was claimed finished. The
+   * run's outcome is `blocked`, the word the bridge already reads as "the agent reported for itself".
+   */
+  private async waitOnPerson(input: CompleteVerbInput, run: Row): Promise<Result<CardView>> {
+    const cardId = run.card_id as string;
+    const now = this.now();
+    const handoffJson = input.handoff !== undefined ? JSON.stringify(input.handoff) : null;
+    this.sql.exec(
+      `UPDATE runs SET status = 'ended', outcome = 'blocked', ended_at = ?, handoff_json = ? WHERE id = ?`,
+      now,
+      handoffJson,
+      input.runId,
+    );
+    this.cancelElicitationsForRun(input.runId);
+    const url = input.url?.trim();
+    const question = url ? `${input.question!.trim()}\n\n${url}` : input.question!.trim();
+    const asked: AgentActivityInput = {
+      runId: input.runId,
+      leaseEpoch: input.leaseEpoch,
+      agentId: input.agentId,
+      type: 'elicitation',
+      body: question,
+      parameter: input.options !== undefined ? ({ options: input.options } as JsonValue) : null,
+    };
+    // On the replay as the question it is, like a live run's.
+    this.sql.exec(
+      `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
+       VALUES (?, ?, 'elicitation', 0, ?, NULL, ?, ?)`,
+      input.runId,
+      cardId,
+      question,
+      JSON.stringify({ parameter: asked.parameter ?? null, result: url ? { url } : null, signal: null }),
+      now,
+    );
+    this.openElicitation(asked, run, cardId, now);
+    this.sql.exec(
+      `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
+      now,
+      cardId,
+    );
+    this.emit('card.waiting_on_person', { cardId, runId: input.runId });
     this.reportRun(input.runId);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
@@ -5199,7 +5448,7 @@ export class BoardDO extends DurableObject<Env> {
           : { feedback: input.comment ?? null };
       this.sql.exec(
         `UPDATE cards SET current_stage_key = ?, state = 'submitted', delegate_agent_id = NULL,
-         current_run_id = NULL, failure_count = 0, handoff_json = ?, updated_at = ? WHERE id = ?`,
+         current_run_id = NULL, failure_count = 0, auto_returns = 0, handoff_json = ?, updated_at = ? WHERE id = ?`,
         gate.return_stage_key,
         JSON.stringify(merged),
         now,
@@ -5276,6 +5525,16 @@ export class BoardDO extends DurableObject<Env> {
       };
     }
 
+    // A question an agent parked the card on (`complete` with `needs-person`) has no live run to
+    // carry the answer back to: the card resumes by being worked again, at the same stage.
+    const asker = this.sql.exec(`SELECT status, handoff_json FROM runs WHERE id = ?`, elicitation.runId).toArray()[0];
+    if (asker && (asker.status as string) === 'ended') {
+      if (card.state !== 'input-required' || card.currentStageKey !== elicitation.stageKey) {
+        return { ok: false, code: 'CARD_NOT_WAITING', message: `a card in "${card.state}" is not waiting on an answer` };
+      }
+      return this.resumeParkedQuestion(elicitation, card, { option, text, answeredBy: input.answeredBy }, (asker.handoff_json as string | null) ?? null);
+    }
+
     // The card must still be waiting on this answer, and it moves by the contract's transition.
     const event: TaskEventType = card.state === 'auth-required' ? 'account_linked' : 'human_reply';
     if (!canTransition(card.state, event)) {
@@ -5326,6 +5585,82 @@ export class BoardDO extends DurableObject<Env> {
       ok: true,
       value: { card: this.mustGetCard(card.id), elicitation: this.mustGetElicitation(elicitation.id) },
     };
+  }
+
+  /**
+   * Answer a question an agent parked its card on, and put the card back to work.
+   *
+   * The asking run has ended, so the answer cannot be "collected" the way a live run collects one.
+   * Instead the card returns to `submitted` on the SAME stage, and the next claim is handed:
+   *  - the stage's own input, unchanged — the work continues, it does not start from nothing;
+   *  - `feedback` saying what was asked and what the person answered (the key AgentPod's card
+   *    prompt lifts into its own section), keeping any earlier feedback beneath it;
+   *  - `resumed`: the question, the answer, and the parked run's handoff as `workSoFar`.
+   *
+   * No failure is counted and the stage's automatic rework is not spent: a pause is not a fault.
+   */
+  private async resumeParkedQuestion(
+    elicitation: ElicitationView,
+    card: CardView,
+    answer: { option: string; text: string; answeredBy: string },
+    parkedHandoffJson: string | null,
+  ): Promise<Result<{ card: CardView; elicitation: ElicitationView }>> {
+    const now = this.now();
+    const option = answer.option === '' ? null : answer.option;
+    const text = answer.text === '' ? null : answer.text;
+    this.sql.exec(
+      `UPDATE elicitations SET status = 'answered', answer_option = ?, answer_text = ?, answered_by = ?, answered_at = ? WHERE id = ?`,
+      option,
+      text,
+      answer.answeredBy,
+      now,
+      elicitation.id,
+    );
+    const chosen = elicitation.options.find((o) => o.name === option);
+    const said = [chosen?.title ?? option ?? '', text ?? ''].filter((s) => s !== '').join(' — ');
+
+    const prior = this.parseHandoff(this.getCardHandoffJson(card.id));
+    const base = prior && typeof prior === 'object' && !Array.isArray(prior) ? (prior as Record<string, JsonValue>) : {};
+    const earlier = typeof base.feedback === 'string' && base.feedback.trim() !== '' ? `\n\nEarlier feedback, still standing:\n${base.feedback}` : '';
+    const merged = {
+      ...base,
+      feedback:
+        `You stopped to ask a person:\n${elicitation.question}\n\nThey answered: ${said}\n\n` +
+        `Continue the same work from where you left off.${earlier}`,
+      resumed: {
+        question: elicitation.question,
+        answer: { option, text },
+        answeredBy: answer.answeredBy,
+        workSoFar: this.parseHandoff(parkedHandoffJson),
+      },
+    };
+    this.sql.exec(
+      `UPDATE cards SET state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL, needs_human_json = NULL,
+              handoff_json = ?, updated_at = ? WHERE id = ?`,
+      JSON.stringify(merged),
+      now,
+      card.id,
+    );
+    this.sql.exec(
+      `INSERT INTO activities (run_id, card_id, type, ephemeral, body, action, detail_json, ts)
+       VALUES (?, ?, 'prompt', 0, ?, NULL, ?, ?)`,
+      elicitation.runId,
+      card.id,
+      said,
+      JSON.stringify({ parameter: { elicitationId: elicitation.id, option }, result: null, signal: null }),
+      now,
+    );
+    this.emit('elicitation.answered', {
+      elicitationId: elicitation.id,
+      cardId: card.id,
+      runId: elicitation.runId,
+      option,
+      answeredBy: answer.answeredBy,
+    });
+    this.notifyWorkAvailable(card.id);
+    this.reportRun(elicitation.runId);
+    await this.scheduleReclaim();
+    return { ok: true, value: { card: this.mustGetCard(card.id), elicitation: this.mustGetElicitation(elicitation.id) } };
   }
 
   /** Escalate to a human — the card parks in input-required (docs/08 §6 — gates resolve in P3). */

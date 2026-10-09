@@ -626,7 +626,7 @@ async function main(argv: string[]): Promise<void> {
         fail(
           "usage: supi set-stage <boardId> <stageKey> [--instructions <file|->] [--name <name>]",
           "  [--gate none|approval] [--wip <n>] [--owner <capability>] [--completion <file|->]\n" +
-            "  [--clear-instructions] [--clear-completion]",
+            "  [--clear-instructions] [--clear-completion] [--return-stage <stageKey>] [--clear-return-stage]",
         );
       }
       const patch: Record<string, unknown> = {};
@@ -649,6 +649,11 @@ async function main(argv: string[]): Promise<void> {
         }
       }
       if (rest.includes("--clear-completion")) patch.completion = null;
+      // Where a judge's `changes-needed` sends the card. Its own clearing flag for the reason
+      // `--clear-instructions` has one: a flag that removes something should have to be typed.
+      const returnArg = flag(rest, "--return-stage");
+      if (returnArg) patch.returnStage = returnArg;
+      if (rest.includes("--clear-return-stage")) patch.returnStage = null;
       // Explicit, and its own flag: `--instructions ""` cannot mean "remove" when an empty rule
       // is refused, and a flag that deletes something should have to be typed.
       if (rest.includes("--clear-instructions")) patch.instructions = null;

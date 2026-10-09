@@ -76,6 +76,15 @@ export interface AgentConfig {
   fetch: Fetcher;
 }
 
+/** How a turn went, sent beside the handoff on `complete` (dependency-free mirror of the contract). */
+export interface CompleteOutcome {
+  outcome: 'pass' | 'changes-needed' | 'needs-person';
+  findings?: string;
+  question?: string;
+  url?: string;
+  options?: unknown[];
+}
+
 export interface ClaimedWork {
   runId: string;
   leaseEpoch: number;
@@ -287,8 +296,13 @@ export class SuperpipelineAgent {
   activity(work: ClaimedWork, activity: AgentActivity): Promise<HttpResponse> {
     return this.run(work, 'activities', { ...activity });
   }
-  complete(work: ClaimedWork, handoff?: unknown): Promise<HttpResponse> {
-    return this.run(work, 'complete', { handoff });
+  /**
+   * End the turn. `outcome` says how it went (`StageOutcome` in @superpipeline/contract):
+   * `changes-needed` with `findings` sends the card back to the stage's return stage;
+   * `needs-person` with `question` (and `url`) parks it on a person. Omitted, the card advances.
+   */
+  complete(work: ClaimedWork, handoff?: unknown, outcome?: CompleteOutcome): Promise<HttpResponse> {
+    return this.run(work, 'complete', { handoff, ...(outcome ?? {}) });
   }
   block(work: ClaimedWork, reason: string): Promise<HttpResponse> {
     return this.run(work, 'block', { reason });
