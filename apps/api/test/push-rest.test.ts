@@ -33,6 +33,16 @@ describe('REST — push configs (docs/05 §4)', () => {
     expect(JSON.parse(deliveries[0].body)).toMatchObject({ event: 'work.available', stageKey: 'build' });
   });
 
+  it('rejects an unknown event with 400', async () => {
+    const bid = await board();
+    const res = await SELF.fetch(`${base}/v1/boards/${bid}/push-configs`, {
+      method: 'POST',
+      headers: { ...T, 'X-Agent-Id': 'agt_b' },
+      body: JSON.stringify({ url: 'https://agent.example/hook', token: 's', events: ['card.exploded'] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it('rejects a non-http(s) url with 400', async () => {
     const bid = await board();
     const res = await SELF.fetch(`${base}/v1/boards/${bid}/push-configs`, {

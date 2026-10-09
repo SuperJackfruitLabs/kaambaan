@@ -139,6 +139,7 @@ function statusForCode(code: BoardErrorCode): number {
       return 409;
     case 'UNKNOWN_STAGE':
     case 'INVALID_URL':
+    case 'UNKNOWN_EVENT':
     case 'INVALID_DELIVERY':
     case 'INVALID_USAGE':
     case 'INVALID_STAGES':

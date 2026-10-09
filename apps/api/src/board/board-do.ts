@@ -28,6 +28,7 @@ import {
 } from '../superwitness/client';
 import { logReporter } from '../superwitness/log';
 import { agentNamesFor, principalIdsFor } from '../db/catalog';
+import { SUBSCRIBABLE_EVENTS, cardIdsOf, isRecordEvent, type RecordPushBody } from '../push/events';
 
 /** JSON-serializable value — used for everything that crosses the Durable Object RPC boundary. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -1062,6 +1063,7 @@ export type BoardErrorCode =
   | 'CARD_NOT_WAITING'
   | 'SEPARATION_OF_DUTIES'
   | 'INVALID_URL'
+  | 'UNKNOWN_EVENT'
   | 'INVALID_SIGNATURE'
   | 'NOT_CONFIGURED'
   | 'INVALID_DELIVERY'
@@ -3457,6 +3459,8 @@ export class BoardDO extends DurableObject<Env> {
     }
     const existing = this.sql.exec(`SELECT id FROM push_configs WHERE agent_id = ? AND url = ?`, input.agentId, input.url).toArray()[0];
     const id = existing ? (existing.id as string) : newId('push');
+    const unknown = (input.events ?? []).filter((e) => !SUBSCRIBABLE_EVENTS.has(e));
+    if (unknown.length > 0) return { ok: false, code: 'UNKNOWN_EVENT', message: `cannot subscribe to: ${unknown.join(', ')}` };
     const caps = JSON.stringify(input.capabilities ?? []);
     const events = JSON.stringify(input.events ?? ['work.available']);
     if (existing) {
@@ -6624,6 +6628,23 @@ export class BoardDO extends DurableObject<Env> {
     }
   }
 
+  /** Record events to whoever subscribed (Superlibrary spec §5). One delivery per matching config. */
+  private queueRecordPush(type: string, seq: number, payload: Record<string, unknown>, ts: string): void {
+    const configs = this.sql.exec(`SELECT id, url, events_json FROM push_configs`).toArray()
+      .filter((c) => (JSON.parse(c.events_json as string) as string[]).includes(type));
+    if (configs.length === 0) return;
+    const body: RecordPushBody = { event: type, boardId: this.getMeta('boardId') as string, seq, ts, cardIds: cardIdsOf(payload) };
+    const text = JSON.stringify(body);
+    for (const c of configs) {
+      this.sql.exec(
+        `INSERT INTO push_deliveries (config_id, url, body, status, attempts, created_at) VALUES (?, ?, ?, 'pending', 0, ?)`,
+        c.id, c.url, text, ts,
+      );
+    }
+    // The one alarm drains pending deliveries (scheduleReclaim computes drainAt from them).
+    void this.scheduleReclaim().catch((err) => console.error('record push: alarm not armed', String(err)));
+  }
+
   /** Record an in-app notification for the card's owner and broadcast it (docs/07 §7). */
   private notify(kind: string, cardId: string, body: string): void {
     const card = this.getCardRow(cardId);
@@ -6643,6 +6664,7 @@ export class BoardDO extends DurableObject<Env> {
     const ts = this.now();
     this.sql.exec(`INSERT INTO events (type, payload_json, ts) VALUES (?, ?, ?)`, type, JSON.stringify(payload), ts);
     const seq = Number(this.sql.exec(`SELECT last_insert_rowid() AS seq`).one().seq);
+    if (isRecordEvent(type)) this.queueRecordPush(type, seq, payload, ts);
     const msg = JSON.stringify({ kind: 'event', event: { seq, type, payload, ts } });
     for (const ws of this.ctx.getWebSockets()) {
       try {
