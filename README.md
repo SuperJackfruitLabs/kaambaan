@@ -90,6 +90,10 @@ pnpm --filter @superpipeline/web build
 pnpm --filter @superpipeline/api dev:setup
 ```
 
+The repository on GitHub is a read-only mirror: changes land in the primary repository and reach
+GitHub automatically, so a direct push to GitHub's `main` is refused. Pull requests opened on GitHub
+are still welcome; a maintainer imports them for review.
+
 The initial web build creates the asset directory Wrangler expects. `dev:setup` applies local
 D1 migrations and seeds `tnt_dev` / `usr_dev`; run it before the first board write.
 
