@@ -1,10 +1,10 @@
 <!-- apps/web/src/lib/components/card/RelatedWork.svelte -->
 <script lang="ts">
-  import { libraryRef, outcomeWord, relatedForCard, sentenceFor, type RelatedLite } from '$lib/superlibrary';
+  import { isAbsent, libraryRef, outcomeWord, relatedForCard, sentenceFor, type RelatedLite } from '$lib/superlibrary';
 
   let { cardId }: { cardId: string } = $props();
   let items = $state<RelatedLite[]>([]);
-  let phase = $state<'loading' | 'ok' | 'unavailable'>('loading');
+  let phase = $state<'loading' | 'ok' | 'unavailable' | 'absent'>('loading');
   let why = $state('');
   let attempt = $state(0);
 
@@ -15,12 +15,13 @@
     phase = 'loading';
     relatedForCard(id)
       .then((r) => { if (live) { items = r; phase = 'ok'; } })
-      .catch((e: unknown) => { if (live) { why = sentenceFor(e); phase = 'unavailable'; } });
+      .catch((e: unknown) => { if (live) { if (isAbsent(e)) phase = 'absent'; else { why = sentenceFor(e); phase = 'unavailable'; } } });
     return () => { live = false; };
   });
 </script>
 
 <!-- Text from other people's and agents' work: rendered as text, never as markup. -->
+{#if phase !== 'absent'}
 <section class="sec" aria-labelledby="related-work-h">
   <div id="related-work-h" class="sec-h eyebrow">related prior work</div>
   {#if phase === 'loading'}
@@ -48,3 +49,4 @@
     </ul>
   {/if}
 </section>
+{/if}

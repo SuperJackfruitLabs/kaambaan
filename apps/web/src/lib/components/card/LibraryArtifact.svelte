@@ -30,7 +30,7 @@
 
 <div class="border-border rounded-[7px] border p-2">
   <div class="flex flex-wrap items-center gap-2">
-    <button type="button" class="border-border hover:border-marigold/50 min-h-[44px] rounded-[5px] border px-2 text-xs" aria-expanded={open} aria-controls={frameId} onclick={() => (open = !open)}>
+    <button type="button" class="border-border hover:border-marigold/50 min-h-[44px] rounded-[5px] border px-2 text-xs" aria-expanded={open} aria-controls={open ? frameId : undefined} onclick={() => (open = !open)}>
       {open ? 'Hide preview' : 'Show preview'}
     </button>
     <a {href} target="_blank" rel="noopener noreferrer" class="flex min-h-[44px] min-w-0 flex-1 items-center text-xs [overflow-wrap:anywhere] hover:underline">{title}</a>

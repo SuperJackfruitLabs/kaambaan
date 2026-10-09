@@ -411,4 +411,12 @@ describe('plane sign-in — a third, Superlibrary-audience token for the card dr
     const res = (await handlePlaneSignInRoute(new Request('https://api.test/auth/logout'), envOn(), '/auth/logout'))!;
     expect(cookies(res).get('superpipeline_plane_library_token')).toBe('');
   });
+  it('says so when no Superlibrary is configured, so the page can hide its panels', async () => {
+    const fake = byResource3();
+    const req = new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_refresh=r1' } });
+    const res = (await handlePlaneSignInRoute(req, envOn({ SUPERLIBRARY_AUDIENCE: '' }), '/hub/token', fake.impl))!;
+    expect(await res.json()).toMatchObject({ libraryToken: null, libraryConfigured: false });
+    const configured = (await handlePlaneSignInRoute(new Request('https://api.test/hub/token?library=1', { headers: { Cookie: 'superpipeline_hub_token=app1; superpipeline_plane_library_token=lib1; superpipeline_plane_refresh=r1' } }), env3(), '/hub/token', fake.impl))!;
+    expect(await configured.json()).not.toHaveProperty('libraryConfigured');
+  });
 });

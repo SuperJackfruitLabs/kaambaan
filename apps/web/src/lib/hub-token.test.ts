@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken, forgetLibraryToken } from './hub-token';
+import { hubToken, forgetHubToken, withAuthority, beginHubAuthorization, hubStatus, libraryToken, forgetLibraryToken, libraryConfigured } from './hub-token';
 
 /**
  * Carrying authority from the browser (superpipeline#43, option A).
@@ -403,7 +403,7 @@ describe('libraryToken (spec §9 Embedding)', () => {
     try {
       const first = libraryToken();
       const second = hubStatus();
-      await vi.advanceTimersByTimeAsync(10_001);
+      await vi.advanceTimersByTimeAsync(30_001);
       expect(await first).toBeNull();
       expect((await second).signIn).toBe('github');
       expect(signals[0]).toBeDefined();
@@ -411,5 +411,13 @@ describe('libraryToken (spec §9 Embedding)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  it('learns from the Worker that no Superlibrary is configured, and says so until forgotten', async () => {
+    expect(libraryConfigured()).toBe(true);
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ token: 'a', libraryToken: null, libraryConfigured: false })));
+    expect(await libraryToken()).toBeNull();
+    expect(libraryConfigured()).toBe(false);
+    forgetHubToken();
+    expect(libraryConfigured()).toBe(true);
   });
 });

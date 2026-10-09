@@ -1,9 +1,9 @@
 // apps/web/src/lib/superlibrary.test.ts
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn() }));
-import { forgetLibraryToken, libraryToken } from '$lib/hub-token';
-import { LibraryError, embedCallbacks, libraryRef, sentenceFor } from './superlibrary';
+vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn(), libraryConfigured: vi.fn(() => true) }));
+import { forgetLibraryToken, libraryConfigured, libraryToken } from '$lib/hub-token';
+import { LibraryError, embedCallbacks, libraryFetch, libraryRef, sentenceFor } from './superlibrary';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.mocked(libraryToken).mockResolvedValue('lib-token'); });
 
@@ -61,5 +61,24 @@ describe('Superlibrary references (spec §11: the drawer previews linked artifac
     await cb.setScope!({ itemId: 'itm_0123456789abcdef', scope: 'workspace' });
     expect((await cb.getShareInfo!({ itemId: 'itm_0123456789abcdef' })).scope).toBe('workspace');
     expect(reads).toBe(2);
+  });
+  it('names an unconfigured Superlibrary without calling it, and a hung one ends in a retryable error', async () => {
+    const f = vi.fn();
+    vi.stubGlobal('fetch', f);
+    vi.mocked(libraryConfigured).mockReturnValue(false);
+    vi.mocked(libraryToken).mockResolvedValue(null);
+    await expect(libraryFetch('/api/v1/me')).rejects.toMatchObject({ code: 'not_configured' });
+    expect(f).not.toHaveBeenCalled();
+    vi.mocked(libraryConfigured).mockReturnValue(true);
+    vi.mocked(libraryToken).mockResolvedValue('lib-token');
+    vi.stubGlobal('fetch', vi.fn((_u: string, init: RequestInit) => new Promise((_, rej) => init.signal!.addEventListener('abort', () => rej(new Error('aborted'))))));
+    vi.useFakeTimers();
+    try {
+      const p = libraryFetch('/api/v1/me').catch((e) => e);
+      await vi.advanceTimersByTimeAsync(10_001);
+      const e = await p;
+      expect(e).toBeInstanceOf(LibraryError);
+      expect(sentenceFor(e)).toMatch(/could not be loaded/);
+    } finally { vi.useRealTimers(); }
   });
 });

@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 
 const mount = vi.fn();
 vi.mock('$lib/vendor/superlibrary-embed/superlibrary-embed.js', () => ({ mountArtifact: (...a: unknown[]) => mount(...a) }));
-vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn() }));
+vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn(), libraryConfigured: vi.fn(() => true) }));
 import LibraryArtifact from './LibraryArtifact.svelte';
 import { LibraryError } from '$lib/superlibrary';
 
@@ -38,5 +38,13 @@ describe('LibraryArtifact (spec §9 Embedding, §11)', () => {
     expect(await screen.findByRole('alert')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Hide preview' }));
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+  it('aria-controls names the frame only while it exists', async () => {
+    mount.mockResolvedValue({ destroy: vi.fn(), setTheme: vi.fn(), setVersion: vi.fn(), iframe: document.createElement('iframe') });
+    render(LibraryArtifact, { itemId: 'itm_0123456789abcdef', title: 'Plan' });
+    expect(screen.getByRole('button', { name: 'Show preview' }).hasAttribute('aria-controls')).toBe(false);
+    await fireEvent.click(screen.getByRole('button', { name: 'Show preview' }));
+    const id = screen.getByRole('button', { name: 'Hide preview' }).getAttribute('aria-controls')!;
+    expect(document.getElementById(id)).not.toBeNull();
   });
 });

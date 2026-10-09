@@ -1,11 +1,11 @@
 // apps/web/src/lib/components/card/RelatedWork.svelte.test.ts
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 
 const related = vi.fn();
 vi.mock('$lib/superlibrary', async (orig) => ({ ...(await orig<typeof import('$lib/superlibrary')>()), relatedForCard: (id: string) => related(id) }));
-vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn() }));
+vi.mock('$lib/hub-token', () => ({ libraryToken: vi.fn(async () => 'lib-token'), forgetLibraryToken: vi.fn(), libraryConfigured: vi.fn(() => true) }));
 import RelatedWork from './RelatedWork.svelte';
 import { LibraryError } from '$lib/superlibrary';
 
@@ -45,5 +45,13 @@ describe('Related prior work (superlibrary spec §11)', () => {
     related.mockResolvedValue([{ itemId: 'itm_0123456789abcdef', title: '', kind: 'artifact', outcome: 'completed', snippet: '', url: 'https://app.superlibrary.dev/a/itm_0123456789abcdef' }]);
     render(RelatedWork, { cardId: CARD });
     expect(await screen.findByRole('link', { name: 'itm_0123456789abcdef' })).toBeTruthy();
+  });
+  it.each(['not_configured', 'product_not_enabled'])('shows nothing at all when Superlibrary is absent (%s): no panel, no retry', async (code) => {
+    related.mockRejectedValue(new LibraryError(code === 'not_configured' ? 0 : 403, code));
+    const { container } = render(RelatedWork, { cardId: CARD });
+    await waitFor(() => expect(related).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText(/Looking in Superlibrary/)).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+    expect(container.textContent?.trim()).toBe('');
   });
 });

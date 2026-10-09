@@ -4,10 +4,12 @@
  * signed-in person's own Superlibrary-audience token (hub-token.ts `libraryToken`), so Superlibrary
  * decides what this person may see. No cookies cross: `credentials: 'omit'`.
  */
-import { forgetLibraryToken, libraryToken } from '$lib/hub-token';
+import { forgetLibraryToken, libraryConfigured, libraryToken } from '$lib/hub-token';
 import type { EmbedGrant, MountOptions, Scope, ShareInfo } from '$lib/vendor/superlibrary-embed/superlibrary-embed.js';
 
-export const LIBRARY_URL = ((import.meta.env.PUBLIC_SUPERLIBRARY_URL as string | undefined) ?? 'https://app.superlibrary.dev').replace(/\/+$/, '');
+export const LIBRARY_URL = 'https://app.superlibrary.dev';
+/** A hung Superlibrary ends in the retryable message rather than a spinner. */
+const LIBRARY_TIMEOUT_MS = 10_000;
 const ITEM_PATH = /^\/a\/(itm_[0-9a-f]{16})(?:\/v\/([1-9][0-9]*))?\/?$/;
 
 /** The item (and version) a reference names, when it is a link to this deployment's Superlibrary. */
@@ -26,11 +28,20 @@ export class LibraryError extends Error {
 
 export async function libraryFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const token = await libraryToken();
-  if (!token) throw new LibraryError(0, 'no_token');
+  if (!token) throw new LibraryError(0, libraryConfigured() ? 'no_token' : 'not_configured');
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${token}`);
   if (init.body !== undefined) headers.set('content-type', 'application/json');
-  const res = await fetch(`${LIBRARY_URL}${path}`, { ...init, headers, credentials: 'omit' });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), LIBRARY_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${LIBRARY_URL}${path}`, { ...init, headers, credentials: 'omit', signal: ctl.signal });
+  } catch {
+    throw new LibraryError(0, 'unreachable');
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.status === 401) forgetLibraryToken();
   return res;
 }
@@ -81,6 +92,7 @@ export function embedCallbacks(): Pick<MountOptions, 'getEmbedUrl' | 'getVersion
 }
 
 const SENTENCES: Record<string, string> = {
+  not_configured: 'Superlibrary is not set up here.',
   no_token: 'Previews need you signed in through your workspace account.',
   product_not_enabled: 'Superlibrary is not enabled for this workspace.',
   not_found: 'This artifact is not there, or you cannot see it.',
@@ -101,4 +113,7 @@ export async function relatedForCard(cardId: string): Promise<RelatedLite[]> {
 const OUTCOME_WORDS: Record<string, string> = {
   approved: 'Approved', completed: 'Completed', 'in-progress': 'In progress', superseded: 'Superseded', rejected: 'Rejected', failed: 'Failed', abandoned: 'Abandoned',
 };
+/** Superlibrary is not there for this person at all: show nothing rather than an apology on every card. */
+export const isAbsent = (e: unknown) => e instanceof LibraryError && (e.code === 'not_configured' || e.code === 'product_not_enabled');
+
 export const outcomeWord = (o: string) => OUTCOME_WORDS[o] ?? o;

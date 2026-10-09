@@ -50,6 +50,8 @@ let cached: { token: string; expiresAtMs: number } | null = null;
 let cachedHubAud: { token: string; expiresAtMs: number } | null = null;
 /** The Superlibrary-audience token (spec §9 Embedding), for the card drawer. Minted by our Worker on request. */
 let cachedLibrary: { token: string; expiresAtMs: number } | null = null;
+/** False once the Worker has said this deployment has no Superlibrary: nothing to preview or relate. */
+let libraryAbsent = false;
 let libraryInFlight: Promise<string | null> | null = null;
 let lastSignIn: 'github' | 'org-plane' | null = null;
 let inFlight: Promise<string | null> | null = null;
@@ -84,8 +86,13 @@ function remember(token: string | null | undefined): string | null {
  * rotating refresh token on each, so two overlapping requests from one tab would present the same
  * token twice: a replay to the plane. The queue survives a failed request.
  */
-/** A hung request must not hold the queue: it is abandoned (and answers null) after this long. */
-const HUB_TOKEN_TIMEOUT_MS = 10_000;
+/**
+ * A hung request must not hold the queue: it is abandoned (and answers null) after this long.
+ * The trade-off: abandoning a request the Worker has already started can lose the newest refresh
+ * token (the browser never sees its Set-Cookie), which costs a silent re-authorize. So the bound
+ * is generous, well past a slow plane, and only there to end a request that will never answer.
+ */
+const HUB_TOKEN_TIMEOUT_MS = 30_000;
 let hubTokenTail: Promise<unknown> | null = null;
 function hubTokenFetch(url: string): Promise<Response> {
   const start = async () => {
@@ -277,13 +284,18 @@ export async function hubAudienceToken(): Promise<string | null> {
  * A token Superlibrary accepts for this person, or null: not signed in through the plane, a
  * workspace without Superlibrary, or the plane declined. Null is an ordinary answer: the drawer says so.
  */
+export function libraryConfigured(): boolean {
+  return !libraryAbsent;
+}
+
 export async function libraryToken(): Promise<string | null> {
   if (cachedLibrary && cachedLibrary.expiresAtMs - REFRESH_MARGIN_MS > Date.now()) return cachedLibrary.token;
   if (libraryInFlight) return libraryInFlight;
   libraryInFlight = (async () => {
     try {
       const res = await hubTokenFetch('/hub/token?library=1');
-      const body = (await res.json().catch(() => null)) as { libraryToken?: string | null } | null;
+      const body = (await res.json().catch(() => null)) as { libraryToken?: string | null; libraryConfigured?: boolean } | null;
+      if (res.ok && body?.libraryConfigured === false) libraryAbsent = true;
       const t = res.ok ? (body?.libraryToken ?? null) : null;
       const exp = t ? expiryOf(t) : 0;
       cachedLibrary = t && exp > 0 ? { token: t, expiresAtMs: exp } : null;
@@ -307,6 +319,7 @@ export function forgetHubToken(): void {
   cached = null;
   cachedHubAud = null;
   cachedLibrary = null;
+  libraryAbsent = false;
   lastSignIn = null;
 }
 

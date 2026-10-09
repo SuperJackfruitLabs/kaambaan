@@ -207,7 +207,7 @@ export async function handlePlaneSignInRoute(
     const libResource = wantLibrary ? libraryResource(env) : null;
     let libTok: string | null = wantLibrary ? readCookie(request, LIBRARY_AUD_COOKIE) : null;
     const answer = (token: string | null, hubToken: string | null, headers?: Headers) =>
-      Response.json({ token, hubToken, ...(wantLibrary ? { libraryToken: libTok } : {}), hubConfigured: true, signIn: 'org-plane' }, headers ? { headers } : undefined);
+      Response.json({ token, hubToken, ...(wantLibrary ? { libraryToken: libTok } : {}), ...(wantLibrary && libraryResource(env) === null ? { libraryConfigured: false } : {}), hubConfigured: true, signIn: 'org-plane' }, headers ? { headers } : undefined);
     let app = readCookie(request, TOKEN_COOKIE);
     let hubTok = readCookie(request, HUB_AUD_COOKIE);
     let refresh = readCookie(request, REFRESH_COOKIE);
