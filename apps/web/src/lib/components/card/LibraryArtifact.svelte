@@ -33,7 +33,7 @@
     <button type="button" class="border-border hover:border-marigold/50 min-h-[44px] rounded-[5px] border px-2 text-xs" aria-expanded={open} aria-controls={frameId} onclick={() => (open = !open)}>
       {open ? 'Hide preview' : 'Show preview'}
     </button>
-    <a {href} target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 text-xs break-words hover:underline">{title}</a>
+    <a {href} target="_blank" rel="noopener noreferrer" class="flex min-h-[44px] min-w-0 flex-1 items-center text-xs [overflow-wrap:anywhere] hover:underline">{title}</a>
   </div>
   {#if open}<div id={frameId} class="mt-2" bind:this={host}></div>{/if}
   {#if failure}<p role="alert" class="text-coral mt-2 text-xs">{failure}</p>{/if}

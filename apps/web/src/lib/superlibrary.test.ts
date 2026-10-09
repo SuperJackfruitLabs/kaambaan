@@ -43,8 +43,8 @@ describe('Superlibrary references (spec §11: the drawer previews linked artifac
       return Response.json({ item: { scope: 'workspace', title: 'T', createdBy: 'prn_000000000000000000a2' }, versions: [{ version: 1, revokedAt: null }] });
     }));
     const cb = embedCallbacks();
-    await cb.getVersions({ itemId: 'itm_0123456789abcdef' });
-    await cb.getShareInfo({ itemId: 'itm_0123456789abcdef' });
+    await cb.getVersions!({ itemId: 'itm_0123456789abcdef' });
+    await cb.getShareInfo!({ itemId: 'itm_0123456789abcdef' });
     expect(urls.filter((u) => u.endsWith('/api/v1/items/itm_0123456789abcdef'))).toHaveLength(1);
   });
 });

@@ -85,3 +85,15 @@ const SENTENCES: Record<string, string> = {
 export function sentenceFor(e: unknown): string {
   return (e instanceof LibraryError && SENTENCES[e.code]) || 'The preview could not be loaded. Try again in a moment.';
 }
+export interface RelatedLite { itemId: string; title: string; kind: 'artifact' | 'work-record'; outcome: string; snippet: string; url: string }
+
+/** Items related to this card, as Superlibrary sees them for this person (its visibility rule, spec §4). */
+export async function relatedForCard(cardId: string): Promise<RelatedLite[]> {
+  const body = await jsonOf<{ items: RelatedLite[] }>(await libraryFetch('/api/v1/related', { method: 'POST', body: JSON.stringify({ cardId, limit: 5 }) }));
+  return body.items;
+}
+
+const OUTCOME_WORDS: Record<string, string> = {
+  approved: 'Approved', completed: 'Completed', 'in-progress': 'In progress', superseded: 'Superseded', rejected: 'Rejected', failed: 'Failed', abandoned: 'Abandoned',
+};
+export const outcomeWord = (o: string) => OUTCOME_WORDS[o] ?? o;

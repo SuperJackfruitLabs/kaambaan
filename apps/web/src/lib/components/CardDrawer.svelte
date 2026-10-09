@@ -44,6 +44,7 @@
   import PlanChecklist from '$lib/components/card/PlanChecklist.svelte';
   import CardComments from '$lib/components/card/CardComments.svelte';
   import CardResume from '$lib/components/card/CardResume.svelte';
+  import RelatedWork from '$lib/components/card/RelatedWork.svelte';
   import LibraryArtifact from '$lib/components/card/LibraryArtifact.svelte';
   import { libraryRef } from '$lib/superlibrary';
 
@@ -1832,6 +1833,8 @@
             </div>
           </section>
         {/if}
+
+        {#if cardId}<RelatedWork {cardId} />{/if}
 
         <!-- references -->
         <section class="sec">
