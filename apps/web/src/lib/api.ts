@@ -344,9 +344,23 @@ export interface Gate {
   resolvedAt?: string | null;
   /** What is being approved — the readable part of the handoff. On pending gates in the snapshot. Text only. */
   summary?: string | null;
+  approvalSubject?: {
+    id: string;
+    digest: string;
+    schema: string;
+    revision: number;
+    canonical: Record<string, unknown>;
+  };
+  delivery?: {
+    mode: 'manual' | 'automatic';
+    liveUrl: string | null;
+    readBackStatus: 'not_checked' | 'matched' | 'mismatch';
+    recordedBy: string | null;
+    recordedAt: string | null;
+  };
 }
 
-export type GateDecision = 'approve' | 'request_changes' | 'reject';
+export type GateDecision = 'approve' | 'approve_manual' | 'approve_automatic' | 'request_changes' | 'reject';
 
 /**
  * A question an agent stopped to ask (docs/04 §4). The card waits in `input-required` while the
@@ -859,11 +873,30 @@ export function resolveGate(
   gateId: string,
   decision: GateDecision,
   comment?: string,
+  approvalSubject?: Pick<NonNullable<Gate['approvalSubject']>, 'id' | 'digest'>,
 ): Promise<Response> {
   return fetch(`/v1/boards/${boardId}/gates/${gateId}/resolve`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ decision, comment }),
+    body: JSON.stringify({
+      decision,
+      comment,
+      approvalSubjectId: approvalSubject?.id,
+      approvalSubjectDigest: approvalSubject?.digest,
+    }),
+  }).then(noteAuth);
+}
+
+/** Change delivery mode or record a manually published URL; approved bytes stay unchanged. */
+export function updateApprovalDelivery(
+  boardId: string,
+  gateId: string,
+  update: { mode: 'manual' | 'automatic' } | { liveUrl: string },
+): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/gates/${gateId}/delivery`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(update),
   }).then(noteAuth);
 }
 

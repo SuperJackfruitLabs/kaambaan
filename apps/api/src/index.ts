@@ -147,6 +147,9 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_USAGE':
     case 'INVALID_STAGES':
     case 'INVALID_OUTCOME':
+    case 'INVALID_APPROVAL_SUBJECT':
+    case 'INVALID_APPROVAL_DELIVERY':
+    case 'INVALID_LIVE_URL':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -162,6 +165,11 @@ function statusForCode(code: BoardErrorCode): number {
       return 404;
     case 'STALE_LEASE':
     case 'GATE_NOT_PENDING':
+    case 'APPROVAL_SUBJECT_MISMATCH':
+    case 'APPROVAL_SUBJECT_NOT_VERIFIED':
+    case 'APPROVAL_DELIVERY_NOT_AVAILABLE':
+    case 'APPROVAL_DELIVERY_NOT_MANUAL':
+    case 'APPROVAL_DELIVERY_STARTED':
     // The question was already settled (answered, or retired with its run) — a conflict with the
     // state the caller believed in, not a bad request. Retrying it will never succeed.
     case 'ELICITATION_NOT_PENDING':
@@ -174,7 +182,10 @@ function statusForCode(code: BoardErrorCode): number {
     // The caller authenticated, but this run is another agent's: a permanent refusal of an
     // understood request, and deliberately NOT the 409 that means "your lease lapsed, re-claim".
     case 'NOT_RUN_OWNER':
+    case 'APPROVAL_DECIDER_NOT_ALLOWED':
       return 403;
+    case 'APPROVAL_SUBJECT_EXPIRED':
+      return 410;
     case 'INVALID_SIGNATURE':
       return 401;
     case 'NOT_CONFIGURED':
@@ -3257,6 +3268,45 @@ const worker = {
         return Response.json(result.value);
       }
 
+      // The publisher's final authenticated lease fence. Authoritative stored bytes are returned
+      // only while the run/card/stage/subject/gate/account/expiry binding still agrees.
+      const approvalVerifyMatch = rest.match(/^runs\/([^/]+)\/approval-subject\/verify$/);
+      if (approvalVerifyMatch && request.method === 'POST') {
+        const p = (await request.json()) as {
+          leaseEpoch?: number;
+          expectedSchema?: string;
+          expectedSubjectId?: string;
+          expectedDigest?: string;
+          expectedAccount?: JsonValue;
+        };
+        if (
+          !Number.isInteger(p.leaseEpoch) ||
+          typeof p.expectedSchema !== 'string' ||
+          p.expectedSchema.length === 0 ||
+          typeof p.expectedSubjectId !== 'string' ||
+          p.expectedSubjectId.length === 0 ||
+          typeof p.expectedDigest !== 'string' ||
+          !/^sha256:[0-9a-f]{64}$/.test(p.expectedDigest) ||
+          p.expectedAccount === undefined
+        ) {
+          return Response.json(
+            { error: { code: 'INVALID_APPROVAL_SUBJECT', message: 'leaseEpoch and exact schema, subject id, digest, and account are required' } },
+            { status: 400 },
+          );
+        }
+        const result = await stub.verifyApprovalSubject({
+          runId: approvalVerifyMatch[1]!,
+          leaseEpoch: p.leaseEpoch!,
+          agentId: agent!.agentId,
+          expectedSchema: p.expectedSchema,
+          expectedSubjectId: p.expectedSubjectId,
+          expectedDigest: p.expectedDigest,
+          expectedAccount: p.expectedAccount,
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json(result.value);
+      }
+
       // POST /v1/boards/:id/runs/:runId/:action — agent run verbs (docs/04 §3)
       const runMatch = rest.match(/^runs\/([^/]+)\/([^/]+)$/);
       if (runMatch && request.method === 'POST') {
@@ -3355,15 +3405,56 @@ const worker = {
       // POST /v1/boards/:id/gates/:gateId/resolve — the signed-in human resolves an approval gate (docs/08 §6)
       const gateMatch = rest.match(/^gates\/([^/]+)\/resolve$/);
       if (gateMatch && request.method === 'POST') {
-        const gp = (await request.json()) as { decision: GateDecision; comment?: string };
+        const gp = (await request.json()) as {
+          decision: GateDecision;
+          comment?: string;
+          approvalSubjectId?: string;
+          approvalSubjectDigest?: string;
+        };
+        const localDeciderId = user?.userId ?? 'usr_dev';
+        const gateView = await stub.getGate(gateMatch[1]!);
+        const principalIds =
+          gateView.ok && gateView.value.approvalSubject
+            ? await principalIdsFor(env.DB, tenantId, [localDeciderId])
+            : new Map<string, string>();
         const result = await stub.resolveGate({
           gateId: gateMatch[1]!,
           decision: gp.decision,
-          decidedBy: user?.userId ?? 'usr_dev',
+          decidedBy: principalIds.get(localDeciderId) ?? localDeciderId,
           comment: gp.comment,
+          approvalSubjectId: gp.approvalSubjectId,
+          approvalSubjectDigest: gp.approvalSubjectDigest,
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
+      }
+
+      // POST /v1/boards/:id/gates/:gateId/delivery — alter delivery, never approved bytes.
+      const deliveryMatch = rest.match(/^gates\/([^/]+)\/delivery$/);
+      if (deliveryMatch && request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { mode?: unknown; liveUrl?: unknown } | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { code: 'INVALID_APPROVAL_DELIVERY', message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        if (body.mode !== undefined && body.mode !== 'manual' && body.mode !== 'automatic') {
+          return Response.json(
+            { error: { code: 'INVALID_APPROVAL_DELIVERY', message: 'mode must be manual or automatic' } },
+            { status: 400 },
+          );
+        }
+        if (body.liveUrl !== undefined && typeof body.liveUrl !== 'string') {
+          return Response.json({ error: { code: 'INVALID_LIVE_URL', message: 'liveUrl must be a string' } }, { status: 400 });
+        }
+        const localActorId = user?.userId ?? 'usr_dev';
+        const principalIds = await principalIdsFor(env.DB, tenantId, [localActorId]);
+        const result = await stub.updateApprovalDelivery({
+          gateId: deliveryMatch[1]!,
+          actor: principalIds.get(localActorId) ?? localActorId,
+          ...(body.mode !== undefined ? { mode: body.mode as 'manual' | 'automatic' } : {}),
+          ...(body.liveUrl !== undefined ? { liveUrl: body.liveUrl } : {}),
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ card: result.value, delivery: result.value.delivery });
       }
 
       // GET /v1/boards/:id/elicitations/pending — every question still waiting on a human.

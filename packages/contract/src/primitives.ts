@@ -168,7 +168,7 @@ export type SyncState = z.infer<typeof SyncState>;
  * option ids as the one correction to superpipeline#34 that would have failed at
  * runtime rather than in review.
  */
-export const GateDecision = z.enum(['approve', 'request_changes', 'reject']);
+export const GateDecision = z.enum(['approve', 'approve_manual', 'approve_automatic', 'request_changes', 'reject']);
 export type GateDecision = z.infer<typeof GateDecision>;
 
 /**

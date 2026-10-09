@@ -13,6 +13,7 @@
     deleteCard,
     addReference,
     resolveGate,
+    updateApprovalDelivery,
     answerElicitation,
     archiveCard,
     unarchiveCard,
@@ -32,6 +33,8 @@
     type Milestone,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
+  import { gateDecisionForOption } from '$lib/gate-delivery';
+  import { manualDeliveryItems } from '$lib/approval-delivery';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
   import { buildLinkGroups, edgeKey, type RemoveArgs } from '$lib/components/link-groups';
@@ -99,6 +102,10 @@
   let showToolCalls = $state(false);
   /** Gates that have been decided — the pending one is rendered by its own control above. */
   const decidedGates = $derived((cardDetail?.gates ?? []).filter((g) => g.status !== 'pending'));
+  const deliveryGate = $derived(
+    [...decidedGates].reverse().find((g) => g.approvalSubject && (g.decision === 'approve_manual' || g.decision === 'approve_automatic')),
+  );
+  const manualItems = $derived(deliveryGate?.decision === 'approve_manual' ? manualDeliveryItems(deliveryGate.approvalSubject!.canonical) : []);
   let drawerAttempts = $state<Attempt[]>([]);
   const activityGroups = $derived(groupActivities(cardDetail?.activities ?? [], drawerAttempts ?? []));
   /**
@@ -261,6 +268,9 @@
   let localError = $state<string | null>(null);
   /** A refusal from the gate, rendered in the gate panel rather than at the top of the drawer. */
   let gateError = $state<string | null>(null);
+  let livePostUrl = $state('');
+  let deliverySaving = $state(false);
+  let copiedItem = $state<number | null>(null);
 
   // ---- elicitation (agent question) state ----
   let answerText = $state('');
@@ -286,6 +296,9 @@
       answerText = '';
       gateComment = '';
       gateError = null;
+      livePostUrl = '';
+      deliverySaving = false;
+      copiedItem = null;
       activeInteractiveOption = null;
       editing = false;
       newRefUrl = '';
@@ -664,7 +677,7 @@
   async function onResolve(decision: GateDecision): Promise<void> {
     if (!boardId || !gate) return;
     const comment = gateComment.trim() || undefined;
-    const res = await resolveGate(boardId, gate.id, decision, comment);
+    const res = await resolveGate(boardId, gate.id, decision, comment, gate.approvalSubject);
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
       /**
@@ -687,7 +700,38 @@
     gateError = null;
     localError = null;
     await app.refresh();
-    app.closeCard();
+    if (decision === 'approve_manual' && cardId) {
+      await refreshDrawer(cardId, boardId);
+    } else {
+      app.closeCard();
+    }
+  }
+
+  async function changeDelivery(update: { mode: 'manual' | 'automatic' } | { liveUrl: string }): Promise<void> {
+    if (!boardId || !deliveryGate || deliverySaving) return;
+    deliverySaving = true;
+    gateError = null;
+    try {
+      const res = await updateApprovalDelivery(boardId, deliveryGate.id, update);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        gateError = body?.error?.message ?? `Couldn't update delivery (${res.status})`;
+        return;
+      }
+      if ('liveUrl' in update) livePostUrl = '';
+      await Promise.all([app.refresh(), cardId ? refreshDrawer(cardId, boardId) : Promise.resolve()]);
+    } finally {
+      deliverySaving = false;
+    }
+  }
+
+  async function copyApprovedText(index: number, text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedItem = index;
+    } catch {
+      gateError = 'Clipboard access was refused. Select the exact text manually.';
+    }
   }
 
   // ---- answering an agent's question (docs/04 §4) ----
@@ -1144,19 +1188,22 @@
                 </p>
               {/if}
 
-              {#if gateError}
-                <p role="alert" class="border-coral/40 text-coral mono mb-2.5 rounded-[7px] border px-3 py-2 text-xs" style="background:rgba(255,107,87,.12)">
-                  {gateError}
-                </p>
+              {#if gate.approvalSubject}
+                <div class="bg-inset border-border mono mb-3 rounded-[7px] border p-2.5 text-[11px]">
+                  <div class="mb-1 font-semibold">Immutable approval subject · revision {gate.approvalSubject.revision}</div>
+                  <div class="text-muted-foreground break-all">{gate.approvalSubject.id}</div>
+                  <div class="text-muted-foreground break-all">{gate.approvalSubject.digest}</div>
+                  <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{JSON.stringify(gate.approvalSubject.canonical, null, 2)}</pre>
+                </div>
               {/if}
 
               <!-- gate action buttons — driven by effectiveOptions -->
               <div class="triad flex gap-2 flex-wrap">
                 {#each effectiveOptions as opt (opt.name)}
-                  {#if opt.name === 'approve'}
+                  {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
                     <Button
                       size="sm"
-                      onclick={() => onResolve('approve')}
+                      onclick={() => onResolve(gateDecisionForOption(opt.name))}
                       class="flex-1"
                     >{opt.title}</Button>
                   {:else if opt.name === 'request_changes'}
@@ -1194,6 +1241,73 @@
                     <Button size="sm" variant="outline" onclick={() => onResolve('request_changes')}>Send feedback</Button>
                   </div>
                 </div>
+              {/if}
+            </div>
+          </section>
+        {/if}
+
+        {#if deliveryGate?.approvalSubject}
+          <section class="sec">
+            <div class="border-border bg-inset rounded-[10px] border p-3.5">
+              <div class="mb-2 flex items-center justify-between gap-2">
+                <span class="wordmark text-sm font-semibold">Approved delivery</span>
+                <span class="mono text-muted-foreground text-[10px] uppercase">{deliveryGate.delivery?.mode}</span>
+              </div>
+
+              {#if gateError}
+                <p role="alert" class="border-coral/40 text-coral mono mb-2.5 rounded-[7px] border px-3 py-2 text-xs">{gateError}</p>
+              {/if}
+
+              {#if deliveryGate.decision === 'approve_manual'}
+                <p class="text-muted-foreground mb-3 text-xs">Post these authoritative frozen bytes yourself. No publisher can claim this card.</p>
+                <div class="space-y-3">
+                  {#each manualItems as item (item.index)}
+                    <div class="bg-surface border-border rounded-[7px] border p-2.5">
+                      <div class="mb-2 flex items-center justify-between gap-2">
+                        <span class="mono text-[10px] uppercase">Post {item.index + 1}</span>
+                        <Button size="sm" variant="outline" onclick={() => void copyApprovedText(item.index, item.text)}>
+                          {copiedItem === item.index ? 'Copied' : 'Copy exact text'}
+                        </Button>
+                      </div>
+                      <pre class="font-sans text-xs whitespace-pre-wrap">{item.text}</pre>
+                      {#if item.media.length > 0}
+                        <div class="mt-2 flex flex-wrap gap-2">
+                          {#each item.media as media (media.digest)}
+                            {#if safeHref(media.href)}
+                              <a class="mono text-marigold text-[11px] underline" href={safeHref(media.href)!} download={media.filename} title={media.altText || media.digest}>
+                                Download {media.filename}
+                              </a>
+                            {:else}
+                              <span class="mono text-muted-foreground text-[11px]" title={media.digest}>Media download unavailable</span>
+                            {/if}
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+
+                <div class="mt-3 flex flex-col gap-2">
+                  <label for="manual-live-url" class="mono text-[11px]">Live post URL</label>
+                  <div class="flex gap-2">
+                    <input id="manual-live-url" bind:value={livePostUrl} type="url" placeholder="https://x.com/…/status/…" class="bg-surface border-border min-w-0 flex-1 rounded-[7px] border px-2.5 py-2 text-xs" />
+                    <Button size="sm" disabled={deliverySaving || livePostUrl.trim() === ''} onclick={() => void changeDelivery({ liveUrl: livePostUrl.trim() })}>Record URL</Button>
+                  </div>
+                  {#if deliveryGate.delivery?.liveUrl}
+                    <p class="mono text-[11px]">
+                      Recorded: <a class="underline" href={deliveryGate.delivery.liveUrl} target="_blank" rel="noreferrer">{deliveryGate.delivery.liveUrl}</a>
+                      · read-back {deliveryGate.delivery.readBackStatus === 'not_checked' ? 'not available' : deliveryGate.delivery.readBackStatus}
+                    </p>
+                  {/if}
+                  <Button size="sm" variant="outline" disabled={deliverySaving || !!deliveryGate.delivery?.liveUrl} onclick={() => void changeDelivery({ mode: 'automatic' })}>
+                    Switch to automatic delivery
+                  </Button>
+                </div>
+              {:else if card?.state !== 'working'}
+                <p class="text-muted-foreground mb-2 text-xs">Automatic delivery has not started. You can still take over manually without approving a new digest.</p>
+                <Button size="sm" variant="outline" disabled={deliverySaving} onclick={() => void changeDelivery({ mode: 'manual' })}>Switch to manual delivery</Button>
+              {:else}
+                <p class="text-muted-foreground text-xs">Automatic delivery has started; switching is fenced.</p>
               {/if}
             </div>
           </section>

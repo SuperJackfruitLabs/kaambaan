@@ -145,6 +145,65 @@ const RUN_REPORT_MAX_BATCHES_PER_DRAIN = 10;
  */
 const HANDOFF_SUMMARY_MAX_CHARS = 600;
 
+/** A canonical subject prepared before the card/gate binding transaction. */
+interface PreparedApprovalSubject {
+  id: string;
+  schema: string;
+  revision: number;
+  canonicalBytes: Uint8Array;
+  digest: string;
+  producerRunId: string;
+  producedBy: string;
+  createdAt: string;
+}
+
+export interface ApprovalSubjectView {
+  id: string;
+  digest: string;
+  schema: string;
+  revision: number;
+  canonical: JsonValue;
+}
+
+export interface ApprovalSubjectVerification {
+  boardId: string;
+  projectId: string;
+  cardId: string;
+  runId: string;
+  stageKey: string;
+  canonicalBytesBase64: string;
+  expiresAt: string;
+  subject: ApprovalSubjectView & { account: JsonValue };
+  gate: { id: string; decision: string; decidedBy: string; resolvedAt: string };
+}
+
+/** RFC 8785/JCS serialization for JSON values (ECMAScript primitives, sorted object keys). */
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('approval subject contains a non-I-JSON number');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key]!)}`)
+    .join(',')}}`;
+}
+
+function storedBytes(value: SqlStorageValue): Uint8Array {
+  if (typeof value === 'string') return new TextEncoder().encode(value);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError('approval subject canonical bytes are not binary');
+}
+
+function bytesBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 /**
  * The part of a handoff worth showing a reviewer.
  *
@@ -189,6 +248,90 @@ const DEFAULT_GATE_OPTIONS: GateOption[] = [
   { name: 'request_changes', title: 'Request changes', interactive: true },
   { name: 'reject', title: 'Reject' },
 ];
+
+/** Delivery is chosen by the human; both choices approve the same immutable digest. */
+const APPROVAL_SUBJECT_GATE_OPTIONS: GateOption[] = [
+  { name: 'approve_manual', title: "Approve — I'll post it myself" },
+  { name: 'approve_automatic', title: 'Approve — post automatically' },
+  { name: 'request_changes', title: 'Request changes', interactive: true },
+  { name: 'reject', title: 'Reject' },
+];
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/** Validate the complete public social-publish/v1 payload before any durable write. */
+function socialPublishPayloadError(value: unknown): string | null {
+  const payload = record(value);
+  if (!payload) return 'publicationPayload must be an object';
+  if (payload.channel !== 'x') return 'publicationPayload.channel must be "x"';
+
+  const account = record(payload.account);
+  if (!account || account.platform !== 'x' || !nonEmptyString(account.userId) || !nonEmptyString(account.username)) {
+    return 'publicationPayload.account must identify an x userId and username';
+  }
+
+  if (!Array.isArray(payload.items) || payload.items.length === 0) return 'publicationPayload.items must not be empty';
+  for (let position = 0; position < payload.items.length; position += 1) {
+    const item = record(payload.items[position]);
+    if (!item || !Number.isInteger(item.index) || item.index !== position || !nonEmptyString(item.text)) {
+      return `publicationPayload.items[${position}] needs its ordered index and exact text`;
+    }
+    if (!Array.isArray(item.media)) return `publicationPayload.items[${position}].media must be an array`;
+    for (let mediaIndex = 0; mediaIndex < item.media.length; mediaIndex += 1) {
+      const media = record(item.media[mediaIndex]);
+      if (
+        !media ||
+        !nonEmptyString(media.objectRef) ||
+        typeof media.sha256 !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(media.sha256) ||
+        !nonEmptyString(media.mime) ||
+        !Number.isInteger(media.size) ||
+        (media.size as number) < 0 ||
+        typeof media.altText !== 'string' ||
+        !nonEmptyString(media.rightsRef)
+      ) {
+        return `publicationPayload.items[${position}].media[${mediaIndex}] is incomplete`;
+      }
+    }
+    for (const key of ['replyToPostId', 'quotePostId'] as const) {
+      if (item[key] !== null && !nonEmptyString(item[key])) {
+        return `publicationPayload.items[${position}].${key} must be null or a post id`;
+      }
+    }
+  }
+
+  const timing = record(payload.timing);
+  if (
+    !timing ||
+    (timing.mode !== 'immediate' && timing.mode !== 'scheduled') ||
+    (timing.notBefore !== null && !nonEmptyString(timing.notBefore)) ||
+    !nonEmptyString(timing.expiresAt) ||
+    Number.isNaN(Date.parse(timing.expiresAt)) ||
+    (timing.notBefore !== null && Number.isNaN(Date.parse(timing.notBefore as string))) ||
+    (timing.mode === 'scheduled' && timing.notBefore === null)
+  ) {
+    return 'publicationPayload.timing is invalid';
+  }
+  if (!Array.isArray(payload.evidenceRefs) || !payload.evidenceRefs.every(nonEmptyString)) {
+    return 'publicationPayload.evidenceRefs must be an array of references';
+  }
+  const policy = record(payload.policy);
+  if (
+    !policy ||
+    typeof policy.allowThread !== 'boolean' ||
+    !nonEmptyString(policy.duplicatePolicyId) ||
+    !nonEmptyString(policy.floodPolicyId)
+  ) {
+    return 'publicationPayload.policy is invalid';
+  }
+  return null;
+}
 
 /** A pipeline stage (board column). `ownerKind`/`owner` drive agent claim routing (docs/01, docs/04). */
 /**
@@ -289,6 +432,10 @@ export interface StageDef {
    */
   requires?: { all?: string[]; any?: string[] };
   gate?: 'none' | 'approval';
+  /** Opts this human gate into immutable, digest-bound approval subjects. */
+  approvalSubjectSchema?: string;
+  /** Human principals allowed to decide a bound approval subject. */
+  approvalDeciderPrincipalIds?: string[];
   wipLimit?: number;
   /**
    * What a run must produce here before the board believes it finished
@@ -670,9 +817,15 @@ export interface RunEvidence {
 
 const EVIDENCE_DECISION: Record<string, RunEvidenceGate['decision']> = {
   approve: 'approved',
+  approve_manual: 'approved',
+  approve_automatic: 'approved',
   request_changes: 'changes_requested',
   reject: 'rejected',
 };
+
+function isApproveDecision(decision: GateDecision): boolean {
+  return decision === 'approve' || decision === 'approve_manual' || decision === 'approve_automatic';
+}
 
 /** Per-activity token/cost usage reported by an agent (docs/05 §1). */
 export interface UsageInput {
@@ -783,6 +936,16 @@ export interface GateView {
    * deciding blind. Plain text — a reader must render it as text.
    */
   summary?: string | null;
+  /** Present only for an opt-in digest-bound gate; loaded from immutable subject storage. */
+  approvalSubject?: ApprovalSubjectView;
+  /** Human-selected delivery state for a resolved immutable publishing approval. */
+  delivery?: {
+    mode: 'manual' | 'automatic';
+    liveUrl: string | null;
+    readBackStatus: 'not_checked' | 'matched' | 'mismatch';
+    recordedBy: string | null;
+    recordedAt: string | null;
+  };
 }
 
 /**
@@ -822,8 +985,12 @@ export interface GatePendingBody {
   returnStageKey: string;
   cardTitle: string;
   producedBy: string;
-  /** What the reviewer is being asked to approve; null when nothing was handed forward. */
+  /** What the reviewer is being asked to approve; null for generic handoff-free gates. */
   handoffSummary: string | null;
+  /** Immutable metadata for a digest-bound gate; canonical payload stays behind the authenticated route. */
+  approvalSubject?: Pick<ApprovalSubjectView, 'id' | 'digest' | 'schema' | 'revision'>;
+  /** Authenticated web route for reviewing the authoritative subject. */
+  reviewUrl?: string;
   options: Array<{ id: string; label: string }>;
   /** When the gate opened. The gate's own clock, so a re-read is byte-identical. */
   ts: string;
@@ -1077,6 +1244,16 @@ export type BoardErrorCode =
   | 'STALE_LEASE'
   | 'GATE_NOT_FOUND'
   | 'GATE_NOT_PENDING'
+  | 'INVALID_APPROVAL_SUBJECT'
+  | 'APPROVAL_DECIDER_NOT_ALLOWED'
+  | 'APPROVAL_SUBJECT_MISMATCH'
+  | 'APPROVAL_SUBJECT_NOT_VERIFIED'
+  | 'APPROVAL_SUBJECT_EXPIRED'
+  | 'APPROVAL_DELIVERY_NOT_AVAILABLE'
+  | 'APPROVAL_DELIVERY_NOT_MANUAL'
+  | 'APPROVAL_DELIVERY_STARTED'
+  | 'INVALID_APPROVAL_DELIVERY'
+  | 'INVALID_LIVE_URL'
   | 'ELICITATION_NOT_FOUND'
   | 'ELICITATION_NOT_PENDING'
   | 'INVALID_ANSWER'
@@ -1257,6 +1434,15 @@ export interface BoardStub {
   listRunComments(input: { runId: string; agentId: string | null }): Promise<Result<CommentView[]>>;
   /** Post as the agent holding `runId`, on that run's card (the MCP post tool). */
   addRunComment(input: { runId: string; agentId: string; agentName: string | null; body: string }): Promise<Result<CommentView>>;
+  verifyApprovalSubject(input: {
+    runId: string;
+    leaseEpoch: number;
+    agentId?: string | null;
+    expectedSchema: string;
+    expectedSubjectId: string;
+    expectedDigest: string;
+    expectedAccount: JsonValue;
+  }): Promise<Result<ApprovalSubjectVerification>>;
 
   /** A run as evidence for superwitness (contract C4). `NOT_INITIALIZED` means no such board here. */
   getRunEvidence(runId: string): Promise<Result<RunEvidence>>;
@@ -1335,7 +1521,15 @@ export interface BoardStub {
     decision: GateDecision;
     decidedBy: string;
     comment?: string;
+    approvalSubjectId?: string;
+    approvalSubjectDigest?: string;
   }): Promise<Result<CardView>>;
+  updateApprovalDelivery(input: {
+    gateId: string;
+    actor: string;
+    mode?: 'manual' | 'automatic';
+    liveUrl?: string;
+  }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>>;
   answerElicitation(input: {
     elicitationId: string;
     answeredBy: string;
@@ -1799,6 +1993,11 @@ export class BoardDO extends DurableObject<Env> {
          WHERE id = NEW.id;
        END`,
     );
+    try {
+      this.sql.exec(`ALTER TABLE cards ADD COLUMN active_approval_subject_id TEXT`);
+    } catch {
+      // column already exists
+    }
     // Only `project_id` is indexed: `projectSummary` is the one query that filters cards by it,
     // and nothing here looks cards up by `milestone_id` on its own.
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_cards_project ON cards(project_id)`);
@@ -1843,7 +2042,76 @@ export class BoardDO extends DurableObject<Env> {
     } catch {
       // column already exists
     }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN approval_subject_id TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN approval_subject_digest TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url_recorded_by TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url_recorded_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_readback_status TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN approval_decider_ids_json TEXT`);
+    } catch {
+      // column already exists
+    }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_gates_run ON gates(run_id)`);
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS approval_subjects (
+        id TEXT PRIMARY KEY,
+        card_id TEXT NOT NULL,
+        gate_stage_key TEXT NOT NULL,
+        schema TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        canonical_bytes BLOB NOT NULL,
+        digest TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'invalidated')),
+        producer_run_id TEXT NOT NULL,
+        produced_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        invalidated_at TEXT,
+        invalidated_by TEXT,
+        invalidation_reason TEXT,
+        UNIQUE(card_id, schema, revision)
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_approval_subjects_card ON approval_subjects(card_id)`);
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS approval_delivery_events (
+        id TEXT PRIMARY KEY,
+        gate_id TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        from_mode TEXT,
+        to_mode TEXT,
+        actor TEXT NOT NULL,
+        live_url TEXT,
+        created_at TEXT NOT NULL
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_approval_delivery_events_gate ON approval_delivery_events(gate_id)`);
     // An agent's open question to a human (docs/04 §4). Persisting it is what makes an answer
     // possible: the activity stream is append-only history, and history cannot be replied to.
     this.sql.exec(
@@ -2404,6 +2672,7 @@ export class BoardDO extends DurableObject<Env> {
     }
     const unresolvedBlockers = this.unresolvedBlockerCount(cardId);
     const now = this.now();
+    this.invalidateApprovalSubject(cardId, 'card.route_changed', actorUserId ?? null);
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
@@ -2643,9 +2912,15 @@ export class BoardDO extends DurableObject<Env> {
       sets.push('title = ?');
       vals.push(patch.title);
     }
+    const normalizedSpec =
+      patch.spec === undefined
+        ? undefined
+        : this.getMeta('dueBackfillDone')
+          ? stripStaleSpecKeys(patch.spec)
+          : patch.spec;
     if (patch.spec !== undefined) {
       sets.push('spec_json = ?');
-      vals.push(JSON.stringify(this.getMeta('dueBackfillDone') ? stripStaleSpecKeys(patch.spec) : patch.spec));
+      vals.push(JSON.stringify(normalizedSpec));
     }
     if (patch.priority !== undefined) {
       sets.push('priority = ?');
@@ -2693,7 +2968,10 @@ export class BoardDO extends DurableObject<Env> {
       const nowMs = Date.parse(this.now());
       const prevMs = existing.updatedAt ? Date.parse(existing.updatedAt) : Number.NaN;
       vals.push(new Date(Number.isNaN(prevMs) ? nowMs : Math.max(nowMs, prevMs + 1)).toISOString());
-      this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
+      this.ctx.storage.transactionSync(() => {
+        this.invalidateApprovalSubject(cardId, patch.spec !== undefined ? 'card.spec_changed' : 'card.changed', null);
+        this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
+      });
     }
     const card = this.mustGetCard(cardId);
     this.emit('card.updated', { card });
@@ -4792,6 +5070,103 @@ export class BoardDO extends DurableObject<Env> {
     return { comments: kept, commentsOmitted: live.length - kept.length };
   }
 
+  async verifyApprovalSubject(input: {
+    runId: string;
+    leaseEpoch: number;
+    agentId?: string | null;
+    expectedSchema: string;
+    expectedSubjectId: string;
+    expectedDigest: string;
+    expectedAccount: JsonValue;
+  }): Promise<Result<ApprovalSubjectVerification>> {
+    const auth = this.authorizeRun(input);
+    if (!auth.ok) return auth;
+    const boardId = this.getMeta('boardId');
+    if (!boardId) return { ok: false, code: 'NOT_INITIALIZED', message: 'board is not initialized' };
+
+    const run = auth.run;
+    const cardId = run.card_id as string;
+    const cardRow = this.getCardRow(cardId);
+    const subjectId = (cardRow?.active_approval_subject_id as string | null | undefined) ?? null;
+    if (!cardRow || cardRow.current_stage_key !== run.stage_key || !subjectId) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'the run is not bound to an active approval subject' };
+    }
+
+    const subjectRow = this.sql.exec(`SELECT * FROM approval_subjects WHERE id = ?`, subjectId).toArray()[0];
+    const gate = this.sql
+      .exec(`SELECT * FROM gates WHERE approval_subject_id = ? AND card_id = ? ORDER BY rowid DESC LIMIT 1`, subjectId, cardId)
+      .toArray()[0];
+    const subject = this.approvalSubjectView(subjectId);
+    const stage = this.stages().find((candidate) => candidate.key === (run.stage_key as string));
+    if (
+      !subjectRow ||
+      !subject ||
+      subjectRow.status !== 'active' ||
+      subjectRow.card_id !== cardId ||
+      !gate ||
+      gate.status !== 'resolved' ||
+      !isApproveDecision(gate.decision as GateDecision) ||
+      gate.decision === 'approve_manual' ||
+      gate.approval_subject_digest !== subject.digest ||
+      gate.stage_key !== subjectRow.gate_stage_key ||
+      !gate.decided_by ||
+      !gate.resolved_at ||
+      !stage ||
+      stage.ownerKind !== 'capability' ||
+      !stageCapabilitiesMet(stage, ['x-publish'])
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject and gate binding is not valid' };
+    }
+    if (
+      subject.schema !== input.expectedSchema ||
+      input.expectedSubjectId !== subject.id ||
+      input.expectedDigest !== subject.digest
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject does not match executor expectations' };
+    }
+
+    const canonical = record(subject.canonical);
+    const account = canonical?.account as JsonValue | undefined;
+    const timing = record(canonical?.timing);
+    const projectId = (cardRow.project_id as string | null | undefined) ?? null;
+    if (
+      !account ||
+      !timing ||
+      !nonEmptyString(timing.expiresAt) ||
+      !projectId ||
+      canonical?.cardId !== cardId ||
+      canonical.projectId !== projectId
+    ) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject lacks its card, project, account, or expiry binding' };
+    }
+    if (canonicalJson(input.expectedAccount) !== canonicalJson(account)) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED', message: 'approval subject account does not match executor expectations' };
+    }
+    if (Date.parse(timing.expiresAt) <= this.nowMs()) {
+      return { ok: false, code: 'APPROVAL_SUBJECT_EXPIRED', message: 'approval subject has expired' };
+    }
+
+    return {
+      ok: true,
+      value: {
+        boardId,
+        projectId,
+        cardId,
+        runId: input.runId,
+        stageKey: run.stage_key as string,
+        canonicalBytesBase64: bytesBase64(storedBytes(subjectRow.canonical_bytes)),
+        expiresAt: timing.expiresAt,
+        subject: { ...subject, account },
+        gate: {
+          id: gate.id as string,
+          decision: gate.decision as string,
+          decidedBy: gate.decided_by as string,
+          resolvedAt: gate.resolved_at as string,
+        },
+      },
+    };
+  }
+
   /**
    * A run as evidence (superwitness contract C4; charter evidence-joins-on-the-work-run decisions
    * 4 and 5). Read-only. Gates: those this run opened, plus legacy gates (null run_id) on the same
@@ -5139,7 +5514,6 @@ export class BoardDO extends DurableObject<Env> {
     if (!auth.ok) return auth;
     const run = auth.run;
     const cardId = run.card_id as string;
-
     // Refused BEFORE the run ends, so a malformed call is something the agent corrects on the same
     // run rather than a card the board has to reason about. The REST surface casts rather than
     // parses, so the vocabulary is checked here too.
@@ -5153,6 +5527,26 @@ export class BoardDO extends DurableObject<Env> {
     }
     if (input.outcome === 'needs-person') return this.waitOnPerson(input, run);
 
+    const card = this.mustGetCard(cardId);
+    const stages = this.stages();
+    const stageIndex = stages.findIndex((stage) => stage.key === card.currentStageKey);
+    const nextStage = stageIndex === -1 ? undefined : stages[stageIndex + 1];
+    let approvalSubject: PreparedApprovalSubject | null = null;
+    if (nextStage?.approvalSubjectSchema && nextStage.gate === 'approval' && !this.isAgentClaimable(nextStage)) {
+      const prepared = await this.prepareApprovalSubject(card, nextStage, input.handoff, input.runId, run.agent_id as string);
+      if (!prepared.ok) return prepared;
+      approvalSubject = prepared.value;
+
+      // SHA-256 is asynchronous. A Durable Object may admit another request while it is awaited,
+      // so fence again before the first write. The winning completion ends the run synchronously;
+      // every concurrent completion then observes a stale lease instead of colliding mid-transaction.
+      const fenced = this.authorizeRun(input);
+      if (!fenced.ok) return fenced;
+      const current = this.getCard(cardId);
+      if (!current || current.currentStageKey !== card.currentStageKey || (fenced.run.card_id as string) !== cardId) {
+        return { ok: false, code: 'STALE_LEASE', message: 'the card moved while the approval subject was prepared' };
+      }
+    }
     const now = this.now();
     // Computed here rather than further down, because the run's own record needs it too. Same
     // expression the card gets below; `undefined` (no handoff given) stays NULL in both.
@@ -5160,15 +5554,18 @@ export class BoardDO extends DurableObject<Env> {
     // The handoff lands on the RUN as well as the card: the card's copy is what the next claim
     // reads and is overwritten at every stage; this one is the permanent record of what this stage
     // said when it finished.
-    this.sql.exec(
-      `UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ?, handoff_json = ? WHERE id = ?`,
-      now,
-      handoffJson,
-      input.runId,
-    );
-    this.cancelElicitationsForRun(input.runId);
-
-    const card = this.mustGetCard(cardId);
+    const endRun = () => {
+      this.sql.exec(
+        `UPDATE runs SET status = 'ended', outcome = 'completed', ended_at = ?, handoff_json = ? WHERE id = ?`,
+        now,
+        handoffJson,
+        input.runId,
+      );
+      this.cancelElicitationsForRun(input.runId);
+    };
+    // A digest-bound completion commits its run/card/subject/gate binding together below. Generic
+    // completions retain their established order and behaviour.
+    if (!approvalSubject) endRun();
 
     /**
      * Completion is earned, not announced.
@@ -5183,10 +5580,10 @@ export class BoardDO extends DurableObject<Env> {
      * impossible to say. It is recorded on the run, because routing around a check is a legitimate
      * act and a silent one is not.
      */
-    const stages = this.stages();
     const stage = stages.find((st) => st.key === card.currentStageKey);
     const cardOverride = (card.spec as { completion?: CompletionRequirement } | null | undefined)?.completion;
     const requirement = cardOverride ?? stage?.completion;
+    let approvalCompletionRecord: Record<string, unknown> | null = null;
 
     const returnsSoFar = Number(this.getCardRow(cardId)?.auto_returns ?? 0);
     const route = routeOutcome(
@@ -5211,16 +5608,25 @@ export class BoardDO extends DurableObject<Env> {
     // one automatic rework naming what to add, then a person.
     if (route.kind === 'refuse') refusals.push(route.reason);
 
-    if (requirement || input.outcome !== undefined || refusals.length > 0) {
-      this.recordRunCompletion(input.runId, {
+    const completionRecord =
+      requirement || input.outcome !== undefined || refusals.length > 0
+        ? {
         ...(verdict ?? { met: refusals.length === 0 }),
         ...(refusals.length > 0 ? { met: false, reason: refusals.join('; ') } : {}),
         ...(requirement ? { override: cardOverride !== undefined } : {}),
         ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
-      });
+          }
+        : null;
+    if (completionRecord) {
+      if (approvalSubject && refusals.length === 0 && route.kind === 'advance') {
+        approvalCompletionRecord = completionRecord;
+      } else {
+        this.recordRunCompletion(input.runId, completionRecord);
+      }
     }
 
     if (refusals.length > 0) {
+      if (approvalSubject) endRun();
       const why = refusals.join('; ');
       // Blocked, not failed (D1): the agent asserted something untrue. The run says so whatever
       // happens to the card next.
@@ -5248,6 +5654,7 @@ export class BoardDO extends DurableObject<Env> {
     }
 
     if (route.kind === 'return' || route.kind === 'park') {
+      if (approvalSubject) endRun();
       const findings = input.findings!.trim();
       // The findings go on the thread, where people read, as the judge's own words.
       this.writeComment(cardId, { kind: 'agent', id: run.agent_id as string, name: null }, findings);
@@ -5272,7 +5679,15 @@ export class BoardDO extends DurableObject<Env> {
       return { ok: true, value: this.mustGetCard(cardId) };
     }
 
-    this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId);
+    if (approvalSubject) {
+      this.ctx.storage.transactionSync(() => {
+        endRun();
+        if (approvalCompletionRecord) this.recordRunCompletion(input.runId, approvalCompletionRecord);
+        this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId, approvalSubject);
+      });
+    } else {
+      this.advanceCard(cardId, card.currentStageKey, run.agent_id as string, handoffJson, input.runId, null);
+    }
     // After advanceCard: a human gate it opened judges this run, so the run reports `waiting`.
     this.reportRun(input.runId);
     await this.scheduleReclaim();
@@ -5416,6 +5831,8 @@ export class BoardDO extends DurableObject<Env> {
     decision: GateDecision;
     decidedBy: string;
     comment?: string;
+    approvalSubjectId?: string;
+    approvalSubjectDigest?: string;
   }): Promise<Result<CardView>> {
     const gate = this.sql.exec(`SELECT * FROM gates WHERE id = ?`, input.gateId).toArray()[0];
     if (!gate) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${input.gateId}` };
@@ -5425,6 +5842,38 @@ export class BoardDO extends DurableObject<Env> {
     if (input.decidedBy === (gate.produced_by as string)) {
       return { ok: false, code: 'SEPARATION_OF_DUTIES', message: 'the producer cannot resolve their own gate' };
     }
+
+    const boundSubjectId = (gate.approval_subject_id as string | null) ?? null;
+    if (boundSubjectId) {
+      const deciders = JSON.parse((gate.approval_decider_ids_json as string | null) ?? '[]') as string[];
+      if (input.decidedBy.startsWith('agt_') || !deciders.includes(input.decidedBy)) {
+        return {
+          ok: false,
+          code: 'APPROVAL_DECIDER_NOT_ALLOWED',
+          message: 'this principal is not an authorized human decider for the approval subject',
+        };
+      }
+      if (
+        input.approvalSubjectId !== boundSubjectId ||
+        input.approvalSubjectDigest !== (gate.approval_subject_digest as string)
+      ) {
+        return {
+          ok: false,
+          code: 'APPROVAL_SUBJECT_MISMATCH',
+          message: 'the rendered approval subject id and digest no longer match this gate',
+        };
+      }
+      const subject = this.sql.exec(`SELECT status, digest FROM approval_subjects WHERE id = ?`, boundSubjectId).toArray()[0];
+      if (
+        !subject ||
+        subject.status !== 'active' ||
+        subject.digest !== gate.approval_subject_digest ||
+        this.getCardRow(gate.card_id as string)?.active_approval_subject_id !== boundSubjectId
+      ) {
+        return { ok: false, code: 'APPROVAL_SUBJECT_MISMATCH', message: 'the approval subject is no longer active' };
+      }
+    }
+
     const cardId = gate.card_id as string;
     const now = this.now();
     this.sql.exec(
@@ -5435,11 +5884,29 @@ export class BoardDO extends DurableObject<Env> {
       now,
       input.gateId,
     );
-    if (input.decision === 'approve') {
+    if (boundSubjectId && (input.decision === 'approve_manual' || input.decision === 'approve_automatic')) {
+      this.sql.exec(
+        `INSERT INTO approval_delivery_events
+           (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+         VALUES (?, ?, ?, 'approved', NULL, ?, ?, NULL, ?)`,
+        newId('ade'),
+        input.gateId,
+        boundSubjectId,
+        input.decision === 'approve_manual' ? 'manual' : 'automatic',
+        input.decidedBy,
+        now,
+      );
+    }
+    if (input.decision === 'approve_manual' && boundSubjectId) {
+      // A manual approval remains on its human stage: publisher claims are impossible by routing,
+      // while verifyApprovalSubject independently fences a corrupted or stale claim.
+      this.parkForHuman(cardId, { reason: 'review', detail: 'approved for manual delivery' });
+    } else if (isApproveDecision(input.decision)) {
       // The approver becomes the producer of any chained gate (keeps separation-of-duties intact).
       // An approval produces no new work, so a chained gate judges the same run's work.
       this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
     } else if (input.decision === 'request_changes') {
+      if (boundSubjectId) this.invalidateApprovalSubject(cardId, 'gate.request_changes', input.decidedBy);
       // Keep the agent's prior handoff and add the reviewer's feedback so rework has full context.
       const prior = this.parseHandoff(this.getCardHandoffJson(cardId));
       const merged =
@@ -5457,6 +5924,7 @@ export class BoardDO extends DurableObject<Env> {
       this.emit('card.changes_requested', { cardId, gateId: input.gateId, to: gate.return_stage_key });
       this.notifyWorkAvailable(cardId); // back on a claimable stage for rework
     } else {
+      if (boundSubjectId) this.invalidateApprovalSubject(cardId, 'gate.reject', input.decidedBy);
       this.sql.exec(
         `UPDATE cards SET state = 'rejected', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
         now,
@@ -5470,6 +5938,114 @@ export class BoardDO extends DurableObject<Env> {
     if (judged) this.reportRun(judged);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
+  }
+
+  /** Change delivery mechanics without changing the approved immutable bytes. */
+  async updateApprovalDelivery(input: {
+    gateId: string;
+    actor: string;
+    mode?: 'manual' | 'automatic';
+    liveUrl?: string;
+  }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>> {
+    const gate = this.sql.exec(`SELECT * FROM gates WHERE id = ?`, input.gateId).toArray()[0];
+    if (!gate) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${input.gateId}` };
+    const subjectId = (gate.approval_subject_id as string | null) ?? null;
+    const decision = gate.decision as string | null;
+    if (gate.status !== 'resolved' || !subjectId || (decision !== 'approve_manual' && decision !== 'approve_automatic')) {
+      return { ok: false, code: 'APPROVAL_DELIVERY_NOT_AVAILABLE', message: 'this gate has no changeable delivery approval' };
+    }
+    const deciders = JSON.parse((gate.approval_decider_ids_json as string | null) ?? '[]') as string[];
+    if (input.actor.startsWith('agt_') || !deciders.includes(input.actor)) {
+      return { ok: false, code: 'APPROVAL_DECIDER_NOT_ALLOWED', message: 'this principal cannot change approval delivery' };
+    }
+    const cardId = gate.card_id as string;
+    const cardRow = this.getCardRow(cardId);
+    const subject = this.sql.exec(`SELECT status FROM approval_subjects WHERE id = ?`, subjectId).toArray()[0];
+    if (!cardRow || cardRow.active_approval_subject_id !== subjectId || subject?.status !== 'active') {
+      return { ok: false, code: 'APPROVAL_SUBJECT_MISMATCH', message: 'the approved subject is no longer active' };
+    }
+    if ((input.mode === undefined) === (input.liveUrl === undefined)) {
+      return { ok: false, code: 'INVALID_APPROVAL_DELIVERY', message: 'provide exactly one of mode or liveUrl' };
+    }
+
+    const now = this.now();
+    if (input.liveUrl !== undefined) {
+      if (decision !== 'approve_manual') {
+        return { ok: false, code: 'APPROVAL_DELIVERY_NOT_MANUAL', message: 'a live URL is recorded only for manual delivery' };
+      }
+      let parsed: URL;
+      try {
+        parsed = new URL(input.liveUrl);
+      } catch {
+        return { ok: false, code: 'INVALID_LIVE_URL', message: 'live URL must be an absolute https URL' };
+      }
+      if (parsed.protocol !== 'https:') {
+        return { ok: false, code: 'INVALID_LIVE_URL', message: 'live URL must be an absolute https URL' };
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          `UPDATE gates SET live_post_url = ?, live_post_url_recorded_by = ?, live_post_url_recorded_at = ?,
+                            live_post_readback_status = 'not_checked' WHERE id = ?`,
+          parsed.toString(),
+          input.actor,
+          now,
+          input.gateId,
+        );
+        this.sql.exec(
+          `INSERT INTO approval_delivery_events
+             (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+           VALUES (?, ?, ?, 'live_url_recorded', 'manual', 'manual', ?, ?, ?)`,
+          newId('ade'),
+          input.gateId,
+          subjectId,
+          input.actor,
+          parsed.toString(),
+          now,
+        );
+      });
+    } else {
+      const currentMode = decision === 'approve_manual' ? 'manual' : 'automatic';
+      const nextMode = input.mode!;
+      if (nextMode !== currentMode) {
+        if (currentMode === 'automatic' && (cardRow.current_run_id || cardRow.state === 'working')) {
+          return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'automatic delivery has already been claimed' };
+        }
+        if (currentMode === 'manual' && gate.live_post_url) {
+          return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'manual delivery already has a recorded live URL' };
+        }
+        this.ctx.storage.transactionSync(() => {
+          if (currentMode === 'automatic') {
+            this.sql.exec(
+              `UPDATE cards SET current_stage_key = ?, state = 'input-required', delegate_agent_id = NULL,
+                                current_run_id = NULL, needs_human_json = ?, updated_at = ? WHERE id = ?`,
+              gate.stage_key,
+              JSON.stringify({ reason: 'review', detail: 'approved for manual delivery' }),
+              now,
+              cardId,
+            );
+          } else {
+            this.setNeedsHuman(cardId, null);
+            this.advanceCard(cardId, gate.stage_key as string, input.actor, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
+          }
+          this.sql.exec(`UPDATE gates SET decision = ? WHERE id = ?`, nextMode === 'manual' ? 'approve_manual' : 'approve_automatic', input.gateId);
+          this.sql.exec(
+            `INSERT INTO approval_delivery_events
+               (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+             VALUES (?, ?, ?, 'mode_switched', ?, ?, ?, NULL, ?)`,
+            newId('ade'),
+            input.gateId,
+            subjectId,
+            currentMode,
+            nextMode,
+            input.actor,
+            now,
+          );
+        });
+      }
+    }
+
+    const view = this.rowToGate(this.getGateRow(input.gateId)!);
+    return { ok: true, value: { ...this.mustGetCard(cardId), delivery: view.delivery! } };
   }
 
   /**
@@ -5946,7 +6522,14 @@ export class BoardDO extends DurableObject<Env> {
    * `TaskState`. It is not literally true here ("a human must act"); `openChildCount > 0` is what a
    * reader (Task 17's UI) uses to tell this park apart from a real review gate.
    */
-  private advanceCard(cardId: string, fromStageKey: string, producedBy: string, handoffJson: string | null, runId: string | null): void {
+  private advanceCard(
+    cardId: string,
+    fromStageKey: string,
+    producedBy: string,
+    handoffJson: string | null,
+    runId: string | null,
+    approvalSubject: PreparedApprovalSubject | null = null,
+  ): void {
     const openChildren = this.openChildCount(cardId);
     if (openChildren > 0) {
       this.sql.exec(
@@ -5998,7 +6581,7 @@ export class BoardDO extends DurableObject<Env> {
       cardId,
     );
     this.emit('card.advanced', { cardId, from: fromStageKey, to: next.key });
-    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy, runId);
+    if (gated) this.createGate(cardId, next.key, fromStageKey, producedBy, runId, approvalSubject);
     else this.notifyWorkAvailable(cardId);
   }
 
@@ -6050,21 +6633,156 @@ export class BoardDO extends DurableObject<Env> {
     if (pending.runId) this.reportRun(pending.runId);
   }
 
-  private createGate(cardId: string, stageKey: string, returnStageKey: string, producedBy: string, runId: string | null): string {
-    const id = newId('gate');
+  /** Retire the active subject without deleting its immutable audit row. */
+  private invalidateApprovalSubject(cardId: string, reason: string, invalidatedBy: string | null): void {
+    const cardRow = this.getCardRow(cardId);
+    const subjectId = (cardRow?.active_approval_subject_id as string | null | undefined) ?? null;
+    if (!subjectId) return;
     const now = this.now();
     this.sql.exec(
-      `INSERT INTO gates (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at, run_id)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-      id,
-      cardId,
-      stageKey,
-      returnStageKey,
-      producedBy,
-      JSON.stringify(DEFAULT_GATE_OPTIONS),
+      `UPDATE approval_subjects
+          SET status = 'invalidated', invalidated_at = ?, invalidated_by = ?, invalidation_reason = ?
+        WHERE id = ? AND status = 'active'`,
       now,
-      runId,
+      invalidatedBy,
+      reason,
+      subjectId,
     );
+    this.sql.exec(
+      `UPDATE gates SET status = 'cancelled', resolved_at = ?
+        WHERE approval_subject_id = ? AND status = 'pending'`,
+      now,
+      subjectId,
+    );
+    this.sql.exec(`UPDATE cards SET active_approval_subject_id = NULL WHERE id = ?`, cardId);
+
+    const stage = this.stages().find((candidate) => candidate.key === (cardRow?.current_stage_key as string));
+    if (stage && this.isAgentClaimable(stage)) {
+      // A publisher may already be looking for work. Parking the card prevents a fresh claim; any
+      // existing run is fenced again by verifyApprovalSubject before it may cause a side effect.
+      this.sql.exec(
+        `UPDATE cards SET state = 'input-required', delegate_agent_id = NULL, current_run_id = NULL, updated_at = ? WHERE id = ?`,
+        now,
+        cardId,
+      );
+    }
+  }
+
+  private async prepareApprovalSubject(
+    card: CardView,
+    stage: StageDef,
+    handoff: JsonValue | undefined,
+    runId: string,
+    producedBy: string,
+  ): Promise<Result<PreparedApprovalSubject>> {
+    const invalid = (message: string): Result<PreparedApprovalSubject> => ({
+      ok: false,
+      code: 'INVALID_APPROVAL_SUBJECT',
+      message,
+    });
+    if (stage.approvalSubjectSchema !== 'social-publish/v1') {
+      return invalid(`unsupported approval subject schema: ${stage.approvalSubjectSchema ?? ''}`);
+    }
+    if (!stage.approvalDeciderPrincipalIds?.length || stage.approvalDeciderPrincipalIds.some((id) => !nonEmptyString(id))) {
+      return invalid(`stage "${stage.key}" needs at least one approval decider principal`);
+    }
+    if (card.projectId === null) return invalid('approval subject card needs a project');
+    if (handoff === null || typeof handoff !== 'object' || Array.isArray(handoff)) {
+      return invalid('approval subject handoff must be an object');
+    }
+    const payload = handoff.publicationPayload;
+    const payloadError = socialPublishPayloadError(payload);
+    if (payloadError) return invalid(payloadError);
+
+    const prior = this.sql
+      .exec(
+        `SELECT COALESCE(MAX(revision), 0) AS revision FROM approval_subjects WHERE card_id = ? AND schema = ?`,
+        card.id,
+        stage.approvalSubjectSchema,
+      )
+      .one();
+    const revision = Number(prior.revision) + 1;
+    let canonical: string;
+    try {
+      canonical = canonicalJson({
+        ...(payload as Record<string, JsonValue>),
+        schema: stage.approvalSubjectSchema,
+        cardId: card.id,
+        projectId: card.projectId,
+        revision,
+      });
+    } catch (error) {
+      return invalid((error as Error).message);
+    }
+    const canonicalBytes = new TextEncoder().encode(canonical);
+    const hash = await crypto.subtle.digest('SHA-256', canonicalBytes);
+    const digest = `sha256:${[...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+    return {
+      ok: true,
+      value: {
+        id: newId('aps'),
+        schema: stage.approvalSubjectSchema,
+        revision,
+        canonicalBytes,
+        digest,
+        producerRunId: runId,
+        producedBy,
+        createdAt: this.now(),
+      },
+    };
+  }
+
+  private createGate(
+    cardId: string,
+    stageKey: string,
+    returnStageKey: string,
+    producedBy: string,
+    runId: string | null,
+    approvalSubject: PreparedApprovalSubject | null = null,
+  ): string {
+    const id = newId('gate');
+    const now = this.now();
+    const stage = this.stages().find((candidate) => candidate.key === stageKey);
+    this.ctx.storage.transactionSync(() => {
+      if (approvalSubject) {
+        this.sql.exec(
+          `INSERT INTO approval_subjects
+             (id, card_id, gate_stage_key, schema, revision, canonical_bytes, digest, status,
+              producer_run_id, produced_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+          approvalSubject.id,
+          cardId,
+          stageKey,
+          approvalSubject.schema,
+          approvalSubject.revision,
+          approvalSubject.canonicalBytes,
+          approvalSubject.digest,
+          approvalSubject.producerRunId,
+          approvalSubject.producedBy,
+          approvalSubject.createdAt,
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO gates
+           (id, card_id, stage_key, return_stage_key, status, produced_by, options_json, created_at, run_id,
+            approval_subject_id, approval_subject_digest, approval_decider_ids_json)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        cardId,
+        stageKey,
+        returnStageKey,
+        producedBy,
+        JSON.stringify(approvalSubject ? APPROVAL_SUBJECT_GATE_OPTIONS : DEFAULT_GATE_OPTIONS),
+        now,
+        runId,
+        approvalSubject?.id ?? null,
+        approvalSubject?.digest ?? null,
+        approvalSubject ? JSON.stringify(stage?.approvalDeciderPrincipalIds ?? []) : null,
+      );
+      if (approvalSubject) {
+        this.sql.exec(`UPDATE cards SET active_approval_subject_id = ? WHERE id = ?`, approvalSubject.id, cardId);
+      }
+    });
     this.emit('gate.opened', { gateId: id, cardId, stageKey });
     this.notify('gate', cardId, `Review needed at ${stageKey}`);
     this.notifyGatePending(id);
@@ -6371,20 +7089,7 @@ export class BoardDO extends DurableObject<Env> {
     return this.sql
       .exec(`SELECT * FROM gates WHERE status = 'pending' ORDER BY created_at ASC`)
       .toArray()
-      .map((r) => ({
-        id: r.id as string,
-        cardId: r.card_id as string,
-        stageKey: r.stage_key as string,
-        status: r.status as 'pending' | 'resolved',
-        decision: (r.decision as string | null) ?? null,
-        options: JSON.parse(r.options_json as string) as GateOption[],
-        producedBy: r.produced_by as string,
-        createdAt: r.created_at as string,
-        decidedBy: (r.decided_by as string | null) ?? null,
-        comment: (r.comment as string | null) ?? null,
-        resolvedAt: (r.resolved_at as string | null) ?? null,
-        summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
-      }));
+      .map((r) => this.rowToGate(r as Row));
   }
 
   /**
@@ -6404,18 +7109,52 @@ export class BoardDO extends DurableObject<Env> {
 
   /** One gate row as a `GateView`. Shared, so one gate and a card's gates cannot disagree. */
   private rowToGate(r: Row): GateView {
+    const subjectId = (r.approval_subject_id as string | null) ?? null;
+    const approvalSubject = subjectId ? this.approvalSubjectView(subjectId) : null;
+    const decision = (r.decision as string | null) ?? null;
+    const delivery =
+      decision === 'approve_manual' || decision === 'approve_automatic'
+        ? {
+            mode: (decision === 'approve_manual' ? 'manual' : 'automatic') as 'manual' | 'automatic',
+            liveUrl: (r.live_post_url as string | null) ?? null,
+            readBackStatus: ((r.live_post_readback_status as 'not_checked' | 'matched' | 'mismatch' | null) ?? 'not_checked'),
+            recordedBy: (r.live_post_url_recorded_by as string | null) ?? null,
+            recordedAt: (r.live_post_url_recorded_at as string | null) ?? null,
+          }
+        : null;
     return {
       id: r.id as string,
       cardId: r.card_id as string,
       stageKey: r.stage_key as string,
       status: r.status as 'pending' | 'resolved',
-      decision: (r.decision as string | null) ?? null,
+      decision,
       options: JSON.parse(r.options_json as string) as GateOption[],
       producedBy: r.produced_by as string,
       createdAt: r.created_at as string,
       decidedBy: (r.decided_by as string | null) ?? null,
       comment: (r.comment as string | null) ?? null,
       resolvedAt: (r.resolved_at as string | null) ?? null,
+      ...(approvalSubject
+        ? { approvalSubject }
+        : { summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)) }),
+      ...(delivery ? { delivery } : {}),
+    };
+  }
+
+  private approvalSubjectView(id: string): ApprovalSubjectView | null {
+    const row = this.sql.exec(`SELECT * FROM approval_subjects WHERE id = ?`, id).toArray()[0];
+    if (!row) return null;
+    const stored = row.canonical_bytes as string | ArrayBuffer | ArrayBufferView;
+    const canonicalText =
+      typeof stored === 'string'
+        ? stored
+        : new TextDecoder().decode(stored instanceof ArrayBuffer ? new Uint8Array(stored) : stored);
+    return {
+      id: row.id as string,
+      digest: row.digest as string,
+      schema: row.schema as string,
+      revision: Number(row.revision),
+      canonical: JSON.parse(canonicalText) as JsonValue,
     };
   }
 
@@ -6802,9 +7541,15 @@ export class BoardDO extends DurableObject<Env> {
     const cardId = gate.card_id as string;
     const card = this.getCard(cardId);
     if (!card) return null;
+    const boardId = this.getMeta('boardId');
+    const subjectId = (gate.approval_subject_id as string | null) ?? null;
+    const subject = subjectId ? this.approvalSubjectView(subjectId) : null;
+    const approvalSubject = subject
+      ? { id: subject.id, digest: subject.digest, schema: subject.schema, revision: subject.revision }
+      : null;
     return {
       event: 'gate.pending',
-      boardId: this.getMeta('boardId'),
+      boardId,
       // `?? ''` rather than omitted: see `GatePendingBody.boardName`.
       boardName: this.getMeta('name') ?? '',
       cardId,
@@ -6819,7 +7564,13 @@ export class BoardDO extends DurableObject<Env> {
       // the only way to read it is to leave for the board. That was the state
       // for a day (supermessage#37) because every test asserted the gate's
       // SHAPE rather than whether a human could act on one.
-      handoffSummary: handoffSummary(this.getCardHandoffJson(cardId)),
+      handoffSummary: approvalSubject ? null : handoffSummary(this.getCardHandoffJson(cardId)),
+      ...(approvalSubject
+        ? {
+            approvalSubject,
+            reviewUrl: `/b/${encodeURIComponent(boardId!)}/c/${encodeURIComponent(cardId)}`,
+          }
+        : {}),
       // `id`/`label`, not `name`/`title`: the wire names are pinned by
       // agentpod fixtures/ecosystem-identity/matrix_gate_events.json, which
       // three repos validate against. The board's own vocabulary stops here.
