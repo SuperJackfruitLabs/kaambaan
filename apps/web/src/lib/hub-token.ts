@@ -84,9 +84,19 @@ function remember(token: string | null | undefined): string | null {
  * rotating refresh token on each, so two overlapping requests from one tab would present the same
  * token twice: a replay to the plane. The queue survives a failed request.
  */
+/** A hung request must not hold the queue: it is abandoned (and answers null) after this long. */
+const HUB_TOKEN_TIMEOUT_MS = 10_000;
 let hubTokenTail: Promise<unknown> | null = null;
 function hubTokenFetch(url: string): Promise<Response> {
-  const start = () => fetch(url, { credentials: 'same-origin' });
+  const start = async () => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), HUB_TOKEN_TIMEOUT_MS);
+    try {
+      return await fetch(url, { credentials: 'same-origin', signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const run = hubTokenTail ? hubTokenTail.then(start) : start();
   const mine = run.then(() => undefined, () => undefined);
   hubTokenTail = mine;

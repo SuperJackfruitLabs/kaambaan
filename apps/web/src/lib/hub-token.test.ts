@@ -391,4 +391,25 @@ describe('libraryToken (spec §9 Embedding)', () => {
     expect(calls).toBeGreaterThan(1);
     expect(peak).toBe(1);
   });
+  it('abandons a hung /hub/token request so it cannot hold the queue', async () => {
+    const signals: Array<AbortSignal | undefined> = [];
+    vi.stubGlobal('fetch', vi.fn((_u: string, init?: RequestInit) => {
+      signals.push(init?.signal ?? undefined);
+      return signals.length === 1
+        ? new Promise<Response>((_, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('aborted'))))
+        : Promise.resolve(Response.json({ libraryToken: jwt(soon()) }));
+    }));
+    vi.useFakeTimers();
+    try {
+      const first = libraryToken();
+      const second = hubStatus();
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(await first).toBeNull();
+      expect((await second).signIn).toBe('github');
+      expect(signals[0]).toBeDefined();
+      expect(signals).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
