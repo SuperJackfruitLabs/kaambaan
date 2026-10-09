@@ -68,7 +68,7 @@ two agents on one card.
 
 | verb | what happens to the card |
 |---|---|
-| **complete** | the stage's completion requirement is checked. If it is met, the card advances to the next stage carrying your `handoff`. If it is not, your run is recorded `blocked` and the card goes back to the same stage **once**, with feedback naming what was missing; a second refusal **parks it on a human**. |
+| **complete** | ends your turn, saying how it went with `outcome` — see [Say how it went](#say-how-it-went). On `pass` (or no outcome, on most stages) the stage's completion requirement is checked. If it is met, the card advances to the next stage carrying your `handoff`. If it is not, your run is recorded `blocked` and the card goes back to the same stage **once**, with feedback naming what was missing; a second refusal **parks it on a human**. |
 | **submit for review** | opens an approval gate and stops. For a gated stage. |
 | **block** | you need something to proceed — the card parks on a human, carrying your reason verbatim |
 | **fail** | you could not do it. `reason` is required and must be non-empty. |
@@ -76,6 +76,50 @@ two agents on one card.
 
 After **two** consecutive failed or reclaimed runs a card parks for a human rather than cycling
 through agents.
+
+## Say how it went
+
+`complete` takes an `outcome`. It is a field, not something read out of your handoff: a handoff
+saying "unsafe — do not ship" with no outcome is, to the board, a finished stage, and the card moves
+on.
+
+| `outcome` | when | what you also send | what happens to the card |
+|---|---|---|---|
+| `pass` | your stage's work is done and good | your `handoff` | advances, exactly as `complete` always did. What no outcome means on a stage that judges nothing. |
+| `changes-needed` | you **judged** work — reviewed, integrated, tested it — and it is not good enough | `findings`: what must change (required, at most 8 KB) | goes **back** to the stage the board names for this one, with your findings posted on the card as your comment and handed to the fixer as `handoff.feedback` and `handoff.findings` (beside your own handoff and `returnedFrom`). It never advances. |
+| `needs-person` | you cannot go on without a person: approve a sign-in, decide something only they can, grant access | `question`: what they must do (required); `url` when there is a link; `options` to offer choices | **waits on them** — see [When you need a person](#when-you-need-a-person) |
+
+A stage that sends work back is a **judging stage**: it declares a `returnStage`. There, a
+completion with **no** outcome is refused like a missing handoff key (one automatic rework naming
+what to add, then a person) — silence is not a pass. On a stage with no `returnStage`,
+`changes-needed` parks the card on a person with your findings instead of advancing it.
+
+The board sends a card back on its own **twice**. The third `changes-needed` parks it on a person
+(`needsHuman.reason: repeated-failure`) rather than looping fix → judge forever. The count is per
+card and only a person resets it: resuming the card, moving it, or a reviewer requesting changes. A
+later `pass` does not.
+
+A malformed outcome — `changes-needed` with no findings, `needs-person` with no question — is refused
+with `INVALID_OUTCOME` **before** your run ends. Correct it and call `complete` again on the same
+run.
+
+## When you need a person
+
+Do not end your turn with "approve this, then reply done" in a handoff. The board cannot tell that
+from a finished stage, checks it as one, and parks the card as a broken handoff.
+
+Call `complete` with `outcome: "needs-person"`, a `question`, and the `url` if there is one:
+
+- your run ends (outcome `blocked`, so a bridge watching the run sees that **you** reported); the
+  completion requirement is **not** checked, and neither an attempt nor the stage's automatic
+  rework is spent — pausing is not failing
+- the card parks in `input-required` with `needsHuman.reason: question`, and your question — link
+  included — appears in **Needs you**, on the card, and in the board's chat room, exactly like a
+  question asked mid-run
+- when a person answers, the card goes back to **the same stage**, claimable. The next claim's
+  handoff is the stage's original input plus `feedback` (what you asked and what they answered,
+  with any earlier feedback kept beneath it) and `resumed`: `{ question, answer, answeredBy,
+  workSoFar }`, where `workSoFar` is the handoff you parked with. Put what you had done there.
 
 ## Earning a completion
 
@@ -135,7 +179,8 @@ around a check is a legitimate act, and a silent one is not.
 
 ## Asking a question
 
-If you need input mid-run, post an activity of type `elicitation` with a `signal`. The card moves
+To wait for a person **after your turn ends**, use `complete` with `needs-person` (above). To ask
+while you keep holding the card — a harness that can sit and wait — post an activity of type `elicitation` with a `signal`. The card moves
 to `input-required` and waits, and the card records that it is waiting on **your** question.
 
 Collect the answer with `superpipeline_get_run` (REST: the run context route), on the token you
@@ -143,7 +188,8 @@ already hold. It returns your run, its card, its stage, the handoff, the card's 
 `elicitations` — your questions and their answers — and the card's newest `comments`. There is no second credential and no callback
 to receive.
 
-There is no separate "request input" tool. An elicitation is an activity, on both wires.
+There is no separate "request input" tool. A mid-run question is an activity, and an end-of-turn
+one is an outcome of `complete`, on both wires.
 
 Three things worth knowing:
 
@@ -244,6 +290,7 @@ card and shows up in a handoff. Wrong routing strands every card in the lane wit
 | `ELICITATION_NOT_PENDING` | that question was answered or retired already. |
 | `SEPARATION_OF_DUTIES` | you may not answer your own question, or decide your own gate. |
 | `INVALID_USAGE` | reported tokens or cost were negative or not finite. |
+| `INVALID_OUTCOME` | `complete` named an outcome without what it needs (`findings`, `question`), an unknown outcome, or a `url` that is not http(s). Your run is still live. |
 | `UNKNOWN_STAGE` | no stage by that key on this board. |
 | `STAGE_NOT_EMPTY` | a stage you tried to remove still holds cards. |
 

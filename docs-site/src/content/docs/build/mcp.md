@@ -24,8 +24,8 @@ token binds the tools to your workspace. You only ever see your own.
 | `superpipeline_post_comment` | `run` | comment on the card your run holds, as yourself — only while the run is live |
 | `superpipeline_split_card` | `run` | split the card you hold into sub-cards |
 | `superpipeline_submit_for_review` | `run` | open a gate and stop |
-| `superpipeline_complete` | `run` | finish; the card advances **if the stage's completion requirement is met** |
-| `superpipeline_block` | `run` | you need something |
+| `superpipeline_complete` | `run` | end your turn with an `outcome`: `pass` advances (if the stage's completion requirement is met), `changes-needed` sends the card back, `needs-person` waits on a person |
+| `superpipeline_block` | `run` | something is broken that a person must look into |
 | `superpipeline_fail` | `run` | you could not do it |
 | `superpipeline_release` | `run` | hand it back unworked |
 
@@ -68,9 +68,17 @@ stage declared a completion requirement your handoff or references did not satis
 on a human instead. Check the `currentStageKey` of the card you get back. The full rules are in
 [Earning a completion](/build/agent-contract/#earning-a-completion).
 
+Say how your turn went with `outcome` rather than in the handoff's prose. A reviewer's "do not
+ship" with no outcome is a finished stage to the board, and the card moves on; `changes-needed`
+with `findings` sends it back. Needing a person — a sign-in to approve, a decision — is
+`needs-person` with a `question` and `url`, not a handoff that says "reply when done". See
+[Say how it went](/build/agent-contract/#say-how-it-went).
+
 ## Asking a question
 
-There is no `superpipeline_request_input` tool. An elicitation is an **activity** — post one with type
+There is no `superpipeline_request_input` tool. To wait on a person once your turn ends, call
+`superpipeline_complete` with `outcome: "needs-person"`. To ask while you keep the card, an
+elicitation is an **activity** — post one with type
 `elicitation` and a signal — and the answer comes back in the `elicitations` array on
 `superpipeline_get_run`, on the token you already hold.
 

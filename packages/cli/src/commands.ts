@@ -528,6 +528,17 @@ export const COMMANDS: CommandSpec[] = [
           "(see Stage runbooks and completion)",
       },
       { name: "--clear-completion", type: "boolean", default: "off", description: "remove the stage's completion requirement" },
+      {
+        name: "--return-stage",
+        value: "<stageKey>",
+        type: "string",
+        default: "unchanged",
+        description:
+          "make this a judging stage: a run that completes with outcome `changes-needed` sends the card back to this " +
+          "EARLIER stage with its findings (at most twice before it waits for a person), and a completion here must say " +
+          "`pass` or `changes-needed`",
+      },
+      { name: "--clear-return-stage", type: "boolean", default: "off", description: "stop the stage judging: remove its return stage" },
     ],
     summary: "change ONE stage, leaving the others alone",
     description:
@@ -540,11 +551,13 @@ export const COMMANDS: CommandSpec[] = [
     fails: [
       "`<boardId>` or `<stageKey>` is missing, or no flag is given (`Nothing to change.`)",
       "an `--instructions` or `--completion` file cannot be read, or the completion file is not JSON",
+      "`--return-stage` names a stage that does not exist or is not earlier than this one (`INVALID_STAGES`)",
     ],
     examples: [
       "supi set-stage brd_8f2c… build --instructions runbooks/build.md",
       "supi set-stage brd_8f2c… review --gate approval --wip 3",
       "supi set-stage brd_8f2c… build --clear-completion",
+      "supi set-stage brd_8f2c… integrate --return-stage fix",
     ],
   },
 

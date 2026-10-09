@@ -217,7 +217,7 @@ supi set-stale brd_8f2c… --off
 Changes the named fields of one stage and nothing else. At least one flag is required. A person may set any field. An agent token with `compose` may set `--instructions` only — the other fields are routing, and the server refuses them by name.
 
 ```sh
-supi set-stage <boardId> <stageKey> [--instructions <file|->] [--clear-instructions] [--name <name>] [--gate none|approval] [--wip <n>|none] [--owner <capability>] [--completion <file|->] [--clear-completion]
+supi set-stage <boardId> <stageKey> [--instructions <file|->] [--clear-instructions] [--name <name>] [--gate none|approval] [--wip <n>|none] [--owner <capability>] [--completion <file|->] [--clear-completion] [--return-stage <stageKey>] [--clear-return-stage]
 ```
 
 | argument | meaning |
@@ -235,6 +235,8 @@ supi set-stage <boardId> <stageKey> [--instructions <file|->] [--clear-instructi
 | `--owner <capability>` | string | unchanged | the capability an agent must hold to claim cards here |
 | `--completion <file\|->` | file path, or `-` for stdin | unchanged | what a run must produce before the board believes it finished, as JSON from a file or stdin (see Stage runbooks and completion) |
 | `--clear-completion` | boolean | off | remove the stage's completion requirement |
+| `--return-stage <stageKey>` | string | unchanged | make this a judging stage: a run that completes with outcome `changes-needed` sends the card back to this EARLIER stage with its findings (at most twice before it waits for a person), and a completion here must say `pass` or `changes-needed` |
+| `--clear-return-stage` | boolean | off | stop the stage judging: remove its return stage |
 
 **Who may run it**
 
@@ -251,6 +253,7 @@ An agent may only send `--instructions`.
 
 - `<boardId>` or `<stageKey>` is missing, or no flag is given (`Nothing to change.`)
 - an `--instructions` or `--completion` file cannot be read, or the completion file is not JSON
+- `--return-stage` names a stage that does not exist or is not earlier than this one (`INVALID_STAGES`)
 - there is no usable credential, or the server refuses it (401) or the act (403), or answers any other error
 
 **Example**
@@ -259,4 +262,5 @@ An agent may only send `--instructions`.
 supi set-stage brd_8f2c… build --instructions runbooks/build.md
 supi set-stage brd_8f2c… review --gate approval --wip 3
 supi set-stage brd_8f2c… build --clear-completion
+supi set-stage brd_8f2c… integrate --return-stage fix
 ```

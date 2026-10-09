@@ -110,6 +110,12 @@ export const Stage = z.object({
    * that omits a field the server enforces is a trap for anyone writing a client against it.
    */
   completion: CompletionRequirement.nullish(),
+  /**
+   * Where a run's `outcome: "changes-needed"` sends the card: an EARLIER stage's key (see
+   * `returnStageError`). Declaring it makes this a judging stage — a completion here must say
+   * `pass` or `changes-needed`. Absent, the stage behaves exactly as before.
+   */
+  returnStage: z.string().min(1).optional(),
   wipLimit: z.number().int().min(1).optional(),
 });
 export type Stage = z.infer<typeof Stage>;

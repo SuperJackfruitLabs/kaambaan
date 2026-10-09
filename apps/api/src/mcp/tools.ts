@@ -13,6 +13,7 @@ import { z } from 'zod';
 import type { BoardStub, Result, JsonValue, AgentActivityType } from '../board/board-do';
 import { resolveReferenceInput } from '../references/resolve';
 import { scopePermits, type AgentScope } from '../auth/scopes';
+import { StageOutcome } from '@superpipeline/contract';
 
 /** The principal resolved from the bearer token (the OAuth Resource Server side, docs/05 §2). */
 export interface McpAuth {
@@ -373,18 +374,53 @@ export function registerSuperpipelineTools(server: McpServer, deps: ToolDeps): v
   register(
     'superpipeline_complete',
     {
-      description: 'Finish your run successfully; the card advances to the next stage carrying your handoff.',
-      inputSchema: { boardId: z.string(), runId: z.string(), leaseEpoch: z.number().int().min(0), handoff: json.optional() },
+      description:
+        'End your turn on this card and say how it went with `outcome`. ' +
+        '`pass` (the default on most stages): your work is done and good — the card advances carrying your handoff. ' +
+        '`changes-needed`: you judged the work and it is NOT good enough — give `findings` (what must change); ' +
+        'the card goes back to the stage that fixes it, with your findings, instead of moving on. Use this rather ' +
+        'than writing "unsafe" or "do not ship" in a handoff that then advances. A stage that judges work requires ' +
+        'you to say `pass` or `changes-needed`. ' +
+        '`needs-person`: you cannot go on without a person (approve a sign-in, make a decision, grant access) — give ' +
+        '`question` (what they must do) and `url` if there is a link; the card waits on them in Needs you and the ' +
+        "board's chat room, and when they answer the card comes back to this stage with their answer and your " +
+        'handoff as the work so far. Never end your turn with "do X, then reply" in a handoff — use needs-person.',
+      inputSchema: {
+        boardId: z.string(),
+        runId: z.string(),
+        leaseEpoch: z.number().int().min(0),
+        handoff: json.optional(),
+        outcome: StageOutcome.optional(),
+        findings: z.string().optional(),
+        question: z.string().optional(),
+        url: z.string().optional(),
+        options: z.array(z.unknown()).optional(),
+      },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    async ({ boardId, runId, leaseEpoch, handoff }) =>
-      fromResult(await deps.boardStub(boardId).complete({ runId, leaseEpoch, agentId: auth.agentId, handoff: handoff as JsonValue })),
+    async ({ boardId, runId, leaseEpoch, handoff, outcome, findings, question, url, options }) =>
+      fromResult(
+        await deps.boardStub(boardId).complete({
+          runId,
+          leaseEpoch,
+          agentId: auth.agentId,
+          handoff: handoff as JsonValue,
+          outcome,
+          findings,
+          question,
+          url,
+          options: options as JsonValue,
+        }),
+      ),
   );
 
   register(
     'superpipeline_block',
     {
-      description: 'Mark the run blocked on an external dependency; releases the lease.',
+      description:
+        'Mark the run blocked on something you cannot fix and a person must look into; releases the lease and ' +
+        'ends the work. To ask a person something and carry on once they answer, use superpipeline_complete with ' +
+        'outcome "needs-person" instead.',
       inputSchema: { boardId: z.string(), runId: z.string(), leaseEpoch: z.number().int().min(0), reason: z.string().min(1) },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
     },

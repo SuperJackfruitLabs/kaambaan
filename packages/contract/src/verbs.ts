@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { BoardId, CardId, RunId, TaskId, AgentId, ElicitationId } from './ids';
 import { ActivityType, Signal, ReferenceProvider, ReferenceSourceType } from './primitives';
 import { Card, Task, Reference } from './entities';
+import { StageOutcome } from './outcome';
 
 /**
  * Surface-neutral verb input/output schemas (docs/04 §3). The same schema validates a call
@@ -97,6 +98,19 @@ export const CompleteInput = z.object({
       next: z.string().optional(),
     })
     .optional(),
+  /**
+   * What kind of finish this is (`StageOutcome`). Absent is `pass` on a stage that judges nothing —
+   * every caller that predates it — and refused on a stage that declares a `returnStage`.
+   */
+  outcome: StageOutcome.optional(),
+  /** `changes-needed`: what must change. Required with it. */
+  findings: z.string().max(8192).optional(),
+  /** `needs-person`: what the person must do or decide. Required with it. */
+  question: z.string().max(4000).optional(),
+  /** `needs-person`: where they do it, when there is somewhere. */
+  url: z.string().optional(),
+  /** `needs-person`: choices to offer, same shape an elicitation's options take. */
+  options: z.array(z.unknown()).optional(),
 });
 export type CompleteInput = z.infer<typeof CompleteInput>;
 

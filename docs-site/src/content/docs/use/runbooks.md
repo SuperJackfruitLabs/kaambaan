@@ -69,6 +69,34 @@ an attempt, so the [circuit breaker](/use/stuck-cards/#what-heals-itself) still 
 Every failing arm is named at once, so a person fixes both rather than discovering the second on
 the next attempt.
 
+## Sending work back
+
+A stage that **judges** work — review, integrate, test — can name where a failing verdict sends the
+card: its `returnStage`, an **earlier** stage's key.
+
+```sh
+supi set-stage <boardId> integrate --return-stage fix
+supi set-stage <boardId> integrate --clear-return-stage
+```
+
+The agent says how its turn went with a field, `outcome`, not with prose in its handoff — see
+[Say how it went](/build/agent-contract/#say-how-it-went). On a judging stage:
+
+- `changes-needed` sends the card back to the return stage. The judge's `findings` are posted on the
+  card as its comment and handed to the fixer as `handoff.feedback`. It never advances.
+- `pass` advances, as before.
+- **no outcome is refused**, through the same one automatic rework a missing handoff key gets. A
+  verdict the board cannot read is not a pass.
+
+The board sends a card back on its own **twice**; the third `changes-needed` parks it on a person
+(`repeated-failure`) with the findings. Only a person resets that — resuming the card, moving it,
+or requesting changes at a review.
+
+A stage without a `returnStage` behaves exactly as before, except that a `changes-needed` there
+parks the card on a person instead of advancing it. The return stage must exist and come earlier;
+`set-stage`, `set-stages` and removing the stage it names are all refused otherwise
+(`INVALID_STAGES`).
+
 ## A card may override its stage
 
 A card can carry its own `completion`, and it **replaces** the stage's rather than merging with it —
@@ -101,7 +129,8 @@ stage instructions once — a whole-pipeline write discards whatever it was not 
 a concurrent edit to a stage nobody meant to touch.
 
 Prefer `set-stage`. An agent holding `compose` may set `instructions` and nothing else: the owner,
-order, gate and WIP limit are routing, and wrong routing strands every card in the lane silently.
+order, gate, WIP limit and return stage are routing, and wrong routing strands every card in the
+lane silently.
 
 ## Next
 

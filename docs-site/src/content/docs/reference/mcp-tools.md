@@ -169,7 +169,7 @@ Submit your work at a gated stage for human review (opens an approval gate).
 
 ## superpipeline_complete
 
-Finish your run successfully; the card advances to the next stage carrying your handoff.
+End your turn on this card and say how it went with `outcome`. `pass` (the default on most stages): your work is done and good — the card advances carrying your handoff. `changes-needed`: you judged the work and it is NOT good enough — give `findings` (what must change); the card goes back to the stage that fixes it, with your findings, instead of moving on. Use this rather than writing "unsafe" or "do not ship" in a handoff that then advances. A stage that judges work requires you to say `pass` or `changes-needed`. `needs-person`: you cannot go on without a person (approve a sign-in, make a decision, grant access) — give `question` (what they must do) and `url` if there is a link; the card waits on them in Needs you and the board's chat room, and when they answer the card comes back to this stage with their answer and your handoff as the work so far. Never end your turn with "do X, then reply" in a handoff — use needs-person.
 
 **Scope** `run`. **Hints** writes.
 
@@ -179,10 +179,15 @@ Finish your run successfully; the card advances to the next stage carrying your 
 | `runId` | string | yes |
 | `leaseEpoch` | integer (≥ 0) | yes |
 | `handoff` | object | no |
+| `outcome` | one of `pass`, `changes-needed`, `needs-person` | no |
+| `findings` | string | no |
+| `question` | string | no |
+| `url` | string | no |
+| `options` | array of any JSON | no |
 
 ## superpipeline_block
 
-Mark the run blocked on an external dependency; releases the lease.
+Mark the run blocked on something you cannot fix and a person must look into; releases the lease and ends the work. To ask a person something and carry on once they answer, use superpipeline_complete with outcome "needs-person" instead.
 
 **Scope** `run`. **Hints** writes, destructive.
 

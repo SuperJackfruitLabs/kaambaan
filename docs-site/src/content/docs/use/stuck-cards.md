@@ -19,13 +19,15 @@ mystery.
 | an agent reported a failure (`fail`) | the card goes back to its stage, with the failure reason handed to the next agent |
 | an agent gave the card back (`release`) | it is claimable again at once, with no penalty |
 | a card's handoff failed the stage's [completion requirement](/use/runbooks/) | **one automatic rework**: the card goes back to the same stage with feedback naming exactly what was missing |
+| a **judging stage** (one with a [return stage](/use/runbooks/#sending-work-back)) found changes needed | the card goes **back** to the return stage, with the judge's findings on the card as a comment and in the fixer's handoff |
 | a card it was waiting on finished | it becomes claimable, and the agents that can take it are told |
 | a parent's last open sub-task finished | the parent's deferred advance happens |
 
 Two limits stop any of this from looping. The **circuit breaker** parks a card for a person after
 two consecutive failed attempts — a crash, a reclaim, or a completion rework all count. And the
-**completion rework happens once per visit to a stage**: a second refusal parks the card. Only a
-person starts the count again, by resuming the card or by requesting changes at a review.
+**completion rework happens once per visit to a stage**: a second refusal parks the card. And a
+judge sends a card **back at most twice**; the third "changes needed" parks it. Only a person starts
+these counts again — by resuming the card, moving it, or requesting changes at a review.
 
 ## What waits for a person
 
@@ -33,10 +35,10 @@ A card that needs you is in `input-required`, and it says why:
 
 | reason | what it means | what you do |
 |---|---|---|
-| `question` | the agent asked something and is waiting | answer it on the card |
+| `question` | the agent asked something and is waiting — mid-run, or because it ended its turn needing you (a sign-in to approve, a decision) | answer it on the card or in the board's chat room. An agent that ended its turn gets the card back at the same stage with your answer and its work so far |
 | `review` | it is at an approval gate | read what was produced, then approve or request changes |
-| `blocked` | the agent stopped and said why, or the completion check refused it twice | fix what it names, then **resume** it |
-| `repeated-failure` | two attempts in a row failed | read the log, fix the cause, then **resume** it |
+| `blocked` | the agent stopped and said why, the completion check refused it twice, or a stage with no return stage found changes needed | fix what it names, then **resume** it |
+| `repeated-failure` | two attempts in a row failed, or a judge found changes needed a third time | read the log and the findings, fix the cause, then **resume** it |
 | `not-authorised` | nobody allowed to dispatch this work asked for it | staff an agent that may take it, or have someone with the grant re-queue it |
 
 One more kind of stuck card is not in `input-required` at all: a card **sitting in a stage nothing
