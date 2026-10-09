@@ -148,6 +148,8 @@ function statusForCode(code: BoardErrorCode): number {
     case 'INVALID_STAGES':
     case 'INVALID_OUTCOME':
     case 'INVALID_APPROVAL_SUBJECT':
+    case 'INVALID_APPROVAL_DELIVERY':
+    case 'INVALID_LIVE_URL':
       return 400;
     case 'BUDGET_EXCEEDED':
       return 402; // Payment Required — the board/card budget cap was reached
@@ -165,6 +167,9 @@ function statusForCode(code: BoardErrorCode): number {
     case 'GATE_NOT_PENDING':
     case 'APPROVAL_SUBJECT_MISMATCH':
     case 'APPROVAL_SUBJECT_NOT_VERIFIED':
+    case 'APPROVAL_DELIVERY_NOT_AVAILABLE':
+    case 'APPROVAL_DELIVERY_NOT_MANUAL':
+    case 'APPROVAL_DELIVERY_STARTED':
     // The question was already settled (answered, or retired with its run) — a conflict with the
     // state the caller believed in, not a bad request. Retrying it will never succeed.
     case 'ELICITATION_NOT_PENDING':
@@ -3422,6 +3427,34 @@ const worker = {
         });
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
         return Response.json({ card: result.value });
+      }
+
+      // POST /v1/boards/:id/gates/:gateId/delivery — alter delivery, never approved bytes.
+      const deliveryMatch = rest.match(/^gates\/([^/]+)\/delivery$/);
+      if (deliveryMatch && request.method === 'POST') {
+        const body = (await request.json().catch(() => null)) as { mode?: unknown; liveUrl?: unknown } | null;
+        if (!body || typeof body !== 'object') {
+          return Response.json({ error: { code: 'INVALID_APPROVAL_DELIVERY', message: 'Expected a JSON object.' } }, { status: 400 });
+        }
+        if (body.mode !== undefined && body.mode !== 'manual' && body.mode !== 'automatic') {
+          return Response.json(
+            { error: { code: 'INVALID_APPROVAL_DELIVERY', message: 'mode must be manual or automatic' } },
+            { status: 400 },
+          );
+        }
+        if (body.liveUrl !== undefined && typeof body.liveUrl !== 'string') {
+          return Response.json({ error: { code: 'INVALID_LIVE_URL', message: 'liveUrl must be a string' } }, { status: 400 });
+        }
+        const localActorId = user?.userId ?? 'usr_dev';
+        const principalIds = await principalIdsFor(env.DB, tenantId, [localActorId]);
+        const result = await stub.updateApprovalDelivery({
+          gateId: deliveryMatch[1]!,
+          actor: principalIds.get(localActorId) ?? localActorId,
+          ...(body.mode !== undefined ? { mode: body.mode as 'manual' | 'automatic' } : {}),
+          ...(body.liveUrl !== undefined ? { liveUrl: body.liveUrl } : {}),
+        });
+        if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
+        return Response.json({ card: result.value, delivery: result.value.delivery });
       }
 
       // GET /v1/boards/:id/elicitations/pending — every question still waiting on a human.

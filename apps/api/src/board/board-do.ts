@@ -938,6 +938,14 @@ export interface GateView {
   summary?: string | null;
   /** Present only for an opt-in digest-bound gate; loaded from immutable subject storage. */
   approvalSubject?: ApprovalSubjectView;
+  /** Human-selected delivery state for a resolved immutable publishing approval. */
+  delivery?: {
+    mode: 'manual' | 'automatic';
+    liveUrl: string | null;
+    readBackStatus: 'not_checked' | 'matched' | 'mismatch';
+    recordedBy: string | null;
+    recordedAt: string | null;
+  };
 }
 
 /**
@@ -1241,6 +1249,11 @@ export type BoardErrorCode =
   | 'APPROVAL_SUBJECT_MISMATCH'
   | 'APPROVAL_SUBJECT_NOT_VERIFIED'
   | 'APPROVAL_SUBJECT_EXPIRED'
+  | 'APPROVAL_DELIVERY_NOT_AVAILABLE'
+  | 'APPROVAL_DELIVERY_NOT_MANUAL'
+  | 'APPROVAL_DELIVERY_STARTED'
+  | 'INVALID_APPROVAL_DELIVERY'
+  | 'INVALID_LIVE_URL'
   | 'ELICITATION_NOT_FOUND'
   | 'ELICITATION_NOT_PENDING'
   | 'INVALID_ANSWER'
@@ -1511,6 +1524,12 @@ export interface BoardStub {
     approvalSubjectId?: string;
     approvalSubjectDigest?: string;
   }): Promise<Result<CardView>>;
+  updateApprovalDelivery(input: {
+    gateId: string;
+    actor: string;
+    mode?: 'manual' | 'automatic';
+    liveUrl?: string;
+  }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>>;
   answerElicitation(input: {
     elicitationId: string;
     answeredBy: string;
@@ -2034,6 +2053,26 @@ export class BoardDO extends DurableObject<Env> {
       // column already exists
     }
     try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url_recorded_by TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_url_recorded_at TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.sql.exec(`ALTER TABLE gates ADD COLUMN live_post_readback_status TEXT`);
+    } catch {
+      // column already exists
+    }
+    try {
       this.sql.exec(`ALTER TABLE gates ADD COLUMN approval_decider_ids_json TEXT`);
     } catch {
       // column already exists
@@ -2059,6 +2098,20 @@ export class BoardDO extends DurableObject<Env> {
       )`,
     );
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_approval_subjects_card ON approval_subjects(card_id)`);
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS approval_delivery_events (
+        id TEXT PRIMARY KEY,
+        gate_id TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        from_mode TEXT,
+        to_mode TEXT,
+        actor TEXT NOT NULL,
+        live_url TEXT,
+        created_at TEXT NOT NULL
+      )`,
+    );
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_approval_delivery_events_gate ON approval_delivery_events(gate_id)`);
     // An agent's open question to a human (docs/04 §4). Persisting it is what makes an answer
     // possible: the activity stream is append-only history, and history cannot be replied to.
     this.sql.exec(
@@ -5053,6 +5106,7 @@ export class BoardDO extends DurableObject<Env> {
       !gate ||
       gate.status !== 'resolved' ||
       !isApproveDecision(gate.decision as GateDecision) ||
+      gate.decision === 'approve_manual' ||
       gate.approval_subject_digest !== subject.digest ||
       gate.stage_key !== subjectRow.gate_stage_key ||
       !gate.decided_by ||
@@ -5830,7 +5884,24 @@ export class BoardDO extends DurableObject<Env> {
       now,
       input.gateId,
     );
-    if (isApproveDecision(input.decision)) {
+    if (boundSubjectId && (input.decision === 'approve_manual' || input.decision === 'approve_automatic')) {
+      this.sql.exec(
+        `INSERT INTO approval_delivery_events
+           (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+         VALUES (?, ?, ?, 'approved', NULL, ?, ?, NULL, ?)`,
+        newId('ade'),
+        input.gateId,
+        boundSubjectId,
+        input.decision === 'approve_manual' ? 'manual' : 'automatic',
+        input.decidedBy,
+        now,
+      );
+    }
+    if (input.decision === 'approve_manual' && boundSubjectId) {
+      // A manual approval remains on its human stage: publisher claims are impossible by routing,
+      // while verifyApprovalSubject independently fences a corrupted or stale claim.
+      this.parkForHuman(cardId, { reason: 'review', detail: 'approved for manual delivery' });
+    } else if (isApproveDecision(input.decision)) {
       // The approver becomes the producer of any chained gate (keeps separation-of-duties intact).
       // An approval produces no new work, so a chained gate judges the same run's work.
       this.advanceCard(cardId, gate.stage_key as string, input.decidedBy, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
@@ -5867,6 +5938,112 @@ export class BoardDO extends DurableObject<Env> {
     if (judged) this.reportRun(judged);
     await this.scheduleReclaim();
     return { ok: true, value: this.mustGetCard(cardId) };
+  }
+
+  /** Change delivery mechanics without changing the approved immutable bytes. */
+  async updateApprovalDelivery(input: {
+    gateId: string;
+    actor: string;
+    mode?: 'manual' | 'automatic';
+    liveUrl?: string;
+  }): Promise<Result<CardView & { delivery: NonNullable<GateView['delivery']> }>> {
+    const gate = this.sql.exec(`SELECT * FROM gates WHERE id = ?`, input.gateId).toArray()[0];
+    if (!gate) return { ok: false, code: 'GATE_NOT_FOUND', message: `gate not found: ${input.gateId}` };
+    const subjectId = (gate.approval_subject_id as string | null) ?? null;
+    const decision = gate.decision as string | null;
+    if (gate.status !== 'resolved' || !subjectId || (decision !== 'approve_manual' && decision !== 'approve_automatic')) {
+      return { ok: false, code: 'APPROVAL_DELIVERY_NOT_AVAILABLE', message: 'this gate has no changeable delivery approval' };
+    }
+    const deciders = JSON.parse((gate.approval_decider_ids_json as string | null) ?? '[]') as string[];
+    if (input.actor.startsWith('agt_') || !deciders.includes(input.actor)) {
+      return { ok: false, code: 'APPROVAL_DECIDER_NOT_ALLOWED', message: 'this principal cannot change approval delivery' };
+    }
+    const cardId = gate.card_id as string;
+    const cardRow = this.getCardRow(cardId);
+    const subject = this.sql.exec(`SELECT status FROM approval_subjects WHERE id = ?`, subjectId).toArray()[0];
+    if (!cardRow || cardRow.active_approval_subject_id !== subjectId || subject?.status !== 'active') {
+      return { ok: false, code: 'APPROVAL_SUBJECT_MISMATCH', message: 'the approved subject is no longer active' };
+    }
+    if ((input.mode === undefined) === (input.liveUrl === undefined)) {
+      return { ok: false, code: 'INVALID_APPROVAL_DELIVERY', message: 'provide exactly one of mode or liveUrl' };
+    }
+
+    const now = this.now();
+    if (input.liveUrl !== undefined) {
+      if (decision !== 'approve_manual') {
+        return { ok: false, code: 'APPROVAL_DELIVERY_NOT_MANUAL', message: 'a live URL is recorded only for manual delivery' };
+      }
+      let parsed: URL;
+      try {
+        parsed = new URL(input.liveUrl);
+      } catch {
+        return { ok: false, code: 'INVALID_LIVE_URL', message: 'live URL must be an absolute https URL' };
+      }
+      if (parsed.protocol !== 'https:') {
+        return { ok: false, code: 'INVALID_LIVE_URL', message: 'live URL must be an absolute https URL' };
+      }
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          `UPDATE gates SET live_post_url = ?, live_post_url_recorded_by = ?, live_post_url_recorded_at = ?,
+                            live_post_readback_status = 'not_checked' WHERE id = ?`,
+          parsed.toString(),
+          input.actor,
+          now,
+          input.gateId,
+        );
+        this.sql.exec(
+          `INSERT INTO approval_delivery_events
+             (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+           VALUES (?, ?, ?, 'live_url_recorded', 'manual', 'manual', ?, ?, ?)`,
+          newId('ade'),
+          input.gateId,
+          subjectId,
+          input.actor,
+          parsed.toString(),
+          now,
+        );
+      });
+    } else {
+      const currentMode = decision === 'approve_manual' ? 'manual' : 'automatic';
+      const nextMode = input.mode!;
+      if (nextMode !== currentMode) {
+        if (currentMode === 'automatic') {
+          if (cardRow.current_run_id || cardRow.state === 'working') {
+            return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'automatic delivery has already been claimed' };
+          }
+          this.sql.exec(
+            `UPDATE cards SET current_stage_key = ?, state = 'input-required', delegate_agent_id = NULL,
+                              current_run_id = NULL, needs_human_json = ?, updated_at = ? WHERE id = ?`,
+            gate.stage_key,
+            JSON.stringify({ reason: 'review', detail: 'approved for manual delivery' }),
+            now,
+            cardId,
+          );
+        } else {
+          if (gate.live_post_url) {
+            return { ok: false, code: 'APPROVAL_DELIVERY_STARTED', message: 'manual delivery already has a recorded live URL' };
+          }
+          this.setNeedsHuman(cardId, null);
+          this.advanceCard(cardId, gate.stage_key as string, input.actor, this.getCardHandoffJson(cardId), (gate.run_id as string | null) ?? null);
+        }
+        this.sql.exec(`UPDATE gates SET decision = ? WHERE id = ?`, nextMode === 'manual' ? 'approve_manual' : 'approve_automatic', input.gateId);
+        this.sql.exec(
+          `INSERT INTO approval_delivery_events
+             (id, gate_id, subject_id, event, from_mode, to_mode, actor, live_url, created_at)
+           VALUES (?, ?, ?, 'mode_switched', ?, ?, ?, NULL, ?)`,
+          newId('ade'),
+          input.gateId,
+          subjectId,
+          currentMode,
+          nextMode,
+          input.actor,
+          now,
+        );
+      }
+    }
+
+    const view = this.rowToGate(this.getGateRow(input.gateId)!);
+    return { ok: true, value: { ...this.mustGetCard(cardId), delivery: view.delivery! } };
   }
 
   /**
@@ -6932,12 +7109,23 @@ export class BoardDO extends DurableObject<Env> {
   private rowToGate(r: Row): GateView {
     const subjectId = (r.approval_subject_id as string | null) ?? null;
     const approvalSubject = subjectId ? this.approvalSubjectView(subjectId) : null;
+    const decision = (r.decision as string | null) ?? null;
+    const delivery =
+      decision === 'approve_manual' || decision === 'approve_automatic'
+        ? {
+            mode: (decision === 'approve_manual' ? 'manual' : 'automatic') as 'manual' | 'automatic',
+            liveUrl: (r.live_post_url as string | null) ?? null,
+            readBackStatus: ((r.live_post_readback_status as 'not_checked' | 'matched' | 'mismatch' | null) ?? 'not_checked'),
+            recordedBy: (r.live_post_url_recorded_by as string | null) ?? null,
+            recordedAt: (r.live_post_url_recorded_at as string | null) ?? null,
+          }
+        : null;
     return {
       id: r.id as string,
       cardId: r.card_id as string,
       stageKey: r.stage_key as string,
       status: r.status as 'pending' | 'resolved',
-      decision: (r.decision as string | null) ?? null,
+      decision,
       options: JSON.parse(r.options_json as string) as GateOption[],
       producedBy: r.produced_by as string,
       createdAt: r.created_at as string,
@@ -6946,6 +7134,7 @@ export class BoardDO extends DurableObject<Env> {
       resolvedAt: (r.resolved_at as string | null) ?? null,
       summary: handoffSummary(this.getCardHandoffJson(r.card_id as string)),
       ...(approvalSubject ? { approvalSubject } : {}),
+      ...(delivery ? { delivery } : {}),
     };
   }
 

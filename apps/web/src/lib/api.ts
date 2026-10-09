@@ -351,6 +351,13 @@ export interface Gate {
     revision: number;
     canonical: Record<string, unknown>;
   };
+  delivery?: {
+    mode: 'manual' | 'automatic';
+    liveUrl: string | null;
+    readBackStatus: 'not_checked' | 'matched' | 'mismatch';
+    recordedBy: string | null;
+    recordedAt: string | null;
+  };
 }
 
 export type GateDecision = 'approve' | 'approve_manual' | 'approve_automatic' | 'request_changes' | 'reject';
@@ -877,6 +884,19 @@ export function resolveGate(
       approvalSubjectId: approvalSubject?.id,
       approvalSubjectDigest: approvalSubject?.digest,
     }),
+  }).then(noteAuth);
+}
+
+/** Change delivery mode or record a manually published URL; approved bytes stay unchanged. */
+export function updateApprovalDelivery(
+  boardId: string,
+  gateId: string,
+  update: { mode: 'manual' | 'automatic' } | { liveUrl: string },
+): Promise<Response> {
+  return fetch(`/v1/boards/${boardId}/gates/${gateId}/delivery`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(update),
   }).then(noteAuth);
 }
 

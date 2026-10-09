@@ -344,18 +344,135 @@ describe('bound gate resolution', () => {
     });
   });
 
-  it.each(['approve_manual', 'approve_automatic'] as const)(
-    'persists %s as the delivery choice while approving the exact digest',
-    async (decision) => {
+  it.each([
+    ['approve_manual', 'approve', 'input-required'],
+    ['approve_automatic', 'publish', 'submitted'],
+  ] as const)(
+    'persists %s as the delivery choice and routes it safely',
+    async (decision, currentStageKey, stateName) => {
       const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-delivery-${decision}`)) as unknown as DurableObjectStub<BoardDO>;
       await runInDurableObject(stub, async (board: BoardDO, state) => {
         const opened = await openBoundGate(board, state, decision);
         const result = await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision } as never);
-        expect(result).toMatchObject({ ok: true, value: { currentStageKey: 'publish' } });
+        expect(result).toMatchObject({ ok: true, value: { currentStageKey, state: stateName } });
         expect(state.storage.sql.exec('SELECT decision FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({ decision });
+        const publisherClaim = await board.claim({ agentId: PUBLISHER, capabilities: ['x-publish'] });
+        expect(publisherClaim).toMatchObject({ claimed: decision === 'approve_automatic' });
       });
     },
   );
+
+  it('refuses canonical bytes to an automatic executor after a manual approval even if the card is incorrectly made claimable', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-manual-executor-fence')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'manual-executor-fence');
+      const approved = await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_manual' } as never);
+      expect(approved.ok).toBe(true);
+
+      // Defense in depth: reproduce the unsafe state from integration independently of routing.
+      state.storage.sql.exec(
+        `UPDATE cards SET current_stage_key = 'publish', state = 'submitted', delegate_agent_id = NULL, current_run_id = NULL WHERE id = ?`,
+        opened.cardId,
+      );
+      const claim = await board.claim({ agentId: PUBLISHER, capabilities: ['x-publish'] });
+      if (!claim.claimed) throw new Error('forced publisher fixture was not claimable');
+      const verified = await board.verifyApprovalSubject({
+        runId: claim.runId,
+        leaseEpoch: claim.leaseEpoch,
+        agentId: PUBLISHER,
+        expectedSchema: 'social-publish/v1',
+        expectedSubjectId: opened.subject.id,
+        expectedDigest: opened.subject.digest,
+        expectedAccount: ACCOUNT,
+      });
+      expect(verified).toMatchObject({ ok: false, code: 'APPROVAL_SUBJECT_NOT_VERIFIED' });
+    });
+  });
+
+  it('audits manual-to-automatic switching and advances the unchanged subject into publishing', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-switch-manual-automatic')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'switch-manual-automatic');
+      await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_manual' } as never);
+      const switched = await board.updateApprovalDelivery({ gateId: opened.gate.id, actor: DECIDER, mode: 'automatic' });
+      expect(switched).toMatchObject({ ok: true, value: { currentStageKey: 'publish', state: 'submitted' } });
+      expect(state.storage.sql.exec('SELECT decision FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({
+        decision: 'approve_automatic',
+      });
+      expect(state.storage.sql.exec('SELECT event, from_mode, to_mode, actor FROM approval_delivery_events').toArray()).toEqual([
+        { event: 'approved', from_mode: null, to_mode: 'manual', actor: DECIDER },
+        { event: 'mode_switched', from_mode: 'manual', to_mode: 'automatic', actor: DECIDER },
+      ]);
+    });
+  });
+
+  it('allows automatic-to-manual switching only before a publisher claim', async () => {
+    for (const claimed of [false, true]) {
+      const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`approval-switch-automatic-manual-${claimed}`)) as unknown as DurableObjectStub<BoardDO>;
+      await runInDurableObject(stub, async (board: BoardDO, state) => {
+        const opened = await openBoundGate(board, state, `switch-automatic-manual-${claimed}`);
+        await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_automatic' } as never);
+        if (claimed) {
+          const claim = await board.claim({ agentId: PUBLISHER, capabilities: ['x-publish'] });
+          if (!claim.claimed) throw new Error('publisher fixture was not claimable');
+        }
+        const switched = await board.updateApprovalDelivery({ gateId: opened.gate.id, actor: DECIDER, mode: 'manual' });
+        if (claimed) {
+          expect(switched).toMatchObject({ ok: false, code: 'APPROVAL_DELIVERY_STARTED' });
+        } else {
+          expect(switched).toMatchObject({ ok: true, value: { currentStageKey: 'approve', state: 'input-required' } });
+          expect(state.storage.sql.exec('SELECT decision FROM gates WHERE id = ?', opened.gate.id).one()).toEqual({
+            decision: 'approve_manual',
+          });
+        }
+      });
+    }
+  });
+
+  it('records a manual live URL with actor/time audit and an explicit unverified read-back status', async () => {
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName('approval-manual-live-url')) as unknown as DurableObjectStub<BoardDO>;
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'manual-live-url');
+      await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_manual' } as never);
+      const recorded = await board.updateApprovalDelivery({
+        gateId: opened.gate.id,
+        actor: DECIDER,
+        liveUrl: 'https://x.example.invalid/fixture/status/1',
+      });
+      expect(recorded).toMatchObject({
+        ok: true,
+        value: { delivery: { mode: 'manual', liveUrl: 'https://x.example.invalid/fixture/status/1', readBackStatus: 'not_checked' } },
+      });
+      expect(
+        state.storage.sql
+          .exec('SELECT event, actor, live_url FROM approval_delivery_events WHERE event = ?', 'live_url_recorded')
+          .one(),
+      ).toEqual({ event: 'live_url_recorded', actor: DECIDER, live_url: 'https://x.example.invalid/fixture/status/1' });
+    });
+  });
+
+  it('serves the audited delivery workflow through the signed-in human route', async () => {
+    const tenantId = 'tnt_delivery_route';
+    const boardId = 'brd_delivery_route';
+    const stub = env.BOARD_DO.get(env.BOARD_DO.idFromName(`${tenantId}:${boardId}`)) as unknown as DurableObjectStub<BoardDO>;
+    let gateId = '';
+    await runInDurableObject(stub, async (board: BoardDO, state) => {
+      const opened = await openBoundGate(board, state, 'delivery-route', { tenantId, boardId });
+      gateId = opened.gate.id;
+      await board.resolveGate({ ...boundDecision(opened.gate, opened.subject), decision: 'approve_manual' } as never);
+    });
+
+    const response = await SELF.fetch(`https://api.test/v1/boards/${boardId}/gates/${gateId}/delivery`, {
+      method: 'POST',
+      headers: auth(tenantId, { 'X-User-Id': DECIDER }),
+      body: JSON.stringify({ mode: 'automatic' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      card: { currentStageKey: 'publish', state: 'submitted' },
+      delivery: { mode: 'automatic', liveUrl: null },
+    });
+  });
 
   it.each(['request_changes', 'reject'] as const)(
     '%s retires the bound subject and clears the active pointer',
