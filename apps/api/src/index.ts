@@ -33,7 +33,7 @@ import {
   type JsonValue,
   type StaleCardView,
 } from './board/board-do';
-import type { LinkKind } from './board/links';
+import { isEnforcedKind, type LinkKind } from './board/links';
 import type { Env } from './env';
 import { newId } from './ids';
 import { boardStub } from './board/stub';
@@ -2603,17 +2603,24 @@ const worker = {
           return Response.json({ ok: true, enforced: false as const });
         }
 
+        if (kind === 'supersedes' && fromCardId === toCardId) {
+          return Response.json(
+            { error: { code: 'INVALID_LINK', message: 'a card cannot supersede itself' } },
+            { status: 400 },
+          );
+        }
+
         // Same-board: Task 12's enforced edge on the DO, unchanged from Task 17a except that the
         // response now names its own `enforced` boolean too, matching the cross-board arm above so
         // a caller never has to infer enforcement from whether `toBoardId` was sent.
         if (request.method === 'POST') {
           const result = await stub.addLink({ fromCardId, toCardId, kind, createdBy: user?.userId ?? null });
           if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-          return Response.json({ link: { ...result.value, enforced: true as const } }, { status: 201 });
+          return Response.json({ link: { ...result.value, enforced: isEnforcedKind(kind) } }, { status: 201 });
         }
         const result = await stub.removeLink(fromCardId, toCardId, kind);
         if (!result.ok) return Response.json({ error: result }, { status: statusForCode(result.code) });
-        return Response.json({ ...result.value, enforced: true as const });
+        return Response.json({ ...result.value, enforced: isEnforcedKind(kind) });
       }
 
       // POST /v1/boards/:id/cards/:cardId/split — decompose a card into claimable children, one
@@ -3043,6 +3050,9 @@ const worker = {
         // caller could register the subscription under any agent id it liked while authenticating
         // as a different one). A cast is not validation, so the route has to name what it accepts
         // rather than forward what it received.
+        if (body.events !== undefined && (!Array.isArray(body.events) || body.events.some((e) => typeof e !== 'string'))) {
+          return Response.json({ error: { code: 'INVALID_BODY', message: '`events` must be an array of event names' } }, { status: 400 });
+        }
         const result = await stub.registerPushConfig({
           agentId,
           url: body.url,

@@ -4,6 +4,9 @@
 
 export type LinkKind = 'blocks' | 'relates' | 'parent' | 'supersedes';
 
+/** Whether a same-board edge of this kind can refuse a claim: only `blocks` and `parent` do. */
+export const isEnforcedKind = (kind: LinkKind): boolean => kind === 'blocks' || kind === 'parent';
+
 export interface LinkRow {
   fromCardId: string;
   toCardId: string;

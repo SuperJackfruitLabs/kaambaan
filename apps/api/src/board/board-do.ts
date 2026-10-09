@@ -11,7 +11,7 @@ import { mapGithubEvent } from '../references/github-events';
 import { mapForgeEvent } from '../references/forge-events';
 import { estimateCostUsd } from '../metering/pricing';
 import { parseWindowMs } from '../metering/window';
-import { signAndSend, type PushSender } from '../push/deliver';
+import { PUSH_TIMEOUT_MS, signAndSend, type PushSender } from '../push/deliver';
 import { isPublicHttpUrl } from '../push/ssrf';
 import { resolveLabelNames } from '../db/labels';
 import { parseRule, nextFireAt, advanceFireTime } from './recurrence';
@@ -106,6 +106,8 @@ const HEARTBEAT_TIMEOUT_MS = 15 * 60 * 1000;
 const CIRCUIT_BREAKER_LIMIT = 2;
 /** Push delivery attempts before a delivery is dead-lettered (docs/05 §4). */
 const MAX_PUSH_ATTEMPTS = 5;
+/** One config's share of a single drain. */
+const MAX_PUSH_PER_CONFIG_PER_DRAIN = 10;
 /**
  * How long after a delivery is queued the alarm drains it, doubling per attempt
  * (docs/05 §4): 5s, 10s, 20s, 40s, 80s, then dead-lettered.
@@ -1250,7 +1252,7 @@ export interface BoardStub {
   getPushDeliveries(opts?: { status?: string }): Promise<PushDeliveryView[]>;
   pendingGateDeliveries(): Promise<GatePendingBody[]>;
   pendingElicitationDeliveries(): Promise<ElicitationPendingBody[]>;
-  dispatchPushDeliveries(): Promise<{ sent: number; failed: number }>;
+  dispatchPushDeliveries(sender?: PushSender, opts?: { timeoutMs?: number }): Promise<{ sent: number; failed: number }>;
   getRunReportOutbox(): Promise<RunReportOutboxRow[]>;
   sweepBoard(nowIso: string): Promise<{ overdueNotified: number; schedulesFired: number; staleNotified: number }>;
   /** Cards waiting past the threshold — the board's own unless `afterHours` is given. See `StaleCardView`. */
@@ -1359,7 +1361,7 @@ export interface RunVerbInput {
  * Each claim takes a lease with a fencing epoch; a missed heartbeat is reclaimed via a DO alarm,
  * and repeated failures trip a circuit breaker.
  */
-const defaultPushSender: PushSender = (url, init) => fetch(url, init).then((r) => ({ status: r.status }));
+const defaultPushSender: PushSender = (url, init) => fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(PUSH_TIMEOUT_MS) }).then((r) => ({ status: r.status }));
 
 export class BoardDO extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -3563,19 +3565,30 @@ export class BoardDO extends DurableObject<Env> {
    * is injectable (tests pass a stub); production durability — Queue + Workflow with exponential
    * backoff — wraps this. A single drain marks each delivery sent/failed.
    */
-  async dispatchPushDeliveries(sender: PushSender = defaultPushSender): Promise<{ sent: number; failed: number }> {
+  async dispatchPushDeliveries(sender: PushSender = defaultPushSender, opts?: { timeoutMs?: number }): Promise<{ sent: number; failed: number }> {
     // Retry pending + previously-failed rows under the attempt cap; exhausted ones are dead-lettered.
+    // Fresh deliveries go first (attempts ASC), and no one config takes more than
+    // MAX_PUSH_PER_CONFIG_PER_DRAIN of a drain, so a down endpoint's retries cannot starve another
+    // config's pushes on the same board.
+    const perConfig = new Map<string, number>();
     const rows = this.sql
       .exec(
-        `SELECT d.id, d.url, d.body, d.attempts, c.token FROM push_deliveries d JOIN push_configs c ON d.config_id = c.id
-         WHERE d.status IN ('pending', 'failed') AND d.attempts < ? ORDER BY d.id ASC LIMIT 50`,
+        `SELECT d.id, d.config_id, d.url, d.body, d.attempts, c.token FROM push_deliveries d JOIN push_configs c ON d.config_id = c.id
+         WHERE d.status IN ('pending', 'failed') AND d.attempts < ? ORDER BY d.attempts ASC, d.id ASC LIMIT 500`,
         MAX_PUSH_ATTEMPTS,
       )
-      .toArray();
+      .toArray()
+      .filter((r) => {
+        const n = perConfig.get(r.config_id as string) ?? 0;
+        if (n >= MAX_PUSH_PER_CONFIG_PER_DRAIN) return false;        
+        perConfig.set(r.config_id as string, n + 1);
+        return true;
+      })
+      .slice(0, 50);
     let sent = 0;
     let failed = 0;
     for (const r of rows) {
-      const outcome = await signAndSend({ id: Number(r.id), url: r.url as string, body: r.body as string, token: r.token as string }, sender);
+      const outcome = await signAndSend({ id: Number(r.id), url: r.url as string, body: r.body as string, token: r.token as string }, sender, opts?.timeoutMs);
       const attempts = Number(r.attempts) + 1;
       const status = outcome.ok ? 'sent' : attempts >= MAX_PUSH_ATTEMPTS ? 'dead' : 'failed';
       this.sql.exec(`UPDATE push_deliveries SET status = ?, attempts = ?, last_status = ? WHERE id = ?`, status, attempts, outcome.status, r.id);

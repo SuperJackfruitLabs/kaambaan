@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { recogniseParts } from '../src/providers';
+import { ReferenceSourceType } from '../src/primitives';
 
 const H = 'app.superlibrary.dev';
 
@@ -19,5 +20,9 @@ describe('Superlibrary references', () => {
   });
   it('does not claim another host', () => {
     expect(recogniseParts('example.test', ['a', 'itm_0123456789abcdef'])).toMatchObject({ provider: 'url' });
+  });
+  it('produces a source type the contract accepts', () => {
+    const r = recogniseParts(H, ['a', 'itm_0123456789abcdef']);
+    expect(ReferenceSourceType.safeParse(r.sourceType).success).toBe(true);
   });
 });

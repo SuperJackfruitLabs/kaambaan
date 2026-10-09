@@ -73,6 +73,32 @@ describe('supersedes (REST)', () => {
     expect(res.status).toBe(201);
     const list = (await (await SELF.fetch(`${base}/v1/boards/${b}/cards/${old}/links`, { headers: T })).json()) as { links: { kind: string; enforced: boolean }[] };
     expect(list.links).toContainEqual(expect.objectContaining({ kind: 'supersedes', enforced: false }));
+    expect(((await res.json()) as { link: { enforced: boolean } }).link.enforced).toBe(false);
+    const del = await SELF.fetch(`${base}/v1/boards/${b}/links`, { method: 'DELETE', headers: T, body: JSON.stringify({ fromCardId: next, toCardId: old, kind: 'supersedes' }) });
+    expect(((await del.json()) as { enforced: boolean }).enforced).toBe(false);
+  });
+
+  it('stamps blocks as enforced on POST', async () => {
+    const b = await board('Enf');
+    const x = await card(b, 'x');
+    const y = await card(b, 'y');
+    const res = await SELF.fetch(`${base}/v1/boards/${b}/links`, { method: 'POST', headers: T, body: JSON.stringify({ fromCardId: x, toCardId: y, kind: 'blocks' }) });
+    expect(((await res.json()) as { link: { enforced: boolean } }).link.enforced).toBe(true);
+  });
+
+  it('refuses a card superseding itself', async () => {
+    const b = await board('Self');
+    const x = await card(b, 'x');
+    const res = await SELF.fetch(`${base}/v1/boards/${b}/links`, { method: 'POST', headers: T, body: JSON.stringify({ fromCardId: x, toCardId: x, kind: 'supersedes' }) });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('INVALID_LINK');
+  });
+
+  it('refuses a non-array events on push-configs with 400 INVALID_BODY', async () => {
+    const b = await board('Push');
+    const res = await SELF.fetch(`${base}/v1/boards/${b}/push-configs`, { method: 'POST', headers: { ...T, 'X-Agent-Id': 'agt_x' }, body: JSON.stringify({ url: 'https://hook.example.com/x', token: 't', events: 'link.added' }) });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('INVALID_BODY');
   });
 
   it('refuses a cross-board supersedes with 400 INVALID_LINK_KIND', async () => {
@@ -92,5 +118,6 @@ describe('supersedes (REST)', () => {
     const c = await card(away, 'C');
     const res = await SELF.fetch(`${base}/v1/boards/${home}/links`, { method: 'DELETE', headers: T, body: JSON.stringify({ fromCardId: a, toCardId: c, toBoardId: away, kind: 'supersedes' }) });
     expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('INVALID_LINK_KIND');
   });
 });

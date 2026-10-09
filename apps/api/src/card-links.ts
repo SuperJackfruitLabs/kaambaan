@@ -2,6 +2,7 @@ import type { Env } from './env';
 import { boardStub } from './board/stub';
 import type { BoardStub } from './board/board-do';
 import { listExternalLinksFor } from './db/card-links-external';
+import { isEnforcedKind } from './board/links';
 
 /**
  * Names for the boards in `boardIds`, but ONLY the ones `tenantId` actually owns — a board id that
@@ -95,7 +96,7 @@ export async function cardLinksBody(env: Env, tenantId: string, stub: BoardStub,
         // claim it does not — unreachable today only because of a web-side defect being fixed
         // separately, and the whole point of this flag is that a client should never have to
         // infer enforcement itself, including for the one kind that has none.
-        links: links.map((l) => ({ ...l, enforced: l.kind === 'blocks' || l.kind === 'parent' })),
+        links: links.map((l) => ({ ...l, enforced: isEnforcedKind(l.kind) })),
         externalLinks: externalLinks.map((l, i) => ({
           ...l,
           enforced: false as const,
