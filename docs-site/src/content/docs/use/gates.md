@@ -21,6 +21,16 @@ entering that stage opens a gate; no card leaves it without a decision.
 Each is recorded with **who decided, when, and any comment they left**. That record is part of
 the card's history, not a transient notification.
 
+### Adding a note
+
+In the board, a pending gate shows **Add a note (optional)** above the buttons. Whatever you write
+is recorded with the decision, whichever you take: approve, reject or request changes. Leaving it
+empty records no comment. **Request changes needs a note**, because it becomes the instruction the
+next run reads. The note is plain text, up to 8192 characters. A card's tile carries a **Review**
+button that opens the card, where the note and the decision are.
+
+The CLI does the same with `--comment` (see [`supi approve`](/reference/cli/gates/#supi-approve)).
+
 ## The rule that makes a gate mean something
 
 **Whoever produced the work cannot resolve its gate.** superpipeline refuses it:

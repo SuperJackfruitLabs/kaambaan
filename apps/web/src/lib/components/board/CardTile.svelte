@@ -1,8 +1,6 @@
 <script lang="ts">
   import { displayAgent } from '$lib/names';
   import type { Card, Reference } from '$lib/api';
-  import { resolveGate, type GateDecision } from '$lib/api';
-  import { gateDecisionForOption } from '$lib/gate-delivery';
   import { app } from '$lib/stores/app.svelte';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { cardDraggable } from '$lib/dnd';
@@ -201,20 +199,6 @@
     if (e.key === 'm' || e.key === 'M') {
       e.preventDefault();
       moveMenuOpen = !moveMenuOpen;
-    }
-  }
-
-  // Gate quick-actions (approve / request_changes / reject) shown directly on the tile
-  // so the operator can act without opening the drawer — matches the gates.spec.ts expectation.
-  async function onGateResolve(e: MouseEvent, decision: GateDecision): Promise<void> {
-    e.stopPropagation(); // don't open the drawer
-    const bid = app.boardId;
-    const g = gate;
-    if (!bid || !g) return;
-    const res = await resolveGate(bid, g.id, decision, undefined, g.approvalSubject);
-    if (res.ok) {
-      app.closeCard(); // close drawer if open for this card
-      await app.refresh();
     }
   }
 </script>
@@ -418,22 +402,21 @@
     </div>
   {/if}
 
-  <!-- gate quick-actions: Approve / Request changes / Reject — visible directly on the tile -->
+  <!--
+    A pending gate: one button that opens the drawer, where the decision and its note live.
+
+    The tile used to carry Approve and Reject directly, and they sent no comment (every UI
+    approval was recorded with `comment: null`). There is no room on a tile for an honest note
+    field, and a decision with no way to explain it is the thing being fixed, so the tile no
+    longer decides: it takes the reviewer to the drawer.
+  -->
   {#if gate}
     <div class="mt-2.5 flex flex-wrap gap-1.5" role="group" aria-label="Gate actions">
-      {#each (gate.options.length > 0 ? gate.options : [
-        { name: 'approve', title: 'Approve', interactive: false },
-        { name: 'request_changes', title: 'Request changes', interactive: true },
-        { name: 'reject', title: 'Reject', interactive: false },
-      ]) as opt (opt.name)}
-        {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
-          <Button size="sm" onclick={(e: MouseEvent) => onGateResolve(e, gateDecisionForOption(opt.name))}>{opt.title}</Button>
-        {:else if opt.name === 'request_changes'}
-          <Button size="sm" variant="outline" onclick={() => app.openCard(card.id)}>{opt.title}</Button>
-        {:else if opt.name === 'reject'}
-          <Button size="sm" variant="ghost" onclick={(e: MouseEvent) => onGateResolve(e, 'reject')}>{opt.title}</Button>
-        {/if}
-      {/each}
+      <Button
+        size="sm"
+        onclick={(e: MouseEvent) => { e.stopPropagation(); app.openCard(card.id); }}
+        style="min-height:var(--tap)"
+      >⚑ Review</Button>
     </div>
   {/if}
 </div>
