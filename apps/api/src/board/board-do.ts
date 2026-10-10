@@ -2676,19 +2676,7 @@ export class BoardDO extends DurableObject<Env> {
     // A manual move overrides any in-flight review: cancel pending gates and return the card to a
     // clean, claimable state. Without this, dragging a card off a human gate strands it in
     // input-required with an orphaned pending gate that no agent can claim and no human can resolve.
-    // Runs whose wait this move ends — judged by a pending gate, or asking a pending question —
-    // change reported state. Collected before the cancels below change what they read as.
-    const waitingRuns = new Set<string>();
-    for (const g of this.sql.exec(`SELECT * FROM gates WHERE card_id = ? AND status = 'pending'`, cardId).toArray()) {
-      const judged = this.runJudgedByGate(g);
-      if (judged) waitingRuns.add(judged);
-    }
-    for (const e of this.sql.exec(`SELECT DISTINCT run_id FROM elicitations WHERE card_id = ? AND status = 'pending'`, cardId).toArray()) {
-      waitingRuns.add(e.run_id as string);
-    }
-    this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
-    this.cancelElicitationsForCard(cardId);
-    for (const r of waitingRuns) this.reportRun(r);
+    this.cancelPendingReviews(cardId, now);
     // The person moving it IS the human attention the card was waiting for; carrying
     // the request across the move would ask for something already given.
     this.setNeedsHuman(cardId, null);
@@ -2968,8 +2956,29 @@ export class BoardDO extends DurableObject<Env> {
       const nowMs = Date.parse(this.now());
       const prevMs = existing.updatedAt ? Date.parse(existing.updatedAt) : Number.NaN;
       vals.push(new Date(Number.isNaN(prevMs) ? nowMs : Math.max(nowMs, prevMs + 1)).toISOString());
+      const archiving = typeof patch.archivedAt === 'string';
       this.ctx.storage.transactionSync(() => {
-        this.invalidateApprovalSubject(cardId, patch.spec !== undefined ? 'card.spec_changed' : 'card.changed', null);
+        this.invalidateApprovalSubject(
+          cardId,
+          archiving ? 'card.archived' : patch.spec !== undefined ? 'card.spec_changed' : 'card.changed',
+          null,
+        );
+        if (archiving) {
+          // Archiving takes a card out of the working set, so whatever it was waiting on a person for
+          // ends with it - the same cancel a manual move performs. Without this the gate stayed
+          // pending: in Needs you, in `supi gates`, pushed to the bridges, for a card nobody can see.
+          const ended = this.cancelPendingReviews(cardId, this.now());
+          const parked = this.getCardRow(cardId)?.state === 'input-required';
+          // A card left in input-required with nothing pending would be restored as a silent wedge.
+          // Say why, in the card's own state: restoring never reopens the review (see the docs) - the
+          // person resumes it to an earlier stage or moves it, both of which already exist.
+          if (ended > 0 && parked) {
+            this.setNeedsHuman(cardId, {
+              reason: 'blocked',
+              detail: 'its pending review or question was cancelled when the card was archived',
+            });
+          }
+        }
         this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
       });
     }
@@ -6633,6 +6642,33 @@ export class BoardDO extends DurableObject<Env> {
     if (pending.runId) this.reportRun(pending.runId);
   }
 
+  /**
+   * End everything on a card that is waiting on a person: its pending gates and its pending
+   * questions. Returns how many were ended.
+   *
+   * Shared by the two ways a card stops being worked in place - a manual move and an archive - so
+   * they cannot disagree about what "the review is over" means. Runs whose wait this ends (judged
+   * by a pending gate, or asking a pending question) change reported state, so they are collected
+   * BEFORE the cancels change what they read as and reported AFTER, in the same synchronous span.
+   *
+   * It does not touch the card row: the move re-queues the card and the archive keeps it where it
+   * is, and each says so itself.
+   */
+  private cancelPendingReviews(cardId: string, now: string): number {
+    const waitingRuns = new Set<string>();
+    const gates = this.sql.exec(`SELECT * FROM gates WHERE card_id = ? AND status = 'pending'`, cardId).toArray();
+    for (const g of gates) {
+      const judged = this.runJudgedByGate(g);
+      if (judged) waitingRuns.add(judged);
+    }
+    const questions = this.sql.exec(`SELECT DISTINCT run_id FROM elicitations WHERE card_id = ? AND status = 'pending'`, cardId).toArray();
+    for (const e of questions) waitingRuns.add(e.run_id as string);
+    this.sql.exec(`UPDATE gates SET status = 'cancelled', resolved_at = ? WHERE card_id = ? AND status = 'pending'`, now, cardId);
+    this.cancelElicitationsForCard(cardId);
+    for (const r of waitingRuns) this.reportRun(r);
+    return gates.length + questions.length;
+  }
+
   /** Retire the active subject without deleting its immutable audit row. */
   private invalidateApprovalSubject(cardId: string, reason: string, invalidatedBy: string | null): void {
     const cardRow = this.getCardRow(cardId);
@@ -6895,7 +6931,7 @@ export class BoardDO extends DurableObject<Env> {
    */
   private pendingElicitationRows(): Row[] {
     return this.sql
-      .exec(`SELECT * FROM elicitations WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC`)
+      .exec(`SELECT * FROM elicitations WHERE status = 'pending' AND card_id NOT IN (SELECT id FROM cards WHERE archived_at IS NOT NULL) ORDER BY created_at ASC, rowid ASC`)
       .toArray() as Row[];
   }
 
@@ -7087,7 +7123,7 @@ export class BoardDO extends DurableObject<Env> {
 
   private pendingGates(): GateView[] {
     return this.sql
-      .exec(`SELECT * FROM gates WHERE status = 'pending' ORDER BY created_at ASC`)
+      .exec(`SELECT * FROM gates WHERE status = 'pending' AND card_id NOT IN (SELECT id FROM cards WHERE archived_at IS NOT NULL) ORDER BY created_at ASC`)
       .toArray()
       .map((r) => this.rowToGate(r as Row));
   }
@@ -7690,7 +7726,7 @@ export class BoardDO extends DurableObject<Env> {
    */
   async pendingGateDeliveries(): Promise<GatePendingBody[]> {
     return this.sql
-      .exec(`SELECT * FROM gates WHERE status = 'pending' ORDER BY created_at ASC`)
+      .exec(`SELECT * FROM gates WHERE status = 'pending' AND card_id NOT IN (SELECT id FROM cards WHERE archived_at IS NOT NULL) ORDER BY created_at ASC`)
       .toArray()
       .map((r) => this.gatePendingBody(r as Row))
       .filter((b): b is GatePendingBody => b !== null);
