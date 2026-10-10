@@ -12,7 +12,6 @@
     updateCard,
     deleteCard,
     addReference,
-    resolveGate,
     updateApprovalDelivery,
     answerElicitation,
     archiveCard,
@@ -33,7 +32,7 @@
     type Milestone,
   } from '$lib/api';
   import { Button } from '$lib/components/ui/button';
-  import { gateDecisionForOption } from '$lib/gate-delivery';
+  import GateActions from '$lib/components/card/GateActions.svelte';
   import { manualDeliveryItems } from '$lib/approval-delivery';
   import { agentColor, initialOf } from '$lib/components/agentColor';
   import { resolveCardLabelsForEdit } from '$lib/components/card-labels';
@@ -285,21 +284,15 @@
   const FEED_COALESCE_MS = 1000;
 
   // ---- gate state ----
-  // which option is interactive (request_changes) — shows comment textarea
-  let activeInteractiveOption = $state<string | null>(null);
-  let gateComment = $state('');
-
   // ---- refresh drawer data when card opens / changes ----
   $effect(() => {
     const id = cardId;
     if (id && boardId) {
       answerText = '';
-      gateComment = '';
       gateError = null;
       livePostUrl = '';
       deliverySaving = false;
       copiedItem = null;
-      activeInteractiveOption = null;
       editing = false;
       newRefUrl = '';
       localError = null;
@@ -674,10 +667,8 @@
   }
 
   // ---- gate resolution ----
-  async function onResolve(decision: GateDecision): Promise<void> {
-    if (!boardId || !gate) return;
-    const comment = gateComment.trim() || undefined;
-    const res = await resolveGate(boardId, gate.id, decision, comment, gate.approvalSubject);
+  async function onGateResponse(decision: GateDecision, res: Response): Promise<boolean> {
+    if (!boardId) return false;
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
       /**
@@ -695,7 +686,7 @@
         : `Couldn't record that decision (${res.status})`;
       // Whatever refused us knows something this tab does not; the card's own record settles it.
       await Promise.all([app.refresh(), refreshDrawer(cardId!, boardId)]);
-      return;
+      return false;
     }
     gateError = null;
     localError = null;
@@ -705,6 +696,7 @@
     } else {
       app.closeCard();
     }
+    return true;
   }
 
   async function changeDelivery(update: { mode: 'manual' | 'automatic' } | { liveUrl: string }): Promise<void> {
@@ -1169,13 +1161,6 @@
 
         <!-- gate panel — only when a pending gate exists -->
         {#if gate}
-          {@const effectiveOptions = gate.options.length > 0
-            ? gate.options
-            : [
-                { name: 'approve', title: 'Approve', interactive: false },
-                { name: 'request_changes', title: 'Request changes', interactive: true },
-                { name: 'reject', title: 'Reject', interactive: false },
-              ]}
           <section class="sec">
             <div class="gate border rounded-[10px] p-3.5" style="border-color:rgba(255,107,87,.35);background:rgba(255,107,87,.06)">
               <div class="gh mb-2.5 flex items-center gap-2">
@@ -1197,51 +1182,7 @@
                 </div>
               {/if}
 
-              <!-- gate action buttons — driven by effectiveOptions -->
-              <div class="triad flex gap-2 flex-wrap">
-                {#each effectiveOptions as opt (opt.name)}
-                  {#if opt.name === 'approve' || opt.name === 'approve_manual' || opt.name === 'approve_automatic'}
-                    <Button
-                      size="sm"
-                      onclick={() => onResolve(gateDecisionForOption(opt.name))}
-                      class="flex-1"
-                    >{opt.title}</Button>
-                  {:else if opt.name === 'request_changes'}
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onclick={() => {
-                        activeInteractiveOption = activeInteractiveOption === 'request_changes' ? null : 'request_changes';
-                      }}
-                      class="flex-1"
-                    >{opt.title}</Button>
-                  {:else if opt.name === 'reject'}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onclick={() => onResolve('reject')}
-                      class="flex-1"
-                    >{opt.title}</Button>
-                  {/if}
-                {/each}
-              </div>
-
-              <!-- request_changes comment box -->
-              {#if activeInteractiveOption === 'request_changes'}
-                <div class="reject-box mt-3">
-                  <textarea
-                    bind:value={gateComment}
-                    rows="3"
-                    placeholder="What needs to change? This feedback threads into the agent's next attempt…"
-                    class="bg-inset border-border focus:border-coral w-full resize-none rounded-[7px] border px-2.5 py-2 text-xs outline-none"
-                    style="border-color:rgba(255,107,87,.4)"
-                  ></textarea>
-                  <div class="mt-2 flex justify-end gap-1.5">
-                    <Button size="sm" variant="ghost" onclick={() => { activeInteractiveOption = null; gateComment = ''; }}>Cancel</Button>
-                    <Button size="sm" variant="outline" onclick={() => onResolve('request_changes')}>Send feedback</Button>
-                  </div>
-                </div>
-              {/if}
+              {#if boardId}<GateActions {boardId} {gate} onResponse={onGateResponse} />{/if}
             </div>
           </section>
         {/if}
