@@ -59,7 +59,7 @@ supi approve <boardId> <gateId> [--comment "why"]
 
 | flag | type | default | meaning |
 |---|---|---|---|
-| `--comment "why"` | string | no comment | recorded with the decision and shown to whoever reads the card. The web board offers the same note on every decision |
+| `--comment "why"` | string | no comment | recorded with the decision and shown to whoever reads the card |
 
 **Who may run it**
 
@@ -96,7 +96,7 @@ supi reject <boardId> <gateId> [--comment "why"]
 
 | flag | type | default | meaning |
 |---|---|---|---|
-| `--comment "why"` | string | no comment | recorded with the decision and shown to whoever reads the card. The web board offers the same note on every decision |
+| `--comment "why"` | string | no comment | recorded with the decision and shown to whoever reads the card |
 
 **Who may run it**
 
