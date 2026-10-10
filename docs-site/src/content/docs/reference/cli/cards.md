@@ -267,6 +267,8 @@ supi stale --hours 0 --json
 
 Archives a card now. It leaves the board's lanes and appears under the web app's "show archived" filter.
 
+Archiving also ends whatever the card was waiting on a person for, the same way moving it does: its pending approval gates and pending questions are cancelled (so they leave Needs you and `supi gates`), and an active approval subject is invalidated. A cancelled gate stays cancelled. Restoring the card does not reopen it: a card that was waiting is restored parked as `blocked`, saying its review was cancelled when it was archived. Resume it to an earlier stage (`supi resume`) or move it to put it back to work.
+
 ```sh
 supi archive <boardId> <cardId>
 ```

@@ -120,6 +120,11 @@ supi archive <boardId> <cardId>
 An archived card leaves the board's lanes and the claim queue without being deleted, and the "show
 archived" filter brings it back into view.
 
+Archiving cancels anything the card was waiting on a person for: its pending approval gates and
+questions are closed, so they no longer appear in Needs you or `supi gates`. Restoring the card does
+not bring them back. A card that was waiting comes back parked as blocked, with the reason on it;
+resume it to an earlier stage or move it to start it again.
+
 ## Next
 
 - [Recurring cards](/use/recurring/) — work that comes back on a cadence
