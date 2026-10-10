@@ -2963,22 +2963,7 @@ export class BoardDO extends DurableObject<Env> {
           archiving ? 'card.archived' : patch.spec !== undefined ? 'card.spec_changed' : 'card.changed',
           null,
         );
-        if (archiving) {
-          // Archiving takes a card out of the working set, so whatever it was waiting on a person for
-          // ends with it - the same cancel a manual move performs. Without this the gate stayed
-          // pending: in Needs you, in `supi gates`, pushed to the bridges, for a card nobody can see.
-          const ended = this.cancelPendingReviews(cardId, this.now());
-          const parked = this.getCardRow(cardId)?.state === 'input-required';
-          // A card left in input-required with nothing pending would be restored as a silent wedge.
-          // Say why, in the card's own state: restoring never reopens the review (see the docs) - the
-          // person resumes it to an earlier stage or moves it, both of which already exist.
-          if (ended > 0 && parked) {
-            this.setNeedsHuman(cardId, {
-              reason: 'blocked',
-              detail: 'its pending review or question was cancelled when the card was archived',
-            });
-          }
-        }
+        if (archiving) this.endReviewsOfArchivedCard(cardId);
         this.sql.exec(`UPDATE cards SET ${sets.join(', ')} WHERE id = ?`, ...vals, cardId);
       });
     }
@@ -4331,6 +4316,23 @@ export class BoardDO extends DurableObject<Env> {
       }
     }
 
+    /**
+     * ONE-SHOT, CHANGES LIVE DATA. Cancels the pending gates and questions of cards that were
+     * archived before archiving learned to cancel them (observed 2026-10-10: seven such gates in
+     * Needs you). Its own flag, for the reason `terminalBackfillDone` gives. Only an ARCHIVED
+     * card's PENDING rows are touched; a live card's gate is never read here.
+     */
+    let archivedReviewsError: unknown = null;
+    if (!this.getMeta('archivedReviewsBackfillDone')) {
+      try {
+        const { cancelled } = this.backfillArchivedReviews();
+        this.setMeta('archivedReviewsBackfillDone', '1');
+        if (cancelled > 0) this.emit('cards.archived_reviews_backfilled', { cancelled });
+      } catch (err) {
+        archivedReviewsError = err;
+      }
+    }
+
     let backfillError: unknown = null;
     if (!this.getMeta('dueBackfillDone')) {
       try {
@@ -4403,6 +4405,7 @@ export class BoardDO extends DurableObject<Env> {
     // Reported after the sweep's own work, same as `backfillError` above: a migration that failed
     // must be visible to the caller, and must not have cost the overdue pass or the schedules.
     if (terminalBackfillError) throw terminalBackfillError;
+    if (archivedReviewsError) throw archivedReviewsError;
 
     return { overdueNotified, schedulesFired, staleNotified };
   }
@@ -6667,6 +6670,52 @@ export class BoardDO extends DurableObject<Env> {
     this.cancelElicitationsForCard(cardId);
     for (const r of waitingRuns) this.reportRun(r);
     return gates.length + questions.length;
+  }
+
+  /**
+   * What archiving does to a card's waiting on a person. Archiving takes a card out of the working
+   * set, so whatever it was waiting on a person for ends with it - the same cancel a manual move
+   * performs. Without this the gate stayed pending: in Needs you, in `supi gates`, pushed to the
+   * bridges, for a card nobody can see.
+   *
+   * A card left in input-required with nothing pending would be restored as a silent wedge. So it
+   * says why, in the card's own state: restoring never reopens the review (a cancelled gate stays
+   * cancelled) - the person resumes it to an earlier stage or moves it, both of which exist.
+   * Returns how many gates and questions were ended.
+   */
+  private endReviewsOfArchivedCard(cardId: string): number {
+    const ended = this.cancelPendingReviews(cardId, this.now());
+    if (ended > 0 && this.getCardRow(cardId)?.state === 'input-required') {
+      this.setNeedsHuman(cardId, {
+        reason: 'blocked',
+        detail: 'its pending review or question was cancelled when the card was archived',
+      });
+    }
+    return ended;
+  }
+
+  /**
+   * The one-shot behind `archivedReviewsBackfillDone`: `endReviewsOfArchivedCard` for every card
+   * that was archived before archiving did it. Selects only archived cards that still have a
+   * PENDING gate or question, so a live card, and any decided row, is out of its reach by query.
+   */
+  private backfillArchivedReviews(): { cancelled: number } {
+    const rows = this.sql
+      .exec(
+        `SELECT id FROM cards WHERE archived_at IS NOT NULL AND (
+           id IN (SELECT card_id FROM gates WHERE status = 'pending') OR
+           id IN (SELECT card_id FROM elicitations WHERE status = 'pending'))`,
+      )
+      .toArray();
+    let cancelled = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const r of rows) {
+        const cardId = r.id as string;
+        this.invalidateApprovalSubject(cardId, 'card.archived', null);
+        cancelled += this.endReviewsOfArchivedCard(cardId);
+      }
+    });
+    return { cancelled };
   }
 
   /** Retire the active subject without deleting its immutable audit row. */

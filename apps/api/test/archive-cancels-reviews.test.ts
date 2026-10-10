@@ -55,12 +55,16 @@ async function cardAtReview(board: BoardDO, title: string, projectId?: string): 
   return card.value.id;
 }
 
+/** The stored status, not the read shape: the reads hide an archived card's rows whatever they say. */
+const rawStatus = (state: DurableObjectState, table: 'gates' | 'elicitations', cardId: string): string[] =>
+  state.storage.sql.exec(`SELECT status FROM ${table} WHERE card_id = ?`, cardId).toArray().map((r) => r.status as string);
+
 const pendingFor = async (board: BoardDO, cardId: string) =>
   (await board.getState()).gates.filter((g) => g.cardId === cardId && g.status === 'pending');
 
 describe('archiving a card ends what was waiting on a person', () => {
   it('cancels the card\'s pending gate, so it leaves every pending list', async () => {
-    await runInDurableObject(stubFor('arch-gate'), async (board: BoardDO) => {
+    await runInDurableObject(stubFor('arch-gate'), async (board: BoardDO, state) => {
       await board.init({ id: 'brd_ag', tenantId: 'tnt_a', name: 'A', stages: REVIEW });
       const cardId = await cardAtReview(board, 'Post');
       expect(await pendingFor(board, cardId)).toHaveLength(1);
@@ -68,6 +72,7 @@ describe('archiving a card ends what was waiting on a person', () => {
       const r = await board.updateCard(cardId, { archivedAt: ARCHIVED });
       expect(r.ok).toBe(true);
 
+      expect(rawStatus(state, 'gates', cardId)).toEqual(['cancelled']);
       expect(await pendingFor(board, cardId)).toHaveLength(0);
       expect(await board.pendingGateDeliveries()).toHaveLength(0);
     });
@@ -88,7 +93,7 @@ describe('archiving a card ends what was waiting on a person', () => {
   });
 
   it('cancels the card\'s pending question', async () => {
-    await runInDurableObject(stubFor('arch-elc'), async (board: BoardDO) => {
+    await runInDurableObject(stubFor('arch-elc'), async (board: BoardDO, state) => {
       await board.init({ id: 'brd_ae', tenantId: 'tnt_a', name: 'E', stages: ASKING });
       const card = await board.createCard({ title: 'Add a feature', ownerUserId: 'usr_a' });
       if (!card.ok) throw new Error(card.message);
@@ -102,6 +107,7 @@ describe('archiving a card ends what was waiting on a person', () => {
 
       await board.updateCard(card.value.id, { archivedAt: ARCHIVED });
 
+      expect(rawStatus(state, 'elicitations', card.value.id)).toEqual(['cancelled']);
       expect(await board.pendingElicitationDeliveries()).toHaveLength(0);
       expect((await board.getState()).elicitations.filter((e) => e.status === 'pending')).toHaveLength(0);
     });
@@ -120,12 +126,12 @@ describe('archiving a card ends what was waiting on a person', () => {
       expect(subject.status).toBe('invalidated');
       expect(subject.invalidation_reason).toBe('card.archived');
       expect(sql.exec(`SELECT active_approval_subject_id AS s FROM cards WHERE id = ?`, cardId).one().s).toBeNull();
-      expect(await pendingFor(board, cardId)).toHaveLength(0);
+      expect(rawStatus(state, 'gates', cardId)).toEqual(['cancelled']);
     });
   });
 
   it('is relayed: the card update is pushed and the gate is gone from the reconcile list', async () => {
-    await runInDurableObject(stubFor('arch-relay'), async (board: BoardDO) => {
+    await runInDurableObject(stubFor('arch-relay'), async (board: BoardDO, state) => {
       await board.init({ id: 'brd_ar', tenantId: 'tnt_a', name: 'R', stages: REVIEW });
       await board.registerPushConfig({
         agentId: 'agt_bridge', url: HOOK, token: 's', capabilities: [], events: ['gate.pending', 'card.updated'],
@@ -138,18 +144,20 @@ describe('archiving a card ends what was waiting on a person', () => {
 
       const bodies = (await board.getPushDeliveries()).slice(before).map((d) => JSON.parse(d.body));
       expect(bodies.map((b) => b.event)).toContain('card.updated');
+      // Gone from the list the hub reconciles against because it is cancelled, not merely hidden.
+      expect(rawStatus(state, 'gates', cardId)).toEqual(['cancelled']);
       expect(await board.pendingGateDeliveries()).toEqual([]);
     });
   });
 
   it('leaves another card\'s gate alone', async () => {
-    await runInDurableObject(stubFor('arch-other'), async (board: BoardDO) => {
+    await runInDurableObject(stubFor('arch-other'), async (board: BoardDO, state) => {
       await board.init({ id: 'brd_ao', tenantId: 'tnt_a', name: 'O', stages: REVIEW });
       const a = await cardAtReview(board, 'A');
       const b = await cardAtReview(board, 'B');
       await board.updateCard(a, { archivedAt: ARCHIVED });
-      expect(await pendingFor(board, a)).toHaveLength(0);
-      expect(await pendingFor(board, b)).toHaveLength(1);
+      expect(rawStatus(state, 'gates', a)).toEqual(['cancelled']);
+      expect(rawStatus(state, 'gates', b)).toEqual(['pending']);
     });
   });
 
@@ -179,13 +187,14 @@ describe('a gate whose card is archived is never listed as pending', () => {
 
 describe('restoring an archived card', () => {
   it('does not resurrect the cancelled gate, and says why the card is waiting', async () => {
-    await runInDurableObject(stubFor('unarch'), async (board: BoardDO) => {
+    await runInDurableObject(stubFor('unarch'), async (board: BoardDO, state) => {
       await board.init({ id: 'brd_un', tenantId: 'tnt_a', name: 'U', stages: REVIEW });
       const a = await cardAtReview(board, 'A');
       await board.updateCard(a, { archivedAt: ARCHIVED });
       const restored = await board.updateCard(a, { archivedAt: null });
       expect(restored.ok).toBe(true);
 
+      expect(rawStatus(state, 'gates', a)).toEqual(['cancelled']);
       expect(await pendingFor(board, a)).toHaveLength(0);
       expect(await board.pendingGateDeliveries()).toHaveLength(0);
       if (!restored.ok) return;
