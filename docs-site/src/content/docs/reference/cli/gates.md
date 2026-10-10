@@ -14,7 +14,7 @@ Every command here also takes `--json` and `--help` — see [the overview](/refe
 
 ## `supi gates`
 
-Every gate on the board that is open and waiting for a decision, with the card it holds.
+Every gate on the board that is open and waiting for a decision, with the card it holds. A gate on an archived card is never listed: archiving cancels it.
 
 ```sh
 supi gates <boardId>
